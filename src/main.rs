@@ -11,6 +11,7 @@
 #![allow(missing_docs)]
 
 mod config;
+mod setup;
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -96,7 +97,7 @@ async fn main() {
 
     match cli.command {
         None | Some(Commands::Run) => cmd_run(&cli).await,
-        Some(Commands::Setup) => cmd_setup(),
+        Some(Commands::Setup) => cmd_setup(config_path.as_deref()),
         Some(Commands::Config { action }) => cmd_config(config_path.as_deref(), action),
         Some(Commands::Migrate) => cmd_migrate(&cli),
         Some(Commands::Backup) => cmd_backup(&cli),
@@ -263,10 +264,8 @@ async fn init_mesh_plugin(
     Some(transport)
 }
 
-fn cmd_setup() {
-    // TODO: interactive setup wizard.
-    eprintln!("error: setup wizard not yet implemented.");
-    std::process::exit(1);
+fn cmd_setup(config_path: Option<&std::path::Path>) {
+    setup::run_wizard(config_path);
 }
 
 fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {

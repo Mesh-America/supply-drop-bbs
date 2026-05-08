@@ -158,12 +158,15 @@
 # docs/OPERATIONS.md for USB vs Pi HAT setup instructions.
 
 [plugins.mesh]
-# How to reach the radio. "serial" for USB companion devices (default);
-# "tcp" or "hat" for pymc_core + Pi HAT setups.
-# connection_type = "serial"
+# How to reach the radio.
+#   "tcp"    — connect to a pymc_core CompanionFrameServer over TCP (default)
+#   "hat"    — same as tcp; the setup wizard offers Pi HAT GPIO/SPI hints
+#   "serial" — connect directly to a USB companion device (Heltec V3,
+#              T-Beam, RAK4631, etc.) — no pymc_core required (ADR-0013)
+# connection_type = "tcp"
 
 # ── Serial mode (connection_type = "serial") ──────────────────────
-# Serial device. The setup wizard detects this automatically.
+# Serial device. The setup wizard detects and sets this automatically.
 # serial_port = "/dev/ttyACM0"
 # baud_rate = 115200
 
