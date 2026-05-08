@@ -96,7 +96,7 @@ jobs:
       - name: Build (admin-web feature)
         run: cargo build --release --target ${{ matrix.target }} --features admin-web
 
-      - name: Build (headless: cli only)
+      - name: "Build (headless: cli only)"
         run: |
           cargo build --release --target ${{ matrix.target }} \
             --no-default-features --features transport-cli
