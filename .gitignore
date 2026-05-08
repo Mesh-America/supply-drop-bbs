@@ -1,0 +1,52 @@
+# Rust build artifacts
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# We DO commit Cargo.lock — this is a binary, not a library.
+# Reproducible builds for operators matter more than dependency
+# upgrade flexibility for downstream users (there are no downstream
+# users; we're the leaf of the dependency graph).
+# !Cargo.lock  (kept here as a reminder of the policy)
+
+# Database files generated at runtime
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Local config that might contain secrets
+config.toml
+config.local.toml
+config.dev.toml
+!config.example.toml
+
+# Logs
+*.log
+/var/log/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Python tooling that sometimes shows up in mixed environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node/web tooling (the admin UI's frontend bundler will live here later)
+node_modules/
+dist/
+.parcel-cache/
+.vite/
+
+# Coverage
+*.profraw
+*.profdata
+/coverage/
