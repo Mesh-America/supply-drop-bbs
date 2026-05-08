@@ -1,0 +1,24 @@
+# Cargo configuration for Supply Drop BBS.
+#
+# Most settings here are dev-experience and CI-friendly. Operators
+# building from source on their target machine don't need any of
+# these.
+
+[net]
+# Use the system git CLI for fetches. Faster and more reliable
+# than libgit2 on slow / restricted networks (corporate proxies,
+# Pi-on-a-spotty-uplink, etc.).
+git-fetch-with-cli = true
+
+# ─── Cross-compilation linkers ─────────────────────────────────────
+#
+# Used when building release binaries for ARM targets from an x86
+# host (CI, dev box). The named linkers must be installed on the
+# build machine: `gcc-aarch64-linux-gnu` and `gcc-arm-linux-gnueabihf`
+# on Debian/Ubuntu.
+
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+
+[target.armv7-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"

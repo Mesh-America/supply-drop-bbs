@@ -1,0 +1,19 @@
+[package]
+name        = "bbs-plugin-api"
+description = "The plugin contract for Supply Drop BBS: traits and types every plugin compiles against"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+license-file = "../../LICENSE"
+publish      = false
+
+# This crate is the contract — keep it small. Plugins depend on it
+# directly. Heavy dependencies don't belong here.
+
+[dependencies]
+# (filled in as the implementation lands)
+
+[lints]
+workspace = true

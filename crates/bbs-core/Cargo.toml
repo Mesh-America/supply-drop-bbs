@@ -1,0 +1,16 @@
+[package]
+name        = "bbs-core"
+description = "Domain types, persistence, and business logic for Supply Drop BBS"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+license-file = "../../LICENSE"
+publish      = false
+
+[dependencies]
+# (filled in as the implementation lands)
+
+[lints]
+workspace = true

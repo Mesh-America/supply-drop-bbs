@@ -1,0 +1,12 @@
+# Formatting rules for Supply Drop BBS.
+#
+# We stick to stable rustfmt options only — no nightly features —
+# so contributors can format without thinking about toolchain
+# details. Run `cargo fmt --all` before committing; CI enforces
+# it.
+
+edition       = "2021"
+hard_tabs     = false
+tab_spaces    = 4
+max_width     = 100
+newline_style = "Unix"

@@ -16,11 +16,13 @@
 *.sqlite-wal
 *.sqlite-shm
 
-# Local config that might contain secrets
-config.toml
-config.local.toml
-config.dev.toml
-!config.example.toml
+# Local BBS config that might contain secrets. Anchored to the
+# repo root so .cargo/config.toml (a Cargo settings file we DO
+# commit) is unaffected.
+/config.toml
+/config.local.toml
+/config.dev.toml
+!/config.example.toml
 
 # Logs
 *.log

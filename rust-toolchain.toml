@@ -1,0 +1,10 @@
+# Pinned Rust toolchain. Contributors cloning the repo and running
+# any cargo command will have rustup auto-install this version.
+#
+# We pin to a specific stable rather than tracking `stable` so
+# CI builds and contributor builds match bit-for-bit.
+
+[toolchain]
+channel    = "1.76"
+components = ["rustfmt", "clippy"]
+profile    = "minimal"

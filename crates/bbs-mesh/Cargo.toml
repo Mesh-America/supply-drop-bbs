@@ -1,0 +1,18 @@
+[package]
+name        = "bbs-mesh"
+description = "MeshCore transport plugin for Supply Drop BBS"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+license-file = "../../LICENSE"
+publish      = false
+
+[dependencies]
+bbs-core.workspace           = true
+bbs-plugin-api.workspace     = true
+meshcore-companion.workspace = true
+
+[lints]
+workspace = true

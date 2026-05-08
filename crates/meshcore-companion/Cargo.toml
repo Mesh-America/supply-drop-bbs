@@ -1,0 +1,21 @@
+[package]
+name        = "meshcore-companion"
+description = "A pure-Rust client of the MeshCore companion-frame TCP protocol"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+license-file = "../../LICENSE"
+publish      = false       # candidate for future crates.io publish
+
+# This crate is a candidate to be published to crates.io eventually
+# (it's standalone — usable by anyone speaking to a MeshCore
+# CompanionFrameServer, BBS-related or not). Until we're ready to
+# stabilise the API, `publish = false` keeps us flexible.
+
+[dependencies]
+# (filled in as the implementation lands)
+
+[lints]
+workspace = true

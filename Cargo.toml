@@ -1,0 +1,99 @@
+[package]
+name = "supply-drop-bbs"
+description = "A bulletin-board system for LoRa mesh networks"
+version.workspace = true
+edition.workspace = true
+license-file = "LICENSE"
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false                       # we don't publish to crates.io
+
+[[bin]]
+name = "supply-drop-bbs"
+path = "src/main.rs"
+
+# ─── Cargo features ───────────────────────────────────────────────
+#
+# Plugins are selected at compile time, not at runtime. See
+# docs/adr/0004-cargo-features-not-runtime-plugins.md for the
+# rationale. Operators wanting an unusual combination build from
+# source with `cargo build --release --features <list>`.
+[features]
+default          = ["transport-cli", "transport-mesh"]
+transport-cli    = ["dep:bbs-cli"]
+transport-mesh   = ["dep:bbs-mesh"]
+admin-web        = ["dep:bbs-web"]
+
+[dependencies]
+bbs-core.workspace        = true
+bbs-plugin-api.workspace  = true
+bbs-cli   = { workspace = true, optional = true }
+bbs-mesh  = { workspace = true, optional = true }
+bbs-web   = { workspace = true, optional = true }
+
+[lints]
+workspace = true
+
+# ──────────────────────────────────────────────────────────────────
+# Workspace
+# ──────────────────────────────────────────────────────────────────
+
+[workspace]
+resolver = "2"
+members  = ["crates/*"]
+
+[workspace.package]
+version      = "0.1.0-alpha.0"
+edition      = "2021"
+authors      = ["Mesh-America"]
+repository   = "https://github.com/Mesh-America/supply-drop-bbs"
+rust-version = "1.76"
+
+# Shared dependencies. As we add real deps (sqlx, axum, tokio, etc.)
+# they go here so every workspace member uses the same version.
+[workspace.dependencies]
+bbs-core           = { path = "crates/bbs-core",           version = "0.1.0-alpha.0" }
+bbs-plugin-api     = { path = "crates/bbs-plugin-api",     version = "0.1.0-alpha.0" }
+bbs-cli            = { path = "crates/bbs-cli",            version = "0.1.0-alpha.0" }
+bbs-mesh           = { path = "crates/bbs-mesh",           version = "0.1.0-alpha.0" }
+bbs-web            = { path = "crates/bbs-web",            version = "0.1.0-alpha.0" }
+meshcore-companion = { path = "crates/meshcore-companion", version = "0.1.0-alpha.0" }
+
+# Workspace-wide lint config. Applied to every member crate via
+# `[lints] workspace = true` in their Cargo.toml. Centralising here
+# means a contributor changing lint policy has one file to edit.
+[workspace.lints.rust]
+unsafe_code   = "forbid"      # we don't need it; if we do, that's an ADR
+missing_docs  = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all          = { level = "warn", priority = -1 }
+# We deliberately skip clippy::pedantic — too noisy for v1. Specific
+# pedantic lints can be opted into per-crate as we encounter cases
+# where they pull their weight.
+
+# ──────────────────────────────────────────────────────────────────
+# Release profile tuning
+# ──────────────────────────────────────────────────────────────────
+[profile.release]
+# LTO trades build time for runtime speed and binary size. For a Pi
+# deployment, smaller + faster wins.
+lto           = "thin"
+codegen-units = 1
+strip         = "symbols"
+# Don't panic-abort: we want backtraces in the field. The size cost
+# is tiny.
+panic         = "unwind"
+
+# A faster dev-build profile for the inner loop of contributors.
+[profile.dev]
+opt-level = 0
+
+# When CI builds release binaries we want them as small as possible.
+# This profile is for release-ready artifacts; CI uses it in tag
+# builds. Inherits from release; overrides where stricter.
+[profile.release-min]
+inherits = "release"
+opt-level = "z"               # optimise for size

@@ -1,0 +1,17 @@
+[package]
+name        = "bbs-web"
+description = "Web admin UI plugin for Supply Drop BBS (default OFF)"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+license-file = "../../LICENSE"
+publish      = false
+
+[dependencies]
+bbs-core.workspace       = true
+bbs-plugin-api.workspace = true
+
+[lints]
+workspace = true
