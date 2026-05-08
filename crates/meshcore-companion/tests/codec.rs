@@ -1,0 +1,553 @@
+/// Codec tests for the companion-frame protocol.
+///
+/// Each test section corresponds to a decoded frame type or an encoding
+/// command. Wire bytes are constructed by hand from the documented layouts
+/// (confirmed against `pymc_core/frame_server.py`).
+
+use meshcore_companion::{
+    constants::*,
+    decode_inbound, encode_outbound, strip_frame_header,
+    error::FrameDecodeError,
+    frame::{InboundFrame, OutboundFrame},
+    types::{BattAndStorage, ChannelMsg, Contact, ContactMsg, LoginSuccess, SentResult},
+};
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Build a raw wire frame (prefix + LE-length + payload).
+fn wire(prefix: u8, payload: &[u8]) -> Vec<u8> {
+    let mut v = vec![prefix];
+    v.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+    v.extend_from_slice(payload);
+    v
+}
+
+// ── strip_frame_header ────────────────────────────────────────────────────────
+
+#[test]
+fn strip_header_happy_path() {
+    let payload = &[RESP_CODE_OK];
+    let raw = wire(FRAME_OUTBOUND_PREFIX, payload);
+    assert_eq!(strip_frame_header(&raw).unwrap(), payload);
+}
+
+#[test]
+fn strip_header_wrong_prefix() {
+    let raw = wire(0x00, &[RESP_CODE_OK]);
+    let err = strip_frame_header(&raw).unwrap_err();
+    assert_eq!(err, FrameDecodeError::WrongPrefix { expected: FRAME_OUTBOUND_PREFIX, got: 0x00 });
+}
+
+#[test]
+fn strip_header_empty_rejects() {
+    let err = strip_frame_header(&[]).unwrap_err();
+    assert!(matches!(err, FrameDecodeError::WrongPrefix { .. }));
+}
+
+#[test]
+fn strip_header_payload_too_large() {
+    // Claim 200 bytes (> MAX_PAYLOAD_SIZE = 169).
+    let mut raw = vec![FRAME_OUTBOUND_PREFIX, 200u8, 0u8];
+    raw.extend(vec![0u8; 200]);
+    let err = strip_frame_header(&raw).unwrap_err();
+    assert_eq!(err, FrameDecodeError::PayloadTooLarge(200));
+}
+
+// ── decode_inbound — zero-body frames ─────────────────────────────────────────
+
+#[test]
+fn decode_ok() {
+    let frame = decode_inbound(&[RESP_CODE_OK]).unwrap();
+    assert_eq!(frame, InboundFrame::Ok);
+}
+
+#[test]
+fn decode_disabled() {
+    let frame = decode_inbound(&[RESP_CODE_DISABLED]).unwrap();
+    assert_eq!(frame, InboundFrame::Disabled);
+}
+
+#[test]
+fn decode_no_more_messages() {
+    let frame = decode_inbound(&[RESP_CODE_NO_MORE_MESSAGES]).unwrap();
+    assert_eq!(frame, InboundFrame::NoMoreMessages);
+}
+
+#[test]
+fn decode_msg_waiting() {
+    let frame = decode_inbound(&[PUSH_CODE_MSG_WAITING]).unwrap();
+    assert_eq!(frame, InboundFrame::MsgWaiting);
+}
+
+#[test]
+fn decode_contacts_full() {
+    let frame = decode_inbound(&[PUSH_CODE_CONTACTS_FULL]).unwrap();
+    assert_eq!(frame, InboundFrame::ContactsFull);
+}
+
+// ── decode_inbound — small structured frames ──────────────────────────────────
+
+#[test]
+fn decode_err() {
+    let frame = decode_inbound(&[RESP_CODE_ERR, ERR_CODE_NOT_FOUND]).unwrap();
+    assert_eq!(frame, InboundFrame::Err { error_code: ERR_CODE_NOT_FOUND });
+}
+
+#[test]
+fn decode_contacts_start() {
+    let count: u32 = 42;
+    let mut payload = vec![RESP_CODE_CONTACTS_START];
+    payload.extend_from_slice(&count.to_le_bytes());
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::ContactsStart { count: 42 });
+}
+
+#[test]
+fn decode_end_of_contacts() {
+    let ts: u32 = 0xDEAD_BEEF;
+    let mut payload = vec![RESP_CODE_END_OF_CONTACTS];
+    payload.extend_from_slice(&ts.to_le_bytes());
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::EndOfContacts { most_recent_lastmod: 0xDEAD_BEEF });
+}
+
+#[test]
+fn decode_curr_time() {
+    let t: u32 = 1_700_000_000;
+    let mut payload = vec![RESP_CODE_CURR_TIME];
+    payload.extend_from_slice(&t.to_le_bytes());
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::CurrTime { unix_time: 1_700_000_000 });
+}
+
+#[test]
+fn decode_batt_and_storage() {
+    let mut payload = vec![RESP_CODE_BATT_AND_STORAGE];
+    payload.extend_from_slice(&3800u16.to_le_bytes()); // millivolts
+    payload.extend_from_slice(&512u32.to_le_bytes()); // used_kb
+    payload.extend_from_slice(&4096u32.to_le_bytes()); // total_kb
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::BattAndStorage(BattAndStorage {
+            millivolts: 3800,
+            used_kb: 512,
+            total_kb: 4096
+        })
+    );
+}
+
+#[test]
+fn decode_sent_result() {
+    let mut payload = vec![RESP_CODE_SENT];
+    payload.push(MSG_SEND_SENT_DIRECT); // is_flood = 0 (direct, not flood)
+    payload.extend_from_slice(&0x0000_1234u32.to_le_bytes()); // expected_ack
+    payload.extend_from_slice(&30_000u32.to_le_bytes()); // timeout_ms
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::Sent(SentResult {
+            is_flood: false,
+            expected_ack: 0x1234,
+            timeout_ms: 30_000
+        })
+    );
+}
+
+#[test]
+fn decode_send_confirmed() {
+    let mut payload = vec![PUSH_CODE_SEND_CONFIRMED];
+    payload.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes()); // crc
+    payload.extend_from_slice(&[0u8; 4]); // zero padding
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::SendConfirmed { crc: 0xCAFE_BABE });
+}
+
+#[test]
+fn decode_advert() {
+    let pubkey = [0xABu8; 32];
+    let mut payload = vec![PUSH_CODE_ADVERT];
+    payload.extend_from_slice(&pubkey);
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::Advert { pubkey });
+}
+
+#[test]
+fn decode_path_updated() {
+    let pubkey = [0x11u8; 32];
+    let mut payload = vec![PUSH_CODE_PATH_UPDATED];
+    payload.extend_from_slice(&pubkey);
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::PathUpdated { pubkey });
+}
+
+#[test]
+fn decode_contact_deleted() {
+    let pubkey = [0x22u8; 32];
+    let mut payload = vec![PUSH_CODE_CONTACT_DELETED];
+    payload.extend_from_slice(&pubkey);
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::ContactDeleted { pubkey });
+}
+
+// ── decode_inbound — contact message v1/v2 ────────────────────────────────────
+
+#[test]
+fn decode_contact_msg_recv() {
+    let sender = [1u8, 2, 3, 4, 5, 6];
+    let path_len: u8 = 2;
+    let txt_type = TXT_TYPE_PLAIN;
+    let timestamp: u32 = 1_700_000_100;
+    let text = b"Hello world";
+
+    let mut payload = vec![RESP_CODE_CONTACT_MSG_RECV];
+    payload.extend_from_slice(&sender);
+    payload.push(path_len);
+    payload.push(txt_type);
+    payload.extend_from_slice(&timestamp.to_le_bytes());
+    payload.extend_from_slice(text);
+
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::ContactMsgRecv(ContactMsg {
+            sender_key_prefix: sender,
+            path_len: 2,
+            txt_type: TXT_TYPE_PLAIN,
+            timestamp: 1_700_000_100,
+            text: "Hello world".to_owned(),
+            snr: None,
+        })
+    );
+}
+
+// ── decode_inbound — channel message v1/v2 ───────────────────────────────────
+
+#[test]
+fn decode_channel_msg_recv() {
+    let channel_idx: u8 = 1;
+    let path_len: u8 = 0;
+    let txt_type = TXT_TYPE_PLAIN;
+    let timestamp: u32 = 1_700_000_200;
+    let text = b"Alice: hi there";
+
+    let mut payload = vec![RESP_CODE_CHANNEL_MSG_RECV];
+    payload.push(channel_idx);
+    payload.push(path_len);
+    payload.push(txt_type);
+    payload.extend_from_slice(&timestamp.to_le_bytes());
+    payload.extend_from_slice(text);
+
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::ChannelMsgRecv(ChannelMsg {
+            channel_idx: 1,
+            path_len: 0,
+            txt_type: TXT_TYPE_PLAIN,
+            timestamp: 1_700_000_200,
+            text: "Alice: hi there".to_owned(),
+            snr: None,
+        })
+    );
+}
+
+// ── decode_inbound — contact message v3 (with SNR) ───────────────────────────
+
+#[test]
+fn decode_contact_msg_recv_v3() {
+    // snr_byte encodes as (dB * 4); −6 dB → i8 = −24 → byte 0xE8
+    let snr_byte: i8 = -24; // −24 / 4 = −6.0 dB
+    let sender = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+    let path_len: u8 = 1;
+    let txt_type = TXT_TYPE_PLAIN;
+    let timestamp: u32 = 1_700_000_300;
+    let text = b"v3 msg";
+
+    let mut payload = vec![RESP_CODE_CONTACT_MSG_RECV_V3];
+    payload.push(snr_byte as u8); // snr_byte at body[0]
+    payload.push(0); // reserved
+    payload.push(0); // reserved
+    // after stripping 3 bytes, the msg starts at body[3]:
+    payload.extend_from_slice(&sender);
+    payload.push(path_len);
+    payload.push(txt_type);
+    payload.extend_from_slice(&timestamp.to_le_bytes());
+    payload.extend_from_slice(text);
+
+    let frame = decode_inbound(&payload).unwrap();
+    if let InboundFrame::ContactMsgRecvV3(msg) = frame {
+        assert_eq!(msg.sender_key_prefix, sender);
+        assert_eq!(msg.text, "v3 msg");
+        let snr = msg.snr.unwrap();
+        assert!((snr - (-6.0f32)).abs() < 0.01, "snr mismatch: {snr}");
+    } else {
+        panic!("expected ContactMsgRecvV3, got {frame:?}");
+    }
+}
+
+// ── decode_inbound — login success ───────────────────────────────────────────
+
+#[test]
+fn decode_login_success() {
+    let prefix = [1u8, 2, 3, 4, 5, 6];
+    let tag: u32 = 0xDEAD_C0DE;
+    let acl: u8 = 0b0000_0011;
+    let fw: u8 = 10;
+
+    let mut payload = vec![PUSH_CODE_LOGIN_SUCCESS];
+    payload.push(1u8); // is_admin = true
+    payload.extend_from_slice(&prefix);
+    payload.extend_from_slice(&tag.to_le_bytes());
+    payload.push(acl);
+    payload.push(fw);
+
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::LoginSuccess(LoginSuccess {
+            is_admin: true,
+            pubkey_prefix: prefix,
+            tag: 0xDEAD_C0DE,
+            acl_permissions: acl,
+            firmware_ver_level: 10,
+        })
+    );
+}
+
+// ── decode_inbound — unknown type byte ───────────────────────────────────────
+
+#[test]
+fn decode_unknown_type_byte() {
+    let payload = vec![0xFE, 0x01, 0x02];
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::Unknown { type_byte: 0xFE, payload: payload.clone() });
+}
+
+// ── decode_inbound — error cases ─────────────────────────────────────────────
+
+#[test]
+fn decode_empty_payload_errors() {
+    let err = decode_inbound(&[]).unwrap_err();
+    assert_eq!(err, FrameDecodeError::BodyTooShort { type_byte: 0, needed: 1, got: 0 });
+}
+
+#[test]
+fn decode_body_too_short_for_type() {
+    // RESP_CODE_ERR needs at least 1 body byte, give 0.
+    let err = decode_inbound(&[RESP_CODE_ERR]).unwrap_err();
+    assert_eq!(
+        err,
+        FrameDecodeError::BodyTooShort { type_byte: RESP_CODE_ERR, needed: 1, got: 0 }
+    );
+}
+
+#[test]
+fn decode_invalid_utf8_errors() {
+    // RESP_CODE_CHANNEL_MSG_RECV: [chan_idx][path_len][txt_type][ts×4][invalid utf8]
+    let mut payload = vec![RESP_CODE_CHANNEL_MSG_RECV];
+    payload.push(0); // channel_idx
+    payload.push(0); // path_len
+    payload.push(0); // txt_type
+    payload.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+    payload.push(0xFF); // invalid UTF-8 byte
+    let err = decode_inbound(&payload).unwrap_err();
+    assert_eq!(err, FrameDecodeError::InvalidUtf8);
+}
+
+// ── decode_inbound — contact struct ──────────────────────────────────────────
+
+fn build_contact_body() -> (Vec<u8>, Contact) {
+    let pubkey = [0x55u8; 32];
+    let adv_type = ADV_TYPE_CHAT;
+    let flags: u8 = 0;
+    let out_path_len_byte: u8 = 0xFF; // unknown → -1
+    let out_path = [0u8; 64];
+    let mut name_buf = [0u8; 32];
+    let name = b"TestNode";
+    name_buf[..name.len()].copy_from_slice(name);
+    let last_advert: u32 = 100;
+    let lat: i32 = 37_422_160; // ≈37.42216°N
+    let lon: i32 = -122_084_058; // ≈122.08406°W
+    let lastmod: u32 = 200;
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&pubkey);
+    body.push(adv_type);
+    body.push(flags);
+    body.push(out_path_len_byte);
+    body.extend_from_slice(&out_path);
+    body.extend_from_slice(&name_buf);
+    body.extend_from_slice(&last_advert.to_le_bytes());
+    body.extend_from_slice(&lat.to_le_bytes());
+    body.extend_from_slice(&lon.to_le_bytes());
+    body.extend_from_slice(&lastmod.to_le_bytes());
+
+    let contact = Contact {
+        pubkey,
+        adv_type: ADV_TYPE_CHAT,
+        flags: 0,
+        out_path_len: -1,
+        out_path: [0u8; 64],
+        name: "TestNode".to_owned(),
+        last_advert_timestamp: 100,
+        gps_lat: 37_422_160,
+        gps_lon: -122_084_058,
+        lastmod: 200,
+    };
+    (body, contact)
+}
+
+#[test]
+fn decode_contact() {
+    let (body, expected) = build_contact_body();
+    let mut payload = vec![RESP_CODE_CONTACT];
+    payload.extend_from_slice(&body);
+    let frame = decode_inbound(&payload).unwrap();
+    assert_eq!(frame, InboundFrame::Contact(expected));
+}
+
+#[test]
+fn decode_out_path_len_direct() {
+    // out_path_len = 0 means direct (not 0xFF).
+    let (mut body, _) = build_contact_body();
+    body[34] = 0; // out_path_len byte: direct
+    let mut payload = vec![RESP_CODE_CONTACT];
+    payload.extend_from_slice(&body);
+    if let InboundFrame::Contact(c) = decode_inbound(&payload).unwrap() {
+        assert_eq!(c.out_path_len, 0);
+    } else {
+        panic!("expected Contact");
+    }
+}
+
+// ── encode_outbound ───────────────────────────────────────────────────────────
+
+#[test]
+fn encode_app_start() {
+    let wire_bytes = encode_outbound(&OutboundFrame::AppStart { app_target_version: APP_TARGET_VER_V3 });
+    // [FRAME_INBOUND_PREFIX][len_lo][len_hi][CMD_APP_START][APP_TARGET_VER_V3]
+    assert_eq!(wire_bytes[0], FRAME_INBOUND_PREFIX);
+    let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
+    let payload = &wire_bytes[3..3 + len];
+    assert_eq!(payload[0], CMD_APP_START);
+    assert_eq!(payload[1], APP_TARGET_VER_V3);
+    assert_eq!(len, 2);
+}
+
+#[test]
+fn encode_sync_next_message() {
+    let wire_bytes = encode_outbound(&OutboundFrame::SyncNextMessage);
+    let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
+    assert_eq!(len, 1);
+    assert_eq!(wire_bytes[3], CMD_SYNC_NEXT_MESSAGE);
+}
+
+#[test]
+fn encode_get_contacts() {
+    let since: u32 = 1_700_000_000;
+    let wire_bytes = encode_outbound(&OutboundFrame::GetContacts { since });
+    let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
+    assert_eq!(len, 5);
+    assert_eq!(wire_bytes[3], CMD_GET_CONTACTS);
+    let decoded_since = u32::from_le_bytes([wire_bytes[4], wire_bytes[5], wire_bytes[6], wire_bytes[7]]);
+    assert_eq!(decoded_since, since);
+}
+
+#[test]
+fn encode_send_txt_msg_layout() {
+    // Confirm 4 reserved bytes at positions 2-5 (after txt_type and attempt).
+    // Wire payload: [CMD][txt_type][attempt][0x00×4][prefix×6][text…]
+    let prefix = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+    let wire_bytes = encode_outbound(&OutboundFrame::SendTxtMsg {
+        txt_type: TXT_TYPE_PLAIN,
+        attempt: 1,
+        pubkey_prefix: prefix,
+        text: "hi".to_owned(),
+    });
+    let payload = &wire_bytes[3..];
+    assert_eq!(payload[0], CMD_SEND_TXT_MSG);
+    assert_eq!(payload[1], TXT_TYPE_PLAIN); // txt_type
+    assert_eq!(payload[2], 1u8); // attempt
+    assert_eq!(&payload[3..7], &[0u8; 4]); // 4 reserved bytes
+    assert_eq!(&payload[7..13], &prefix); // pubkey_prefix at data[6:12] (relative to CMD byte = index 0)
+    assert_eq!(&payload[13..15], b"hi");
+}
+
+#[test]
+fn encode_send_channel_txt_msg_layout() {
+    // Wire payload: [CMD][txt_type][channel_idx][0x00×4][text…]
+    let wire_bytes = encode_outbound(&OutboundFrame::SendChannelTxtMsg {
+        txt_type: TXT_TYPE_PLAIN,
+        channel_idx: 2,
+        text: "group msg".to_owned(),
+    });
+    let payload = &wire_bytes[3..];
+    assert_eq!(payload[0], CMD_SEND_CHANNEL_TXT_MSG);
+    assert_eq!(payload[1], TXT_TYPE_PLAIN);
+    assert_eq!(payload[2], 2u8); // channel_idx
+    assert_eq!(&payload[3..7], &[0u8; 4]); // 4 reserved bytes
+    assert_eq!(&payload[7..16], b"group msg");
+}
+
+#[test]
+fn encode_set_device_time() {
+    let t: u32 = 1_234_567_890;
+    let wire_bytes = encode_outbound(&OutboundFrame::SetDeviceTime { unix_time: t });
+    let payload = &wire_bytes[3..];
+    assert_eq!(payload[0], CMD_SET_DEVICE_TIME);
+    let decoded = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+    assert_eq!(decoded, t);
+}
+
+#[test]
+fn encode_set_advert_name_null_terminated() {
+    let wire_bytes =
+        encode_outbound(&OutboundFrame::SetAdvertName { name: "BBS".to_owned() });
+    let payload = &wire_bytes[3..];
+    assert_eq!(payload[0], CMD_SET_ADVERT_NAME);
+    assert_eq!(&payload[1..4], b"BBS");
+    assert_eq!(payload[4], 0u8); // null terminator
+}
+
+#[test]
+fn encode_set_advert_name_truncates_at_31() {
+    // 40-char name should be truncated to 31 bytes + 1 null = 32 bytes of name field.
+    let name = "A".repeat(40);
+    let wire_bytes = encode_outbound(&OutboundFrame::SetAdvertName { name });
+    let payload = &wire_bytes[3..];
+    // payload[1..32] = 31 'A' bytes, payload[32] = null
+    assert_eq!(payload.len(), 1 + 31 + 1); // cmd + name + null
+    assert_eq!(payload[32], 0u8);
+}
+
+#[test]
+fn encode_remove_contact() {
+    let pubkey = [0xFFu8; 32];
+    let wire_bytes = encode_outbound(&OutboundFrame::RemoveContact { pubkey });
+    let payload = &wire_bytes[3..];
+    assert_eq!(payload[0], CMD_REMOVE_CONTACT);
+    assert_eq!(&payload[1..33], &pubkey);
+}
+
+// ── strip + decode round-trip ─────────────────────────────────────────────────
+
+#[test]
+fn strip_then_decode_ok() {
+    let payload = &[RESP_CODE_OK];
+    let raw = wire(FRAME_OUTBOUND_PREFIX, payload);
+    let stripped = strip_frame_header(&raw).unwrap();
+    let frame = decode_inbound(stripped).unwrap();
+    assert_eq!(frame, InboundFrame::Ok);
+}
+
+#[test]
+fn strip_then_decode_curr_time() {
+    let t: u32 = 1_700_000_999;
+    let mut payload = vec![RESP_CODE_CURR_TIME];
+    payload.extend_from_slice(&t.to_le_bytes());
+    let raw = wire(FRAME_OUTBOUND_PREFIX, &payload);
+    let stripped = strip_frame_header(&raw).unwrap();
+    let frame = decode_inbound(stripped).unwrap();
+    assert_eq!(frame, InboundFrame::CurrTime { unix_time: t });
+}

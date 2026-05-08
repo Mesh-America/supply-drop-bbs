@@ -25,11 +25,20 @@
 //!   reach our parser here. The decoder gets `proptest`
 //!   roundtrip tests and `cargo fuzz` targets when implementation
 //!   begins. See [docs/PROTOCOL.md](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/PROTOCOL.md).
-//!
-//! ## Status
-//!
-//! Placeholder. Real implementation lands in subsequent commits.
 
-/// Internal placeholder so the crate has at least one item to
-/// compile. Removed when real types land.
-pub fn placeholder() {}
+// Suppress missing-docs until this crate is ready to publish.
+#![allow(missing_docs)]
+
+pub mod client;
+pub mod constants;
+pub mod error;
+pub mod frame;
+pub mod types;
+
+pub use client::{ClientConfig, ClientEvent, CompanionClient, SendError};
+pub use error::FrameDecodeError;
+pub use frame::{decode_inbound, encode_outbound, strip_frame_header, InboundFrame, OutboundFrame};
+pub use types::{
+    BattAndStorage, ChannelInfo, ChannelMsg, Contact, ContactMsg, DeviceInfo, ExportedContact,
+    LoginSuccess, SelfInfo, SentResult,
+};
