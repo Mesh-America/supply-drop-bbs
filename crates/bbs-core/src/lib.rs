@@ -29,6 +29,7 @@
 //! concrete `Host` implementation come in subsequent commits.
 
 pub mod db;
+pub mod host;
 pub mod ids;
 pub mod message;
 pub mod room;
@@ -38,6 +39,7 @@ pub mod user;
 // ── Re-exports of the most-used items ────────────────────────────
 
 pub use db::{Database, DbOpenError, MessagePage, MessageStore, RoomStore, StoreError, UserStore};
+pub use host::BbsHost;
 pub use ids::{MessageId, RoomId, UserId};
 pub use message::{InvalidMessageContent, Message};
 pub use room::{InvalidRoomDescription, InvalidRoomName, Room};
