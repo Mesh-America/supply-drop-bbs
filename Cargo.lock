@@ -94,9 +94,14 @@ dependencies = [
 name = "bbs-mesh"
 version = "0.1.0-alpha.0"
 dependencies = [
+ "async-trait",
  "bbs-core",
  "bbs-plugin-api",
  "meshcore-companion",
+ "serde",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

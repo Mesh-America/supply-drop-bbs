@@ -214,6 +214,18 @@ impl CompanionClient {
     pub fn try_recv(&mut self) -> Result<ClientEvent, mpsc::error::TryRecvError> {
         self.event_rx.try_recv()
     }
+
+    /// Clone the outbound command sender.
+    ///
+    /// Useful when the event-receiving side (i.e. `recv()`) is moved into a
+    /// background task while the caller still needs to enqueue commands — for
+    /// example in a plugin that holds `CompanionClient` in a worker task but
+    /// needs to send frames from a `notify()` call on a different code path.
+    ///
+    /// Senders are cheap to clone and share; they do not need to be exclusive.
+    pub fn sender(&self) -> mpsc::Sender<OutboundFrame> {
+        self.cmd_tx.clone()
+    }
 }
 
 // ── Background worker ─────────────────────────────────────────────────────────

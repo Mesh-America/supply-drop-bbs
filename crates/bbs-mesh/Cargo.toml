@@ -13,6 +13,12 @@ publish      = false
 bbs-core.workspace           = true
 bbs-plugin-api.workspace     = true
 meshcore-companion.workspace = true
+async-trait.workspace = true
+serde.workspace       = true
+thiserror.workspace   = true
+tracing.workspace     = true
+# sync (Mutex, watch) + rt (spawn) are the only extras we need on top of workspace defaults.
+tokio = { workspace = true, features = ["sync", "rt"] }
 
 [lints]
 workspace = true

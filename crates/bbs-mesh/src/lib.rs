@@ -1,29 +1,57 @@
 //! # bbs-mesh
 //!
-//! The MeshCore transport plugin for Supply Drop BBS. Connects to
-//! `pymc_core`'s `CompanionFrameServer` (the radio bridge process)
-//! over TCP using the companion-frame protocol, and translates
-//! between MeshCore packets and BBS-core's `Command` / `Response`
-//! types.
+//! The MeshCore transport plugin for Supply Drop BBS.  Connects to
+//! `pymc_core`'s `CompanionFrameServer` over TCP and translates between
+//! MeshCore direct messages and the BBS [`Command`] / [`Response`] types
+//! defined in [`bbs-plugin-api`](bbs_plugin_api).
 //!
-//! See [docs/PROTOCOL.md](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/PROTOCOL.md)
-//! for the wire format and command vocabulary.
+//! ## Architecture overview
+//!
+//! ```text
+//! ┌──────────────────────────────────────────────────────────────┐
+//! │  pymc_core CompanionFrameServer  (radio bridge, TCP :5000)   │
+//! └──────────────────────┬───────────────────────────────────────┘
+//!                        │ companion-frame TCP protocol
+//! ┌──────────────────────▼───────────────────────────────────────┐
+//! │  meshcore-companion  CompanionClient                         │
+//! │  (frame codec + reconnecting TCP client)                     │
+//! └──────────────────────┬───────────────────────────────────────┘
+//!                        │ ClientEvent channel
+//! ┌──────────────────────▼───────────────────────────────────────┐
+//! │  bbs-mesh  MeshTransport                                     │
+//! │  ┌─────────────────────────────────────────────────────────┐ │
+//! │  │  event_loop task                                        │ │
+//! │  │  ContactMsgRecv → parse_command → host.process_command  │ │
+//! │  │  → format_response → SendTxtMsg                         │ │
+//! │  └─────────────────────────────────────────────────────────┘ │
+//! │  notify() → render_notification → SendTxtMsg                 │
+//! └──────────────────────┬───────────────────────────────────────┘
+//!                        │ Host trait
+//! ┌──────────────────────▼───────────────────────────────────────┐
+//! │  bbs-core  (domain logic, persistence)                       │
+//! └──────────────────────────────────────────────────────────────┘
+//! ```
 //!
 //! ## Identity mapping
 //!
-//! Per [ADR-0011](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/adr/0011-transport-protocol-agnostic-core.md),
-//! the mapping between MeshCore identities (cryptographic public
-//! keys) and BBS usernames lives in this crate's own
-//! `meshcore_identities` table — not in `bbs-core`'s schema. A
-//! sibling transport for Meshtastic would maintain its own
-//! analogous table without touching this one.
+//! Per [ADR-0011], the mapping between MeshCore public-key prefixes and BBS
+//! session IDs lives entirely within this crate's [`SessionState`].  No
+//! MeshCore-specific identifiers appear in `bbs-core`'s schema.
 //!
-//! Default-on (cargo feature `transport-mesh`).
+//! [ADR-0011]: https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/adr/0011-transport-protocol-agnostic-core.md
 //!
-//! ## Status
+//! ## Configuration
 //!
-//! Placeholder. Real implementation lands in subsequent commits.
+//! See [`MeshConfig`] for all available options and their defaults.
 
-/// Internal placeholder so the crate has at least one item to
-/// compile. Removed when real types land.
-pub fn placeholder() {}
+// Suppress missing-docs for this internal crate until the API stabilises.
+#![allow(missing_docs)]
+
+pub mod command;
+pub mod config;
+pub mod session;
+pub mod transport;
+
+pub use config::MeshConfig;
+pub use session::{SessionEntry, SessionState};
+pub use transport::MeshTransport;
