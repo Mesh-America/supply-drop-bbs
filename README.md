@@ -12,18 +12,22 @@ small, sharp domain core and a pluggable transport architecture.
 Supply Drop BBS is the BBS half of a mesh-radio operator's stack. It speaks
 to:
 
-- **A radio bridge** (separate process — currently
+- **Mesh radios**, via a pluggable transport architecture. v1 supports
+  [MeshCore](https://meshcore.dev) (through
   [`pymc_core`](https://github.com/meshcore-dev/pymc_core)'s
-  CompanionFrameServer) over a TCP companion-frame protocol. The BBS does
-  not own the radio directly.
+  CompanionFrameServer running as a separate radio-bridge process).
+  Other LoRa mesh protocols — [Meshtastic](https://meshtastic.org)
+  most notably — are explicitly on the roadmap as sibling transport
+  plugins. The BBS-core itself is protocol-agnostic; see
+  [ADR-0011](docs/adr/0011-transport-protocol-agnostic-core.md).
 - **CLI clients** over a Unix-domain socket, for local administration and
   scripting.
 - **An optional admin web UI** (off by default), purely for sysop
   maintenance — not for end-user message reading.
 
-Users — humans on mesh nodes — interact with the BBS over the radio
-transport. The web UI exists so the sysop can keep the system healthy
-without having to drive everything through mesh DMs.
+Users — humans on mesh nodes — interact with the BBS over whichever mesh
+transport is configured. The web UI exists so the sysop can keep the
+system healthy without having to drive everything through mesh DMs.
 
 ## Why a rewrite
 

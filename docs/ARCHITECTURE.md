@@ -833,6 +833,7 @@ Decisions with their own dedicated record:
 | 0008 | TOML config with env var + CLI overrides        | Accepted |
 | 0009 | Tracing-based logging that respects config      | Accepted |
 | 0010 | OpenAPI generated from Rust via utoipa          | Accepted |
+| 0011 | Transport-protocol agnostic core                | Accepted |
 
 ---
 
