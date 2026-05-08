@@ -29,11 +29,7 @@
 //! [`render_notification`] converts a [`Notification`] (a host-initiated push)
 //! into the text string delivered via [`OutboundFrame::SendTxtMsg`].
 
-use bbs_plugin_api::{
-    event::Notification,
-    identity::Username,
-    Command, Response,
-};
+use bbs_plugin_api::{event::Notification, identity::Username, Command, Response};
 
 // ── Command parsing ───────────────────────────────────────────────────────────
 
@@ -58,7 +54,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
     // If the host is waiting for a reply, treat the whole message as one
     // regardless of whether it looks like a command keyword.
     if awaiting_reply {
-        return Some(Command::WorkflowReply { reply: text.to_owned() });
+        return Some(Command::WorkflowReply {
+            reply: text.to_owned(),
+        });
     }
 
     // ── Strip optional command prefix ────────────────────────────────────────
@@ -113,7 +111,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "whoami" => Some(Command::Whoami),
 
-        _ => Some(Command::Unknown { raw: text.to_owned() }),
+        _ => Some(Command::Unknown {
+            raw: text.to_owned(),
+        }),
     }
 }
 
@@ -126,10 +126,7 @@ fn split_first_word(s: &str) -> (&str, Option<&str>) {
         None => (s, None),
         Some(i) => {
             let rest = s[i..].trim_start();
-            (
-                &s[..i],
-                if rest.is_empty() { None } else { Some(rest) },
-            )
+            (&s[..i], if rest.is_empty() { None } else { Some(rest) })
         }
     }
 }
@@ -151,7 +148,10 @@ pub fn format_response(response: &Response) -> Option<String> {
         // `awaiting_reply` flag to interpret the next message correctly.
         Response::Prompt { text, .. } => Some(text.clone()),
 
-        Response::LoggedIn { user } => Some(format!("Welcome, {}. Type 'help' for commands.", user.as_str())),
+        Response::LoggedIn { user } => Some(format!(
+            "Welcome, {}. Type 'help' for commands.",
+            user.as_str()
+        )),
 
         Response::LoggedOut => Some("Goodbye. Your session has ended.".to_owned()),
 
@@ -208,11 +208,15 @@ mod tests {
     fn help_with_topic() {
         assert_eq!(
             cmd("help rooms"),
-            Some(Command::Help { topic: Some("rooms".to_owned()) })
+            Some(Command::Help {
+                topic: Some("rooms".to_owned())
+            })
         );
         assert_eq!(
             cmd("HELP  rooms"),
-            Some(Command::Help { topic: Some("rooms".to_owned()) })
+            Some(Command::Help {
+                topic: Some("rooms".to_owned())
+            })
         );
     }
 
@@ -226,7 +230,9 @@ mod tests {
     fn register_missing_username_is_unknown() {
         assert_eq!(
             cmd("register"),
-            Some(Command::Unknown { raw: "register".to_owned() })
+            Some(Command::Unknown {
+                raw: "register".to_owned()
+            })
         );
     }
 
@@ -236,7 +242,9 @@ mod tests {
         assert_eq!(
             cmd("register alice bob"),
             // "alice bob" is not a valid Username (space not allowed)
-            Some(Command::Unknown { raw: "register alice bob".to_owned() })
+            Some(Command::Unknown {
+                raw: "register alice bob".to_owned()
+            })
         );
     }
 
@@ -261,7 +269,9 @@ mod tests {
     fn unknown_keyword() {
         assert_eq!(
             cmd("rooms"),
-            Some(Command::Unknown { raw: "rooms".to_owned() })
+            Some(Command::Unknown {
+                raw: "rooms".to_owned()
+            })
         );
     }
 
@@ -276,7 +286,12 @@ mod tests {
     fn awaiting_reply_wraps_everything() {
         // Even if the text looks like a command keyword, WorkflowReply is used.
         let result = parse_command("help", None, true);
-        assert_eq!(result, Some(Command::WorkflowReply { reply: "help".to_owned() }));
+        assert_eq!(
+            result,
+            Some(Command::WorkflowReply {
+                reply: "help".to_owned()
+            })
+        );
     }
 
     #[test]
@@ -284,7 +299,9 @@ mod tests {
         let result = parse_command("mysecretpassword", None, true);
         assert_eq!(
             result,
-            Some(Command::WorkflowReply { reply: "mysecretpassword".to_owned() })
+            Some(Command::WorkflowReply {
+                reply: "mysecretpassword".to_owned()
+            })
         );
     }
 
@@ -307,7 +324,9 @@ mod tests {
         let result = parse_command("mypassword", Some('!'), true);
         assert_eq!(
             result,
-            Some(Command::WorkflowReply { reply: "mypassword".to_owned() })
+            Some(Command::WorkflowReply {
+                reply: "mypassword".to_owned()
+            })
         );
     }
 
@@ -315,7 +334,9 @@ mod tests {
     fn prefix_with_topic() {
         assert_eq!(
             cmd_prefix("!help rooms"),
-            Some(Command::Help { topic: Some("rooms".to_owned()) })
+            Some(Command::Help {
+                topic: Some("rooms".to_owned())
+            })
         );
     }
 
@@ -344,7 +365,10 @@ mod tests {
     fn format_logged_in() {
         let user = Username::new("alice").unwrap();
         let text = format_response(&Response::LoggedIn { user }).unwrap();
-        assert!(text.contains("alice"), "LoggedIn response must include username");
+        assert!(
+            text.contains("alice"),
+            "LoggedIn response must include username"
+        );
     }
 
     #[test]

@@ -50,8 +50,15 @@ fn build_page(mut rows: Vec<Message>, limit: u32) -> MessagePage {
     let has_more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     rows.sort_by_key(|m| m.id);
-    let next_cursor = if has_more { rows.last().map(|m| m.id) } else { None };
-    MessagePage { messages: rows, next_cursor }
+    let next_cursor = if has_more {
+        rows.last().map(|m| m.id)
+    } else {
+        None
+    };
+    MessagePage {
+        messages: rows,
+        next_cursor,
+    }
 }
 
 // ── Trait ─────────────────────────────────────────────────────────────

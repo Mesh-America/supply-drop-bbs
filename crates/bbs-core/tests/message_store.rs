@@ -23,9 +23,16 @@ async fn post_messages_and_paginate() {
     let (db, _dir) = test_db().await;
     let alice = seed_user(&db, "alice").await;
 
-    let room_id = RoomStore::create(&db, "lobby", None, false, PermissionLevel::User, Timestamp::now())
-        .await
-        .unwrap();
+    let room_id = RoomStore::create(
+        &db,
+        "lobby",
+        None,
+        false,
+        PermissionLevel::User,
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
 
     let mut expected_ids = Vec::new();
     for i in 0u8..5 {
@@ -55,7 +62,10 @@ async fn post_messages_and_paginate() {
         .chain(&page2.messages)
         .map(|m| m.id)
         .collect();
-    assert_eq!(all_ids, expected_ids, "pagination must return all IDs in order");
+    assert_eq!(
+        all_ids, expected_ids,
+        "pagination must return all IDs in order"
+    );
 }
 
 #[tokio::test]
@@ -83,16 +93,18 @@ async fn direct_messages_only_appear_in_list_direct() {
 async fn unread_count_and_mark_read() {
     let (db, _dir) = test_db().await;
     let alice = seed_user(&db, "alice").await;
-    let alice_id = db
-        .get_by_username(&alice)
-        .await
-        .unwrap()
-        .unwrap()
-        .id;
+    let alice_id = db.get_by_username(&alice).await.unwrap().unwrap().id;
 
-    let room_id = RoomStore::create(&db, "news", None, false, PermissionLevel::User, Timestamp::now())
-        .await
-        .unwrap();
+    let room_id = RoomStore::create(
+        &db,
+        "news",
+        None,
+        false,
+        PermissionLevel::User,
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
 
     // 3 messages posted.
     let mut ids = Vec::new();
@@ -128,16 +140,18 @@ async fn unread_count_and_mark_read() {
 async fn delete_message_sets_read_pointer_null() {
     let (db, _dir) = test_db().await;
     let alice = seed_user(&db, "alice").await;
-    let alice_id = db
-        .get_by_username(&alice)
-        .await
-        .unwrap()
-        .unwrap()
-        .id;
+    let alice_id = db.get_by_username(&alice).await.unwrap().unwrap().id;
 
-    let room_id = RoomStore::create(&db, "general", None, false, PermissionLevel::User, Timestamp::now())
-        .await
-        .unwrap();
+    let room_id = RoomStore::create(
+        &db,
+        "general",
+        None,
+        false,
+        PermissionLevel::User,
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
 
     let mid = db
         .post_to_room(room_id, &alice, "ephemeral", Timestamp::now())

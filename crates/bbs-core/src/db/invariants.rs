@@ -16,17 +16,15 @@ use std::collections::{HashMap, HashSet};
 ///
 /// An empty room table is valid (zero heads, zero tails).
 pub async fn verify_room_walk_order(pool: &Pool<Sqlite>) -> Result<(), DbOpenError> {
-    let head_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM rooms WHERE prev_neighbor IS NULL",
-    )
-    .fetch_one(pool)
-    .await?;
+    let head_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE prev_neighbor IS NULL")
+            .fetch_one(pool)
+            .await?;
 
-    let tail_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM rooms WHERE next_neighbor IS NULL",
-    )
-    .fetch_one(pool)
-    .await?;
+    let tail_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE next_neighbor IS NULL")
+            .fetch_one(pool)
+            .await?;
 
     if head_count > 1 {
         return Err(DbOpenError::RoomOrder(format!(
@@ -53,10 +51,9 @@ pub async fn verify_room_walk_order(pool: &Pool<Sqlite>) -> Result<(), DbOpenErr
     }
 
     // Fetch all rows so we can walk the list in memory.
-    let rows: Vec<(i64, Option<i64>)> =
-        sqlx::query_as("SELECT id, next_neighbor FROM rooms")
-            .fetch_all(pool)
-            .await?;
+    let rows: Vec<(i64, Option<i64>)> = sqlx::query_as("SELECT id, next_neighbor FROM rooms")
+        .fetch_all(pool)
+        .await?;
 
     // Build a next-pointer map and find the head.
     let next_map: HashMap<i64, i64> = rows

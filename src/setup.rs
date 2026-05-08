@@ -104,7 +104,10 @@ pub fn run_wizard(config_out: Option<&Path>) {
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
             if let Err(e) = fs::create_dir_all(parent) {
-                eprintln!("error: could not create directory {}: {e}", parent.display());
+                eprintln!(
+                    "error: could not create directory {}: {e}",
+                    parent.display()
+                );
                 std::process::exit(1);
             }
         }

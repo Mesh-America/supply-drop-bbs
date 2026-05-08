@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bbs_plugin_api::{
-    event::{Notification, NotifyOutcome},
     error::{PluginError, TransportError},
+    event::{Notification, NotifyOutcome},
     identity::SessionId,
     plugin::Plugin,
     transport::TransportEngine,
@@ -214,7 +214,10 @@ impl TransportEngine for MeshTransport {
         };
 
         let Some(pubkey_prefix) = pubkey_prefix else {
-            debug!(?session, "notify: no mesh node mapped to session — dropping");
+            debug!(
+                ?session,
+                "notify: no mesh node mapped to session — dropping"
+            );
             return Ok(NotifyOutcome::Dropped);
         };
 
@@ -298,10 +301,21 @@ async fn handle_frame(
             // Only handle plain-text messages; CLI data and signed frames are
             // not BBS commands.
             if msg.txt_type != meshcore_companion::constants::TXT_TYPE_PLAIN {
-                debug!("mesh: ignoring non-plain-text ContactMsg (txt_type={})", msg.txt_type);
+                debug!(
+                    "mesh: ignoring non-plain-text ContactMsg (txt_type={})",
+                    msg.txt_type
+                );
                 return;
             }
-            dispatch_message(msg.sender_key_prefix, &msg.text, host, cmd_tx, state, command_prefix).await;
+            dispatch_message(
+                msg.sender_key_prefix,
+                &msg.text,
+                host,
+                cmd_tx,
+                state,
+                command_prefix,
+            )
+            .await;
         }
 
         // ── Queued message notification ───────────────────────────────────────
@@ -392,7 +406,10 @@ async fn dispatch_message(
         .await
         .is_err()
     {
-        warn!(?session, "mesh: could not enqueue reply — cmd channel closed");
+        warn!(
+            ?session,
+            "mesh: could not enqueue reply — cmd channel closed"
+        );
     }
 }
 

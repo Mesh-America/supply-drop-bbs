@@ -69,7 +69,6 @@ pub struct Config {
     pub plugins: PluginsConfig,
 }
 
-
 impl Config {
     /// Fill in derived defaults that depend on `data_dir`.
     ///

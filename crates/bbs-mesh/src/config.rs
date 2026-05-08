@@ -71,7 +71,6 @@ pub struct MeshConfig {
     pub connection_type: ConnectionType,
 
     // ── TCP / HAT fields ──────────────────────────────────────────────
-
     /// Address of the `CompanionFrameServer` TCP listener.
     ///
     /// Used when `connection_type` is `tcp` or `hat`.
@@ -81,7 +80,6 @@ pub struct MeshConfig {
     pub addr: SocketAddr,
 
     // ── Serial fields ─────────────────────────────────────────────────
-
     /// OS path to the USB serial device.
     ///
     /// Required when `connection_type = "serial"`.
@@ -99,7 +97,6 @@ pub struct MeshConfig {
     pub baud_rate: u32,
 
     // ── Common fields ─────────────────────────────────────────────────
-
     /// Optional single-character prefix that marks a message as a BBS command.
     ///
     /// When set, only messages beginning with this character are interpreted
@@ -159,7 +156,9 @@ impl Default for MeshConfig {
 }
 
 fn default_addr() -> SocketAddr {
-    "127.0.0.1:5000".parse().expect("hard-coded address is valid")
+    "127.0.0.1:5000"
+        .parse()
+        .expect("hard-coded address is valid")
 }
 
 fn default_baud_rate() -> u32 {

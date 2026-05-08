@@ -83,7 +83,9 @@ impl TcpBridge {
     /// Read exactly `n` bytes from the client.
     async fn recv_n(&mut self, n: usize) -> Vec<u8> {
         let mut buf = vec![0u8; n];
-        tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut buf).await.unwrap();
+        tokio::io::AsyncReadExt::read_exact(&mut self.stream, &mut buf)
+            .await
+            .unwrap();
         buf
     }
 }
@@ -110,11 +112,7 @@ async fn loopback() -> (CompanionClient, TcpBridge) {
 
 /// Complete the AppStart handshake on a fresh loopback pair and wait for the
 /// `Connected` event.  Returns the `TcpBridge` so the test can continue.
-async fn complete_handshake(
-    client: &mut CompanionClient,
-    bridge: &mut TcpBridge,
-    name: &str,
-) {
+async fn complete_handshake(client: &mut CompanionClient, bridge: &mut TcpBridge, name: &str) {
     // AppStart = 5 bytes: [prefix][len_lo=2][len_hi=0][CMD_APP_START][version]
     let _app_start = bridge.recv_n(5).await;
     bridge.send(&self_info_frame(name)).await;
@@ -122,7 +120,10 @@ async fn complete_handshake(
         .await
         .expect("timed out waiting for Connected")
         .expect("client channel closed");
-    assert!(matches!(ev, ClientEvent::Connected { .. }), "expected Connected, got {ev:?}");
+    assert!(
+        matches!(ev, ClientEvent::Connected { .. }),
+        "expected Connected, got {ev:?}"
+    );
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -133,9 +134,15 @@ async fn handshake_emits_connected() {
     let (mut client, mut bridge) = loopback().await;
 
     let app_start = bridge.recv_n(5).await;
-    assert_eq!(app_start[0], FRAME_INBOUND_PREFIX, "AppStart must use inbound prefix");
+    assert_eq!(
+        app_start[0], FRAME_INBOUND_PREFIX,
+        "AppStart must use inbound prefix"
+    );
     assert_eq!(app_start[3], CMD_APP_START, "byte[3] must be CMD_APP_START");
-    assert_eq!(app_start[4], APP_TARGET_VER_V3, "byte[4] must be app_target_version");
+    assert_eq!(
+        app_start[4], APP_TARGET_VER_V3,
+        "byte[4] must be app_target_version"
+    );
 
     bridge.send(&self_info_frame("TestRadio")).await;
 
@@ -158,7 +165,11 @@ async fn first_bytes_are_app_start() {
     // [prefix][len_lo=2][len_hi=0][CMD_APP_START][APP_TARGET_VER_V3]
     let wire = bridge.recv_n(5).await;
     assert_eq!(wire[0], FRAME_INBOUND_PREFIX);
-    assert_eq!(u16::from_le_bytes([wire[1], wire[2]]), 2, "payload length must be 2");
+    assert_eq!(
+        u16::from_le_bytes([wire[1], wire[2]]),
+        2,
+        "payload length must be 2"
+    );
     assert_eq!(wire[3], CMD_APP_START);
     assert_eq!(wire[4], APP_TARGET_VER_V3);
 }
@@ -171,15 +182,24 @@ async fn frames_forwarded_after_handshake() {
 
     bridge.send(&curr_time_frame(1_700_000_000)).await;
     let ev = tokio::time::timeout(Duration::from_secs(2), client.recv())
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
-        matches!(ev, ClientEvent::Frame(InboundFrame::CurrTime { unix_time: 1_700_000_000 })),
+        matches!(
+            ev,
+            ClientEvent::Frame(InboundFrame::CurrTime {
+                unix_time: 1_700_000_000
+            })
+        ),
         "unexpected: {ev:?}"
     );
 
     bridge.send(&ok_frame()).await;
     let ev = tokio::time::timeout(Duration::from_secs(2), client.recv())
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(ev, ClientEvent::Frame(InboundFrame::Ok)));
 }
 
@@ -194,7 +214,11 @@ async fn send_command_reaches_bridge() {
     // GetBattAndStorage = 4 bytes: [prefix][len_lo=1][len_hi=0][CMD]
     let cmd = bridge.recv_n(4).await;
     assert_eq!(cmd[0], FRAME_INBOUND_PREFIX);
-    assert_eq!(u16::from_le_bytes([cmd[1], cmd[2]]), 1, "payload length must be 1");
+    assert_eq!(
+        u16::from_le_bytes([cmd[1], cmd[2]]),
+        1,
+        "payload length must be 1"
+    );
     assert_eq!(cmd[3], CMD_GET_BATT_AND_STORAGE);
 }
 
@@ -216,11 +240,15 @@ async fn reconnects_after_disconnect() {
     // ── First connection ──────────────────────────────────────────────────
     let (mut s1, _) = listener.accept().await.unwrap();
     let mut buf = vec![0u8; 5];
-    tokio::io::AsyncReadExt::read_exact(&mut s1, &mut buf).await.unwrap();
+    tokio::io::AsyncReadExt::read_exact(&mut s1, &mut buf)
+        .await
+        .unwrap();
     s1.write_all(&self_info_frame("Node1")).await.unwrap();
 
     let ev = tokio::time::timeout(Duration::from_secs(2), client.recv())
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(ev, ClientEvent::Connected { .. }));
 
     // Simulate bridge disconnect by dropping the server stream.
@@ -228,7 +256,9 @@ async fn reconnects_after_disconnect() {
 
     // Client emits Disconnected(will_retry=true).
     let ev = tokio::time::timeout(Duration::from_secs(2), client.recv())
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert!(
         matches!(ev, ClientEvent::Disconnected { will_retry: true }),
         "expected Disconnected(retry=true), got {ev:?}"
@@ -237,13 +267,17 @@ async fn reconnects_after_disconnect() {
     // ── Second connection (automatic reconnect) ───────────────────────────
     let (mut s2, _) = listener.accept().await.unwrap();
     let mut buf2 = vec![0u8; 5];
-    tokio::io::AsyncReadExt::read_exact(&mut s2, &mut buf2).await.unwrap();
+    tokio::io::AsyncReadExt::read_exact(&mut s2, &mut buf2)
+        .await
+        .unwrap();
     assert_eq!(buf2[3], CMD_APP_START, "expected AppStart on reconnect");
 
     // Complete the handshake to keep the worker happy.
     s2.write_all(&self_info_frame("Node1")).await.unwrap();
     let ev2 = tokio::time::timeout(Duration::from_secs(2), client.recv())
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert!(matches!(ev2, ClientEvent::Connected { .. }));
 }
 
@@ -264,12 +298,16 @@ async fn drop_client_closes_connection() {
 
     let (mut srv, _) = listener.accept().await.unwrap();
     let mut buf = vec![0u8; 5];
-    tokio::io::AsyncReadExt::read_exact(&mut srv, &mut buf).await.unwrap();
+    tokio::io::AsyncReadExt::read_exact(&mut srv, &mut buf)
+        .await
+        .unwrap();
     srv.write_all(&self_info_frame("R")).await.unwrap();
 
     // Wait for Connected before dropping so the worker is in the event loop
     // (not mid-connect) when cmd_tx closes.
-    let _ = tokio::time::timeout(Duration::from_secs(2), client.recv()).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), client.recv())
+        .await
+        .unwrap();
     drop(client);
 
     // The worker should detect cmd_rx closed and exit, which closes the TCP

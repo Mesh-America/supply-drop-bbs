@@ -23,8 +23,8 @@ use crate::{
     constants::*,
     error::FrameDecodeError,
     types::{
-        BattAndStorage, ChannelInfo, ChannelMsg, Contact, ContactMsg, DeviceInfo,
-        ExportedContact, LoginSuccess, SelfInfo, SentResult,
+        BattAndStorage, ChannelInfo, ChannelMsg, Contact, ContactMsg, DeviceInfo, ExportedContact,
+        LoginSuccess, SelfInfo, SentResult,
     },
 };
 
@@ -39,57 +39,114 @@ use crate::{
 pub enum InboundFrame {
     // ─ Solicited responses ─────────────────────────────────────────────────
     Ok,
-    Err { error_code: u8 },
-    ContactsStart { count: u32 },
+    Err {
+        error_code: u8,
+    },
+    ContactsStart {
+        count: u32,
+    },
     Contact(Contact),
-    EndOfContacts { most_recent_lastmod: u32 },
+    EndOfContacts {
+        most_recent_lastmod: u32,
+    },
     SelfInfo(SelfInfo),
     Sent(SentResult),
     ContactMsgRecv(ContactMsg),
     ChannelMsgRecv(ChannelMsg),
-    CurrTime { unix_time: u32 },
+    CurrTime {
+        unix_time: u32,
+    },
     NoMoreMessages,
     ExportContact(ExportedContact),
     BattAndStorage(BattAndStorage),
     DeviceInfo(DeviceInfo),
-    PrivateKey { key: Box<[u8]> },
+    PrivateKey {
+        key: Box<[u8]>,
+    },
     Disabled,
     ContactMsgRecvV3(ContactMsg),
     ChannelMsgRecvV3(ChannelMsg),
     ChannelInfo(ChannelInfo),
-    AutoaddConfig { config: u8 },
+    AutoaddConfig {
+        config: u8,
+    },
     // Raw body for less-common resp codes we parse on demand:
-    Stats { stats_type: u8, raw: Vec<u8> },
-    AdvertPath { raw: Vec<u8> },
-    TuningParams { raw: Vec<u8> },
-    CustomVars { csv: String },
+    Stats {
+        stats_type: u8,
+        raw: Vec<u8>,
+    },
+    AdvertPath {
+        raw: Vec<u8>,
+    },
+    TuningParams {
+        raw: Vec<u8>,
+    },
+    CustomVars {
+        csv: String,
+    },
 
     // ─ Unsolicited push notifications ──────────────────────────────────────
     /// Short advertisement — just the 32-byte public key.
-    Advert { pubkey: [u8; 32] },
+    Advert {
+        pubkey: [u8; 32],
+    },
     /// Full advertisement — same fields as a Contact entry.
     NewAdvert(Contact),
     /// A contact's outbound path was updated.
-    PathUpdated { pubkey: [u8; 32] },
+    PathUpdated {
+        pubkey: [u8; 32],
+    },
     /// Delivery acknowledgement for a sent message.
-    SendConfirmed { crc: u32 },
+    SendConfirmed {
+        crc: u32,
+    },
     /// A message is waiting; call CMD_SYNC_NEXT_MESSAGE.
     MsgWaiting,
-    RawData { snr_byte: i8, rssi_byte: i8, data: Vec<u8> },
+    RawData {
+        snr_byte: i8,
+        rssi_byte: i8,
+        data: Vec<u8>,
+    },
     LoginSuccess(LoginSuccess),
-    LoginFail { pubkey_prefix: [u8; 6] },
-    StatusResponse { pubkey_prefix: [u8; 6], raw: Vec<u8> },
-    LogRxData { snr_byte: i8, rssi_byte: i8, raw: Vec<u8> },
-    TelemetryResponse { pubkey_prefix: [u8; 6], raw: Vec<u8> },
-    BinaryResponse { tag: [u8; 4], raw: Vec<u8> },
-    PathDiscoveryResponse { raw: Vec<u8> },
-    ControlData { raw: Vec<u8> },
-    ContactDeleted { pubkey: [u8; 32] },
+    LoginFail {
+        pubkey_prefix: [u8; 6],
+    },
+    StatusResponse {
+        pubkey_prefix: [u8; 6],
+        raw: Vec<u8>,
+    },
+    LogRxData {
+        snr_byte: i8,
+        rssi_byte: i8,
+        raw: Vec<u8>,
+    },
+    TelemetryResponse {
+        pubkey_prefix: [u8; 6],
+        raw: Vec<u8>,
+    },
+    BinaryResponse {
+        tag: [u8; 4],
+        raw: Vec<u8>,
+    },
+    PathDiscoveryResponse {
+        raw: Vec<u8>,
+    },
+    ControlData {
+        raw: Vec<u8>,
+    },
+    ContactDeleted {
+        pubkey: [u8; 32],
+    },
     ContactsFull,
-    TraceData { raw: Vec<u8> },
+    TraceData {
+        raw: Vec<u8>,
+    },
 
     /// Catch-all for type bytes we don't recognise.
-    Unknown { type_byte: u8, payload: Vec<u8> },
+    Unknown {
+        type_byte: u8,
+        payload: Vec<u8>,
+    },
 }
 
 // ── Outbound frame enum ───────────────────────────────────────────────────────
@@ -98,11 +155,17 @@ pub enum InboundFrame {
 #[derive(Debug, Clone, PartialEq)]
 pub enum OutboundFrame {
     /// Handshake — must be the first command after connecting.
-    AppStart { app_target_version: u8 },
+    AppStart {
+        app_target_version: u8,
+    },
     /// Query firmware version and capabilities.
-    DeviceQuery { app_target_version: u8 },
+    DeviceQuery {
+        app_target_version: u8,
+    },
     /// Fetch all contacts modified since `since` (0 = all).
-    GetContacts { since: u32 },
+    GetContacts {
+        since: u32,
+    },
     /// Pop the next queued inbound message.
     SyncNextMessage,
     /// Send a direct text message to a contact.
@@ -124,42 +187,76 @@ pub enum OutboundFrame {
         password: String,
     },
     GetDeviceTime,
-    SetDeviceTime { unix_time: u32 },
+    SetDeviceTime {
+        unix_time: u32,
+    },
     SendSelfAdvert {
         /// true = flood, false = direct.
         flood: bool,
     },
-    SetAdvertName { name: String },
-    SetAdvertLatlon { lat_1e6: i32, lon_1e6: i32 },
+    SetAdvertName {
+        name: String,
+    },
+    SetAdvertLatlon {
+        lat_1e6: i32,
+        lon_1e6: i32,
+    },
     AddUpdateContact(crate::types::Contact),
-    RemoveContact { pubkey: [u8; 32] },
-    ResetPath { pubkey: [u8; 32] },
-    GetContactByKey { pubkey: [u8; 32] },
-    ShareContact { pubkey: [u8; 32] },
-    ExportContact { pubkey: Option<[u8; 32]> },
-    ImportContact { data: Vec<u8> },
+    RemoveContact {
+        pubkey: [u8; 32],
+    },
+    ResetPath {
+        pubkey: [u8; 32],
+    },
+    GetContactByKey {
+        pubkey: [u8; 32],
+    },
+    ShareContact {
+        pubkey: [u8; 32],
+    },
+    ExportContact {
+        pubkey: Option<[u8; 32]>,
+    },
+    ImportContact {
+        data: Vec<u8>,
+    },
     GetBattAndStorage,
-    GetChannel { channel_idx: Option<u8> },
+    GetChannel {
+        channel_idx: Option<u8>,
+    },
     SetChannel {
         channel_idx: u8,
         name: String,
         /// 32-byte channel secret.
         secret: [u8; 32],
     },
-    Logout { pubkey: [u8; 32] },
-    GetStats { stats_type: u8 },
-    SetFloodScope { key: Option<[u8; 16]> },
+    Logout {
+        pubkey: [u8; 32],
+    },
+    GetStats {
+        stats_type: u8,
+    },
+    SetFloodScope {
+        key: Option<[u8; 16]>,
+    },
     SetOtherParams {
         manual_add: u8,
         telemetry_modes: u8,
         advert_loc_policy: u8,
         multi_acks: u8,
     },
-    SetAutoaddConfig { config: u8 },
+    SetAutoaddConfig {
+        config: u8,
+    },
     GetAutoaddConfig,
-    SetPathHashMode { mode: u8 },
+    SetPathHashMode {
+        mode: u8,
+    },
     /// Escape hatch for commands not yet modelled above.
-    Raw { code: u8, body: Vec<u8> },
+    Raw {
+        code: u8,
+        body: Vec<u8>,
+    },
 }
 
 // ── Low-level framing ─────────────────────────────────────────────────────────
@@ -171,7 +268,10 @@ pub enum OutboundFrame {
 /// Returns a reference to the payload (starting with the type byte) on success.
 pub fn strip_frame_header(raw: &[u8]) -> Result<&[u8], FrameDecodeError> {
     if raw.is_empty() {
-        return Err(FrameDecodeError::WrongPrefix { expected: FRAME_OUTBOUND_PREFIX, got: 0 });
+        return Err(FrameDecodeError::WrongPrefix {
+            expected: FRAME_OUTBOUND_PREFIX,
+            got: 0,
+        });
     }
     if raw[0] != FRAME_OUTBOUND_PREFIX {
         return Err(FrameDecodeError::WrongPrefix {
@@ -201,7 +301,11 @@ pub fn strip_frame_header(raw: &[u8]) -> Result<&[u8], FrameDecodeError> {
 /// `payload[0]` is the type byte.
 pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> {
     if payload.is_empty() {
-        return Err(FrameDecodeError::BodyTooShort { type_byte: 0, needed: 1, got: 0 });
+        return Err(FrameDecodeError::BodyTooShort {
+            type_byte: 0,
+            needed: 1,
+            got: 0,
+        });
     }
     let type_byte = payload[0];
     let body = &payload[1..];
@@ -222,11 +326,15 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         RESP_CODE_OK => Ok(InboundFrame::Ok),
         RESP_CODE_ERR => {
             need!(1);
-            Ok(InboundFrame::Err { error_code: body[0] })
+            Ok(InboundFrame::Err {
+                error_code: body[0],
+            })
         }
         RESP_CODE_CONTACTS_START => {
             need!(4);
-            Ok(InboundFrame::ContactsStart { count: r_u32(body, 0) })
+            Ok(InboundFrame::ContactsStart {
+                count: r_u32(body, 0),
+            })
         }
         RESP_CODE_CONTACT => {
             need!(147);
@@ -234,7 +342,9 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         }
         RESP_CODE_END_OF_CONTACTS => {
             need!(4);
-            Ok(InboundFrame::EndOfContacts { most_recent_lastmod: r_u32(body, 0) })
+            Ok(InboundFrame::EndOfContacts {
+                most_recent_lastmod: r_u32(body, 0),
+            })
         }
         RESP_CODE_SELF_INFO => {
             need!(57);
@@ -254,7 +364,9 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         }
         RESP_CODE_CURR_TIME => {
             need!(4);
-            Ok(InboundFrame::CurrTime { unix_time: r_u32(body, 0) })
+            Ok(InboundFrame::CurrTime {
+                unix_time: r_u32(body, 0),
+            })
         }
         RESP_CODE_NO_MORE_MESSAGES => Ok(InboundFrame::NoMoreMessages),
         RESP_CODE_EXPORT_CONTACT => {
@@ -272,20 +384,28 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         RESP_CODE_PRIVATE_KEY => {
             // Server exports 64-byte expanded key; accept any length ≥ 32.
             need!(32);
-            Ok(InboundFrame::PrivateKey { key: body.to_vec().into_boxed_slice() })
+            Ok(InboundFrame::PrivateKey {
+                key: body.to_vec().into_boxed_slice(),
+            })
         }
         RESP_CODE_DISABLED => Ok(InboundFrame::Disabled),
         RESP_CODE_CONTACT_MSG_RECV_V3 => {
             // [snr_byte][reserved][reserved][sender_prefix×6][path_len][txt_type][ts×4][text]
             need!(15);
             let snr = (body[0] as i8) as f32 / 4.0;
-            Ok(InboundFrame::ContactMsgRecvV3(parse_contact_msg(&body[3..], Some(snr))?))
+            Ok(InboundFrame::ContactMsgRecvV3(parse_contact_msg(
+                &body[3..],
+                Some(snr),
+            )?))
         }
         RESP_CODE_CHANNEL_MSG_RECV_V3 => {
             // [snr_byte][reserved][reserved][channel_idx][path_len][txt_type][ts×4][text]
             need!(10);
             let snr = (body[0] as i8) as f32 / 4.0;
-            Ok(InboundFrame::ChannelMsgRecvV3(parse_channel_msg(&body[3..], Some(snr))?))
+            Ok(InboundFrame::ChannelMsgRecvV3(parse_channel_msg(
+                &body[3..],
+                Some(snr),
+            )?))
         }
         RESP_CODE_CHANNEL_INFO => {
             // [channel_idx][name×32][secret×16]
@@ -298,7 +418,10 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         }
         RESP_CODE_STATS => {
             need!(1);
-            Ok(InboundFrame::Stats { stats_type: body[0], raw: body[1..].to_vec() })
+            Ok(InboundFrame::Stats {
+                stats_type: body[0],
+                raw: body[1..].to_vec(),
+            })
         }
         RESP_CODE_ADVERT_PATH => Ok(InboundFrame::AdvertPath { raw: body.to_vec() }),
         RESP_CODE_TUNING_PARAMS => Ok(InboundFrame::TuningParams { raw: body.to_vec() }),
@@ -309,7 +432,9 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
 
         PUSH_CODE_ADVERT => {
             need!(32);
-            Ok(InboundFrame::Advert { pubkey: copy32(body) })
+            Ok(InboundFrame::Advert {
+                pubkey: copy32(body),
+            })
         }
         PUSH_CODE_NEW_ADVERT => {
             need!(147);
@@ -317,12 +442,16 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         }
         PUSH_CODE_PATH_UPDATED => {
             need!(32);
-            Ok(InboundFrame::PathUpdated { pubkey: copy32(body) })
+            Ok(InboundFrame::PathUpdated {
+                pubkey: copy32(body),
+            })
         }
         PUSH_CODE_SEND_CONFIRMED => {
             // [crc×4][zero×4]
             need!(8);
-            Ok(InboundFrame::SendConfirmed { crc: r_u32(body, 0) })
+            Ok(InboundFrame::SendConfirmed {
+                crc: r_u32(body, 0),
+            })
         }
         PUSH_CODE_MSG_WAITING => Ok(InboundFrame::MsgWaiting),
         PUSH_CODE_RAW_DATA => {
@@ -352,14 +481,19 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
             need!(7);
             let mut prefix = [0u8; 6];
             prefix.copy_from_slice(&body[1..7]);
-            Ok(InboundFrame::LoginFail { pubkey_prefix: prefix })
+            Ok(InboundFrame::LoginFail {
+                pubkey_prefix: prefix,
+            })
         }
         PUSH_CODE_STATUS_RESPONSE => {
             // [reserved][pubkey_prefix×6][raw…]
             need!(7);
             let mut prefix = [0u8; 6];
             prefix.copy_from_slice(&body[1..7]);
-            Ok(InboundFrame::StatusResponse { pubkey_prefix: prefix, raw: body[7..].to_vec() })
+            Ok(InboundFrame::StatusResponse {
+                pubkey_prefix: prefix,
+                raw: body[7..].to_vec(),
+            })
         }
         PUSH_CODE_LOG_RX_DATA => {
             // [snr_byte][rssi_byte][raw…]
@@ -375,14 +509,20 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
             need!(7);
             let mut prefix = [0u8; 6];
             prefix.copy_from_slice(&body[1..7]);
-            Ok(InboundFrame::TelemetryResponse { pubkey_prefix: prefix, raw: body[7..].to_vec() })
+            Ok(InboundFrame::TelemetryResponse {
+                pubkey_prefix: prefix,
+                raw: body[7..].to_vec(),
+            })
         }
         PUSH_CODE_BINARY_RESPONSE => {
             // [reserved][tag×4][response_data…]
             need!(5);
             let mut tag = [0u8; 4];
             tag.copy_from_slice(&body[1..5]);
-            Ok(InboundFrame::BinaryResponse { tag, raw: body[5..].to_vec() })
+            Ok(InboundFrame::BinaryResponse {
+                tag,
+                raw: body[5..].to_vec(),
+            })
         }
         PUSH_CODE_PATH_DISCOVERY_RESPONSE => {
             Ok(InboundFrame::PathDiscoveryResponse { raw: body.to_vec() })
@@ -390,14 +530,19 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         PUSH_CODE_CONTROL_DATA => Ok(InboundFrame::ControlData { raw: body.to_vec() }),
         PUSH_CODE_CONTACT_DELETED => {
             need!(32);
-            Ok(InboundFrame::ContactDeleted { pubkey: copy32(body) })
+            Ok(InboundFrame::ContactDeleted {
+                pubkey: copy32(body),
+            })
         }
         PUSH_CODE_CONTACTS_FULL => Ok(InboundFrame::ContactsFull),
         PUSH_CODE_TRACE_DATA => Ok(InboundFrame::TraceData { raw: body.to_vec() }),
 
         _ => {
             tracing::warn!("unknown companion frame type: 0x{:02X}", type_byte);
-            Ok(InboundFrame::Unknown { type_byte, payload: payload.to_vec() })
+            Ok(InboundFrame::Unknown {
+                type_byte,
+                payload: payload.to_vec(),
+            })
         }
     }
 }
@@ -438,7 +583,12 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
         OutboundFrame::SyncNextMessage => {
             p.push(CMD_SYNC_NEXT_MESSAGE);
         }
-        OutboundFrame::SendTxtMsg { txt_type, attempt, pubkey_prefix, text } => {
+        OutboundFrame::SendTxtMsg {
+            txt_type,
+            attempt,
+            pubkey_prefix,
+            text,
+        } => {
             // Layout confirmed from frame_server._cmd_send_txt_msg:
             // data[0]=txt_type, data[1]=attempt, data[2..6]=reserved(4), data[6..12]=prefix, data[12..]=text
             p.push(CMD_SEND_TXT_MSG);
@@ -448,7 +598,11 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
             p.extend_from_slice(pubkey_prefix);
             p.extend_from_slice(text.as_bytes());
         }
-        OutboundFrame::SendChannelTxtMsg { txt_type, channel_idx, text } => {
+        OutboundFrame::SendChannelTxtMsg {
+            txt_type,
+            channel_idx,
+            text,
+        } => {
             // data[0]=txt_type, data[1]=channel_idx, data[2..6]=reserved(4), data[6..]=text
             p.push(CMD_SEND_CHANNEL_TXT_MSG);
             p.push(*txt_type);
@@ -523,7 +677,11 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
                 p.push(*idx);
             }
         }
-        OutboundFrame::SetChannel { channel_idx, name, secret } => {
+        OutboundFrame::SetChannel {
+            channel_idx,
+            name,
+            secret,
+        } => {
             p.push(CMD_SET_CHANNEL);
             p.push(*channel_idx);
             let nb = name.as_bytes();
@@ -547,7 +705,12 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
                 p.extend_from_slice(k);
             }
         }
-        OutboundFrame::SetOtherParams { manual_add, telemetry_modes, advert_loc_policy, multi_acks } => {
+        OutboundFrame::SetOtherParams {
+            manual_add,
+            telemetry_modes,
+            advert_loc_policy,
+            multi_acks,
+        } => {
             p.push(CMD_SET_OTHER_PARAMS);
             p.push(*manual_add);
             p.push(*telemetry_modes);
@@ -596,7 +759,9 @@ fn copy32(b: &[u8]) -> [u8; 32] {
 
 fn read_cstr(b: &[u8]) -> Result<String, FrameDecodeError> {
     let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
-    std::str::from_utf8(&b[..end]).map(|s| s.to_owned()).map_err(|_| FrameDecodeError::InvalidUtf8)
+    std::str::from_utf8(&b[..end])
+        .map(|s| s.to_owned())
+        .map_err(|_| FrameDecodeError::InvalidUtf8)
 }
 
 fn parse_contact(body: &[u8]) -> Result<Contact, FrameDecodeError> {
@@ -607,7 +772,11 @@ fn parse_contact(body: &[u8]) -> Result<Contact, FrameDecodeError> {
     let adv_type = body[32];
     let flags = body[33];
     let opl_byte = body[34];
-    let out_path_len = if opl_byte == 0xFF { -1i8 } else { opl_byte as i8 };
+    let out_path_len = if opl_byte == 0xFF {
+        -1i8
+    } else {
+        opl_byte as i8
+    };
     let mut out_path = [0u8; 64];
     out_path.copy_from_slice(&body[35..99]);
     let name = read_cstr(&body[99..131])?;
@@ -721,7 +890,13 @@ fn parse_exported_contact(body: &[u8]) -> Result<ExportedContact, FrameDecodeErr
     let name = read_cstr(&body[33..65])?;
     let gps_lat = r_i32(body, 65);
     let gps_lon = r_i32(body, 69);
-    Ok(ExportedContact { pubkey, adv_type, name, gps_lat, gps_lon })
+    Ok(ExportedContact {
+        pubkey,
+        adv_type,
+        name,
+        gps_lat,
+        gps_lon,
+    })
 }
 
 fn parse_contact_msg(body: &[u8], snr: Option<f32>) -> Result<ContactMsg, FrameDecodeError> {
@@ -734,7 +909,14 @@ fn parse_contact_msg(body: &[u8], snr: Option<f32>) -> Result<ContactMsg, FrameD
     let timestamp = r_u32(body, 8);
     let text_bytes = &body[12..];
     let text = read_cstr(text_bytes)?;
-    Ok(ContactMsg { sender_key_prefix, path_len, txt_type, timestamp, text, snr })
+    Ok(ContactMsg {
+        sender_key_prefix,
+        path_len,
+        txt_type,
+        timestamp,
+        text,
+        snr,
+    })
 }
 
 fn parse_channel_msg(body: &[u8], snr: Option<f32>) -> Result<ChannelMsg, FrameDecodeError> {
@@ -746,7 +928,14 @@ fn parse_channel_msg(body: &[u8], snr: Option<f32>) -> Result<ChannelMsg, FrameD
     let timestamp = r_u32(body, 3);
     let text_bytes = &body[7..];
     let text = read_cstr(text_bytes)?;
-    Ok(ChannelMsg { channel_idx, path_len, txt_type, timestamp, text, snr })
+    Ok(ChannelMsg {
+        channel_idx,
+        path_len,
+        txt_type,
+        timestamp,
+        text,
+        snr,
+    })
 }
 
 fn parse_channel_info(body: &[u8]) -> Result<ChannelInfo, FrameDecodeError> {
@@ -755,7 +944,11 @@ fn parse_channel_info(body: &[u8]) -> Result<ChannelInfo, FrameDecodeError> {
     let name = read_cstr(&body[1..33])?;
     let mut secret = [0u8; 16];
     secret.copy_from_slice(&body[33..49]);
-    Ok(ChannelInfo { channel_idx, name, secret })
+    Ok(ChannelInfo {
+        channel_idx,
+        name,
+        secret,
+    })
 }
 
 fn encode_contact_body(p: &mut Vec<u8>, c: &Contact) {

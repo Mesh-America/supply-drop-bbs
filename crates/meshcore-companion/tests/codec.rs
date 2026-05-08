@@ -6,9 +6,10 @@
 
 use meshcore_companion::{
     constants::*,
-    decode_inbound, encode_outbound, strip_frame_header,
+    decode_inbound, encode_outbound,
     error::FrameDecodeError,
     frame::{InboundFrame, OutboundFrame},
+    strip_frame_header,
     types::{BattAndStorage, ChannelMsg, Contact, ContactMsg, LoginSuccess, SentResult},
 };
 
@@ -35,7 +36,13 @@ fn strip_header_happy_path() {
 fn strip_header_wrong_prefix() {
     let raw = wire(0x00, &[RESP_CODE_OK]);
     let err = strip_frame_header(&raw).unwrap_err();
-    assert_eq!(err, FrameDecodeError::WrongPrefix { expected: FRAME_OUTBOUND_PREFIX, got: 0x00 });
+    assert_eq!(
+        err,
+        FrameDecodeError::WrongPrefix {
+            expected: FRAME_OUTBOUND_PREFIX,
+            got: 0x00
+        }
+    );
 }
 
 #[test]
@@ -90,7 +97,12 @@ fn decode_contacts_full() {
 #[test]
 fn decode_err() {
     let frame = decode_inbound(&[RESP_CODE_ERR, ERR_CODE_NOT_FOUND]).unwrap();
-    assert_eq!(frame, InboundFrame::Err { error_code: ERR_CODE_NOT_FOUND });
+    assert_eq!(
+        frame,
+        InboundFrame::Err {
+            error_code: ERR_CODE_NOT_FOUND
+        }
+    );
 }
 
 #[test]
@@ -108,7 +120,12 @@ fn decode_end_of_contacts() {
     let mut payload = vec![RESP_CODE_END_OF_CONTACTS];
     payload.extend_from_slice(&ts.to_le_bytes());
     let frame = decode_inbound(&payload).unwrap();
-    assert_eq!(frame, InboundFrame::EndOfContacts { most_recent_lastmod: 0xDEAD_BEEF });
+    assert_eq!(
+        frame,
+        InboundFrame::EndOfContacts {
+            most_recent_lastmod: 0xDEAD_BEEF
+        }
+    );
 }
 
 #[test]
@@ -117,7 +134,12 @@ fn decode_curr_time() {
     let mut payload = vec![RESP_CODE_CURR_TIME];
     payload.extend_from_slice(&t.to_le_bytes());
     let frame = decode_inbound(&payload).unwrap();
-    assert_eq!(frame, InboundFrame::CurrTime { unix_time: 1_700_000_000 });
+    assert_eq!(
+        frame,
+        InboundFrame::CurrTime {
+            unix_time: 1_700_000_000
+        }
+    );
 }
 
 #[test]
@@ -268,7 +290,7 @@ fn decode_contact_msg_recv_v3() {
     payload.push(snr_byte as u8); // snr_byte at body[0]
     payload.push(0); // reserved
     payload.push(0); // reserved
-    // after stripping 3 bytes, the msg starts at body[3]:
+                     // after stripping 3 bytes, the msg starts at body[3]:
     payload.extend_from_slice(&sender);
     payload.push(path_len);
     payload.push(txt_type);
@@ -321,7 +343,13 @@ fn decode_login_success() {
 fn decode_unknown_type_byte() {
     let payload = vec![0xFE, 0x01, 0x02];
     let frame = decode_inbound(&payload).unwrap();
-    assert_eq!(frame, InboundFrame::Unknown { type_byte: 0xFE, payload: payload.clone() });
+    assert_eq!(
+        frame,
+        InboundFrame::Unknown {
+            type_byte: 0xFE,
+            payload: payload.clone()
+        }
+    );
 }
 
 // ── decode_inbound — error cases ─────────────────────────────────────────────
@@ -329,7 +357,14 @@ fn decode_unknown_type_byte() {
 #[test]
 fn decode_empty_payload_errors() {
     let err = decode_inbound(&[]).unwrap_err();
-    assert_eq!(err, FrameDecodeError::BodyTooShort { type_byte: 0, needed: 1, got: 0 });
+    assert_eq!(
+        err,
+        FrameDecodeError::BodyTooShort {
+            type_byte: 0,
+            needed: 1,
+            got: 0
+        }
+    );
 }
 
 #[test]
@@ -338,7 +373,11 @@ fn decode_body_too_short_for_type() {
     let err = decode_inbound(&[RESP_CODE_ERR]).unwrap_err();
     assert_eq!(
         err,
-        FrameDecodeError::BodyTooShort { type_byte: RESP_CODE_ERR, needed: 1, got: 0 }
+        FrameDecodeError::BodyTooShort {
+            type_byte: RESP_CODE_ERR,
+            needed: 1,
+            got: 0
+        }
     );
 }
 
@@ -425,7 +464,9 @@ fn decode_out_path_len_direct() {
 
 #[test]
 fn encode_app_start() {
-    let wire_bytes = encode_outbound(&OutboundFrame::AppStart { app_target_version: APP_TARGET_VER_V3 });
+    let wire_bytes = encode_outbound(&OutboundFrame::AppStart {
+        app_target_version: APP_TARGET_VER_V3,
+    });
     // [FRAME_INBOUND_PREFIX][len_lo][len_hi][CMD_APP_START][APP_TARGET_VER_V3]
     assert_eq!(wire_bytes[0], FRAME_INBOUND_PREFIX);
     let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
@@ -450,7 +491,8 @@ fn encode_get_contacts() {
     let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
     assert_eq!(len, 5);
     assert_eq!(wire_bytes[3], CMD_GET_CONTACTS);
-    let decoded_since = u32::from_le_bytes([wire_bytes[4], wire_bytes[5], wire_bytes[6], wire_bytes[7]]);
+    let decoded_since =
+        u32::from_le_bytes([wire_bytes[4], wire_bytes[5], wire_bytes[6], wire_bytes[7]]);
     assert_eq!(decoded_since, since);
 }
 
@@ -502,8 +544,9 @@ fn encode_set_device_time() {
 
 #[test]
 fn encode_set_advert_name_null_terminated() {
-    let wire_bytes =
-        encode_outbound(&OutboundFrame::SetAdvertName { name: "BBS".to_owned() });
+    let wire_bytes = encode_outbound(&OutboundFrame::SetAdvertName {
+        name: "BBS".to_owned(),
+    });
     let payload = &wire_bytes[3..];
     assert_eq!(payload[0], CMD_SET_ADVERT_NAME);
     assert_eq!(&payload[1..4], b"BBS");

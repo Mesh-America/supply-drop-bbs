@@ -39,14 +39,24 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Override the data directory (database, logs, backups).
-    #[arg(long, global = true, value_name = "PATH", env = "SUPPLY_DROP__BBS__DATA_DIR")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "PATH",
+        env = "SUPPLY_DROP__BBS__DATA_DIR"
+    )]
     data_dir: Option<PathBuf>,
 
     /// Override the log level (TRACE/DEBUG/INFO/WARN/ERROR).
     ///
     /// When this flag is used the effective level is announced in the
     /// first log line (ADR-0009: no silent stomps).
-    #[arg(long, global = true, value_name = "LEVEL", env = "SUPPLY_DROP__LOGGING__LEVEL")]
+    #[arg(
+        long,
+        global = true,
+        value_name = "LEVEL",
+        env = "SUPPLY_DROP__LOGGING__LEVEL"
+    )]
     log_level: Option<String>,
 
     #[command(subcommand)]

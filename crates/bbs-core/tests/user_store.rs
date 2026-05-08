@@ -104,9 +104,16 @@ async fn hard_delete_fails_when_messages_exist() {
         .unwrap();
 
     // Create a room and post a message so hard_delete should be refused.
-    let room_id = RoomStore::create(&db, "lobby", None, false, PermissionLevel::User, Timestamp::now())
-        .await
-        .unwrap();
+    let room_id = RoomStore::create(
+        &db,
+        "lobby",
+        None,
+        false,
+        PermissionLevel::User,
+        Timestamp::now(),
+    )
+    .await
+    .unwrap();
 
     db.post_to_room(room_id, &alice, "hello", Timestamp::now())
         .await
@@ -141,16 +148,10 @@ async fn list_filters_by_status() {
         .await
         .unwrap();
 
-    let active = db
-        .list(Some(UserStatus::Active), 100, 0)
-        .await
-        .unwrap();
+    let active = db.list(Some(UserStatus::Active), 100, 0).await.unwrap();
     assert_eq!(active.len(), 2);
 
-    let banned = db
-        .list(Some(UserStatus::Banned), 100, 0)
-        .await
-        .unwrap();
+    let banned = db.list(Some(UserStatus::Banned), 100, 0).await.unwrap();
     assert_eq!(banned.len(), 1);
     assert_eq!(banned[0].username.as_str(), "bob");
 }

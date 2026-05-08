@@ -12,14 +12,14 @@
 
 use std::{sync::Arc, time::Duration};
 
-use bbs_plugin_api::{
-    testing::MockHost,
-    Command, Response,
-    plugin::Plugin,
-    transport::TransportEngine,
-    event::{Notification, NotifyOutcome},
-};
 use bbs_mesh::{MeshConfig, MeshTransport};
+use bbs_plugin_api::{
+    event::{Notification, NotifyOutcome},
+    plugin::Plugin,
+    testing::MockHost,
+    transport::TransportEngine,
+    Command, Response,
+};
 use meshcore_companion::constants::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -100,10 +100,7 @@ impl Bridge {
 /// Spin up a [`MeshTransport`] against an in-process loopback listener.
 ///
 /// `host` is an `Arc<MockHost>` so the caller can keep a clone for inspection.
-async fn make_transport(
-    host: Arc<MockHost>,
-    prefix: Option<char>,
-) -> (MeshTransport, Bridge) {
+async fn make_transport(host: Arc<MockHost>, prefix: Option<char>) -> (MeshTransport, Bridge) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -142,7 +139,8 @@ async fn help_command_reaches_host() {
     assert_eq!(received.len(), 1, "expected exactly 1 command");
     assert!(
         matches!(received[0].1, Command::Help { topic: None }),
-        "expected Help{{None}}, got {:?}", received[0].1
+        "expected Help{{None}}, got {:?}",
+        received[0].1
     );
 
     transport.stop().await.unwrap();
@@ -179,7 +177,10 @@ async fn prompt_sets_workflow_state() {
     let host = Arc::new(MockHost::new());
     host.set_response_for(
         |cmd| matches!(cmd, Command::Help { .. }),
-        Response::Prompt { text: "Enter password:".to_owned(), hide_input: true },
+        Response::Prompt {
+            text: "Enter password:".to_owned(),
+            hide_input: true,
+        },
     );
     host.set_response_for(
         |cmd| matches!(cmd, Command::WorkflowReply { .. }),
@@ -200,7 +201,8 @@ async fn prompt_sets_workflow_state() {
     assert!(matches!(received[0].1, Command::Help { .. }));
     assert!(
         matches!(&received[1].1, Command::WorkflowReply { reply } if reply == "mypassword"),
-        "expected WorkflowReply, got {:?}", received[1].1
+        "expected WorkflowReply, got {:?}",
+        received[1].1
     );
 
     transport.stop().await.unwrap();
@@ -219,7 +221,11 @@ async fn prefix_filters_non_prefixed_messages() {
 
     bridge.send(&contact_msg_frame(sender, "help")).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert_eq!(host.commands_received().len(), 0, "unprefixed message should be ignored");
+    assert_eq!(
+        host.commands_received().len(),
+        0,
+        "unprefixed message should be ignored"
+    );
 
     bridge.send(&contact_msg_frame(sender, "!help")).await;
     tokio::time::sleep(Duration::from_millis(50)).await;

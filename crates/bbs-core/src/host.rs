@@ -28,10 +28,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
+use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
     Command, DomainEvent, HostError, PermissionCtx, PermissionLevel, Response, SessionId,
 };
-use bbs_plugin_api::host::Host;
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info};
 
@@ -127,20 +127,16 @@ impl Host for BbsHost {
             }
 
             // Auth flow — placeholder until credential store is wired in.
-            Command::Register { .. } | Command::Login { .. } | Command::WorkflowReply { .. } => {
-                Ok(Response::Error(
-                    "Authentication not yet implemented.".into(),
-                ))
-            }
+            Command::Register { .. } | Command::Login { .. } | Command::WorkflowReply { .. } => Ok(
+                Response::Error("Authentication not yet implemented.".into()),
+            ),
 
             Command::Unknown { raw } => Ok(Response::Text(format!(
                 "Unknown command: '{raw}'. Type 'help' for the command list."
             ))),
 
             // Non-exhaustive catch-all: new Command variants land here.
-            _ => Ok(Response::Error(
-                "Command not yet supported.".into(),
-            )),
+            _ => Ok(Response::Error("Command not yet supported.".into())),
         }
     }
 
@@ -265,7 +261,9 @@ mod tests {
         let host = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let resp = host.process_command(sid, Command::Whoami).await.unwrap();
-        let Response::Text(text) = resp else { panic!("expected Text") };
+        let Response::Text(text) = resp else {
+            panic!("expected Text")
+        };
         assert!(text.contains("Not logged in"));
     }
 

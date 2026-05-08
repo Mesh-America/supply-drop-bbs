@@ -7,10 +7,12 @@ pub enum FrameDecodeError {
     #[error("frame payload length {0} exceeds MAX_PAYLOAD_SIZE (169)")]
     PayloadTooLarge(usize),
 
-    #[error(
-        "frame type 0x{type_byte:02X} body too short: need ≥{needed} bytes, got {got}"
-    )]
-    BodyTooShort { type_byte: u8, needed: usize, got: usize },
+    #[error("frame type 0x{type_byte:02X} body too short: need ≥{needed} bytes, got {got}")]
+    BodyTooShort {
+        type_byte: u8,
+        needed: usize,
+        got: usize,
+    },
 
     #[error("invalid UTF-8 in frame field")]
     InvalidUtf8,

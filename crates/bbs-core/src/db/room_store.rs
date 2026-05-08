@@ -60,10 +60,8 @@ pub trait RoomStore: Send + Sync {
     async fn list_in_order(&self) -> Result<Vec<Room>, StoreError>;
 
     /// Return rooms whose `min_permission_level` is at most `min_permission`.
-    async fn list_readable(
-        &self,
-        min_permission: PermissionLevel,
-    ) -> Result<Vec<Room>, StoreError>;
+    async fn list_readable(&self, min_permission: PermissionLevel)
+        -> Result<Vec<Room>, StoreError>;
 
     /// Create a new room appended to the tail of the walk order.
     async fn create(
@@ -88,11 +86,7 @@ pub trait RoomStore: Send + Sync {
     /// Move `room_id` to immediately after `after_id` in the walk
     /// order, or to the head position if `after_id` is `None`. Runs
     /// as a single write transaction.
-    async fn reorder(
-        &self,
-        room_id: RoomId,
-        after_id: Option<RoomId>,
-    ) -> Result<(), StoreError>;
+    async fn reorder(&self, room_id: RoomId, after_id: Option<RoomId>) -> Result<(), StoreError>;
 
     /// Delete a room. Cascades to `room_messages` and
     /// `user_room_state`; the underlying `messages` rows survive.
@@ -189,7 +183,10 @@ impl RoomStore for Database {
         let mut map: std::collections::HashMap<RoomId, Room> =
             rooms.drain(..).map(|r| (r.id, r)).collect();
 
-        let head_id = map.values().find(|r| r.prev_neighbor.is_none()).map(|r| r.id);
+        let head_id = map
+            .values()
+            .find(|r| r.prev_neighbor.is_none())
+            .map(|r| r.id);
         if let Some(mut current_id) = head_id {
             loop {
                 let room = map.remove(&current_id).expect("id must be present");
@@ -251,11 +248,10 @@ impl RoomStore for Database {
 
         let mut tx = self.write_pool.begin().await?;
 
-        let tail_id: Option<i64> = sqlx::query_scalar!(
-            "SELECT id FROM rooms WHERE next_neighbor IS NULL LIMIT 1"
-        )
-        .fetch_optional(&mut *tx)
-        .await?;
+        let tail_id: Option<i64> =
+            sqlx::query_scalar!("SELECT id FROM rooms WHERE next_neighbor IS NULL LIMIT 1")
+                .fetch_optional(&mut *tx)
+                .await?;
 
         let result = sqlx::query!(
             "INSERT INTO rooms (name, description, read_only, min_permission_level,
@@ -337,11 +333,7 @@ impl RoomStore for Database {
         Ok(())
     }
 
-    async fn reorder(
-        &self,
-        room_id: RoomId,
-        after_id: Option<RoomId>,
-    ) -> Result<(), StoreError> {
+    async fn reorder(&self, room_id: RoomId, after_id: Option<RoomId>) -> Result<(), StoreError> {
         let rid = room_id.as_i64();
         let mut tx = self.write_pool.begin().await?;
 
@@ -387,13 +379,9 @@ impl RoomStore for Database {
                 .await?;
 
                 if let Some(nh) = new_head {
-                    sqlx::query!(
-                        "UPDATE rooms SET prev_neighbor = ? WHERE id = ?",
-                        rid,
-                        nh
-                    )
-                    .execute(&mut *tx)
-                    .await?;
+                    sqlx::query!("UPDATE rooms SET prev_neighbor = ? WHERE id = ?", rid, nh)
+                        .execute(&mut *tx)
+                        .await?;
                 }
 
                 sqlx::query!(
@@ -407,31 +395,21 @@ impl RoomStore for Database {
             Some(target_id) => {
                 let tid = target_id.as_i64();
 
-                let target_next: Option<i64> = sqlx::query_scalar!(
-                    "SELECT next_neighbor FROM rooms WHERE id = ?",
-                    tid
-                )
-                .fetch_optional(&mut *tx)
-                .await?
-                .flatten();
+                let target_next: Option<i64> =
+                    sqlx::query_scalar!("SELECT next_neighbor FROM rooms WHERE id = ?", tid)
+                        .fetch_optional(&mut *tx)
+                        .await?
+                        .flatten();
 
                 if let Some(tn) = target_next {
-                    sqlx::query!(
-                        "UPDATE rooms SET prev_neighbor = ? WHERE id = ?",
-                        rid,
-                        tn
-                    )
-                    .execute(&mut *tx)
-                    .await?;
+                    sqlx::query!("UPDATE rooms SET prev_neighbor = ? WHERE id = ?", rid, tn)
+                        .execute(&mut *tx)
+                        .await?;
                 }
 
-                sqlx::query!(
-                    "UPDATE rooms SET next_neighbor = ? WHERE id = ?",
-                    rid,
-                    tid
-                )
-                .execute(&mut *tx)
-                .await?;
+                sqlx::query!("UPDATE rooms SET next_neighbor = ? WHERE id = ?", rid, tid)
+                    .execute(&mut *tx)
+                    .await?;
 
                 sqlx::query!(
                     "UPDATE rooms SET prev_neighbor = ?, next_neighbor = ? WHERE id = ?",

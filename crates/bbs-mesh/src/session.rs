@@ -72,7 +72,13 @@ impl SessionState {
         if let Some(entry) = self.by_prefix.get(&prefix) {
             return (entry.session_id, false);
         }
-        self.by_prefix.insert(prefix, SessionEntry { session_id: new_id, awaiting_reply: false });
+        self.by_prefix.insert(
+            prefix,
+            SessionEntry {
+                session_id: new_id,
+                awaiting_reply: false,
+            },
+        );
         self.by_session.insert(new_id, prefix);
         (new_id, true)
     }
