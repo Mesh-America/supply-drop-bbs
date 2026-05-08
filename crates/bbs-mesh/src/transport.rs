@@ -37,7 +37,7 @@ use bbs_plugin_api::{
     Host, Response,
 };
 use meshcore_companion::{
-    client::{ClientConfig, ClientEvent, CompanionClient},
+    client::{ClientConfig, ClientEvent, CompanionClient, SerialConfig},
     constants::TXT_TYPE_PLAIN,
     frame::OutboundFrame,
 };
@@ -46,7 +46,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     command::{format_response, parse_command, render_notification},
-    config::MeshConfig,
+    config::{ConnectionType, MeshConfig},
     session::SessionState,
 };
 
@@ -100,22 +100,50 @@ impl Plugin for MeshTransport {
 
     /// Connect the companion client and wire internal channels.
     ///
-    /// This is where the TCP connection attempt begins (in a background task
-    /// spawned by [`CompanionClient::connect`]).  The `start()` call is what
-    /// actually begins processing events from that connection.
+    /// Dispatches to TCP or serial based on [`MeshConfig::connection_type`].
+    /// The actual I/O begins in a background task; `start()` moves the client
+    /// into the event-loop task to begin processing frames.
     async fn init(config: Self::Config, host: Arc<dyn Host>) -> Result<Self, PluginError> {
-        let client_config = ClientConfig {
-            addr: config.addr,
-            app_target_version: config.app_target_version,
-            reconnect_delay_initial: config.reconnect_delay_initial(),
-            reconnect_delay_max: config.reconnect_delay_max(),
+        let client = match config.connection_type {
+            ConnectionType::Tcp | ConnectionType::Hat => {
+                let client_config = ClientConfig {
+                    addr: config.addr,
+                    app_target_version: config.app_target_version,
+                    reconnect_delay_initial: config.reconnect_delay_initial(),
+                    reconnect_delay_max: config.reconnect_delay_max(),
+                };
+                info!(
+                    addr = %config.addr,
+                    mode = ?config.connection_type,
+                    "mesh transport: connecting via TCP"
+                );
+                CompanionClient::connect(client_config)
+            }
+
+            ConnectionType::Serial => {
+                let port = config.serial_port.clone().ok_or_else(|| {
+                    PluginError::InvalidConfig(
+                        "connection_type = 'serial' requires serial_port to be set".into(),
+                    )
+                })?;
+                let serial_config = SerialConfig {
+                    port: port.clone(),
+                    baud_rate: config.baud_rate,
+                    app_target_version: config.app_target_version,
+                    reconnect_delay_initial: config.reconnect_delay_initial(),
+                    reconnect_delay_max: config.reconnect_delay_max(),
+                };
+                info!(
+                    port = %port,
+                    baud = config.baud_rate,
+                    "mesh transport: connecting via serial"
+                );
+                CompanionClient::connect_serial(serial_config)
+            }
         };
 
-        let client = CompanionClient::connect(client_config);
         let cmd_tx = client.sender();
         let (shutdown_tx, _) = watch::channel(false);
-
-        info!(addr = %config.addr, "mesh transport initialised");
 
         Ok(Self {
             host,

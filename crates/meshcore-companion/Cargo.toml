@@ -15,8 +15,9 @@ publish      = false       # candidate for future crates.io publish
 # stabilise the API, `publish = false` keeps us flexible.
 
 [dependencies]
-thiserror.workspace = true
-tracing.workspace   = true
+thiserror.workspace  = true
+tracing.workspace    = true
+tokio-serial.workspace = true
 # net + io-util add TCP and AsyncRead/AsyncWriteExt on top of the workspace feature set.
 tokio = { workspace = true, features = ["net", "io-util"] }
 

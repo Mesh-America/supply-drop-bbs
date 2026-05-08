@@ -35,7 +35,7 @@ pub mod error;
 pub mod frame;
 pub mod types;
 
-pub use client::{ClientConfig, ClientEvent, CompanionClient, SendError};
+pub use client::{ClientConfig, ClientEvent, CompanionClient, SendError, SerialConfig};
 pub use error::FrameDecodeError;
 pub use frame::{decode_inbound, encode_outbound, strip_frame_header, InboundFrame, OutboundFrame};
 pub use types::{

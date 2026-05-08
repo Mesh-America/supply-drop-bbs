@@ -52,6 +52,6 @@ pub mod config;
 pub mod session;
 pub mod transport;
 
-pub use config::MeshConfig;
+pub use config::{ConnectionType, MeshConfig};
 pub use session::{SessionEntry, SessionState};
 pub use transport::MeshTransport;

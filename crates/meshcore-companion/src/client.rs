@@ -1,65 +1,68 @@
-//! Async TCP client for the MeshCore companion-frame protocol.
+//! Async client for the MeshCore companion-frame protocol.
+//!
+//! Supports two transports:
+//!
+//! - **TCP** ([`CompanionClient::connect`]) — connects to a
+//!   `CompanionFrameServer`, typically `pymc_core`'s TCP bridge.  Used in
+//!   HAT and standalone TCP deployments.
+//!
+//! - **Serial** ([`CompanionClient::connect_serial`]) — opens a local USB
+//!   serial port (e.g. a Heltec V3 or T-Beam).  The companion-frame protocol
+//!   is byte-stream-agnostic; the same codec runs over both transports.
 //!
 //! # Connection model
 //!
-//! [`CompanionClient`] maintains a persistent connection to a
-//! `CompanionFrameServer` (typically `pymc_core`'s TCP bridge).  Internally
-//! it runs a background Tokio task that owns the socket and handles
-//! reconnection automatically.
+//! [`CompanionClient`] is a channel-based handle.  The actual I/O runs in a
+//! background Tokio task that owns the stream and handles reconnection.
 //!
 //! ```text
-//! ┌─────────────────────────────────────────┐
-//! │             CompanionClient              │
-//! │  cmd_tx ──► [channel] ──► worker task   │
-//! │  event_rx ◄── [channel] ◄── worker task │
-//! └─────────────────────────────────────────┘
-//!              │                │
-//!            write            read
-//!              └──► TCP socket ◄┘
+//! ┌─────────────────────────────────────────────┐
+//! │               CompanionClient               │
+//! │  cmd_tx ──► [channel] ──► background task  │
+//! │  event_rx ◄── [channel] ◄── background task │
+//! └─────────────────────────────────────────────┘
+//!                │                  │
+//!              write               read
+//!                └──► stream (TCP or serial) ◄┘
 //! ```
 //!
 //! # Lifecycle
 //!
-//! 1. Call [`CompanionClient::connect`] — spawns the background task and
-//!    returns immediately.  The task begins connecting in the background.
-//! 2. Poll [`CompanionClient::recv`] (or integrate the event stream into a
-//!    `select!` loop) to consume [`ClientEvent`]s.
-//! 3. Call [`CompanionClient::send`] to dispatch commands.  Sends are
-//!    fire-and-forget from the caller's perspective; the worker serialises and
-//!    writes them over TCP.
-//! 4. Drop the client to trigger a clean shutdown.  The background task exits
-//!    once it detects that the command channel is closed.
+//! 1. Call [`CompanionClient::connect`] or [`CompanionClient::connect_serial`]
+//!    — spawns the background task and returns immediately.
+//! 2. Poll [`CompanionClient::recv`] to consume [`ClientEvent`]s.
+//! 3. Send outbound frames via [`CompanionClient::send`] or
+//!    [`CompanionClient::sender`].
+//! 4. Drop the client to signal a clean shutdown.
 //!
 //! # Reconnection
 //!
-//! On any TCP error the worker emits [`ClientEvent::Disconnected`] with
-//! `will_retry: true`, sleeps for a backoff period, then reconnects.
-//! The backoff starts at [`ClientConfig::reconnect_delay_initial`] and
-//! doubles after each failed attempt, capped at
-//! [`ClientConfig::reconnect_delay_max`].
+//! On any I/O error the worker emits [`ClientEvent::Disconnected`] with
+//! `will_retry: true`, sleeps for a backoff period (exponential, capped), then
+//! reconnects.  The backoff parameters are set on [`ClientConfig`] and
+//! [`SerialConfig`].
 //!
 //! # Handshake
 //!
-//! After each successful TCP connect the worker sends
+//! After each successful connection the worker sends
 //! [`OutboundFrame::AppStart`] and expects [`InboundFrame::SelfInfo`] as the
-//! very first response.  A [`ClientEvent::Connected`] carrying the
-//! [`SelfInfo`] is emitted once the handshake succeeds.  Subsequent frames
-//! are forwarded as [`ClientEvent::Frame`].
+//! first response.  A [`ClientEvent::Connected`] carrying the [`SelfInfo`] is
+//! emitted once the handshake completes.
 
 use std::{io, net::SocketAddr, time::Duration};
 
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc,
     time::sleep,
 };
+use tokio_serial::SerialPortBuilderExt;
 use tracing::{debug, info, warn};
 
 use crate::{
     constants::{FRAME_OUTBOUND_PREFIX, MAX_PAYLOAD_SIZE},
-    decode_inbound,
-    encode_outbound,
+    decode_inbound, encode_outbound,
     error::FrameDecodeError,
     frame::{InboundFrame, OutboundFrame},
     types::SelfInfo,
@@ -67,18 +70,15 @@ use crate::{
 
 // ── Public types ──────────────────────────────────────────────────────────────
 
-/// Configuration for [`CompanionClient`].
-///
-/// Construct via [`ClientConfig::new`] or use [`Default`] for the standard
-/// BBS defaults.
+/// Configuration for a TCP [`CompanionClient`].
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
     /// Address of the `CompanionFrameServer` TCP listener.
     pub addr: SocketAddr,
 
-    /// Protocol version code sent in the [`OutboundFrame::AppStart`]
-    /// handshake.  Use [`crate::constants::APP_TARGET_VER_V3`] unless you
-    /// have a specific reason to request an older format.
+    /// Protocol version code sent in the [`OutboundFrame::AppStart`] handshake.
+    /// Use [`crate::constants::APP_TARGET_VER_V3`] unless you have a specific
+    /// reason to request an older format.
     pub app_target_version: u8,
 
     /// Delay before the first reconnect attempt after a disconnect.
@@ -103,42 +103,65 @@ impl ClientConfig {
     }
 }
 
+/// Configuration for a serial [`CompanionClient`].
+#[derive(Debug, Clone)]
+pub struct SerialConfig {
+    /// OS path to the serial device.
+    ///
+    /// Examples: `/dev/ttyACM0` (Linux), `/dev/tty.usbmodem*` (macOS),
+    /// `COM3` (Windows).
+    pub port: String,
+
+    /// Baud rate. MeshCore USB companion devices default to 115 200.
+    pub baud_rate: u32,
+
+    /// Protocol version code sent in the [`OutboundFrame::AppStart`] handshake.
+    pub app_target_version: u8,
+
+    /// Delay before the first reconnect attempt after a port error.
+    pub reconnect_delay_initial: Duration,
+
+    /// Maximum delay between reconnect attempts.
+    pub reconnect_delay_max: Duration,
+}
+
 /// Events emitted by [`CompanionClient`].
 ///
-/// Callers should handle all variants; unrecognised frame types are surfaced
-/// as [`InboundFrame::Unknown`] inside [`ClientEvent::Frame`] rather than
-/// being silently dropped.
+/// Callers should handle all variants; unrecognised frame types surface as
+/// [`InboundFrame::Unknown`] inside [`ClientEvent::Frame`].
 #[derive(Debug)]
 pub enum ClientEvent {
-    /// The TCP connection is up and the AppStart handshake succeeded.
+    /// The connection is up and the AppStart handshake succeeded.
     ///
-    /// Carries the [`SelfInfo`] returned by the radio bridge, which includes
-    /// node identity, radio parameters, and GPS coordinates.
+    /// Carries the [`SelfInfo`] returned by the device, which includes node
+    /// identity, radio parameters, and GPS coordinates.
     Connected { self_info: SelfInfo },
 
-    /// The TCP connection was lost or the handshake failed.
+    /// The connection was lost or the handshake failed.
     ///
     /// When `will_retry` is `true` the worker is sleeping before the next
-    /// reconnect attempt.  When `false` the client is shutting down
-    /// (caller dropped the handle).
+    /// reconnect attempt.  When `false` the client is shutting down (caller
+    /// dropped the handle).
     Disconnected { will_retry: bool },
 
-    /// A frame received from the radio bridge.
+    /// A frame received from the device.
     Frame(InboundFrame),
 }
 
 /// Error returned by [`CompanionClient::send`] when the background worker has
-/// exited (i.e. the client was dropped or the runtime shut down).
+/// exited.
 #[derive(Debug, thiserror::Error)]
 #[error("companion client worker has exited; cannot send frame")]
 pub struct SendError(pub OutboundFrame);
 
 /// Async handle to a persistent MeshCore companion connection.
 ///
-/// Cheaply cloneable via the inner channels.  Dropping the last clone shuts
-/// down the background worker.
+/// Construct via [`CompanionClient::connect`] (TCP) or
+/// [`CompanionClient::connect_serial`] (USB serial).  The type is
+/// transport-agnostic after construction: both transports produce the same
+/// [`ClientEvent`] stream and accept the same [`OutboundFrame`] commands.
 ///
-/// # Example
+/// # Example (TCP)
 ///
 /// ```no_run
 /// use std::net::SocketAddr;
@@ -153,10 +176,10 @@ pub struct SendError(pub OutboundFrame);
 ///     while let Some(event) = client.recv().await {
 ///         match event {
 ///             ClientEvent::Connected { self_info } => {
-///                 println!("connected as {}", self_info.node_name);
+///                 println!("connected: {}", self_info.node_name);
 ///                 client.send(OutboundFrame::GetBattAndStorage).await.ok();
 ///             }
-///             ClientEvent::Frame(frame) => println!("frame: {frame:?}"),
+///             ClientEvent::Frame(frame) => println!("{frame:?}"),
 ///             ClientEvent::Disconnected { will_retry } => {
 ///                 println!("disconnected (retry={will_retry})");
 ///             }
@@ -170,71 +193,63 @@ pub struct CompanionClient {
 }
 
 impl CompanionClient {
-    /// Spawn the background worker and return a client handle.
+    /// Spawn a TCP background worker and return a client handle.
     ///
     /// The worker begins connecting immediately.  This call never blocks; the
     /// first [`ClientEvent::Connected`] or [`ClientEvent::Disconnected`]
     /// arrives via [`Self::recv`] once the connection attempt completes.
     pub fn connect(config: ClientConfig) -> Self {
-        // 32-command buffer: generous for BBS use cases; back-pressure kicks
-        // in if the socket stalls (e.g. during a reconnect).
         let (cmd_tx, cmd_rx) = mpsc::channel(32);
-        // 64-event buffer: radio can burst frames (contact sync, messages).
         let (event_tx, event_rx) = mpsc::channel(64);
-
-        tokio::spawn(run_worker(config, cmd_rx, event_tx));
-
+        tokio::spawn(run_tcp_worker(config, cmd_rx, event_tx));
         Self { cmd_tx, event_rx }
     }
 
-    /// Send a command to the radio bridge.
+    /// Spawn a USB serial background worker and return a client handle.
     ///
-    /// Returns `Ok(())` once the command is queued; actual transmission
-    /// happens asynchronously.  If the worker has exited (client dropped or
-    /// runtime shut down) returns [`SendError`] carrying the frame back.
+    /// The worker opens the serial port immediately.  If the port is
+    /// unavailable, it retries with exponential backoff (same model as the TCP
+    /// reconnect loop).
+    pub fn connect_serial(config: SerialConfig) -> Self {
+        let (cmd_tx, cmd_rx) = mpsc::channel(32);
+        let (event_tx, event_rx) = mpsc::channel(64);
+        tokio::spawn(run_serial_worker(config, cmd_rx, event_tx));
+        Self { cmd_tx, event_rx }
+    }
+
+    /// Send a command to the device.
     ///
-    /// Back-pressure: if the command channel is full this awaits until space
-    /// is available.
+    /// Returns `Ok(())` once the command is queued; transmission is
+    /// asynchronous.  Returns [`SendError`] if the worker has exited.
     pub async fn send(&self, frame: OutboundFrame) -> Result<(), SendError> {
         self.cmd_tx.send(frame).await.map_err(|e| SendError(e.0))
     }
 
-    /// Receive the next [`ClientEvent`] from the radio bridge.
+    /// Receive the next [`ClientEvent`].
     ///
-    /// Returns `None` when the background worker has exited (all senders
-    /// dropped), signalling that the client is shut down.
+    /// Returns `None` when the background worker has exited.
     pub async fn recv(&mut self) -> Option<ClientEvent> {
         self.event_rx.recv().await
     }
 
     /// Non-blocking variant of [`Self::recv`].
-    ///
-    /// Returns `Ok(event)` if one is immediately available, or an
-    /// [`mpsc::error::TryRecvError`] otherwise.
     pub fn try_recv(&mut self) -> Result<ClientEvent, mpsc::error::TryRecvError> {
         self.event_rx.try_recv()
     }
 
     /// Clone the outbound command sender.
     ///
-    /// Useful when the event-receiving side (i.e. `recv()`) is moved into a
-    /// background task while the caller still needs to enqueue commands — for
-    /// example in a plugin that holds `CompanionClient` in a worker task but
-    /// needs to send frames from a `notify()` call on a different code path.
-    ///
-    /// Senders are cheap to clone and share; they do not need to be exclusive.
+    /// Useful when the receiving side is moved into a background task while
+    /// the caller still needs to enqueue commands from a different code path
+    /// (e.g. a plugin's `notify()` method).
     pub fn sender(&self) -> mpsc::Sender<OutboundFrame> {
         self.cmd_tx.clone()
     }
 }
 
-// ── Background worker ─────────────────────────────────────────────────────────
+// ── TCP worker ────────────────────────────────────────────────────────────────
 
-/// Root task: reconnect loop with exponential backoff.
-///
-/// Exits cleanly when `cmd_rx` is closed (caller dropped the client) or when
-/// `event_tx` is closed (caller dropped the receiver — unusual but handled).
-async fn run_worker(
+async fn run_tcp_worker(
     config: ClientConfig,
     mut cmd_rx: mpsc::Receiver<OutboundFrame>,
     event_tx: mpsc::Sender<ClientEvent>,
@@ -242,68 +257,149 @@ async fn run_worker(
     let mut backoff = config.reconnect_delay_initial;
 
     loop {
-        debug!(addr = %config.addr, "companion: attempting TCP connect");
-        match attempt_session(&config, &mut cmd_rx, &event_tx).await {
+        debug!(addr = %config.addr, "companion/tcp: connecting");
+        match attempt_tcp_session(&config, &mut cmd_rx, &event_tx).await {
             SessionOutcome::Shutdown => {
-                info!("companion: clean shutdown");
+                info!("companion/tcp: clean shutdown");
                 break;
             }
             SessionOutcome::IoError(e) => {
-                warn!("companion: session ended with error: {e}");
-                // Notify callers; ignore send error (they may have dropped recv).
-                let _ = event_tx.send(ClientEvent::Disconnected { will_retry: true }).await;
-                debug!("companion: reconnecting in {backoff:?}");
+                warn!("companion/tcp: session error: {e}");
+                let _ = event_tx
+                    .send(ClientEvent::Disconnected { will_retry: true })
+                    .await;
+                debug!("companion/tcp: reconnecting in {backoff:?}");
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(config.reconnect_delay_max);
             }
         }
     }
 
-    // Tell callers we're done (will_retry=false distinguishes clean exit from
-    // a transient disconnect).
-    let _ = event_tx.send(ClientEvent::Disconnected { will_retry: false }).await;
+    let _ = event_tx
+        .send(ClientEvent::Disconnected { will_retry: false })
+        .await;
 }
 
-/// Outcome of a single connection attempt + session.
-enum SessionOutcome {
-    /// `cmd_rx` or `event_tx` closed — time to exit the reconnect loop.
-    Shutdown,
-    /// TCP or protocol error — reconnect after backoff.
-    IoError(io::Error),
-}
-
-/// Run one full session: connect → handshake → event loop.
-///
-/// Returns when the session ends for any reason.
-async fn attempt_session(
+async fn attempt_tcp_session(
     config: &ClientConfig,
     cmd_rx: &mut mpsc::Receiver<OutboundFrame>,
     event_tx: &mpsc::Sender<ClientEvent>,
 ) -> SessionOutcome {
-    // ── TCP connect ──────────────────────────────────────────────────────────
     let stream = match TcpStream::connect(config.addr).await {
         Ok(s) => s,
         Err(e) => return SessionOutcome::IoError(e),
     };
-    info!(addr = %config.addr, "companion: TCP connected");
+    info!(addr = %config.addr, "companion/tcp: connected");
 
     // Disable Nagle: companion frames are small, latency matters more than
     // throughput.
     if let Err(e) = stream.set_nodelay(true) {
-        warn!("companion: could not set TCP_NODELAY: {e}");
+        warn!("companion/tcp: could not set TCP_NODELAY: {e}");
     }
 
     let (mut reader, mut writer) = stream.into_split();
+    run_session(
+        &mut reader,
+        &mut writer,
+        config.app_target_version,
+        cmd_rx,
+        event_tx,
+    )
+    .await
+}
 
-    // ── Handshake ────────────────────────────────────────────────────────────
-    let handshake = encode_outbound(&OutboundFrame::AppStart {
-        app_target_version: config.app_target_version,
-    });
+// ── Serial worker ─────────────────────────────────────────────────────────────
+
+async fn run_serial_worker(
+    config: SerialConfig,
+    mut cmd_rx: mpsc::Receiver<OutboundFrame>,
+    event_tx: mpsc::Sender<ClientEvent>,
+) {
+    let mut backoff = config.reconnect_delay_initial;
+
+    loop {
+        debug!(port = %config.port, baud = config.baud_rate, "companion/serial: opening port");
+        match attempt_serial_session(&config, &mut cmd_rx, &event_tx).await {
+            SessionOutcome::Shutdown => {
+                info!("companion/serial: clean shutdown");
+                break;
+            }
+            SessionOutcome::IoError(e) => {
+                warn!("companion/serial: session error: {e}");
+                let _ = event_tx
+                    .send(ClientEvent::Disconnected { will_retry: true })
+                    .await;
+                debug!("companion/serial: reopening in {backoff:?}");
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(config.reconnect_delay_max);
+            }
+        }
+    }
+
+    let _ = event_tx
+        .send(ClientEvent::Disconnected { will_retry: false })
+        .await;
+}
+
+async fn attempt_serial_session(
+    config: &SerialConfig,
+    cmd_rx: &mut mpsc::Receiver<OutboundFrame>,
+    event_tx: &mpsc::Sender<ClientEvent>,
+) -> SessionOutcome {
+    let stream = match tokio_serial::new(&config.port, config.baud_rate).open_native_async() {
+        Ok(s) => s,
+        Err(e) => {
+            return SessionOutcome::IoError(io::Error::other(format!(
+                "could not open serial port {}: {e}",
+                config.port
+            )));
+        }
+    };
+    info!(port = %config.port, baud = config.baud_rate, "companion/serial: port opened");
+
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    run_session(
+        &mut reader,
+        &mut writer,
+        config.app_target_version,
+        cmd_rx,
+        event_tx,
+    )
+    .await
+}
+
+// ── Shared session logic ──────────────────────────────────────────────────────
+
+/// Outcome of a single connection attempt + session.
+enum SessionOutcome {
+    /// Command channel or event channel closed — exit the reconnect loop.
+    Shutdown,
+    /// I/O or protocol error — reconnect after backoff.
+    IoError(io::Error),
+}
+
+/// Handshake + event loop shared by TCP and serial sessions.
+///
+/// Works for any `AsyncRead`/`AsyncWrite` pair.  Returns when the session
+/// ends for any reason.
+async fn run_session<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    app_target_version: u8,
+    cmd_rx: &mut mpsc::Receiver<OutboundFrame>,
+    event_tx: &mpsc::Sender<ClientEvent>,
+) -> SessionOutcome
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    // ── AppStart handshake ────────────────────────────────────────────────────
+    let handshake = encode_outbound(&OutboundFrame::AppStart { app_target_version });
     if let Err(e) = writer.write_all(&handshake).await {
         return SessionOutcome::IoError(e);
     }
 
-    let self_info = match read_frame(&mut reader).await {
+    let self_info = match read_frame(reader).await {
         Err(e) => return SessionOutcome::IoError(e),
         Ok(InboundFrame::SelfInfo(info)) => info,
         Ok(other) => {
@@ -316,15 +412,18 @@ async fn attempt_session(
     };
 
     info!(node = %self_info.node_name, "companion: handshake complete");
-    if event_tx.send(ClientEvent::Connected { self_info }).await.is_err() {
+    if event_tx
+        .send(ClientEvent::Connected { self_info })
+        .await
+        .is_err()
+    {
         return SessionOutcome::Shutdown;
     }
 
-    // ── Event loop ───────────────────────────────────────────────────────────
+    // ── Event loop ────────────────────────────────────────────────────────────
     loop {
         tokio::select! {
-            // Inbound: frame from radio bridge.
-            result = read_frame(&mut reader) => {
+            result = read_frame(reader) => {
                 match result {
                     Ok(frame) => {
                         debug!("companion: rx {frame:?}");
@@ -336,7 +435,6 @@ async fn attempt_session(
                 }
             }
 
-            // Outbound: command from the caller.
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(frame) => {
@@ -358,10 +456,9 @@ async fn attempt_session(
 /// Read one complete frame from `reader`.
 ///
 /// Reads the 3-byte header (prefix + LE u16 length), validates the prefix,
-/// reads the payload, then decodes it.  Returns an `io::Error` on any TCP
-/// error or protocol violation so the caller can treat all failures uniformly.
+/// reads the payload, then decodes.  Returns `io::Error` on any failure so
+/// the caller can treat all session errors uniformly.
 async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<InboundFrame> {
-    // Read and validate the 3-byte header.
     let mut header = [0u8; 3];
     reader.read_exact(&mut header).await?;
 
@@ -379,16 +476,15 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<InboundF
     if payload_len > MAX_PAYLOAD_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("companion: payload length {payload_len} exceeds MAX_PAYLOAD_SIZE ({MAX_PAYLOAD_SIZE})"),
+            format!(
+                "companion: payload length {payload_len} exceeds MAX_PAYLOAD_SIZE ({MAX_PAYLOAD_SIZE})"
+            ),
         ));
     }
 
-    // Read the payload.
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload).await?;
 
-    // Decode.
-    decode_inbound(&payload).map_err(|e: FrameDecodeError| {
-        io::Error::new(io::ErrorKind::InvalidData, e.to_string())
-    })
+    decode_inbound(&payload)
+        .map_err(|e: FrameDecodeError| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
