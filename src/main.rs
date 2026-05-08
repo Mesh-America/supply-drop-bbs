@@ -223,6 +223,9 @@ async fn cmd_run(cli: &Cli) {
     // shutdown.  Only compiled-in plugins appear here (cargo features gate
     // what's available — see ADR-0004).
 
+    #[cfg(feature = "transport-cli")]
+    let _cli_transport = init_cli_plugin(&cfg.plugins.cli, Arc::clone(&host)).await;
+
     #[cfg(feature = "transport-mesh")]
     let mesh_transport = init_mesh_plugin(&cfg.plugins.mesh, Arc::clone(&host)).await;
 
@@ -272,6 +275,19 @@ async fn init_mesh_plugin(
     }
 
     Some(transport)
+}
+
+/// Initialise and start the CLI transport plugin.
+///
+/// Stub — real implementation lands once `bbs-cli` has its `Plugin` impl.
+/// Exists now so `host` is consumed in all feature combinations and the
+/// supervisor code reads consistently across plugins.
+#[cfg(feature = "transport-cli")]
+async fn init_cli_plugin(
+    _cli_cfg: &bbs_cli::CliConfig,
+    _host: Arc<dyn bbs_plugin_api::Host>,
+) -> Option<()> {
+    None
 }
 
 fn cmd_setup(config_path: Option<&std::path::Path>) {
