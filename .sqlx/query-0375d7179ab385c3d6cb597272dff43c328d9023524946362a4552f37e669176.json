@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO messages (sender, recipient, content, timestamp)\n             VALUES (?, NULL, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "0375d7179ab385c3d6cb597272dff43c328d9023524946362a4552f37e669176"
+}

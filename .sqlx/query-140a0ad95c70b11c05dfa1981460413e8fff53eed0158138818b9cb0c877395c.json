@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE rooms SET next_neighbor = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "140a0ad95c70b11c05dfa1981460413e8fff53eed0158138818b9cb0c877395c"
+}

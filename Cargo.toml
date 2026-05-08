@@ -72,7 +72,10 @@ thiserror   = "1"
 # `time` is the modern Rust datetime library. `serde-well-known`
 # pulls in the RFC3339 helpers we use for Timestamp.
 time        = { version = "0.3", features = ["serde", "serde-well-known", "macros"] }
-tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
+tokio       = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
+sqlx        = { version = "0.8", features = ["sqlite", "runtime-tokio", "time", "macros"] }
+argon2      = { version = "0.5", features = ["std"] }
+tempfile    = "3"
 tracing     = "0.1"
 uuid        = { version = "1", features = ["v4", "serde"] }
 

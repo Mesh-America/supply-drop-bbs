@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!\", name AS \"name!\", description, read_only AS \"read_only!\",\n                      min_permission_level AS \"min_permission_level!\",\n                      prev_neighbor, next_neighbor, created_at AS \"created_at!\"\n               FROM rooms WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "name!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "description",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "read_only!",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "min_permission_level!",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "prev_neighbor",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "next_neighbor",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at!",
+        "ordinal": 7,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "d272239aaf1185c9a375351e413df7257c11eed625fe1a9e68c3ed224de48b60"
+}

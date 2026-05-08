@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT display_name, status AS \"status!\", permission_level AS \"permission_level!\",\n                      last_login_at\n               FROM users WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "display_name",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "status!",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "permission_level!",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_login_at",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "9c6ee3e66b53c4b7d79327486453b80fb1f860d308053818607490baffbb26de"
+}

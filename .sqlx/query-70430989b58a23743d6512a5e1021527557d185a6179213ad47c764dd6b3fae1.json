@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT phc_hash AS \"phc_hash!\" FROM user_credentials WHERE user_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "phc_hash!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "70430989b58a23743d6512a5e1021527557d185a6179213ad47c764dd6b3fae1"
+}

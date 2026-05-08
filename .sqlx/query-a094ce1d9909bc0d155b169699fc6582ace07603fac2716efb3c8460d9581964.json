@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE rooms SET description = ?, read_only = ?, min_permission_level = ?\n             WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "a094ce1d9909bc0d155b169699fc6582ace07603fac2716efb3c8460d9581964"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO user_room_state (user_id, room_id, last_read_message_id)\n            VALUES (?, ?, ?)\n            ON CONFLICT(user_id, room_id) DO UPDATE\n              SET last_read_message_id = MAX(excluded.last_read_message_id,\n                                            COALESCE(last_read_message_id, 0))\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "19a94715237fdb54271464b1639b5c0711ac99dee4a4d4854a3f3602878aab91"
+}

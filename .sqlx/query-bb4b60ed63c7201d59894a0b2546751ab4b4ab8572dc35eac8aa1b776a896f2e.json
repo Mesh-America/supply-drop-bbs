@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO room_messages (room_id, message_id) VALUES (?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "bb4b60ed63c7201d59894a0b2546751ab4b4ab8572dc35eac8aa1b776a896f2e"
+}

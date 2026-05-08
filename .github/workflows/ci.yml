@@ -10,6 +10,9 @@ env:
   # Treat warnings as errors in CI. Local dev still gets warnings;
   # the wall is at the merge gate.
   RUSTFLAGS: -D warnings
+  # Use pre-committed .sqlx/ query metadata instead of a live DB.
+  # Developers run `cargo sqlx prepare --workspace` after schema changes.
+  SQLX_OFFLINE: "true"
 
 jobs:
   # ─── The headline job: format, lint, build, test ────────────────

@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT description, read_only AS \"read_only!\", min_permission_level AS \"min_permission_level!\"\n               FROM rooms WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "description",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "read_only!",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "min_permission_level!",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "f4ad716bd595771a76c0bffcd7c2f7ac8225bce00f74a2e3db40a251fe67df25"
+}

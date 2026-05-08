@@ -15,15 +15,20 @@ publish      = false
 # concrete impl, and that's us.
 bbs-plugin-api.workspace = true
 
+argon2.workspace    = true
+async-trait.workspace = true
 serde.workspace     = true
+sqlx.workspace      = true
 thiserror.workspace = true
 time.workspace      = true
+tokio.workspace     = true
+tracing.workspace   = true
 
 [dev-dependencies]
-serde_json = { workspace = true }
-# `proptest` is in workspace deps and will be added here when we
-# write property tests (deferred to a later commit so we land
-# meaningful properties, not boilerplate).
+proptest    = { workspace = true }
+serde_json  = { workspace = true }
+tempfile    = { workspace = true }
+tokio       = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT next_neighbor FROM rooms WHERE id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "next_neighbor",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "9a4de1cbb9d17bba100bb9943520799fc835a60807fb5182a967533001c30ccf"
+}
