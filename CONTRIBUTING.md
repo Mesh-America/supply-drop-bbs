@@ -11,7 +11,7 @@ of authored material directed at incorporation — **you agree that your
 contribution is licensed to the project under the same license as the
 project itself** (Apache 2.0 with Commons Clause).
 
-You **also grant the project's licensor (currently Taedryn / TJ Downes) a
+You **also grant the project's licensor (currently Mesh-America) a
 perpetual, worldwide, non-exclusive, royalty-free license to relicense
 your contribution under different terms** in any future version of the
 project. This is the relicensing-flexibility insurance the project keeps
