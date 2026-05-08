@@ -20,7 +20,7 @@ path = "src/main.rs"
 # rationale. Operators wanting an unusual combination build from
 # source with `cargo build --release --features <list>`.
 [features]
-default          = ["transport-cli", "transport-mesh"]
+default          = ["transport-cli", "transport-mesh", "admin-web"]
 transport-cli    = ["dep:bbs-cli"]
 transport-mesh   = ["dep:bbs-mesh"]
 admin-web        = ["dep:bbs-web"]

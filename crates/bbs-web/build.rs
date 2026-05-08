@@ -13,7 +13,6 @@ fn main() {
         "web/package.json",
         "web/vite.config.ts",
         "web/tsconfig.json",
-        "web/tsconfig.app.json",
     ] {
         println!("cargo:rerun-if-changed={path}");
     }

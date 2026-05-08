@@ -18,7 +18,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -71,6 +71,33 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     let data_dir = PathBuf::from(&data_dir_str);
 
+    // ── Web admin ─────────────────────────────────────────────────────────────
+    section("Web admin UI");
+
+    println!("The web admin lets you monitor adverts, logs, and send adverts from a browser.");
+    println!("It binds to your Pi's network address so you can reach it from another device.");
+    println!();
+
+    let admin_password = loop {
+        let pw: String = Password::with_theme(&theme)
+            .with_prompt("Admin password")
+            .with_confirmation("Confirm password", "Passwords do not match — try again")
+            .interact()
+            .unwrap_or_else(|_| cancelled());
+
+        if pw.len() < 8 {
+            println!("  Password must be at least 8 characters — try again.");
+            continue;
+        }
+        break pw;
+    };
+
+    let web_bind: String = Input::with_theme(&theme)
+        .with_prompt("Web admin bind address")
+        .default("0.0.0.0:8080".into())
+        .interact_text()
+        .unwrap_or_else(|_| cancelled());
+
     // ── Confirm & write ───────────────────────────────────────────────────────
     section("Write config");
 
@@ -92,14 +119,16 @@ pub fn run_wizard(config_out: Option<&Path>) {
         std::process::exit(0);
     }
 
-    let toml = build_toml(
-        &bbs_name,
-        &data_dir,
+    let toml = build_toml(&TomlParams {
+        bbs_name: &bbs_name,
+        data_dir: &data_dir,
         connection_type,
-        serial_port.as_deref(),
+        serial_port: serial_port.as_deref(),
         baud_rate,
-        tcp_addr.as_deref(),
-    );
+        tcp_addr: tcp_addr.as_deref(),
+        admin_password: &admin_password,
+        web_bind: &web_bind,
+    });
 
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -122,7 +151,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     // ── Next steps ────────────────────────────────────────────────────────────
     section("Next steps");
-    print_next_steps(connection_type, serial_port.as_deref());
+    print_next_steps(connection_type, serial_port.as_deref(), &web_bind);
 }
 
 // ── Connection type configuration ─────────────────────────────────────────────
@@ -233,14 +262,18 @@ fn configure_tcp(
 ///
 /// Only non-default values are written.  Operators can run
 /// `supply-drop-bbs config show` to see all effective values.
-fn build_toml(
-    bbs_name: &str,
-    data_dir: &Path,
-    connection_type: &str,
-    serial_port: Option<&str>,
+struct TomlParams<'a> {
+    bbs_name: &'a str,
+    data_dir: &'a Path,
+    connection_type: &'a str,
+    serial_port: Option<&'a str>,
     baud_rate: Option<u32>,
-    tcp_addr: Option<&str>,
-) -> String {
+    tcp_addr: Option<&'a str>,
+    admin_password: &'a str,
+    web_bind: &'a str,
+}
+
+fn build_toml(p: &TomlParams<'_>) -> String {
     let mut s = String::new();
 
     writeln!(s, "# Supply Drop BBS — configuration").unwrap();
@@ -259,26 +292,26 @@ fn build_toml(
 
     // [bbs]
     writeln!(s, "\n[bbs]").unwrap();
-    writeln!(s, "name = {}", toml_str(bbs_name)).unwrap();
-    writeln!(s, "data_dir = {}", toml_str(&data_dir.to_string_lossy())).unwrap();
+    writeln!(s, "name = {}", toml_str(p.bbs_name)).unwrap();
+    writeln!(s, "data_dir = {}", toml_str(&p.data_dir.to_string_lossy())).unwrap();
 
     // [plugins.mesh]
     writeln!(s, "\n[plugins.mesh]").unwrap();
-    writeln!(s, "connection_type = {}", toml_str(connection_type)).unwrap();
+    writeln!(s, "connection_type = {}", toml_str(p.connection_type)).unwrap();
 
-    match connection_type {
+    match p.connection_type {
         "serial" => {
-            if let Some(port) = serial_port {
+            if let Some(port) = p.serial_port {
                 writeln!(s, "serial_port = {}", toml_str(port)).unwrap();
             }
-            if let Some(baud) = baud_rate {
+            if let Some(baud) = p.baud_rate {
                 if baud != 115_200 {
                     writeln!(s, "baud_rate = {baud}").unwrap();
                 }
             }
         }
         "tcp" | "hat" => {
-            if let Some(addr) = tcp_addr {
+            if let Some(addr) = p.tcp_addr {
                 if addr != "127.0.0.1:5000" {
                     writeln!(s, "addr = {}", toml_str(addr)).unwrap();
                 }
@@ -286,6 +319,14 @@ fn build_toml(
         }
         _ => {}
     }
+
+    // [plugins.web]
+    writeln!(s, "\n[plugins.web]").unwrap();
+    writeln!(s, "admin_password = {}", toml_str(p.admin_password)).unwrap();
+    if p.web_bind != "127.0.0.1:8080" {
+        writeln!(s, "bind = {}", toml_str(p.web_bind)).unwrap();
+    }
+    writeln!(s, "cookie_secure = false").unwrap();
 
     s
 }
@@ -341,7 +382,7 @@ fn list_serial_ports() -> Vec<PortInfo> {
 
 // ── Next steps ────────────────────────────────────────────────────────────────
 
-fn print_next_steps(connection_type: &str, serial_port: Option<&str>) {
+fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: &str) {
     // Serial-specific: dialout group on Linux.
     if connection_type == "serial" && cfg!(target_os = "linux") {
         println!("To allow Supply Drop BBS to access the serial port, your user must");
@@ -386,6 +427,15 @@ fn print_next_steps(connection_type: &str, serial_port: Option<&str>) {
         println!("  supply-drop-bbs run");
     }
 
+    // Web admin URL hint.
+    let display_bind = if web_bind.starts_with("0.0.0.0") {
+        web_bind.replacen("0.0.0.0", "<your-pi-ip>", 1)
+    } else {
+        web_bind.to_owned()
+    };
+    println!("Once running, open the web admin at:");
+    println!();
+    println!("  http://{display_bind}");
     println!();
     println!("Setup complete!");
 }

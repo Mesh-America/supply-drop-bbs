@@ -1,0 +1,26 @@
+[Unit]
+Description=Supply Drop BBS
+Documentation=https://github.com/Mesh-America/supply-drop-bbs
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=supply-drop
+Group=supply-drop
+# dialout gives access to the radio's serial port
+SupplementaryGroups=dialout
+ExecStart=/usr/local/bin/supply-drop-bbs run --config /etc/supply-drop-bbs/config.toml
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=supply-drop-bbs
+
+# Allow writing to the data directory (set in config.toml data_dir)
+ReadWritePaths=/var/lib/supply-drop-bbs
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
