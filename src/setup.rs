@@ -74,29 +74,45 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // ── Web admin ─────────────────────────────────────────────────────────────
     section("Web admin UI");
 
-    println!("The web admin lets you monitor adverts, logs, and send adverts from a browser.");
-    println!("It binds to your Pi's network address so you can reach it from another device.");
+    println!("The web admin is a browser-based dashboard for monitoring adverts,");
+    println!("live logs, and sending adverts. You can enable or disable it at any");
+    println!("time by re-running 'supply-drop-bbs setup' or editing config.toml.");
     println!();
 
-    let admin_password = loop {
-        let pw: String = Password::with_theme(&theme)
-            .with_prompt("Admin password")
-            .with_confirmation("Confirm password", "Passwords do not match — try again")
-            .interact()
+    let web_enabled = Confirm::with_theme(&theme)
+        .with_prompt("Enable the web admin UI?")
+        .default(true)
+        .interact()
+        .unwrap_or_else(|_| cancelled());
+
+    let (admin_password, web_bind) = if web_enabled {
+        println!();
+
+        let pw = loop {
+            let pw: String = Password::with_theme(&theme)
+                .with_prompt("Admin password")
+                .with_confirmation("Confirm password", "Passwords do not match — try again")
+                .interact()
+                .unwrap_or_else(|_| cancelled());
+
+            if pw.len() < 8 {
+                println!("  Password must be at least 8 characters — try again.");
+                continue;
+            }
+            break pw;
+        };
+
+        let bind: String = Input::with_theme(&theme)
+            .with_prompt("Web admin bind address")
+            .default("0.0.0.0:8080".into())
+            .interact_text()
             .unwrap_or_else(|_| cancelled());
 
-        if pw.len() < 8 {
-            println!("  Password must be at least 8 characters — try again.");
-            continue;
-        }
-        break pw;
+        (Some(pw), Some(bind))
+    } else {
+        println!("  Web admin disabled — you can enable it later by re-running setup.");
+        (None, None)
     };
-
-    let web_bind: String = Input::with_theme(&theme)
-        .with_prompt("Web admin bind address")
-        .default("0.0.0.0:8080".into())
-        .interact_text()
-        .unwrap_or_else(|_| cancelled());
 
     // ── Confirm & write ───────────────────────────────────────────────────────
     section("Write config");
@@ -126,8 +142,9 @@ pub fn run_wizard(config_out: Option<&Path>) {
         serial_port: serial_port.as_deref(),
         baud_rate,
         tcp_addr: tcp_addr.as_deref(),
-        admin_password: &admin_password,
-        web_bind: &web_bind,
+        web_enabled,
+        admin_password: admin_password.as_deref(),
+        web_bind: web_bind.as_deref(),
     });
 
     if let Some(parent) = out_path.parent() {
@@ -151,7 +168,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     // ── Next steps ────────────────────────────────────────────────────────────
     section("Next steps");
-    print_next_steps(connection_type, serial_port.as_deref(), &web_bind);
+    print_next_steps(connection_type, serial_port.as_deref(), web_bind.as_deref());
 }
 
 // ── Connection type configuration ─────────────────────────────────────────────
@@ -269,8 +286,9 @@ struct TomlParams<'a> {
     serial_port: Option<&'a str>,
     baud_rate: Option<u32>,
     tcp_addr: Option<&'a str>,
-    admin_password: &'a str,
-    web_bind: &'a str,
+    web_enabled: bool,
+    admin_password: Option<&'a str>,
+    web_bind: Option<&'a str>,
 }
 
 fn build_toml(p: &TomlParams<'_>) -> String {
@@ -322,11 +340,18 @@ fn build_toml(p: &TomlParams<'_>) -> String {
 
     // [plugins.web]
     writeln!(s, "\n[plugins.web]").unwrap();
-    writeln!(s, "admin_password = {}", toml_str(p.admin_password)).unwrap();
-    if p.web_bind != "127.0.0.1:8080" {
-        writeln!(s, "bind = {}", toml_str(p.web_bind)).unwrap();
+    writeln!(s, "enabled = {}", p.web_enabled).unwrap();
+    if p.web_enabled {
+        if let Some(pw) = p.admin_password {
+            writeln!(s, "admin_password = {}", toml_str(pw)).unwrap();
+        }
+        if let Some(bind) = p.web_bind {
+            if bind != "127.0.0.1:8080" {
+                writeln!(s, "bind = {}", toml_str(bind)).unwrap();
+            }
+        }
+        writeln!(s, "cookie_secure = false").unwrap();
     }
-    writeln!(s, "cookie_secure = false").unwrap();
 
     s
 }
@@ -382,7 +407,7 @@ fn list_serial_ports() -> Vec<PortInfo> {
 
 // ── Next steps ────────────────────────────────────────────────────────────────
 
-fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: &str) {
+fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: Option<&str>) {
     // Serial-specific: dialout group on Linux.
     if connection_type == "serial" && cfg!(target_os = "linux") {
         println!("To allow Supply Drop BBS to access the serial port, your user must");
@@ -428,15 +453,22 @@ fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: 
     }
 
     // Web admin URL hint.
-    let display_bind = if web_bind.starts_with("0.0.0.0") {
-        web_bind.replacen("0.0.0.0", "<your-pi-ip>", 1)
+    if let Some(bind) = web_bind {
+        let display_bind = if bind.starts_with("0.0.0.0") {
+            bind.replacen("0.0.0.0", "<your-pi-ip>", 1)
+        } else {
+            bind.to_owned()
+        };
+        println!("Once running, open the web admin at:");
+        println!();
+        println!("  http://{display_bind}");
+        println!();
     } else {
-        web_bind.to_owned()
-    };
-    println!("Once running, open the web admin at:");
-    println!();
-    println!("  http://{display_bind}");
-    println!();
+        println!("Web admin is disabled. To enable it later, run:");
+        println!();
+        println!("  supply-drop-bbs setup");
+        println!();
+    }
     println!("Setup complete!");
 }
 

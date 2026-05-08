@@ -142,14 +142,29 @@ install -m 644 "$SRC_DIR/supply-drop-bbs.service" "$UNIT_FILE"
 systemctl daemon-reload
 success "Systemd unit installed"
 
-# ── First-run setup wizard ────────────────────────────────────────────────────
+# ── Setup wizard ──────────────────────────────────────────────────────────────
 
+run_setup=true
 if [[ -f "$CONFIG_DIR/config.toml" ]]; then
-    warn "Config already exists at $CONFIG_DIR/config.toml — skipping setup wizard."
-    warn "Edit it manually or delete it and re-run this installer to reconfigure."
-else
     echo
-    echo "─── First-time setup ──────────────────────────────────────────────────────"
+    warn "A config file already exists at $CONFIG_DIR/config.toml"
+    echo
+    read -r -p "  Reconfigure now? [Y/n] " _reconfigure
+    _reconfigure="${_reconfigure:-Y}"
+    if [[ ! "$_reconfigure" =~ ^[Yy] ]]; then
+        run_setup=false
+    fi
+fi
+
+if [[ "$run_setup" == true ]]; then
+    # Stop the service while reconfiguring so the new config is picked up cleanly.
+    if systemctl is-active --quiet supply-drop-bbs 2>/dev/null; then
+        info "Stopping supply-drop-bbs for reconfiguration..."
+        systemctl stop supply-drop-bbs
+    fi
+
+    echo
+    echo "─── Setup ─────────────────────────────────────────────────────────────────"
     echo
     "$BIN_PATH" setup --config "$CONFIG_DIR/config.toml"
     chown "root:$SERVICE_USER" "$CONFIG_DIR/config.toml"
@@ -165,8 +180,16 @@ echo "╔═══════════════════════�
 echo "║          Supply Drop BBS is running!             ║"
 echo "╚══════════════════════════════════════════════════╝"
 echo
-echo "  Web admin:  http://$(hostname -I | awk '{print $1}'):8080"
+# Show web admin URL only if the config has it enabled
+if grep -q 'enabled = true' "$CONFIG_DIR/config.toml" 2>/dev/null || \
+   ! grep -q 'enabled = false' "$CONFIG_DIR/config.toml" 2>/dev/null; then
+    _bind=$(grep -A5 '\[plugins.web\]' "$CONFIG_DIR/config.toml" 2>/dev/null | grep '^bind' | cut -d'"' -f2 || true)
+    _bind="${_bind:-0.0.0.0:8080}"
+    _port="${_bind##*:}"
+    echo "  Web admin:  http://$(hostname -I | awk '{print $1}'):${_port}"
+fi
 echo "  Logs:       journalctl -u supply-drop-bbs -f"
 echo "  Config:     $CONFIG_DIR/config.toml"
+echo "  Reconfigure: sudo bash $SRC_DIR/install.sh"
 echo "  Restart:    sudo systemctl restart supply-drop-bbs"
 echo
