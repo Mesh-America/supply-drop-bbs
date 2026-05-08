@@ -3,7 +3,7 @@
 //! The MeshCore transport plugin for Supply Drop BBS. Connects to
 //! `pymc_core`'s `CompanionFrameServer` (the radio bridge process)
 //! over TCP using the companion-frame protocol, and translates
-//! between MeshCore packets and BBS-core's [`Command`] / [`Response`]
+//! between MeshCore packets and BBS-core's `Command` / `Response`
 //! types.
 //!
 //! See [docs/PROTOCOL.md](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/PROTOCOL.md)

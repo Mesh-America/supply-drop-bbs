@@ -3,7 +3,7 @@
 //! The CLI transport plugin for Supply Drop BBS. Listens on a
 //! Unix-domain socket, accepts connections from local CLI clients,
 //! and translates between the line-based CLI protocol and the
-//! BBS-core's [`Command`] / [`Response`] types.
+//! BBS-core's `Command` / `Response` types.
 //!
 //! Used for:
 //!

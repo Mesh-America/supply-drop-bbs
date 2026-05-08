@@ -4,7 +4,7 @@
 //! This crate is intentionally small: it defines traits and shared
 //! types, nothing else. Plugin authors depend on this crate (and
 //! optionally `bbs-core` for domain types) and implement the
-//! [`Plugin`] trait plus any capability traits the plugin uses.
+//! `Plugin` trait plus any capability traits the plugin uses.
 //!
 //! ## What's here
 //!
