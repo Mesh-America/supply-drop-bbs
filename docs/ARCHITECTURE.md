@@ -72,15 +72,46 @@ where relevant.
 
 ### 2.1 Process topology
 
-A running Supply Drop BBS deployment has **two processes** on the
-same host (or different hosts; they only need TCP between them):
+The topology depends on the radio hardware. Both configurations share
+the same Rust binary and config schema; only the `connection_type`
+setting in `[plugins.mesh]` differs.
+
+#### USB device — single process
+
+```
+                  ┌──────────────────────────────┐
+                  │    supply-drop-bbs            │
+                  │    (Rust — the BBS host)      │
+                  │                               │
+                  │    ┌─────────────────────┐   │
+                  │    │     bbs-core        │   │ ← domain, db,
+                  │    └─────────────────────┘   │   sessions,
+                  │                               │   workflows,
+                  │    ┌──────────┐ ┌──────────┐ │   permissions
+                  │    │ bbs-cli  │ │ bbs-mesh │ │
+                  │    └────┬─────┘ └────┬─────┘ │ ← transport
+                  │    ┌────┴─────┐      │       │   plugins
+                  │    │ bbs-web  │ ← optional   │
+                  │    └────┬─────┘      │       │
+                  └─────────┼────────────┼───────┘
+                            │       serial (USB)
+       Unix socket ─────────┘            │
+       (CLI admin)                       ▼
+                                  USB companion device
+       TCP+HTTPS ───── web UI     (Heltec V3, T-Beam, …)
+       (optional)                 running MeshCore firmware
+```
+
+`bbs-mesh` speaks the companion-frame protocol directly over the USB
+serial port via `meshcore-companion`. No bridge process. No Python.
+
+#### Pi HAT — two processes
 
 ```
                   ┌──────────────────────────────┐
                   │    pymc_core                  │
                   │    CompanionFrameServer       │
-                  │    (Python — the radio        │
-                  │     bridge process)           │
+                  │    (Python — radio bridge)    │
                   │                               │
                   │    ┌──────────┐               │
                   │    │  SX1262  │ ← physical    │
@@ -109,21 +140,17 @@ same host (or different hosts; they only need TCP between them):
        (CLI admin)                       │
                                          │
        TCP+HTTPS ────────────────────────┘  ← optional
-       (web admin UI; default OFF)            (TLS terminated
-                                               by reverse
-                                               proxy, not us)
+       (web admin UI; default OFF)
 ```
 
 The two processes are independent. Stopping one doesn't break the
-other; the BBS will report mesh-bridge unavailability cleanly and
-continue serving CLI and web clients. The bridge will buffer or
-drop packets per its own policy when the BBS is down.
+other; the BBS reports mesh unavailability cleanly and continues
+serving CLI and web clients.
 
-The bridge **is not part of this project's source tree**. It is the
-upstream `pymc_core` project's `CompanionFrameServer`. We document its
-configuration in [`OPERATIONS.md`](OPERATIONS.md). If we ever ship
-our own Rust bridge, that's a future decision —
-[ADR-0007](adr/0007-bridge-stays-pymc-core.md) records the v1 stance.
+`pymc_core` is **not part of this project's source tree**. We install
+and configure it as part of the setup wizard for HAT deployments.
+See [ADR-0007](adr/0007-bridge-stays-pymc-core.md) and
+[ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md).
 
 ### 2.2 Crate layout
 
@@ -834,6 +861,8 @@ Decisions with their own dedicated record:
 | 0009 | Tracing-based logging that respects config      | Accepted |
 | 0010 | OpenAPI generated from Rust via utoipa          | Accepted |
 | 0011 | Transport-protocol agnostic core                | Accepted |
+| 0012 | Persistence layer design                        | Accepted |
+| 0013 | Native serial transport for USB companion devices | Accepted |
 
 ---
 

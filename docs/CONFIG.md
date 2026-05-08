@@ -75,7 +75,7 @@ The CLI accepts a small set of overrides:
 
 Subcommands:
 
-- `supply-drop-bbs init` — interactive first-run setup
+- `supply-drop-bbs setup` — interactive setup wizard (device type, radio config, systemd install)
 - `supply-drop-bbs config check` — validate config without starting
 - `supply-drop-bbs config show` — print the effective config
 - `supply-drop-bbs migrate` — apply pending DB migrations
@@ -179,13 +179,64 @@ no-silent-overrides rule.
 
 ## `[plugins.mesh]` — mesh transport
 
-| Key                  | Type    | Default               | Required | Description                                |
-|----------------------|---------|-----------------------|----------|--------------------------------------------|
-| `enabled`            | bool    | `true`                | no       | Whether to start the mesh transport        |
-| `bridge_addr`        | string  | `"127.0.0.1:5000"`    | no       | Address of the radio bridge (`pymc_core` CompanionFrameServer) |
-| `reconnect_delay_ms` | integer | `5000`                | no       | Delay between reconnect attempts after disconnect |
-| `max_reconnect_delay_ms` | integer | `60000`           | no       | Cap on exponential backoff                 |
-| `command_prefix`     | string  | `""`                  | no       | Optional prefix for BBS commands (e.g., `"/"`) |
+### Connection type
+
+| Key                | Type   | Default    | Required | Description                                  |
+|--------------------|--------|------------|----------|----------------------------------------------|
+| `enabled`          | bool   | `true`     | no       | Whether to start the mesh transport          |
+| `connection_type`  | enum   | `"serial"` | no       | How to reach the radio: `"serial"`, `"tcp"`, or `"hat"`. See [ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md). |
+| `command_prefix`   | string | `""`       | no       | Optional single-character prefix for BBS commands (e.g., `"!"`). Empty string means no prefix — every message is treated as a command. |
+
+### Serial mode (`connection_type = "serial"`)
+
+Used for USB-native MeshCore devices (Heltec V3, T-Beam, etc.) that
+run companion-frame firmware. No `pymc_core` required.
+
+| Key           | Type    | Default          | Required | Description                              |
+|---------------|---------|------------------|----------|------------------------------------------|
+| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path. The setup wizard auto-detects this. |
+| `baud_rate`   | integer | `115200`         | no       | Serial baud rate                         |
+
+### TCP / HAT mode (`connection_type = "tcp"` or `"hat"`)
+
+Used when `pymc_core` is running separately (Pi HAT setups or any
+external `CompanionFrameServer`). `"hat"` and `"tcp"` are identical at
+the transport level; the distinction tells the setup wizard to install
+`pymc_core` as a systemd dependency.
+
+| Key                          | Type    | Default            | Required | Description                                             |
+|------------------------------|---------|--------------------|----------|---------------------------------------------------------|
+| `addr`                       | string  | `"127.0.0.1:5000"` | no       | Address of the `CompanionFrameServer`                   |
+| `reconnect_delay_initial_ms` | integer | `1000`             | no       | Initial reconnect delay after disconnect (ms)           |
+| `reconnect_delay_max_ms`     | integer | `60000`            | no       | Maximum reconnect delay after repeated failures (ms). Backoff is exponential between initial and max. |
+| `app_target_version`         | integer | `3`                | no       | Companion protocol version to negotiate. Leave at default unless you know the bridge speaks an older version. |
+
+### HAT pin configuration (`connection_type = "hat"`)
+
+Pin config lives under `[plugins.mesh.hat]`. The setup wizard
+populates this from the chosen preset; manual overrides are supported.
+
+| Key                 | Type    | Default | Required | Description                                     |
+|---------------------|---------|---------|----------|-------------------------------------------------|
+| `preset`            | string  | —       | yes (hat)| HAT model: `"zebrahat"`, `"meshadv-mini"`, `"meshadv"`, `"waveshare"`, `"uconsole"`, `"custom"` |
+| `bus_id`            | integer | `0`     | no       | SPI bus                                         |
+| `cs_pin`            | integer | —       | custom   | SPI chip-select GPIO (BCM numbering)            |
+| `reset_pin`         | integer | —       | custom   | Radio reset GPIO                                |
+| `busy_pin`          | integer | —       | custom   | Radio busy GPIO                                 |
+| `irq_pin`           | integer | —       | custom   | Radio IRQ GPIO                                  |
+| `txen_pin`          | integer | `-1`    | no       | TX-enable GPIO (`-1` = not connected)           |
+| `rxen_pin`          | integer | `-1`    | no       | RX-enable GPIO (`-1` = not connected)           |
+
+Preset defaults (set automatically by the wizard; override only if
+your wiring differs from the standard layout):
+
+| Preset        | CS | Reset | Busy | IRQ | Notes                        |
+|---------------|----|-------|------|-----|------------------------------|
+| `zebrahat`    | 24 | 17    | 27   | 22  |                              |
+| `meshadv-mini`| 8  | 24    | 20   | 16  |                              |
+| `meshadv`     | 21 | 18    | 20   | 16  | TXEN=13, RXEN=12             |
+| `waveshare`   | 21 | 18    | 20   | 16  | TXEN=13, RXEN=12             |
+| `uconsole`    | -1 | 25    | 24   | 26  | bus_id=1, hardware CS        |
 
 ## `[plugins.web]` — admin web (only if `admin-web` feature enabled)
 

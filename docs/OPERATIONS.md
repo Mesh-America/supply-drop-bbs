@@ -2,9 +2,8 @@
 
 How to install, run, update, back up, and recover Supply Drop BBS.
 
-> **Status:** stub. Sections will be fleshed out as the
-> implementation lands. Marked **TBD** where final commands aren't
-> known yet.
+> **Status:** Active. Marked **TBD** where specific commands or
+> service names are not yet finalised.
 
 ## Audience
 
@@ -20,131 +19,130 @@ If you're a contributor or plugin author, see
 
 ## System requirements
 
-| Component         | Minimum                                       |
-|-------------------|-----------------------------------------------|
-| CPU               | armv7 or better. ARM64 (Pi 4+) recommended.   |
-| RAM               | 256 MB available to the BBS process           |
-| Disk              | 2 GB free for DB + logs + backups; SD card OK |
-| Network           | Loopback for the bridge; LAN for web UI       |
-| Radio             | MeshCore-compatible: SX1262 HAT or USB device |
-| OS                | Linux (Debian/Raspberry Pi OS tested). Other Unixes likely work; Windows untested. |
-| Python            | 3.10+ (for the radio bridge process)          |
+| Component | Minimum                                                              |
+|-----------|----------------------------------------------------------------------|
+| CPU       | armv7 or better. ARM64 (Pi 4+) recommended.                         |
+| RAM       | 256 MB available to the BBS process                                  |
+| Disk      | 2 GB free for DB + logs + backups; SD card OK                        |
+| Network   | Loopback only (USB mode) or LAN for web UI                           |
+| Radio     | MeshCore-compatible: SX1262 HAT **or** USB companion device          |
+| OS        | Linux — Debian / Raspberry Pi OS tested. Other Unixes likely work.   |
+| Python    | 3.10+ — **HAT mode only** (for `pymc_core`)                         |
 
-The BBS itself is a single static Rust binary. Python is required
-only for the radio bridge ([ADR-0007](adr/0007-bridge-stays-pymc-core.md)).
+The BBS itself is a single static Rust binary with no runtime
+dependencies. Python is required **only if you are using a Pi HAT**
+([ADR-0007](adr/0007-bridge-stays-pymc-core.md)). USB device operators
+need nothing else ([ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md)).
 
 ## Architecture at a glance
 
-A complete deployment has two processes:
+Supply Drop BBS supports two deployment topologies depending on your
+radio hardware.
+
+### USB device (single-process)
 
 ```
-   ┌─────────────────────┐         ┌────────────────────┐
-   │ pymc_core           │         │ supply-drop-bbs    │
-   │ CompanionFrame      │ ◄─TCP─► │ (Rust BBS host)    │
-   │ Server (Python)     │         │                    │
-   │                     │         │ also exposes:      │
-   │ owns the radio      │         │ - CLI socket        │
-   │                     │         │ - web UI (opt-in)   │
-   └─────────────────────┘         └────────────────────┘
-            │                                 │
-            ▼                                 ▼
-        SX1262 HAT                       sysop / users
-        / USB device
+   ┌──────────────────────────────────────────────────┐
+   │  supply-drop-bbs  (Rust — one process)           │
+   │                                                  │
+   │   bbs-core ── bbs-mesh ── meshcore-companion     │
+   │                                 │                │
+   │                           serial (USB)           │
+   └─────────────────────────────────┼────────────────┘
+                                     │
+                              USB companion device
+                              (Heltec V3, T-Beam, …)
+                              running MeshCore firmware
 ```
 
-The two processes are independent — one can restart without
-breaking the other.
+For USB-native MeshCore devices the BBS speaks the companion-frame
+protocol directly over the serial port. No bridge process, no Python.
+One service to manage.
+
+### Pi HAT (two-process)
+
+```
+   ┌──────────────────────┐         ┌────────────────────────┐
+   │  pymc_core           │         │  supply-drop-bbs       │
+   │  CompanionFrame      │ ◄─TCP─► │  (Rust BBS host)       │
+   │  Server (Python)     │         │                        │
+   │                      │         │  also exposes:         │
+   │  manages GPIO/SPI    │         │  - CLI socket          │
+   │  for the LoRa HAT    │         │  - web UI (opt-in)     │
+   └──────────────────────┘         └────────────────────────┘
+            │                                  │
+            ▼                                  ▼
+      SX1262 LoRa HAT                     sysop / users
+      (ZebraHat, MeshAdv, …)
+```
+
+`pymc_core` owns the radio hardware. The BBS connects to it over a
+localhost TCP companion-frame connection. Two independent processes —
+either can restart without breaking the other.
 
 ## Installation
 
-### Quick path (binary release)
+### One-line install (recommended)
 
-1. **Identify your architecture.**
+```sh
+curl -fsSL https://get.supply-drop.radio/install.sh | bash
+```
 
-   ```sh
-   uname -m
-   # aarch64  → use the aarch64-unknown-linux-gnu binary
-   # armv7l   → use the armv7-unknown-linux-gnueabihf binary
-   # x86_64   → use the x86_64-unknown-linux-gnu binary
-   ```
+The install script:
 
-2. **Download the release tarball** from
-   <https://github.com/Mesh-America/supply-drop-bbs/releases>.
+1. Detects your CPU architecture and downloads the right binary.
+2. Drops the binary in `/usr/local/bin/supply-drop-bbs`.
+3. Launches the **setup wizard** (`supply-drop-bbs setup`).
 
-   Pick the variant matching your needs:
+The wizard asks a small set of questions and handles everything from
+there. You only need to know two things before starting:
 
-   | Variant                       | Includes                          |
-   |-------------------------------|-----------------------------------|
-   | `supply-drop-bbs-<arch>`      | CLI + mesh transports             |
-   | `supply-drop-bbs-web-<arch>`  | CLI + mesh + web admin UI         |
-   | `supply-drop-bbs-headless-<arch>` | CLI only (development)         |
+- **What kind of radio device you have** — USB companion device
+  (Heltec V3, T-Beam, etc.) or a Pi HAT (ZebraHat, MeshAdv, etc.)
+- **Your radio's frequency and TX power** — e.g. 910.525 MHz, 22 dBm
+  for US; 869.525 MHz, 14 dBm for EU
 
-3. **Extract and place the binary.**
+### What the setup wizard does
 
-   ```sh
-   tar -xzf supply-drop-bbs-web-aarch64.tar.gz
-   sudo install -m 0755 supply-drop-bbs /usr/local/bin/
-   ```
+The wizard asks:
 
-   The tarball also contains:
+1. **BBS name** — displayed to users on connect
+2. **Device type** — USB companion device or Pi HAT
+3. **Serial port or HAT preset** — detected automatically where
+   possible; you confirm or override
+4. **Frequency and TX power** — must match the rest of your mesh
+5. **Sysop username** — the first account; gets promoted to sysop
+6. **Install as a system service?** — if yes, installs the systemd
+   unit(s) and enables them
 
-   - `systemd/supply-drop-bbs.service` — the BBS unit file
-   - `systemd/supply-drop-bridge.service` — example bridge unit
-   - `config.example.toml` — annotated config template
+Based on your answers it:
 
-4. **Install the radio bridge.** Per
-   [`pymc_core`](https://github.com/meshcore-dev/pymc_core)'s docs:
+- Writes `/etc/supply-drop-bbs/config.toml` with all settings filled in
+- Runs database migrations
+- For **HAT mode**: installs `pymc_core` (Python), configures SPI/UART,
+  adds your user to the `spi`, `gpio`, and `dialout` groups, and
+  installs a `pymc-core.service` unit alongside `supply-drop-bbs.service`
+- Optionally installs and enables the systemd unit(s)
+- Prints a summary of what changed and whether a reboot is needed
 
-   ```sh
-   sudo apt install python3-venv  # if not already
-   python3 -m venv /opt/pymc-bridge/venv
-   /opt/pymc-bridge/venv/bin/pip install pymc_core
-   ```
+### After the wizard
 
-   Configure it to run a `CompanionFrameServer` on `127.0.0.1:5000`
-   (or any address you want; match it in the BBS config).
+**USB device** — no reboot needed. Start immediately:
 
-5. **Run the BBS first-run setup.**
+```sh
+sudo systemctl start supply-drop-bbs
+sudo journalctl -u supply-drop-bbs -f
+```
 
-   ```sh
-   sudo supply-drop-bbs init
-   ```
+**Pi HAT** — a reboot is typically required after group and UART
+changes. The wizard tells you if this applies:
 
-   This is interactive. It will:
-
-   - Create the data directory (default `/var/lib/supply-drop-bbs`)
-   - Generate a starting `config.toml` with the answers you give
-   - Run database migrations
-   - Prompt for the initial sysop username and password
-   - Optionally install + enable the systemd unit
-
-6. **Verify the config.**
-
-   ```sh
-   supply-drop-bbs config check
-   supply-drop-bbs config show | less
-   ```
-
-   `config check` exits 0 if the config is valid. `config show`
-   prints the *effective* config including defaults.
-
-7. **Start the services.**
-
-   ```sh
-   sudo systemctl enable --now supply-drop-bridge
-   sudo systemctl enable --now supply-drop-bbs
-   ```
-
-8. **Smoke test.**
-
-   ```sh
-   sudo journalctl -u supply-drop-bbs -f
-   # Look for "logging initialised", "transport started", etc.
-   ```
-
-   With the web variant, browse to `http://<host>:8080` (or
-   whatever you configured) and log in with the sysop credentials
-   you set.
+```sh
+sudo reboot
+# After reboot:
+sudo systemctl start pymc-core supply-drop-bbs
+sudo journalctl -u supply-drop-bbs -f
+```
 
 ### Building from source
 
@@ -153,23 +151,29 @@ Required: Rust 1.76+ (`rustup install stable`).
 ```sh
 git clone https://github.com/Mesh-America/supply-drop-bbs
 cd supply-drop-bbs
-cargo build --release --features admin-web   # or omit for no web
+cargo build --release --features admin-web   # or omit for no web UI
 sudo install -m 0755 target/release/supply-drop-bbs /usr/local/bin/
+supply-drop-bbs setup
 ```
 
-Build artifacts depend only on glibc (and OpenSSL only if a future
-feature pulls it in; v1 is rustls-only). On a fresh Pi 4 a release
-build takes ~3 minutes.
+Build artifacts depend only on glibc. On a fresh Pi 4 a release build
+takes ~3 minutes.
 
 ## systemd units
 
-### `supply-drop-bbs.service`
+The setup wizard installs and enables these for you. They are also
+included in the release tarball under `systemd/` if you want to
+manage them manually.
+
+### USB device — one service
+
+#### `supply-drop-bbs.service`
 
 ```ini
 [Unit]
 Description=Supply Drop BBS
-After=network-online.target supply-drop-bridge.service
-Wants=network-online.target supply-drop-bridge.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -178,16 +182,11 @@ Group=bbs
 ExecStart=/usr/local/bin/supply-drop-bbs --config /etc/supply-drop-bbs/config.toml
 Restart=on-failure
 RestartSec=5
-
-# Security hardening
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/supply-drop-bbs /var/log/supply-drop-bbs
 PrivateTmp=true
-PrivateDevices=true
-
-# Resource limits
 MemoryMax=512M
 TasksMax=200
 
@@ -195,15 +194,64 @@ TasksMax=200
 WantedBy=multi-user.target
 ```
 
-The `init` subcommand can install this for you, or you can drop it
-into `/etc/systemd/system/` manually.
+Note: the `bbs` user must be in the `dialout` group to open the
+serial port. The setup wizard handles this.
 
-### `supply-drop-bridge.service`
+### Pi HAT — two services
 
-**TBD** — example unit file for the `pymc_core` bridge process.
-Will be in the release tarball as
-`systemd/supply-drop-bridge.service`. Specifies user, working
-directory, the bridge command, and `Restart=on-failure`.
+#### `pymc-core.service`
+
+```ini
+[Unit]
+Description=pymc_core CompanionFrameServer (LoRa radio bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bbs
+Group=bbs
+WorkingDirectory=/opt/pymc-core
+ExecStart=/opt/pymc-core/venv/bin/python -m pymc_core.server
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+#### `supply-drop-bbs.service` (HAT variant)
+
+```ini
+[Unit]
+Description=Supply Drop BBS
+After=network-online.target pymc-core.service
+Wants=network-online.target
+Requires=pymc-core.service
+
+[Service]
+Type=simple
+User=bbs
+Group=bbs
+ExecStart=/usr/local/bin/supply-drop-bbs --config /etc/supply-drop-bbs/config.toml
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/supply-drop-bbs /var/log/supply-drop-bbs
+PrivateTmp=true
+MemoryMax=512M
+TasksMax=200
+
+[Install]
+WantedBy=multi-user.target
+```
+
+The two services are independent at the socket level — the BBS
+reconnects automatically if `pymc-core` restarts.
 
 ## Update
 
@@ -436,20 +484,33 @@ sudo journalctl -u supply-drop-bbs -n 100 --no-pager
 Look for the first ERROR line. Subsequent errors are usually
 cascading consequences of the first.
 
-### Bridge connection keeps dropping
+### Radio connection keeps dropping
 
-Check the bridge process:
+**USB device:**
 
 ```sh
-sudo systemctl status supply-drop-bridge
-sudo journalctl -u supply-drop-bridge -f
+ls -la /dev/ttyACM* /dev/ttyUSB*          # confirm device is visible
+sudo journalctl -u supply-drop-bbs -f     # look for serial errors
 ```
 
 Common causes:
+- Device not in `dialout` group: `sudo usermod -aG dialout bbs`
+- Wrong serial port configured — check `[plugins.mesh] serial_port`
+- Firmware crashed — unplug and replug the device
 
-- Radio HAT not responding (SPI bus issue, power, antenna)
-- Bridge's `pymc_core` config doesn't match BBS's `bridge_addr`
-- Firewall blocking 127.0.0.1 connections (rare but happens)
+**Pi HAT:**
+
+```sh
+sudo systemctl status pymc-core
+sudo journalctl -u pymc-core -f
+```
+
+Common causes:
+- SPI or GPIO not enabled — run `sudo raspi-config` → Interface Options
+- `bbs` user not in `spi`/`gpio` groups — the setup wizard adds
+  these; a re-login or reboot is required after the change
+- Wrong HAT preset or pin override — check `[plugins.mesh.hat]` in config
+- `pymc_core` version mismatch — check its own logs for protocol errors
 
 ### Database is locked
 
