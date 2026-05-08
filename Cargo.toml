@@ -48,7 +48,7 @@ version      = "0.1.0-alpha.0"
 edition      = "2021"
 authors      = ["Mesh-America"]
 repository   = "https://github.com/Mesh-America/supply-drop-bbs"
-rust-version = "1.76"
+rust-version = "1.88"
 
 # Shared dependencies. As we add real deps (sqlx, axum, etc.) they
 # go here so every workspace member uses the same version.
@@ -65,9 +65,13 @@ meshcore-companion = { path = "crates/meshcore-companion", version = "0.1.0-alph
 # version actually built. When updating any of these, do it in a
 # dedicated PR with the changelog read.
 async-trait = "0.1"
+proptest    = "1"
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
 thiserror   = "1"
+# `time` is the modern Rust datetime library. `serde-well-known`
+# pulls in the RFC3339 helpers we use for Timestamp.
+time        = { version = "0.3", features = ["serde", "serde-well-known", "macros"] }
 tokio       = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing     = "0.1"
 uuid        = { version = "1", features = ["v4", "serde"] }

@@ -1,34 +1,44 @@
 //! # bbs-core
 //!
-//! The domain heart of Supply Drop BBS. This crate owns:
+//! The domain heart of Supply Drop BBS. This commit lays down the
+//! pure-data foundation; persistence and business logic land in
+//! subsequent commits.
 //!
-//! - **Domain types** — `User`, `Room`, `Message`, `Session`,
-//!   `Workflow`, `PermissionLevel`, and the newtypes that wrap
-//!   their identifiers. No protocol-specific fields. See
-//!   [ADR-0011](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/adr/0011-transport-protocol-agnostic-core.md).
-//! - **Persistence** — `sqlx`-backed access to a single SQLite
-//!   database in WAL mode. Compile-time-checked queries; no raw
-//!   SQL escapes from this crate. See
-//!   [ADR-0005](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/adr/0005-db-strategy.md).
-//! - **Business logic** — command processing, permission checks,
-//!   workflow state-machine transitions, audit-log writes.
-//! - **The `Host` implementation** — the concrete type that
-//!   transport plugins drive the BBS through. The `Host` *trait*
-//!   lives in `bbs-plugin-api`; the impl lives here.
+//! ## Module map
 //!
-//! ## Boundaries
+//! - [`ids`]       — `UserId`, `RoomId`, `MessageId` newtypes
+//! - [`timestamp`] — `Timestamp` (UTC-only, RFC 3339 wire format)
+//! - [`user`]      — `User`, `UserStatus`, display-name validation
+//! - [`room`]      — `Room`, name + description validation,
+//!   linked-list neighbour fields
+//! - [`message`]   — `Message`, content validation
 //!
-//! Things this crate does NOT do:
+//! ## Boundaries this crate respects
 //!
-//! - I/O concerns beyond the DB. No HTTP, no sockets, no radio.
-//! - Transport-specific identifiers. Mapping a MeshCore public key
-//!   to a username happens in `bbs-mesh`, not here.
-//! - Plugin lifecycle management. That's the host binary's job.
+//! Per [ADR-0011](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/adr/0011-transport-protocol-agnostic-core.md):
+//!
+//! - No protocol-specific identifiers on domain types. A
+//!   `User` doesn't carry a `mesh_node_id` or a `meshtastic_node_id`
+//!   field; those mappings live in the relevant transport plugin.
+//! - All timestamps are UTC at storage. Local-time conversion
+//!   happens at the rendering boundary (operator UI), not here.
 //!
 //! ## Status
 //!
-//! Placeholder. Real types land in subsequent commits.
+//! Pure data + validation. The `Host` trait implementation,
+//! persistence, and command processing all come in subsequent
+//! commits.
 
-/// Internal placeholder so the crate has at least one item to
-/// compile. Removed when real types land.
-pub fn placeholder() {}
+pub mod ids;
+pub mod message;
+pub mod room;
+pub mod timestamp;
+pub mod user;
+
+// ── Re-exports of the most-used items ────────────────────────────
+
+pub use ids::{MessageId, RoomId, UserId};
+pub use message::{InvalidMessageContent, Message};
+pub use room::{InvalidRoomDescription, InvalidRoomName, Room};
+pub use timestamp::{ParseTimestampError, Timestamp};
+pub use user::{InvalidDisplayName, User, UserStatus};

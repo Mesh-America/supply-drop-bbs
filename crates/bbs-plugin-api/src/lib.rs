@@ -15,7 +15,7 @@
 //! - [`transport`]   — the `TransportEngine` capability trait
 //! - [`event`]       — `DomainEvent`, `Notification`
 //! - [`command`]     — `Command`, `Response` (still placeholders;
-//!                     these grow with feature work)
+//!   these grow with feature work)
 //! - [`error`]       — `PluginError`, `HostError`, `TransportError`
 //! - [`testing`]     — fake `Host` for plugin unit tests
 //!

@@ -10,7 +10,20 @@ license-file = "../../LICENSE"
 publish      = false
 
 [dependencies]
-# (filled in as the implementation lands)
+# bbs-core implements the Host trait, so it depends on the
+# contract crate. Plugins do too — but only one of them owns the
+# concrete impl, and that's us.
+bbs-plugin-api.workspace = true
+
+serde.workspace     = true
+thiserror.workspace = true
+time.workspace      = true
+
+[dev-dependencies]
+serde_json = { workspace = true }
+# `proptest` is in workspace deps and will be added here when we
+# write property tests (deferred to a later commit so we land
+# meaningful properties, not boilerplate).
 
 [lints]
 workspace = true
