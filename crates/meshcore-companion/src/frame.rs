@@ -529,9 +529,7 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
             let nb = name.as_bytes();
             let nlen = nb.len().min(32);
             p.extend_from_slice(&nb[..nlen]);
-            for _ in nlen..32 {
-                p.push(0);
-            }
+            p.resize(p.len() + (32 - nlen), 0);
             p.extend_from_slice(secret);
         }
         OutboundFrame::Logout { pubkey } => {

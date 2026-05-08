@@ -1,12 +1,12 @@
-/// Tests for the companion TCP client.
-///
-/// All tests use an in-process TCP loopback (ephemeral port on 127.0.0.1) so
-/// no real `pymc_core` process or external network is needed.  The test
-/// controls the "server" side manually via [`TcpBridge`].
-///
-/// AppStart is always 5 wire bytes: `[0x3C][0x02][0x00][CMD_APP_START][version]`.
-/// Tests that consume the AppStart always read exactly 5 bytes to avoid
-/// leaving the version byte in the TCP buffer and corrupting subsequent reads.
+//! Tests for the companion TCP client.
+//!
+//! All tests use an in-process TCP loopback (ephemeral port on 127.0.0.1) so
+//! no real `pymc_core` process or external network is needed.  The test
+//! controls the "server" side manually via [`TcpBridge`].
+//!
+//! AppStart is always 5 wire bytes: `[0x3C][0x02][0x00][CMD_APP_START][version]`.
+//! Tests that consume the AppStart always read exactly 5 bytes to avoid
+//! leaving the version byte in the TCP buffer and corrupting subsequent reads.
 
 use std::time::Duration;
 

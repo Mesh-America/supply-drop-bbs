@@ -53,7 +53,7 @@ pub enum ConfigError {
 /// Loaded via [`load`]. All fields have defaults; an empty config file
 /// (or no file at all) is valid and produces a working configuration
 /// with sensible values.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(default)]
     pub bbs: BbsConfig,
@@ -69,18 +69,6 @@ pub struct Config {
     pub plugins: PluginsConfig,
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            bbs: BbsConfig::default(),
-            database: DatabaseConfig::default(),
-            logging: LoggingConfig::default(),
-            security: SecurityConfig::default(),
-            backup: BackupConfig::default(),
-            plugins: PluginsConfig::default(),
-        }
-    }
-}
 
 impl Config {
     /// Fill in derived defaults that depend on `data_dir`.
@@ -556,6 +544,7 @@ fn default_data_dir() -> PathBuf {
 /// - An explicit config path was given but the file does not exist
 /// - The TOML is malformed or contains type errors
 /// - Any required field (those without defaults) is missing
+#[allow(clippy::result_large_err)] // figment::Error is large; boxing it would add noise
 pub fn load(explicit_path: Option<&std::path::Path>) -> Result<Config, ConfigError> {
     let (file_path, was_explicit) = resolve_file(explicit_path);
 

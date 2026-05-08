@@ -97,11 +97,11 @@ impl<'db> CredentialStore<'db> {
             let needs_rehash = Argon2::default()
                 .hash_password(b"probe", &SaltString::generate(&mut OsRng))
                 .ok()
-                .and_then(|fresh| {
+                .map(|fresh| {
                     // Compare the "m=" param of the stored vs fresh PHC string.
                     let stored_m = parsed.params.get_str("m");
                     let fresh_m = fresh.params.get_str("m");
-                    Some(stored_m != fresh_m)
+                    stored_m != fresh_m
                 })
                 .unwrap_or(false);
 

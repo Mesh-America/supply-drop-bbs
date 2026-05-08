@@ -104,6 +104,6 @@ impl SessionState {
     /// Return `true` if the session for `prefix` is currently awaiting a
     /// workflow reply.
     pub fn is_awaiting_reply(&self, prefix: &[u8; 6]) -> bool {
-        self.by_prefix.get(prefix).map_or(false, |e| e.awaiting_reply)
+        self.by_prefix.get(prefix).is_some_and(|e| e.awaiting_reply)
     }
 }

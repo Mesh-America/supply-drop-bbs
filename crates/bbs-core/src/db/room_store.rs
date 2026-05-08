@@ -19,6 +19,7 @@ fn permission_from_i64(n: i64) -> Result<PermissionLevel, StoreError> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn map_room_row(
     id: i64,
     name: String,

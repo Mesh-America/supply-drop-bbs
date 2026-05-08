@@ -1,8 +1,8 @@
-/// Codec tests for the companion-frame protocol.
-///
-/// Each test section corresponds to a decoded frame type or an encoding
-/// command. Wire bytes are constructed by hand from the documented layouts
-/// (confirmed against `pymc_core/frame_server.py`).
+//! Codec tests for the companion-frame protocol.
+//!
+//! Each test section corresponds to a decoded frame type or an encoding
+//! command. Wire bytes are constructed by hand from the documented layouts
+//! (confirmed against `pymc_core/frame_server.py`).
 
 use meshcore_companion::{
     constants::*,

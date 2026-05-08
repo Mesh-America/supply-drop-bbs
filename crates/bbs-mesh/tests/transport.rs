@@ -1,14 +1,14 @@
-/// Integration tests for [`MeshTransport`].
-///
-/// Uses [`MockHost`] from `bbs-plugin-api` and an in-process TCP loopback
-/// (ephemeral port on 127.0.0.1) to exercise the full
-/// `init → start → frame → response` path without a real `pymc_core` process.
-///
-/// # Bridge protocol reminder
-///
-/// The companion client sends AppStart (5 bytes) and expects SelfInfo back
-/// before entering the event loop.  The test bridge must complete this
-/// handshake before sending any other frames.
+//! Integration tests for [`MeshTransport`].
+//!
+//! Uses [`MockHost`] from `bbs-plugin-api` and an in-process TCP loopback
+//! (ephemeral port on 127.0.0.1) to exercise the full
+//! `init → start → frame → response` path without a real `pymc_core` process.
+//!
+//! # Bridge protocol reminder
+//!
+//! The companion client sends AppStart (5 bytes) and expects SelfInfo back
+//! before entering the event loop.  The test bridge must complete this
+//! handshake before sending any other frames.
 
 use std::{sync::Arc, time::Duration};
 
