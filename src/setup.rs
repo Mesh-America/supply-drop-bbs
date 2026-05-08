@@ -59,9 +59,16 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // ── Data storage ──────────────────────────────────────────────────────────
     section("Data storage");
 
-    let default_data_dir = dirs::data_local_dir()
-        .map(|d| d.join("supply-drop-bbs"))
-        .unwrap_or_else(|| PathBuf::from("/var/lib/supply-drop-bbs"));
+    // On Linux the BBS runs as a system service user, so /var/lib is always
+    // correct regardless of who runs the wizard. On macOS/Windows a personal
+    // install into the user's data dir makes more sense.
+    let default_data_dir = if cfg!(target_os = "linux") {
+        PathBuf::from("/var/lib/supply-drop-bbs")
+    } else {
+        dirs::data_local_dir()
+            .map(|d| d.join("supply-drop-bbs"))
+            .unwrap_or_else(|| PathBuf::from("/var/lib/supply-drop-bbs"))
+    };
 
     let data_dir_str: String = Input::with_theme(&theme)
         .with_prompt("Data directory")
