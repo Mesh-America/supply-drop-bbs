@@ -7,21 +7,21 @@
 //!
 //! # Session lifecycle
 //!
-//! 1. First direct message from a prefix → [`SessionState::get_or_create`]
-//!    mints a fresh BBS session via [`Host::create_session`] and records the
+//! 1. First direct message from a prefix → [`SessionState::get_or_insert`]
+//!    mints a fresh BBS session via `Host::create_session` and records the
 //!    mapping in both directions.
 //! 2. Subsequent messages → existing session is returned immediately.
 //! 3. On a clean shutdown (client dropped) or after a prolonged silence the
-//!    supervisor may eventually call [`Host::end_session`]; the mapping is
+//!    supervisor may eventually call `Host::end_session`; the mapping is
 //!    removed from [`SessionState`] at that point.
 //!
 //! # Workflow tracking
 //!
-//! The BBS host returns [`Response::Prompt`] when it wants the user's next
+//! The BBS host returns `Response::Prompt` when it wants the user's next
 //! message to be interpreted as a continuation of a multi-step flow (e.g.,
 //! entering a password during login).  [`SessionEntry::awaiting_reply`] records
 //! this flag so the command parser knows whether to emit
-//! [`Command::WorkflowReply`] instead of trying to parse a command keyword.
+//! `Command::WorkflowReply` instead of trying to parse a command keyword.
 
 use std::collections::HashMap;
 
@@ -33,8 +33,8 @@ pub struct SessionEntry {
     /// The BBS session identifier minted by the host.
     pub session_id: SessionId,
 
-    /// `true` after the host sends a [`Response::Prompt`]; cleared once the
-    /// next user message is dispatched as a [`Command::WorkflowReply`].
+    /// `true` after the host sends `Response::Prompt`; cleared once the
+    /// next user message is dispatched as `Command::WorkflowReply`.
     ///
     /// This ensures passwords, answers to challenge questions, and other
     /// prompted input are never mis-parsed as command keywords.

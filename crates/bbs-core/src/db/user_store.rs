@@ -39,8 +39,8 @@ fn permission_from_i64(n: i64) -> Result<PermissionLevel, StoreError> {
 /// Read/write access to the `users` table.
 ///
 /// Credential operations are deliberately absent; they live on the
-/// internal [`super::credential_store::CredentialStore`], which is
-/// never exposed through [`bbs_plugin_api::Host`].
+/// internal `CredentialStore`, which is never exposed through
+/// [`bbs_plugin_api::Host`].
 #[async_trait]
 pub trait UserStore: Send + Sync {
     /// Fetch a user by their stable integer ID. Returns `None` if no

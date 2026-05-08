@@ -27,7 +27,7 @@
 //! # Notification rendering
 //!
 //! [`render_notification`] converts a [`Notification`] (a host-initiated push)
-//! into the text string delivered via [`OutboundFrame::SendTxtMsg`].
+//! into the text string delivered via `OutboundFrame::SendTxtMsg`.
 
 use bbs_plugin_api::{event::Notification, identity::Username, Command, Response};
 

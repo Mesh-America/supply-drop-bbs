@@ -36,8 +36,7 @@ use tracing::info;
 /// Sync` because `Pool<Sqlite>` does.
 ///
 /// Implements [`UserStore`], [`RoomStore`], and [`MessageStore`]
-/// directly. The internal [`credential_store::CredentialStore`] is
-/// accessed via [`Database::credentials`] and is not part of the
+/// directly. The internal `CredentialStore` is not part of the
 /// public store trait surface.
 #[derive(Clone)]
 pub struct Database {

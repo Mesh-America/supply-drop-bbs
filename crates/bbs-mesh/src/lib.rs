@@ -2,8 +2,8 @@
 //!
 //! The MeshCore transport plugin for Supply Drop BBS.  Connects to
 //! `pymc_core`'s `CompanionFrameServer` over TCP and translates between
-//! MeshCore direct messages and the BBS [`Command`] / [`Response`] types
-//! defined in [`bbs-plugin-api`](bbs_plugin_api).
+//! MeshCore direct messages and the BBS `Command` / `Response` types
+//! defined in `bbs_plugin_api`.
 //!
 //! ## Architecture overview
 //!

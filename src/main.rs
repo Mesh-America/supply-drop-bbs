@@ -71,7 +71,7 @@ enum Commands {
     /// Interactive first-run setup wizard.
     ///
     /// Detects your radio device, writes a config file, and optionally
-    /// installs systemd unit(s). [TBD]
+    /// installs systemd unit(s). \[TBD\]
     Setup,
 
     /// Configuration management.
