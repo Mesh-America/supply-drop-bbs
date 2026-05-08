@@ -10,9 +10,17 @@ license-file = "../../LICENSE"
 publish      = false
 
 [dependencies]
-bbs-core.workspace       = true
 bbs-plugin-api.workspace = true
+async-trait.workspace    = true
 serde.workspace          = true
+thiserror.workspace      = true
+tracing.workspace        = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[dev-dependencies]
+bbs-plugin-api = { workspace = true }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 
 [lints]
 workspace = true

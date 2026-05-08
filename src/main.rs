@@ -224,7 +224,7 @@ async fn cmd_run(cli: &Cli) {
     // what's available — see ADR-0004).
 
     #[cfg(feature = "transport-cli")]
-    let _cli_transport = init_cli_plugin(&cfg.plugins.cli, Arc::clone(&host)).await;
+    let cli_transport = init_cli_plugin(&cfg.plugins.cli, Arc::clone(&host)).await;
 
     #[cfg(feature = "transport-mesh")]
     let mesh_transport = init_mesh_plugin(&cfg.plugins.mesh, Arc::clone(&host)).await;
@@ -243,6 +243,14 @@ async fn cmd_run(cli: &Cli) {
         use bbs_plugin_api::Plugin;
         if let Err(e) = t.stop().await {
             warn!("mesh transport stop error: {e}");
+        }
+    }
+
+    #[cfg(feature = "transport-cli")]
+    if let Some(ref t) = cli_transport {
+        use bbs_plugin_api::Plugin;
+        if let Err(e) = t.stop().await {
+            warn!("cli transport stop error: {e}");
         }
     }
 
@@ -279,15 +287,36 @@ async fn init_mesh_plugin(
 
 /// Initialise and start the CLI transport plugin.
 ///
-/// Stub — real implementation lands once `bbs-cli` has its `Plugin` impl.
-/// Exists now so `host` is consumed in all feature combinations and the
-/// supervisor code reads consistently across plugins.
+/// Returns `None` when the plugin is disabled in config or fails to
+/// initialise (error is logged and the process exits).  On success returns
+/// the running `CliTransport` handle so the supervisor can stop it on
+/// shutdown.
 #[cfg(feature = "transport-cli")]
 async fn init_cli_plugin(
-    _cli_cfg: &bbs_cli::CliConfig,
-    _host: Arc<dyn bbs_plugin_api::Host>,
-) -> Option<()> {
-    None
+    cli_cfg: &bbs_cli::CliConfig,
+    host: Arc<dyn bbs_plugin_api::Host>,
+) -> Option<bbs_cli::CliTransport> {
+    use bbs_plugin_api::Plugin;
+
+    if !cli_cfg.enabled {
+        info!("cli transport: disabled in config — skipping");
+        return None;
+    }
+
+    let transport = match bbs_cli::CliTransport::init(cli_cfg.clone(), host).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("cli transport init failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = transport.start().await {
+        error!("cli transport start failed: {e}");
+        std::process::exit(1);
+    }
+
+    Some(transport)
 }
 
 fn cmd_setup(config_path: Option<&std::path::Path>) {

@@ -136,9 +136,13 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 name = "bbs-cli"
 version = "0.1.0-alpha.0"
 dependencies = [
- "bbs-core",
+ "async-trait",
  "bbs-plugin-api",
  "serde",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
