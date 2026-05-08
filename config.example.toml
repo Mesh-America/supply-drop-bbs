@@ -1,0 +1,207 @@
+# Supply Drop BBS — example configuration
+#
+# This file documents every available configuration knob with its
+# default value. Copy it to `config.toml` (or any of the search
+# paths in docs/CONFIG.md) and uncomment what you want to change.
+#
+# Most operators only need to set a handful of keys. Everything
+# else has a sensible default. Keys that have no sensible default
+# (e.g. external_origin when binding to a non-loopback address)
+# will fail validation at startup with a clear error.
+#
+# To see your effective config (defaults filled in, environment
+# overrides applied) run:
+#
+#     supply-drop-bbs config show
+#
+# To validate without starting:
+#
+#     supply-drop-bbs config check
+#
+
+# ─── BBS identity ─────────────────────────────────────────────────
+
+[bbs]
+# Display name shown to users on connect.
+# name = "Supply Drop BBS"
+
+# Where the BBS stores its data. Created if missing.
+# Default depends on whether you run as root (system install) or
+# as a regular user (user install). Override here to be explicit.
+# data_dir = "/var/lib/supply-drop-bbs"
+
+# Room a newly logged-in user lands in. Must exist after init.
+# starting_room = "Lobby"
+
+# Banner shown on connect. {name} expands to bbs.name.
+# welcome_msg = "Welcome to {name}."
+
+# Display timezone for sysop-facing UI. Storage is always UTC.
+# timezone = "UTC"
+
+
+# ─── Database ─────────────────────────────────────────────────────
+
+[database]
+# SQLite file. Defaults to <data_dir>/bbs.sqlite.
+# path = "/var/lib/supply-drop-bbs/bbs.sqlite"
+
+# Read-only connection pool size. Defaults to cpu_count + 2.
+# read_pool_size = 6
+
+# Time to wait for the writer lock before erroring (milliseconds).
+# busy_timeout_ms = 5000
+
+# SQLite synchronous setting. NORMAL is the SD-card-friendly
+# default; FULL is more conservative; OFF risks data loss.
+# See docs/adr/0005-db-strategy.md for the trade-offs.
+# synchronous = "NORMAL"
+
+# Pages between WAL checkpoints. Larger = fewer fsyncs (better
+# for SD cards) but more disk space used by the WAL. ~40 MB at
+# the default.
+# wal_autocheckpoint = 10000
+
+# Cap on WAL file size in bytes. Default 64 MB.
+# journal_size_limit_bytes = 67108864
+
+
+# ─── Logging ──────────────────────────────────────────────────────
+
+[logging]
+# Root level. TRACE / DEBUG / INFO / WARN / ERROR.
+# CLI flag --log-level overrides this *and announces the override
+# loudly* — there are no silent stomps. See ADR-0009.
+# level = "INFO"
+
+# Log file path. Defaults to <data_dir>/log/bbs.log.
+# file = "/var/log/supply-drop-bbs/bbs.log"
+
+# Rotation size per file in bytes (10 MB default).
+# max_bytes = 10485760
+
+# How many rotated files to keep. Total disk = max_bytes * (backup_count + 1).
+# backup_count = 5
+
+# Output format: "compact" / "pretty" / "json".
+# JSON is for log aggregators; compact is for humans.
+# format = "compact"
+
+# Per-target level overrides. Use this when you want to debug a
+# specific subsystem without turning the whole BBS verbose.
+# Defaults clamp the noisy ones to WARN.
+# [logging.targets]
+# "supply_drop_bbs::transport::mesh" = "DEBUG"
+# "sqlx::query" = "INFO"
+# "meshcore_companion::frame" = "WARN"
+
+
+# ─── Security ─────────────────────────────────────────────────────
+
+[security]
+# Argon2id parameters for password hashing. Tuned for ~250ms on a
+# Pi 4. Increase memory_kib for stronger hashing on faster hardware.
+# argon2_memory_kib = 19456
+# argon2_iterations = 2
+# argon2_parallelism = 1
+
+# Session lifetimes (seconds).
+# Web: 12 hours. Mesh: 3 days (mesh users disconnect / reconnect
+# frequently and re-auth is expensive over radio).
+# session_lifetime_web_secs = 43200
+# session_lifetime_mesh_secs = 259200
+
+# Rate limits (per minute, per source).
+# login_rate_per_min = 5
+# command_rate_per_min = 60
+
+
+# ─── Backup ───────────────────────────────────────────────────────
+
+[backup]
+# Whether to run automatic periodic backups.
+# enabled = true
+
+# Hours between automatic backups.
+# interval_hours = 6
+
+# Where backup files go. Defaults to <data_dir>/backups.
+# directory = "/var/lib/supply-drop-bbs/backups"
+
+# Retention policy.
+# keep_daily = 7
+# keep_weekly = 4
+
+
+# ─── Plugin: CLI transport ────────────────────────────────────────
+
+[plugins.cli]
+# Enabled by default if the transport-cli feature is compiled in.
+# Set false to disable without recompiling.
+# enabled = true
+
+# Unix socket path for the CLI listener.
+# Defaults to <data_dir>/cli.sock.
+# socket = "/var/run/supply-drop-bbs/cli.sock"
+
+# Octal mode of the socket file. 0600 = owner only.
+# socket_mode = "0600"
+
+# Username (or numeric UID) to chown the socket to. Defaults to
+# the BBS process's owner.
+# socket_owner = "bbs"
+
+
+# ─── Plugin: mesh transport ───────────────────────────────────────
+
+[plugins.mesh]
+# enabled = true
+
+# Address of the radio bridge process (pymc_core's
+# CompanionFrameServer). See docs/OPERATIONS.md for setting up the
+# bridge.
+# bridge_addr = "127.0.0.1:5000"
+
+# Reconnection backoff after the bridge disconnects.
+# reconnect_delay_ms = 5000
+# max_reconnect_delay_ms = 60000
+
+# Optional command prefix. If set, mesh users must prefix commands
+# with this string (e.g. "/help" instead of "help"). Useful when
+# the BBS coexists with other mesh applications.
+# command_prefix = ""
+
+
+# ─── Plugin: web admin ────────────────────────────────────────────
+#
+# This section only applies when the BBS is built with the
+# `admin-web` cargo feature. The default release tarball does NOT
+# include this plugin; download the `-web` variant or build from
+# source with `--features admin-web`.
+
+[plugins.web]
+# Set false to disable web at runtime even when the feature is
+# compiled in.
+# enabled = true
+
+# Address to bind. DEFAULT IS 127.0.0.1 — the web UI is not
+# exposed on the network unless you change this AND set
+# external_origin.
+# bind = "127.0.0.1:8080"
+
+# Public origin for CSRF / cookie policy. REQUIRED if bind is
+# anything other than 127.0.0.1 or ::1. Set this to the URL the
+# operator will hit in their browser.
+# external_origin = "https://admin.bbs.example.com"
+
+# Set the Secure flag on cookies. Default true. Only set false
+# for purely local dev.
+# cookie_secure = true
+
+# Expose Prometheus metrics at /metrics.
+# prometheus = false
+
+# Override the Content-Security-Policy header. Default is a
+# strict policy that disallows inline scripts and external
+# resources except 'self'.
+# csp = "default-src 'self'; script-src 'self'; ..."
