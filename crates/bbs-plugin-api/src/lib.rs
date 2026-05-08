@@ -4,35 +4,52 @@
 //! This crate is intentionally small: it defines traits and shared
 //! types, nothing else. Plugin authors depend on this crate (and
 //! optionally `bbs-core` for domain types) and implement the
-//! `Plugin` trait plus any capability traits the plugin uses.
+//! [`Plugin`] trait plus any capability traits the plugin uses.
 //!
-//! ## What's here
+//! ## Module map
 //!
-//! - **`Plugin`** — the base trait every plugin implements.
-//! - **`Host`** — the trait that `bbs-core` implements; plugins
-//!   call into it to drive the BBS.
-//! - **Capability traits** — `TransportEngine`, `RouteContributor`,
-//!   `StaticFileMount`, `ScheduledTask`, `EventConsumer`,
-//!   `MetricsContributor`, `HealthCheck`. A plugin opts into any
-//!   combination.
-//! - **Shared types** — `SessionId`, `Notification`, `DomainEvent`,
-//!   `PluginError`, etc.
-//!
-//! ## What's NOT here
-//!
-//! - Concrete logic. The `Host` *implementation* lives in
-//!   `bbs-core`. The plugin *implementations* live in their own
-//!   crates.
-//! - Protocol-specific types. Transport-specific identifiers
-//!   (MeshCore public keys, Meshtastic node IDs, IRC nicks) live
-//!   in their respective transport plugins, not here. See
-//!   [ADR-0011](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/adr/0011-transport-protocol-agnostic-core.md).
+//! - [`identity`]    — `SessionId`, `Username`
+//! - [`permissions`] — `PermissionLevel`, `PermissionCtx`
+//! - [`plugin`]      — the `Plugin` trait and lifecycle
+//! - [`host`]        — the `Host` trait (implemented by `bbs-core`)
+//! - [`transport`]   — the `TransportEngine` capability trait
+//! - [`event`]       — `DomainEvent`, `Notification`
+//! - [`command`]     — `Command`, `Response` (still placeholders;
+//!                     these grow with feature work)
+//! - [`error`]       — `PluginError`, `HostError`, `TransportError`
+//! - [`testing`]     — fake `Host` for plugin unit tests
 //!
 //! ## Status
 //!
-//! Placeholder. Real traits land in subsequent commits. The shape
-//! sketches in `docs/PLUGIN_API.md` are the design target.
+//! Pre-1.0. Trait shapes will evolve. See
+//! [`docs/PLUGIN_API.md`](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/PLUGIN_API.md)
+//! for the prose introduction and
+//! [`docs/adr/0011-transport-protocol-agnostic-core.md`](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/adr/0011-transport-protocol-agnostic-core.md)
+//! for the protocol-agnosticism rules.
 
-/// Internal placeholder so the crate has at least one item to
-/// compile. Removed when real traits land.
-pub fn placeholder() {}
+pub mod command;
+pub mod error;
+pub mod event;
+pub mod host;
+pub mod identity;
+pub mod permissions;
+pub mod plugin;
+pub mod testing;
+pub mod transport;
+
+// ── Re-exports of the most commonly used items ───────────────────
+//
+// Plugin authors should be able to write
+//
+//     use bbs_plugin_api::{Plugin, Host, SessionId, ...};
+//
+// without spelunking the module tree for every type.
+
+pub use command::{Command, Response};
+pub use error::{HostError, PluginError, TransportError};
+pub use event::{DomainEvent, MessageRecipient, Notification, NotifyOutcome};
+pub use host::Host;
+pub use identity::{SessionId, Username};
+pub use permissions::{PermissionCtx, PermissionLevel};
+pub use plugin::Plugin;
+pub use transport::TransportEngine;

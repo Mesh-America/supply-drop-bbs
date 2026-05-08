@@ -13,7 +13,16 @@ publish      = false
 # directly. Heavy dependencies don't belong here.
 
 [dependencies]
-# (filled in as the implementation lands)
+async-trait.workspace = true
+serde.workspace       = true
+thiserror.workspace   = true
+tokio.workspace       = true
+
+[dev-dependencies]
+# Tokio with the full feature set for tests (we use the macro
+# attributes for #[tokio::test]).
+tokio      = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
