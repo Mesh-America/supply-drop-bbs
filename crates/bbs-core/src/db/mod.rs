@@ -55,18 +55,21 @@ impl Database {
             .map(NonZeroUsize::get)
             .unwrap_or(4);
 
-        let read_opts = base_opts(path).read_only(true);
-        let read_pool = SqlitePoolOptions::new()
-            .max_connections((cpu_count + 2) as u32)
-            .after_connect(|conn, _meta| Box::pin(apply_pragmas(conn)))
-            .connect_with(read_opts)
-            .await?;
-
+        // Write pool is opened first so the file is created before the
+        // read pool attempts to open it read-only (SQLite cannot create a
+        // file when opened read-only, even with create_if_missing).
         let write_opts = base_opts(path);
         let write_pool = SqlitePoolOptions::new()
             .max_connections(1)
             .after_connect(|conn, _meta| Box::pin(apply_pragmas(conn)))
             .connect_with(write_opts)
+            .await?;
+
+        let read_opts = base_opts(path).read_only(true);
+        let read_pool = SqlitePoolOptions::new()
+            .max_connections((cpu_count + 2) as u32)
+            .after_connect(|conn, _meta| Box::pin(apply_pragmas(conn)))
+            .connect_with(read_opts)
             .await?;
 
         info!("running pending migrations");

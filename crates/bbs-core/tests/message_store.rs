@@ -12,7 +12,7 @@ async fn test_db() -> (Database, tempfile::TempDir) {
 
 async fn seed_user(db: &Database, name: &str) -> Username {
     let u = Username::new(name).unwrap();
-    db.create(&u, None, PermissionLevel::User, Timestamp::now())
+    UserStore::create(db, &u, None, PermissionLevel::User, Timestamp::now())
         .await
         .unwrap();
     u
@@ -23,8 +23,7 @@ async fn post_messages_and_paginate() {
     let (db, _dir) = test_db().await;
     let alice = seed_user(&db, "alice").await;
 
-    let room_id = db
-        .create("lobby", None, false, PermissionLevel::User, Timestamp::now())
+    let room_id = RoomStore::create(&db, "lobby", None, false, PermissionLevel::User, Timestamp::now())
         .await
         .unwrap();
 
@@ -91,8 +90,7 @@ async fn unread_count_and_mark_read() {
         .unwrap()
         .id;
 
-    let room_id = db
-        .create("news", None, false, PermissionLevel::User, Timestamp::now())
+    let room_id = RoomStore::create(&db, "news", None, false, PermissionLevel::User, Timestamp::now())
         .await
         .unwrap();
 
@@ -137,8 +135,7 @@ async fn delete_message_sets_read_pointer_null() {
         .unwrap()
         .id;
 
-    let room_id = db
-        .create("general", None, false, PermissionLevel::User, Timestamp::now())
+    let room_id = RoomStore::create(&db, "general", None, false, PermissionLevel::User, Timestamp::now())
         .await
         .unwrap();
 
@@ -152,7 +149,7 @@ async fn delete_message_sets_read_pointer_null() {
 
     // Deleting the message should set the read pointer to NULL,
     // which means the count stays 0 (no messages to count).
-    let deleted = db.delete(mid).await.unwrap();
+    let deleted = MessageStore::delete(&db, mid).await.unwrap();
     assert!(deleted);
 
     assert_eq!(db.unread_count(alice_id, room_id).await.unwrap(), 0);
@@ -174,12 +171,11 @@ proptest! {
             let db = Database::open(path.to_str().unwrap()).await.unwrap();
 
             let alice = Username::new("alice").unwrap();
-            db.create(&alice, None, PermissionLevel::User, Timestamp::now())
+            UserStore::create(&db, &alice, None, PermissionLevel::User, Timestamp::now())
                 .await
                 .unwrap();
 
-            let room_id = db
-                .create("room", None, false, PermissionLevel::User, Timestamp::now())
+            let room_id = RoomStore::create(&db, "room", None, false, PermissionLevel::User, Timestamp::now())
                 .await
                 .unwrap();
 
@@ -188,8 +184,7 @@ proptest! {
                 .await
                 .unwrap();
 
-            let fetched = db
-                .get_by_id(mid)
+            let fetched = MessageStore::get_by_id(&db, mid)
                 .await
                 .unwrap()
                 .expect("just posted — must be present");

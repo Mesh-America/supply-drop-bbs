@@ -98,15 +98,13 @@ async fn hard_delete_fails_when_messages_exist() {
     let (db, _dir) = test_db().await;
 
     let alice = Username::new("alice").unwrap();
-    let alice_id = db
-        .create(&alice, None, PermissionLevel::User, Timestamp::now())
+    use bbs_core::{MessageStore, RoomStore};
+    let alice_id = UserStore::create(&db, &alice, None, PermissionLevel::User, Timestamp::now())
         .await
         .unwrap();
 
     // Create a room and post a message so hard_delete should be refused.
-    use bbs_core::{MessageStore, RoomStore};
-    let room_id = db
-        .create("lobby", None, false, PermissionLevel::User, Timestamp::now())
+    let room_id = RoomStore::create(&db, "lobby", None, false, PermissionLevel::User, Timestamp::now())
         .await
         .unwrap();
 
