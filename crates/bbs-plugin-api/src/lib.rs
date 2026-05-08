@@ -27,6 +27,7 @@
 //! [`docs/adr/0011-transport-protocol-agnostic-core.md`](https://github.com/Mesh-America/supply-drop-bbs/blob/main/docs/adr/0011-transport-protocol-agnostic-core.md)
 //! for the protocol-agnosticism rules.
 
+pub mod advert;
 pub mod command;
 pub mod error;
 pub mod event;
@@ -45,6 +46,7 @@ pub mod transport;
 //
 // without spelunking the module tree for every type.
 
+pub use advert::{AdvertBus, AdvertRecord};
 pub use command::{Command, Response};
 pub use error::{HostError, PluginError, TransportError};
 pub use event::{DomainEvent, MessageRecipient, Notification, NotifyOutcome};

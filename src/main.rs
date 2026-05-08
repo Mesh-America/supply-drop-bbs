@@ -229,6 +229,9 @@ async fn cmd_run(cli: &Cli) {
     #[cfg(feature = "transport-mesh")]
     let mesh_transport = init_mesh_plugin(&cfg.plugins.mesh, Arc::clone(&host)).await;
 
+    #[cfg(feature = "admin-web")]
+    let web_plugin = init_web_plugin(&cfg.plugins.web, Arc::clone(&host)).await;
+
     // ── 7. Wait for shutdown signal ───────────────────────────────────────────
     info!("supply-drop-bbs ready — press Ctrl-C to stop");
 
@@ -238,6 +241,14 @@ async fn cmd_run(cli: &Cli) {
     }
 
     // ── 8. Stop plugins (reverse order) ──────────────────────────────────────
+    #[cfg(feature = "admin-web")]
+    if let Some(ref t) = web_plugin {
+        use bbs_plugin_api::Plugin;
+        if let Err(e) = t.stop().await {
+            warn!("web plugin stop error: {e}");
+        }
+    }
+
     #[cfg(feature = "transport-mesh")]
     if let Some(ref t) = mesh_transport {
         use bbs_plugin_api::Plugin;
@@ -317,6 +328,40 @@ async fn init_cli_plugin(
     }
 
     Some(transport)
+}
+
+/// Initialise and start the web admin plugin.
+///
+/// Returns `None` when the plugin is disabled in config or fails to
+/// initialise (error is logged and the process exits).  On success returns
+/// the running `WebPlugin` handle so the supervisor can stop it on
+/// shutdown.
+#[cfg(feature = "admin-web")]
+async fn init_web_plugin(
+    web_cfg: &bbs_web::WebConfig,
+    host: Arc<dyn bbs_plugin_api::Host>,
+) -> Option<bbs_web::WebPlugin> {
+    use bbs_plugin_api::Plugin;
+
+    if !web_cfg.enabled {
+        info!("web admin: disabled in config — skipping");
+        return None;
+    }
+
+    let plugin = match bbs_web::WebPlugin::init(web_cfg.clone(), host).await {
+        Ok(p) => p,
+        Err(e) => {
+            error!("web admin init failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = plugin.start().await {
+        error!("web admin start failed: {e}");
+        std::process::exit(1);
+    }
+
+    Some(plugin)
 }
 
 fn cmd_setup(config_path: Option<&std::path::Path>) {

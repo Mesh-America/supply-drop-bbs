@@ -22,6 +22,9 @@
 //! types in `bbs-core`. For now `process_command` is the route
 //! through which transport plugins manipulate domain state.
 
+use std::sync::Arc;
+
+use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
 use crate::error::HostError;
 use crate::event::DomainEvent;
@@ -92,4 +95,14 @@ pub trait Host: Send + Sync {
     /// (audit log, reports) should subscribe directly to the
     /// audit log via `process_command`-driven flows, not events.
     fn events(&self) -> broadcast::Receiver<DomainEvent>;
+
+    // ── Mesh adverts ────────────────────────────────────────────
+
+    /// Access the shared advert bus.
+    ///
+    /// `MeshTransport` writes records here when adverts are heard
+    /// over the air and subscribes to the send-request channel.
+    /// `WebPlugin` reads the list and triggers sends on behalf of
+    /// the sysop.
+    fn advert_bus(&self) -> Arc<AdvertBus>;
 }

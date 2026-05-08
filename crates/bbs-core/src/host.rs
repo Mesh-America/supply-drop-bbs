@@ -26,8 +26,10 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use bbs_plugin_api::advert::AdvertBus;
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
     Command, DomainEvent, HostError, PermissionCtx, PermissionLevel, Response, SessionId,
@@ -66,6 +68,8 @@ pub struct BbsHost {
     sessions: RwLock<HashMap<SessionId, SessionRecord>>,
     /// Monotonically increasing session ID counter.
     next_id: AtomicU64,
+    /// Shared mesh advertisement store + send-request bus.
+    advert_bus: Arc<AdvertBus>,
 }
 
 impl BbsHost {
@@ -81,6 +85,7 @@ impl BbsHost {
             events_tx,
             sessions: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            advert_bus: Arc::new(AdvertBus::new()),
         }
     }
 }
@@ -188,6 +193,10 @@ impl Host for BbsHost {
 
     fn events(&self) -> broadcast::Receiver<DomainEvent> {
         self.events_tx.subscribe()
+    }
+
+    fn advert_bus(&self) -> Arc<AdvertBus> {
+        Arc::clone(&self.advert_bus)
     }
 }
 

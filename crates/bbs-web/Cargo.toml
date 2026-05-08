@@ -12,7 +12,19 @@ publish      = false
 [dependencies]
 bbs-core.workspace       = true
 bbs-plugin-api.workspace = true
+async-trait.workspace    = true
 serde.workspace          = true
+serde_json.workspace     = true
+thiserror.workspace      = true
+tracing.workspace        = true
+uuid.workspace           = true
+time.workspace           = true
+tokio = { workspace = true, features = ["net", "macros", "time"] }
+axum.workspace           = true
+axum-extra.workspace     = true
+tower-http.workspace     = true
+rust-embed.workspace     = true
+mime_guess.workspace     = true
 
 [lints]
 workspace = true

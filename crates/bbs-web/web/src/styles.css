@@ -1,0 +1,119 @@
+/* Supply Drop BBS admin: minimal monospace UI, theme-aware.
+ *
+ * Theming via `data-theme` on <html>:
+ *   (none)              — follow system preference
+ *   data-theme="light"  — force light
+ *   data-theme="dark"   — force dark
+ */
+
+:root {
+  color-scheme: light dark;
+  --bg: #fff;
+  --fg: #1a1a1a;
+  --muted: #666;
+  --border: #d0d0d0;
+  --accent: #0066cc;
+  --accent-bg: #e6f0ff;
+  --accent-fg: #fff;
+  --error: #c0392b;
+  --warning: #d67e00;
+  --row-alt: #fafafa;
+  --code-bg: #f4f4f4;
+  --topbar-h: 49px;
+  font-family: ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #161616;
+    --fg: #e8e8e8;
+    --muted: #999;
+    --border: #303030;
+    --accent: #66aaff;
+    --accent-bg: #1f3050;
+    --error: #ff7b6e;
+    --warning: #ffb84d;
+    --row-alt: #1c1c1c;
+    --code-bg: #1c1c1c;
+  }
+}
+
+:root[data-theme="dark"] {
+  --bg: #161616;
+  --fg: #e8e8e8;
+  --muted: #999;
+  --border: #303030;
+  --accent: #66aaff;
+  --accent-bg: #1f3050;
+  --error: #ff7b6e;
+  --warning: #ffb84d;
+  --row-alt: #1c1c1c;
+  --code-bg: #1c1c1c;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  min-height: 100vh;
+}
+
+button {
+  font: inherit;
+  background: var(--accent);
+  color: var(--accent-fg);
+  border: 1px solid var(--accent);
+  padding: 0.4rem 0.9rem;
+  cursor: pointer;
+  border-radius: 3px;
+}
+button:hover { filter: brightness(1.1); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.secondary { background: transparent; color: var(--accent); }
+button.danger { background: var(--error); border-color: var(--error); color: #fff; }
+
+input, select, textarea {
+  font: inherit;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 0.4rem 0.5rem;
+  border-radius: 3px;
+}
+input:focus, select:focus, textarea:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+table { border-collapse: collapse; width: 100%; }
+th, td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+th {
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 0.85em;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+tbody tr:nth-child(even) { background: var(--row-alt); }
+
+code, pre {
+  background: var(--code-bg);
+  padding: 0.1em 0.3em;
+  border-radius: 2px;
+}
+pre { padding: 0.6rem 0.8rem; overflow: auto; }
+
+.muted { color: var(--muted); }
+.error { color: var(--error); }
+.warning { color: var(--warning); }

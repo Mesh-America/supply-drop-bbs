@@ -173,6 +173,35 @@ impl Plugin for MeshTransport {
         let shutdown_rx = self.shutdown_tx.subscribe();
         let prefix = self.command_prefix;
 
+        // Watch for advert-send requests from the web UI.
+        let mut advert_send_rx = host.advert_bus().subscribe_send();
+        let advert_cmd_tx = self.cmd_tx.clone();
+        let mut advert_shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = advert_send_rx.recv() => {
+                        match result {
+                            Ok(flood) => {
+                                if advert_cmd_tx
+                                    .send(OutboundFrame::SendSelfAdvert { flood })
+                                    .await
+                                    .is_err()
+                                {
+                                    warn!("mesh: could not enqueue SendSelfAdvert — cmd channel closed");
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("mesh: advert send requests lagged by {n}");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    _ = advert_shutdown_rx.changed() => break,
+                }
+            }
+        });
+
         tokio::spawn(event_loop(client, host, cmd_tx, state, shutdown_rx, prefix));
 
         info!("mesh transport started");
@@ -328,12 +357,20 @@ async fn handle_frame(
         }
 
         // ── Contact advertisements ────────────────────────────────────────────
-        // Nodes that advertise themselves but haven't messaged yet.  We log
-        // them but don't create sessions (sessions are minted on first DM).
+        // Record in the shared advert bus so the web UI can display them.
+        // Sessions are minted on first DM, not on advert.
         InboundFrame::Advert { pubkey } => {
+            host.advert_bus().upsert_short(pubkey);
             debug!(prefix = ?&pubkey[..6], "mesh: short advert received");
         }
         InboundFrame::NewAdvert(contact) => {
+            host.advert_bus().upsert(
+                contact.pubkey,
+                contact.name.clone(),
+                contact.adv_type,
+                contact.gps_lat,
+                contact.gps_lon,
+            );
             debug!(name = %contact.name, "mesh: full advert (new contact) received");
         }
 

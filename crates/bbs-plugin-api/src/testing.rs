@@ -28,16 +28,19 @@
 //! framework, no fluent assertions, just a thread-safe handle that
 //! plugin tests use to set up state and inspect what happened.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use tokio::sync::broadcast;
+
+use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
 use crate::error::HostError;
 use crate::event::DomainEvent;
 use crate::identity::{SessionId, Username};
 use crate::permissions::{PermissionCtx, PermissionLevel};
 use crate::Host;
-use async_trait::async_trait;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use tokio::sync::broadcast;
 
 /// Type alias for a command-matcher predicate. A boxed `Fn` so
 /// matchers can capture state.
@@ -58,6 +61,7 @@ pub struct MockHost {
     next_session_id: AtomicU64,
     state: Mutex<MockHostState>,
     events: broadcast::Sender<DomainEvent>,
+    advert_bus: Arc<AdvertBus>,
 }
 
 struct MockHostState {
@@ -110,6 +114,7 @@ impl MockHost {
                 commands_received: Vec::new(),
             }),
             events: tx,
+            advert_bus: Arc::new(AdvertBus::new()),
         }
     }
 
@@ -247,6 +252,10 @@ impl Host for MockHost {
 
     fn events(&self) -> broadcast::Receiver<DomainEvent> {
         self.events.subscribe()
+    }
+
+    fn advert_bus(&self) -> Arc<AdvertBus> {
+        Arc::clone(&self.advert_bus)
     }
 }
 
