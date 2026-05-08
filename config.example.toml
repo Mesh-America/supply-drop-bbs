@@ -153,23 +153,37 @@
 
 
 # ─── Plugin: mesh transport ───────────────────────────────────────
+#
+# See docs/CONFIG.md §[plugins.mesh] for the full reference and
+# docs/OPERATIONS.md for USB vs Pi HAT setup instructions.
 
 [plugins.mesh]
-# enabled = true
+# How to reach the radio. "serial" for USB companion devices (default);
+# "tcp" or "hat" for pymc_core + Pi HAT setups.
+# connection_type = "serial"
 
-# Address of the radio bridge process (pymc_core's
-# CompanionFrameServer). See docs/OPERATIONS.md for setting up the
-# bridge.
-# bridge_addr = "127.0.0.1:5000"
+# ── Serial mode (connection_type = "serial") ──────────────────────
+# Serial device. The setup wizard detects this automatically.
+# serial_port = "/dev/ttyACM0"
+# baud_rate = 115200
+
+# ── TCP / HAT mode (connection_type = "tcp" or "hat") ─────────────
+# Address of the pymc_core CompanionFrameServer.
+# addr = "127.0.0.1:5000"
 
 # Reconnection backoff after the bridge disconnects.
-# reconnect_delay_ms = 5000
-# max_reconnect_delay_ms = 60000
+# reconnect_delay_initial_ms = 1000
+# reconnect_delay_max_ms = 60000
 
-# Optional command prefix. If set, mesh users must prefix commands
-# with this string (e.g. "/help" instead of "help"). Useful when
-# the BBS coexists with other mesh applications.
-# command_prefix = ""
+# Companion protocol version. Leave at default unless your bridge
+# does not support v3.
+# app_target_version = 3
+
+# ── All modes ─────────────────────────────────────────────────────
+# Optional single-character command prefix. When set, mesh users must
+# start messages with this character (e.g. "!" → "!help"). When unset
+# every direct message is treated as a command.
+# command_prefix = "!"
 
 
 # ─── Plugin: web admin ────────────────────────────────────────────

@@ -12,6 +12,7 @@ publish      = false
 [dependencies]
 bbs-core.workspace       = true
 bbs-plugin-api.workspace = true
+serde.workspace          = true
 
 [lints]
 workspace = true

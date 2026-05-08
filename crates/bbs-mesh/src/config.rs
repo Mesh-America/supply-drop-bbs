@@ -8,7 +8,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use meshcore_companion::constants::APP_TARGET_VER_V3;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Configuration for [`MeshTransport`](crate::MeshTransport).
 ///
@@ -28,7 +28,7 @@ use serde::Deserialize;
 /// reconnect_delay_initial_ms = 2000
 /// reconnect_delay_max_ms     = 120000
 /// ```
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshConfig {
     /// Address of the `CompanionFrameServer` TCP listener.
