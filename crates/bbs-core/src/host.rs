@@ -1633,8 +1633,9 @@ impl BbsHost {
 
         let mut lines = vec![format!("[{} — scan]", room.name)];
         for msg in &visible {
-            let snippet: String = msg.content.chars().take(40).collect();
-            let ellipsis = if msg.content.len() > 40 { "…" } else { "" };
+            let flat: String = msg.content.replace('\r', "").replace('\n', " ");
+            let snippet: String = flat.chars().take(40).collect();
+            let ellipsis = if flat.chars().count() > 40 { "…" } else { "" };
             lines.push(format!(
                 "#{} {}: {}{}",
                 msg.id.as_i64(),
@@ -2375,15 +2376,14 @@ Sysop:\n\
 fn format_message(msg: &Message) -> String {
     let id = msg.id.as_i64();
     let sender = msg.sender.as_str();
+    // Collapse embedded newlines so a multiline body doesn't corrupt the listing
+    // format (lines are separated by \n in the response text).
+    let content = msg.content.replace('\r', "").replace('\n', " ");
     if let Some(ref recipient) = msg.recipient {
-        format!(
-            "#{id} [DM→{}] {}: {}",
-            recipient.as_str(),
-            sender,
-            msg.content
-        )
+        let r = recipient.as_str();
+        format!("#{id} [DM→{r}] {sender}: {content}")
     } else {
-        format!("#{id} {}: {}", sender, msg.content)
+        format!("#{id} {sender}: {content}")
     }
 }
 
