@@ -10,6 +10,7 @@ interface Room {
   min_permission_level: number
   message_count: number
   created_at: string
+  deletable: boolean
 }
 
 const rooms = ref<Room[]>([])
@@ -21,8 +22,6 @@ const actionOk = ref<string | null>(null)
 const newName = ref('')
 const newDesc = ref('')
 const creating = ref(false)
-
-const SYSTEM_ROOMS = [1, 2, 3]
 
 async function load() {
   loading.value = true
@@ -120,7 +119,7 @@ onMounted(load)
           <td>{{ r.min_permission_level }}</td>
           <td class="muted small">{{ r.created_at.slice(0, 10) }}</td>
           <td>
-            <span v-if="SYSTEM_ROOMS.includes(r.id)" class="muted small">system</span>
+            <span v-if="!r.deletable" class="muted small">system</span>
             <button v-else class="small-btn danger" @click="remove(r)">delete</button>
           </td>
         </tr>

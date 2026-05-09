@@ -56,6 +56,9 @@ pub struct AdminRoomSummary {
     pub message_count: i64,
     /// RFC 3339 creation timestamp.
     pub created_at: String,
+    /// Whether this room can be deleted. False for the five built-in system
+    /// rooms (Lobby, Mail, Aides, Sysop, System).
+    pub deletable: bool,
 }
 
 /// A message as seen by the admin.

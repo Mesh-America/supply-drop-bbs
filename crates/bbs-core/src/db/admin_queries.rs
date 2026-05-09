@@ -76,14 +76,16 @@ impl Database {
 
         rows.into_iter()
             .map(|r| {
+                let id: i64 = r.try_get("id")?;
                 Ok(AdminRoomSummary {
-                    id: r.try_get("id")?,
+                    id,
                     name: r.try_get("name")?,
                     description: r.try_get("description")?,
                     read_only: r.try_get::<i64, _>("read_only")? != 0,
                     min_permission_level: r.try_get::<i64, _>("min_permission_level")? as u8,
                     message_count: r.try_get("message_count")?,
                     created_at: r.try_get("created_at")?,
+                    deletable: id > 5,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()

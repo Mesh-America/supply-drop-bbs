@@ -472,8 +472,8 @@ impl Host for BbsHost {
     }
 
     async fn admin_delete_room(&self, room_id: i64) -> Result<bool, HostError> {
-        // Protect system rooms.
-        if room_id <= 3 {
+        // Protect all five built-in rooms (Lobby=1, Mail=2, Aides=3, Sysop=4, System=5).
+        if room_id <= 5 {
             return Err(HostError::PreconditionFailed(
                 "system rooms cannot be deleted".into(),
             ));
@@ -2124,6 +2124,8 @@ impl BbsHost {
 
 fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
     let logged_in = level.is_some();
+    let is_aide = level >= Some(PermissionLevel::Aide);
+    let is_sysop = level >= Some(PermissionLevel::Sysop);
 
     match topic {
         None => {
@@ -2134,22 +2136,26 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             }
         }
         Some(t) => match t.to_ascii_lowercase().as_str() {
+            // `H all` lists available topic categories — keeps the response
+            // well under the 176-byte mesh payload limit.
             "all" if logged_in => {
-                let mut parts = vec![HELP_READING_POSTING, HELP_NAVIGATION, HELP_ACCOUNT];
-                if level >= Some(PermissionLevel::Aide) {
-                    parts.push(HELP_AIDE);
+                let mut topics = "Help topics:\n reading  posting\n navigation  account".to_owned();
+                if is_aide {
+                    topics.push_str("  aide");
                 }
-                if level >= Some(PermissionLevel::Sysop) {
-                    parts.push(HELP_SYSOP);
+                if is_sysop {
+                    topics.push_str("  sysop");
                 }
-                parts.join("\n\n")
+                topics.push_str("\nH <topic>  H <key> for detail");
+                topics
             }
             "all" => HELP_QUICK_ANON.to_owned(),
-            "reading" | "posting" if logged_in => HELP_READING_POSTING.to_owned(),
+            "reading" if logged_in => HELP_READING.to_owned(),
+            "posting" if logged_in => HELP_POSTING.to_owned(),
             "navigation" | "nav" if logged_in => HELP_NAVIGATION.to_owned(),
             "account" if logged_in => HELP_ACCOUNT.to_owned(),
-            "aide" if level >= Some(PermissionLevel::Aide) => HELP_AIDE.to_owned(),
-            "sysop" if level >= Some(PermissionLevel::Sysop) => HELP_SYSOP.to_owned(),
+            "aide" if is_aide => HELP_AIDE.to_owned(),
+            "sysop" if is_sysop => HELP_SYSOP.to_owned(),
             cmd => help_for_command(cmd, level),
         },
     }
@@ -2164,56 +2170,58 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         // ── Always available ─────────────────────────────────────────────
         "h" | "help" | "?" => {
             if logged_in {
-                "H — quick menu. H all = full menu.\n\
-                 H reading/nav/account/aide/sysop\n\
-                 H <key> for one command."
+                "H — help (also: ?)\n\
+                 H all = topic list\n\
+                 H reading / posting / navigation / account\n\
+                 H <key> for detail on one command"
             } else {
                 "H — show this help."
             }
         }
         "q" => {
             if logged_in {
-                "Q — Log out."
+                "Q — log out"
             } else {
-                "Q — Quit."
+                "Q — quit"
             }
         }
-        "register" => "REGISTER <username> — Create a new account.",
-        "login" => "LOGIN <username> — Log in to an existing account.",
-        "cancel" => "CANCEL — Cancel the current workflow.",
+        "register" => "REGISTER <user> — create an account",
+        "login" => "LOGIN <user> — log in to your account",
+        "cancel" => "CANCEL — cancel the current workflow",
 
         // ── Logged-in only ───────────────────────────────────────────────
-        "n" if logged_in => "N — Read new messages since last visit.",
-        "f" if logged_in => "F — Read messages oldest-first. F <id> to start from a message.",
-        "r" if logged_in => "R — Read messages newest-first.",
-        "s" if logged_in => "S — Show message summaries in this room.",
-        ".ff" if logged_in => ".FF — Skip to latest, marking all as read.",
-        "e" if logged_in => "E — Compose a message in this room.",
-        "d" if logged_in => "D <id> — Delete a message. Aides can delete any message.",
-        "g" if logged_in => "G — Go to next room with unread messages.",
-        "c" if logged_in => "C <name> — Change room by name or number.",
-        "k" if logged_in => "K — List all rooms you can access.",
-        "i" if logged_in => "I — Toggle ignore on this room.",
-        "m" if logged_in => "M — Go to Mail (private messages).",
-        "w" if logged_in => "W — List users currently online.",
+        "n" if logged_in => "N — read new messages since last visit",
+        "f" if logged_in => "F — forward-read (oldest first)\nF <id> to start from a specific message",
+        "r" if logged_in => "R — reverse-read (newest first)",
+        "s" if logged_in => "S — scan message headers in this room",
+        ".ff" if logged_in => ".FF — fast-forward past unread\nResets your last-read pointer to the latest message.",
+        "e" if logged_in => "E — enter a message in this room",
+        "d" if logged_in => "D <id> — delete a message\nAides and sysops can delete any message.",
+        "g" if logged_in => "G — go to next room with unread messages",
+        "c" if logged_in => "C <name> — change room by name or number",
+        "k" if logged_in => "K — list known rooms",
+        "i" if logged_in => "I — ignore this room (toggle)\nIgnored rooms are skipped during navigation.",
+        "m" if logged_in => "M — go to Mail (private messages)",
+        "w" if logged_in => "W — who's online",
         "b" if logged_in => {
-            "B <user> — toggle block. +user force-block,\n\
-             -user unblock. Hides their posts from you."
+            "B <user> — block / unblock user\n\
+             Prefix + to force-block, - to force-unblock, or omit to toggle.\n\
+             Hides their messages from you."
         }
-        "profile" if logged_in => "PROFILE — Edit your display name.",
-        "stop" if logged_in => "STOP — Interrupt message output.",
+        "profile" if logged_in => "PROFILE — edit your display name",
+        "stop" if logged_in => "STOP — stop pending messages",
 
         // ── Aide+ only ───────────────────────────────────────────────────
-        "v" if is_aide => "V <user> — Validate (approve) a pending user.",
-        "pending" if is_aide => "PENDING — List users awaiting validation.",
-        ".er" if is_aide => ".ER — Edit this room's settings.",
-        ".eu" if is_aide => ".EU <user> — Edit a user's profile or permissions.",
-        "ban" if is_aide => "BAN <user> — Ban a user account.",
+        "v" if is_aide => "V — validate pending users\nEnters the user validation workflow.",
+        "pending" if is_aide => "PENDING — list users awaiting validation",
+        ".er" if is_aide => ".ER — edit current room\nEdit name, description, read-only flag, or min permission level.",
+        ".eu" if is_aide => ".EU <user> — edit a user's profile or permissions\nAides cannot promote to Sysop.",
+        "ban" if is_aide => "BAN <user> — ban a user account",
 
         // ── Sysop+ only ──────────────────────────────────────────────────
-        "unban" if is_sysop => "UNBAN <user> — Lift a ban.",
-        ".c" if is_sysop => ".C <name> — Create a new room.",
-        ".dr" if is_sysop => ".DR <name> — Delete a room.",
+        "unban" if is_sysop => "UNBAN <user> — lift a ban",
+        ".c" if is_sysop => ".C — create a new room\nEnters the room creation workflow.",
+        ".dr" if is_sysop => ".DR <name> — delete a room",
 
         other => return format!("No help for '{other}'. H for menu."),
     };
@@ -2221,22 +2229,33 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
 }
 
 const HELP_QUICK_ANON: &str = "\
-REGISTER <user>  LOGIN <user>\n\
-Q quit           H help";
+REGISTER <user>  create an account\n\
+LOGIN <user>     log in to your account\n\
+Q  quit\n\
+H  help";
 
 const HELP_QUICK_LOGGED_IN: &str = "\
-K rooms  C change  N new\n\
-E enter  G unread  M mail\n\
-Q quit   W online  ?=help\n\
-H all | H <key> for more";
+Quick start:\n\
+ K  list known rooms\n\
+ C  change room\n\
+ N  read new messages\n\
+ E  enter a message\n\
+ G  next unread room\n\
+ M  go to Mail\n\
+H all  H <key> for more";
 
-const HELP_READING_POSTING: &str = "\
+const HELP_READING: &str = "\
 Reading:\n\
- F  oldest first  N  new\n\
- R  newest first  S  scan\n\
- .FF  skip to latest\n\
+ N    read new messages\n\
+ F    forward-read (oldest first)\n\
+ R    reverse-read (newest first)\n\
+ S    scan message headers\n\
+ .FF  fast-forward past unread";
+
+const HELP_POSTING: &str = "\
 Posting:\n\
- D  delete  E  enter";
+ D    delete a message\n\
+ E    enter a message";
 
 const HELP_NAVIGATION: &str = "\
 Navigation:\n\
@@ -2257,17 +2276,17 @@ Account:\n\
 
 const HELP_AIDE: &str = "\
 Aide:\n\
- .ER   edit current room\n\
- .EU   edit a user\n\
- BAN   ban a user\n\
+ .ER     edit current room\n\
+ .EU     edit a user\n\
+ BAN     ban a user\n\
  PENDING  pending users\n\
- V     validate a user";
+ V       validate pending users";
 
 const HELP_SYSOP: &str = "\
 Sysop:\n\
- .C    create a room\n\
+ .C    create a new room\n\
  .DR   delete a room\n\
- UNBAN lift a ban";
+ UNBAN  lift a ban";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
