@@ -85,6 +85,26 @@ enum Commands {
 
     /// Trigger an immediate database backup.
     Backup,
+
+    /// Manage user accounts.
+    User {
+        #[command(subcommand)]
+        action: UserAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum UserAction {
+    /// Promote a user to Sysop (permission level 100).
+    Promote {
+        /// BBS username to promote.
+        username: String,
+    },
+    /// Demote a user back to regular User (permission level 10).
+    Demote {
+        /// BBS username to demote.
+        username: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -111,6 +131,7 @@ async fn main() {
         Some(Commands::Config { action }) => cmd_config(config_path.as_deref(), action),
         Some(Commands::Migrate) => cmd_migrate(&cli),
         Some(Commands::Backup) => cmd_backup(&cli),
+        Some(Commands::User { action }) => cmd_user(config_path.as_deref(), action).await,
     }
 }
 
@@ -401,6 +422,52 @@ fn cmd_backup(_cli: &Cli) {
     // TODO: open database, trigger VACUUM INTO backup.
     eprintln!("error: backup not yet implemented.");
     std::process::exit(1);
+}
+
+async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
+    let cfg = match config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error loading config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let db_path = cfg
+        .database
+        .path
+        .as_ref()
+        .expect("database.path set by resolve()");
+
+    let db = match Database::open(&db_path.to_string_lossy()).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error opening database: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
+
+    let (username, new_level, label) = match action {
+        UserAction::Promote { username } => (username, 100u8, "sysop"),
+        UserAction::Demote { username } => (username, 10u8, "user"),
+    };
+
+    match host
+        .admin_update_user(&username, None, Some(new_level))
+        .await
+    {
+        Ok(()) => println!("{username} promoted to {label} (level {new_level})"),
+        Err(bbs_plugin_api::HostError::NotFound(_)) => {
+            eprintln!("error: user '{username}' not found");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 // ── Tracing init ──────────────────────────────────────────────────────────────
