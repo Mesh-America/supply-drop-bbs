@@ -86,6 +86,17 @@ impl Bridge {
         let app_start = self.recv_n(5).await;
         assert_eq!(app_start[3], CMD_APP_START, "expected CMD_APP_START");
         self.send(&self_info_frame(name)).await;
+        // Transport immediately drains the queue on connect: read the
+        // SyncNextMessage it sends and reply with NoMoreMessages so the
+        // draining flag clears before tests send real commands.
+        let drain_cmd = self.read_command().await;
+        assert_eq!(
+            drain_cmd[0], CMD_SYNC_NEXT_MESSAGE,
+            "expected initial SyncNextMessage drain"
+        );
+        let no_more = radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]);
+        self.send(&no_more).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     /// Read one outbound frame payload (strips the 3-byte wire header).

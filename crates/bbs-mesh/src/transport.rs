@@ -25,6 +25,7 @@
 //! [`ClientEvent`]s; `notify()` is the sole producer of outbound commands
 //! from the `MeshTransport` side.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -86,6 +87,9 @@ pub struct MeshTransport {
     command_prefix: Option<char>,
     /// Greeting sent to a node the first time it contacts the BBS.
     welcome_message: String,
+    /// Set to `true` while draining stale queued messages on (re)connect.
+    /// Cleared when the bridge signals `NoMoreMessages`.
+    draining: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -155,6 +159,7 @@ impl Plugin for MeshTransport {
             shutdown_tx,
             command_prefix: config.command_prefix,
             welcome_message: config.welcome_message,
+            draining: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -237,6 +242,7 @@ impl Plugin for MeshTransport {
             }
         });
 
+        let draining = Arc::clone(&self.draining);
         tokio::spawn(event_loop(
             client,
             host,
@@ -245,6 +251,7 @@ impl Plugin for MeshTransport {
             shutdown_rx,
             prefix,
             welcome,
+            draining,
         ));
 
         info!("mesh transport started");
@@ -393,6 +400,7 @@ async fn push_domain_notification(
 /// Background task: receive [`ClientEvent`]s and dispatch them.
 ///
 /// Runs until the shutdown watch fires or the companion client channel closes.
+#[allow(clippy::too_many_arguments)]
 async fn event_loop(
     mut client: CompanionClient,
     host: Arc<dyn Host>,
@@ -401,6 +409,7 @@ async fn event_loop(
     mut shutdown_rx: watch::Receiver<bool>,
     command_prefix: Option<char>,
     welcome_message: String,
+    draining: Arc<AtomicBool>,
 ) {
     loop {
         tokio::select! {
@@ -414,8 +423,12 @@ async fn event_loop(
                         info!(
                             node = %self_info.node_name,
                             freq_khz = self_info.frequency_khz,
-                            "mesh: radio bridge connected"
+                            "mesh: radio bridge connected — draining stale queue"
                         );
+                        // Drain any messages that queued while we were offline so
+                        // they don't corrupt in-progress workflows.
+                        draining.store(true, Ordering::Relaxed);
+                        let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
                         if will_retry {
@@ -426,7 +439,7 @@ async fn event_loop(
                         }
                     }
                     Some(ClientEvent::Frame(frame)) => {
-                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message).await;
+                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, &draining).await;
                     }
                 }
             }
@@ -446,12 +459,31 @@ async fn handle_frame(
     state: &Arc<Mutex<SessionState>>,
     command_prefix: Option<char>,
     welcome_message: &str,
+    draining: &Arc<AtomicBool>,
 ) {
     use meshcore_companion::frame::InboundFrame;
 
     match frame {
+        // ── Drain complete ────────────────────────────────────────────────────
+        // Bridge has no more queued messages; resume normal processing.
+        InboundFrame::NoMoreMessages if draining.load(Ordering::Relaxed) => {
+            draining.store(false, Ordering::Relaxed);
+            info!("mesh: stale queue drained — resuming normal processing");
+        }
+
         // ── Direct text messages (v1/v2 and v3 with SNR) ─────────────────────
         InboundFrame::ContactMsgRecv(msg) | InboundFrame::ContactMsgRecvV3(msg) => {
+            // While draining, discard queued messages and request the next one
+            // so we flush the entire backlog before serving live traffic.
+            if draining.load(Ordering::Relaxed) {
+                debug!(
+                    "mesh: discarding stale queued message from {}",
+                    msg.sender_key_prefix[0]
+                );
+                let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
+                return;
+            }
+
             // Only handle plain-text messages; CLI data and signed frames are
             // not BBS commands.
             if msg.txt_type != meshcore_companion::constants::TXT_TYPE_PLAIN {
