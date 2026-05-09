@@ -6,7 +6,8 @@
 //! 2. Configuring the connection (port selection or address entry)
 //! 3. Setting BBS identity (name, data directory)
 //! 4. Writing a `config.toml`
-//! 5. Printing platform-specific next steps (group membership, systemd)
+//! 5. For Pi HAT: prompting region + HAT model and writing `pymc-companion.yaml`
+//! 6. Printing platform-specific next steps (group membership, systemd)
 //!
 //! Entry point: [`run_wizard`].
 
@@ -18,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -59,9 +60,6 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // ── Data storage ──────────────────────────────────────────────────────────
     section("Data storage");
 
-    // On Linux the BBS runs as a system service user, so /var/lib is always
-    // correct regardless of who runs the wizard. On macOS/Windows a personal
-    // install into the user's data dir makes more sense.
     let default_data_dir = if cfg!(target_os = "linux") {
         PathBuf::from("/var/lib/supply-drop-bbs")
     } else {
@@ -81,9 +79,9 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // ── Web admin ─────────────────────────────────────────────────────────────
     section("Web admin UI");
 
-    println!("The web admin is a browser-based dashboard for monitoring adverts,");
-    println!("live logs, and sending adverts. You can enable or disable it at any");
-    println!("time by re-running 'supply-drop-bbs setup' or editing config.toml.");
+    println!("The web admin is a browser-based dashboard for managing users,");
+    println!("rooms, messages, backups, and live logs. Log in with any BBS");
+    println!("account that has Aide or Sysop permission.");
     println!();
 
     let web_enabled = Confirm::with_theme(&theme)
@@ -92,33 +90,24 @@ pub fn run_wizard(config_out: Option<&Path>) {
         .interact()
         .unwrap_or_else(|_| cancelled());
 
-    let (admin_password, web_bind) = if web_enabled {
+    let web_bind = if web_enabled {
         println!();
-
-        let pw = loop {
-            let pw: String = Password::with_theme(&theme)
-                .with_prompt("Admin password")
-                .with_confirmation("Confirm password", "Passwords do not match — try again")
-                .interact()
-                .unwrap_or_else(|_| cancelled());
-
-            if pw.len() < 8 {
-                println!("  Password must be at least 8 characters — try again.");
-                continue;
-            }
-            break pw;
-        };
-
         let bind: String = Input::with_theme(&theme)
             .with_prompt("Web admin bind address")
             .default("0.0.0.0:8080".into())
             .interact_text()
             .unwrap_or_else(|_| cancelled());
-
-        (Some(pw), Some(bind))
+        Some(bind)
     } else {
         println!("  Web admin disabled — you can enable it later by re-running setup.");
-        (None, None)
+        None
+    };
+
+    // ── Pi HAT: region + model ────────────────────────────────────────────────
+    let hat_params = if connection_type == "hat" {
+        Some(configure_hat(&theme, &bbs_name, &data_dir))
+    } else {
+        None
     };
 
     // ── Confirm & write ───────────────────────────────────────────────────────
@@ -129,6 +118,10 @@ pub fn run_wizard(config_out: Option<&Path>) {
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
     println!("\nConfig will be written to: {}", out_path.display());
+    if hat_params.is_some() {
+        let yaml_path = companion_yaml_path(&out_path);
+        println!("HAT config will be written to: {}", yaml_path.display());
+    }
     println!("(Run 'supply-drop-bbs config show' afterwards to see all effective values.)\n");
 
     let confirmed = Confirm::with_theme(&theme)
@@ -149,7 +142,6 @@ pub fn run_wizard(config_out: Option<&Path>) {
         serial_port: serial_port.as_deref(),
         baud_rate,
         web_enabled,
-        admin_password: admin_password.as_deref(),
         web_bind: web_bind.as_deref(),
     });
 
@@ -172,6 +164,17 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     println!("\nConfig written to {}.", out_path.display());
 
+    // Write pymc-companion.yaml if HAT was chosen.
+    if let Some(ref hat) = hat_params {
+        let yaml_path = companion_yaml_path(&out_path);
+        let yaml = build_companion_yaml(hat);
+        if let Err(e) = fs::write(&yaml_path, &yaml) {
+            eprintln!("error: could not write {}: {e}", yaml_path.display());
+            std::process::exit(1);
+        }
+        println!("HAT config written to {}.", yaml_path.display());
+    }
+
     // ── Next steps ────────────────────────────────────────────────────────────
     section("Next steps");
     print_next_steps(connection_type, serial_port.as_deref(), web_bind.as_deref());
@@ -179,9 +182,6 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
 // ── Connection type configuration ─────────────────────────────────────────────
 
-/// USB / serial flow: list ports, let operator pick one, ask baud rate.
-///
-/// Returns `(connection_type, serial_port, baud_rate)`.
 fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Option<u32>) {
     let ports = list_serial_ports();
 
@@ -194,7 +194,6 @@ fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Opt
             .unwrap_or_else(|_| cancelled());
         path
     } else {
-        // Build display strings for the menu.
         let mut items: Vec<String> = ports
             .iter()
             .map(|p| {
@@ -210,7 +209,6 @@ fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Opt
         let choice = prompt_select(theme, "Select serial port", &items, 0);
 
         if choice == ports.len() {
-            // "Enter manually" chosen.
             Input::with_theme(theme)
                 .with_prompt("Serial port path")
                 .interact_text()
@@ -238,12 +236,430 @@ fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Opt
     ("serial", Some(serial_port), Some(baud))
 }
 
+// ── Pi HAT configuration ──────────────────────────────────────────────────────
+
+struct HatPreset {
+    name: &'static str,
+    bus: i32,
+    cs: i32,
+    reset: i32,
+    busy: i32,
+    irq: i32,
+    txen: i32,
+    rxen: i32,
+    dio2: bool,
+    dio3: bool,
+    power: i32,
+    gpiod: bool,
+    gpio_chip: i32,
+    en_pin: Option<i32>,
+    cs_id: Option<i32>,
+    tx_led: Option<i32>,
+    rx_led: Option<i32>,
+}
+
+const HAT_PRESETS: &[HatPreset] = &[
+    HatPreset {
+        name: "ZebraHat 1W",
+        bus: 0,
+        cs: 24,
+        reset: 17,
+        busy: 27,
+        irq: 22,
+        txen: -1,
+        rxen: -1,
+        dio2: true,
+        dio3: true,
+        power: 18,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "Waveshare SX1262 LoRa HAT",
+        bus: 0,
+        cs: 21,
+        reset: 18,
+        busy: 20,
+        irq: 16,
+        txen: 13,
+        rxen: 12,
+        dio2: false,
+        dio3: false,
+        power: 22,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "PiMesh-1W (V1)",
+        bus: 0,
+        cs: 21,
+        reset: 18,
+        busy: 20,
+        irq: 16,
+        txen: 13,
+        rxen: 12,
+        dio2: false,
+        dio3: true,
+        power: 22,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "PiMesh-1W (V2)",
+        bus: 0,
+        cs: -1,
+        reset: 18,
+        busy: 5,
+        irq: 6,
+        txen: -1,
+        rxen: -1,
+        dio2: true,
+        dio3: true,
+        power: 22,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: Some(26),
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "MeshAdv Mini",
+        bus: 0,
+        cs: 8,
+        reset: 24,
+        busy: 20,
+        irq: 16,
+        txen: -1,
+        rxen: 12,
+        dio2: false,
+        dio3: false,
+        power: 22,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "MeshAdv",
+        bus: 0,
+        cs: 21,
+        reset: 18,
+        busy: 20,
+        irq: 16,
+        txen: 13,
+        rxen: 12,
+        dio2: false,
+        dio3: true,
+        power: 22,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "FemtoFox SX1262 1W",
+        bus: 0,
+        cs: 16,
+        reset: 25,
+        busy: 22,
+        irq: 23,
+        txen: -1,
+        rxen: 24,
+        dio2: false,
+        dio3: true,
+        power: 30,
+        gpiod: true,
+        gpio_chip: 1,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "FemtoFox SX1262 2W",
+        bus: 0,
+        cs: 16,
+        reset: 25,
+        busy: 22,
+        irq: 23,
+        txen: -1,
+        rxen: 24,
+        dio2: true,
+        dio3: true,
+        power: 8,
+        gpiod: true,
+        gpio_chip: 1,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "NebraHat 2W",
+        bus: 0,
+        cs: 8,
+        reset: 18,
+        busy: 4,
+        irq: 22,
+        txen: -1,
+        rxen: 25,
+        dio2: true,
+        dio3: true,
+        power: 8,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "RAK6421 + RAK13300x  (Slot 1)",
+        bus: 0,
+        cs: -1,
+        reset: 16,
+        busy: 24,
+        irq: 22,
+        txen: -1,
+        rxen: -1,
+        dio2: true,
+        dio3: true,
+        power: 22,
+        gpiod: true,
+        gpio_chip: 1,
+        en_pin: Some(12),
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "RAK6421 + RAK13300x  (Slot 2)",
+        bus: 0,
+        cs: -1,
+        reset: 24,
+        busy: 19,
+        irq: 18,
+        txen: -1,
+        rxen: -1,
+        dio2: true,
+        dio3: true,
+        power: 22,
+        gpiod: true,
+        gpio_chip: 1,
+        en_pin: Some(26),
+        cs_id: Some(1),
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "Zindello UltraPeater E22",
+        bus: 0,
+        cs: 16,
+        reset: 22,
+        busy: 11,
+        irq: 10,
+        txen: 20,
+        rxen: 21,
+        dio2: false,
+        dio3: true,
+        power: 22,
+        gpiod: true,
+        gpio_chip: 1,
+        en_pin: None,
+        cs_id: None,
+        tx_led: Some(8),
+        rx_led: Some(1),
+    },
+    HatPreset {
+        name: "Zindello UltraPeater E22P",
+        bus: 0,
+        cs: 16,
+        reset: 22,
+        busy: 11,
+        irq: 10,
+        txen: 20,
+        rxen: -1,
+        dio2: false,
+        dio3: true,
+        power: 22,
+        gpiod: true,
+        gpio_chip: 1,
+        en_pin: Some(21),
+        cs_id: None,
+        tx_led: Some(8),
+        rx_led: Some(1),
+    },
+    HatPreset {
+        name: "uConsole LoRa Module v1",
+        bus: 1,
+        cs: -1,
+        reset: 25,
+        busy: 24,
+        irq: 26,
+        txen: -1,
+        rxen: -1,
+        dio2: false,
+        dio3: false,
+        power: 22,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+    HatPreset {
+        name: "uConsole LoRa Module v2",
+        bus: 1,
+        cs: -1,
+        reset: 25,
+        busy: 24,
+        irq: 26,
+        txen: -1,
+        rxen: -1,
+        dio2: true,
+        dio3: true,
+        power: 22,
+        gpiod: false,
+        gpio_chip: 0,
+        en_pin: None,
+        cs_id: None,
+        tx_led: None,
+        rx_led: None,
+    },
+];
+
+struct HatParams {
+    bbs_name: String,
+    identity_path: String,
+    frequency_hz: u64,
+    preset: usize,
+}
+
+fn configure_hat(theme: &ColorfulTheme, bbs_name: &str, data_dir: &Path) -> HatParams {
+    section("Pi HAT — region");
+
+    let region_items = &[
+        "United States  (910.525 MHz)",
+        "Europe         (869.618 MHz)",
+        "Enter frequency manually",
+    ];
+
+    let region_choice = prompt_select(theme, "Select your region", region_items, 0);
+
+    let frequency_hz: u64 = match region_choice {
+        1 => 869_618_000,
+        2 => {
+            let hz_str: String = Input::with_theme(theme)
+                .with_prompt("Frequency in Hz (e.g. 910525000)")
+                .default("910525000".into())
+                .validate_with(|s: &String| -> Result<(), &str> {
+                    if s.parse::<u64>().is_ok() {
+                        Ok(())
+                    } else {
+                        Err("must be a positive integer")
+                    }
+                })
+                .interact_text()
+                .unwrap_or_else(|_| cancelled());
+            hz_str.parse().expect("validated above")
+        }
+        _ => 910_525_000,
+    };
+
+    section("Pi HAT — model");
+
+    let hat_names: Vec<&str> = HAT_PRESETS.iter().map(|h| h.name).collect();
+    let hat_choice = prompt_select(theme, "Select your Pi HAT", &hat_names, 0);
+
+    HatParams {
+        bbs_name: bbs_name.to_owned(),
+        identity_path: data_dir
+            .join("companion.key")
+            .to_string_lossy()
+            .into_owned(),
+        frequency_hz,
+        preset: hat_choice,
+    }
+}
+
+fn companion_yaml_path(config_out: &Path) -> PathBuf {
+    config_out
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("pymc-companion.yaml")
+}
+
+fn build_companion_yaml(p: &HatParams) -> String {
+    let h = &HAT_PRESETS[p.preset];
+    let mut s = String::new();
+
+    writeln!(s, "# pymc-companion configuration").unwrap();
+    writeln!(s, "# Generated by: supply-drop-bbs setup").unwrap();
+    writeln!(s).unwrap();
+    writeln!(s, "companion:").unwrap();
+    writeln!(s, "  node_name: {:?}", p.bbs_name).unwrap();
+    writeln!(s, "  identity_path: {:?}", p.identity_path).unwrap();
+    writeln!(s, "  tcp_port: 5000").unwrap();
+    writeln!(s, "  bind_address: \"127.0.0.1\"").unwrap();
+    writeln!(s, "  autoadd_config: 0x0F").unwrap();
+    writeln!(s).unwrap();
+    writeln!(s, "radio:").unwrap();
+    writeln!(s, "  frequency: {}", p.frequency_hz).unwrap();
+    writeln!(s, "  bandwidth: 62500").unwrap();
+    writeln!(s, "  spreading_factor: 7").unwrap();
+    writeln!(s, "  coding_rate: 5").unwrap();
+    writeln!(s, "  tx_power: {}", h.power).unwrap();
+    writeln!(s, "  preamble_length: 17").unwrap();
+    writeln!(s, "  sync_word: 0x3444").unwrap();
+    writeln!(s, "  bus_id: {}", h.bus).unwrap();
+    writeln!(s, "  cs_pin: {}", h.cs).unwrap();
+    writeln!(s, "  reset_pin: {}", h.reset).unwrap();
+    writeln!(s, "  busy_pin: {}", h.busy).unwrap();
+    writeln!(s, "  irq_pin: {}", h.irq).unwrap();
+    writeln!(s, "  txen_pin: {}", h.txen).unwrap();
+    writeln!(s, "  rxen_pin: {}", h.rxen).unwrap();
+    writeln!(s, "  use_dio2_rf: {}", h.dio2).unwrap();
+    writeln!(s, "  use_dio3_tcxo: {}", h.dio3).unwrap();
+    if h.gpiod {
+        writeln!(s, "  use_gpiod_backend: true").unwrap();
+        writeln!(s, "  gpio_chip: {}", h.gpio_chip).unwrap();
+    }
+    if let Some(v) = h.en_pin {
+        writeln!(s, "  en_pin: {v}").unwrap();
+    }
+    if let Some(v) = h.cs_id {
+        writeln!(s, "  cs_id: {v}").unwrap();
+    }
+    if let Some(v) = h.tx_led {
+        writeln!(s, "  tx_led: {v}").unwrap();
+    }
+    if let Some(v) = h.rx_led {
+        writeln!(s, "  rx_led: {v}").unwrap();
+    }
+
+    s
+}
+
 // ── TOML builder ──────────────────────────────────────────────────────────────
 
-/// Build a minimal TOML config string from wizard answers.
-///
-/// Only non-default values are written.  Operators can run
-/// `supply-drop-bbs config show` to see all effective values.
 struct TomlParams<'a> {
     bbs_name: &'a str,
     data_dir: &'a Path,
@@ -251,7 +667,6 @@ struct TomlParams<'a> {
     serial_port: Option<&'a str>,
     baud_rate: Option<u32>,
     web_enabled: bool,
-    admin_password: Option<&'a str>,
     web_bind: Option<&'a str>,
 }
 
@@ -292,7 +707,7 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 }
             }
         }
-        "hat" => {} // pymc-companion always runs on 127.0.0.1:5000
+        "hat" => {}
         _ => {}
     }
 
@@ -300,9 +715,6 @@ fn build_toml(p: &TomlParams<'_>) -> String {
     writeln!(s, "\n[plugins.web]").unwrap();
     writeln!(s, "enabled = {}", p.web_enabled).unwrap();
     if p.web_enabled {
-        if let Some(pw) = p.admin_password {
-            writeln!(s, "admin_password = {}", toml_str(pw)).unwrap();
-        }
         if let Some(bind) = p.web_bind {
             if bind != "127.0.0.1:8080" {
                 writeln!(s, "bind = {}", toml_str(bind)).unwrap();
@@ -314,10 +726,7 @@ fn build_toml(p: &TomlParams<'_>) -> String {
     s
 }
 
-/// TOML-quote a string value (using basic double-quoted strings).
 fn toml_str(s: &str) -> String {
-    // Escape backslashes and double-quotes; everything else is printable ASCII
-    // or valid UTF-8 which TOML accepts verbatim in a basic string.
     let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
@@ -366,7 +775,6 @@ fn list_serial_ports() -> Vec<PortInfo> {
 // ── Next steps ────────────────────────────────────────────────────────────────
 
 fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: Option<&str>) {
-    // Serial-specific: dialout group on Linux.
     if connection_type == "serial" && cfg!(target_os = "linux") {
         println!("To allow Supply Drop BBS to access the serial port, your user must");
         println!("be in the 'dialout' group:");
@@ -382,11 +790,9 @@ fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: 
         }
     }
 
-    // systemd (Linux).
     if cfg!(target_os = "linux") {
         println!("To run Supply Drop BBS as a systemd service:");
         println!();
-        println!("  # Copy or install the unit file:");
         println!("  sudo install -m 644 supply-drop-bbs.service /etc/systemd/system/");
         println!("  sudo systemctl daemon-reload");
         println!("  sudo systemctl enable --now supply-drop-bbs");
@@ -400,7 +806,6 @@ fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: 
         println!("  supply-drop-bbs run");
     }
 
-    // Web admin URL hint.
     if let Some(bind) = web_bind {
         let display_bind = if bind.starts_with("0.0.0.0") {
             bind.replacen("0.0.0.0", "<your-pi-ip>", 1)
@@ -411,12 +816,10 @@ fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: 
         println!();
         println!("  http://{display_bind}");
         println!();
-    } else {
-        println!("Web admin is disabled. To enable it later, run:");
-        println!();
-        println!("  supply-drop-bbs setup");
-        println!();
+        println!("Log in with any BBS account that has Aide or Sysop permission.");
+        println!("To promote an account: supply-drop-bbs user promote <username>");
     }
+    println!();
     println!("Setup complete!");
 }
 
@@ -439,9 +842,6 @@ fn section(title: &str) {
     println!();
 }
 
-/// Show a `Select` prompt and return the chosen index.
-///
-/// Accepts a slice of anything that implements `ToString`.
 fn prompt_select<S: ToString>(
     theme: &ColorfulTheme,
     prompt: &str,
@@ -456,7 +856,6 @@ fn prompt_select<S: ToString>(
         .unwrap_or_else(|_| cancelled())
 }
 
-/// Called when a dialoguer prompt is interrupted (Ctrl-C or I/O error).
 fn cancelled() -> ! {
     println!("\nSetup cancelled.");
     std::process::exit(0);
