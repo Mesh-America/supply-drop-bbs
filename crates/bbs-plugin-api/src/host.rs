@@ -25,8 +25,8 @@
 use std::sync::Arc;
 
 use crate::admin::{
-    AdminBackupRecord, AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo,
-    AdminStats, AdminUserInfo,
+    AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports, AdminRoomSummary,
+    AdminSessionInfo, AdminStats, AdminUserInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -233,6 +233,40 @@ pub trait Host: Send + Sync {
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
         let _ = (backup_dir, filename);
         Err(HostError::NotSupported("admin_delete_backup".into()))
+    }
+
+    // ── Audit log ────────────────────────────────────────────────────────────────
+
+    /// Append one entry to the durable audit log.
+    ///
+    /// Called by the host after every privileged action (via command path) and
+    /// by the web plugin after admin UI actions (with `actor = "web:<username>"`).
+    ///
+    /// Failures are logged but not propagated — audit writes must not block or
+    /// fail the action they are recording.
+    async fn admin_write_audit(
+        &self,
+        actor: &str,
+        action: &str,
+        target: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<(), HostError> {
+        let _ = (actor, action, target, detail);
+        Err(HostError::NotSupported("admin_write_audit".into()))
+    }
+
+    /// Return paginated audit log entries, newest first.
+    ///
+    /// `action_filter`: when `Some`, only entries with that `action` value are
+    /// returned.  `limit` caps the result count; `offset` skips that many rows.
+    async fn admin_audit_log(
+        &self,
+        limit: u32,
+        offset: u32,
+        action_filter: Option<&str>,
+    ) -> Result<Vec<AdminAuditEntry>, HostError> {
+        let _ = (limit, offset, action_filter);
+        Err(HostError::NotSupported("admin_audit_log".into()))
     }
 
     // ── Mesh node credentials ────────────────────────────────────────────────────

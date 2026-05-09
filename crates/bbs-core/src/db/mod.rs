@@ -9,6 +9,7 @@
 //! single handle for all persistence operations.
 
 mod admin_queries;
+mod audit_store;
 mod block_store;
 mod credential_store;
 mod error;

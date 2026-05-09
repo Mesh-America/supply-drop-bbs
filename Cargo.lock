@@ -246,7 +246,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bbs-cli"
-version = "0.1.0-alpha.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bbs-plugin-api",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-core"
-version = "0.1.0-alpha.0"
+version = "0.2.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-mesh"
-version = "0.1.0-alpha.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bbs-core",
@@ -291,7 +291,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-plugin-api"
-version = "0.1.0-alpha.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-web"
-version = "0.1.0-alpha.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1371,7 +1371,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "meshcore-companion"
-version = "0.1.0-alpha.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "thiserror 1.0.69",
@@ -2424,7 +2424,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supply-drop-bbs"
-version = "0.1.0-alpha.0"
+version = "0.2.0"
 dependencies = [
  "bbs-cli",
  "bbs-core",

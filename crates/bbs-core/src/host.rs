@@ -600,6 +600,31 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    async fn admin_write_audit(
+        &self,
+        actor: &str,
+        action: &str,
+        target: Option<&str>,
+        detail: Option<&str>,
+    ) -> Result<(), HostError> {
+        self.db
+            .audit_write(actor, action, target, detail)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_audit_log(
+        &self,
+        limit: u32,
+        offset: u32,
+        action_filter: Option<&str>,
+    ) -> Result<Vec<bbs_plugin_api::AdminAuditEntry>, HostError> {
+        self.db
+            .audit_query(limit, offset, action_filter)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
     async fn mesh_node_restore(
         &self,
         session: SessionId,
@@ -1785,6 +1810,23 @@ impl BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
+        // Audit when a privileged user moderates someone else's content.
+        if level >= PermissionLevel::Aide && msg.sender != username {
+            let detail = format!("by {}", msg.sender.as_str());
+            if let Err(e) = self
+                .db
+                .audit_write(
+                    username.as_str(),
+                    "delete_message",
+                    Some(&format!("#{id}")),
+                    Some(&detail),
+                )
+                .await
+            {
+                tracing::warn!("audit write failed: {e}");
+            }
+        }
+
         Ok(Response::Text(format!("Message #{id} deleted.")))
     }
 
@@ -1931,6 +1973,14 @@ impl BbsHost {
             }
         }
 
+        if let Err(e) = self
+            .db
+            .audit_write(actor.as_str(), "validate", Some(username.as_str()), None)
+            .await
+        {
+            tracing::warn!("audit write failed: {e}");
+        }
+
         let _ = self.events_tx.send(DomainEvent::UserValidated {
             user: username.clone(),
         });
@@ -2075,6 +2125,14 @@ impl BbsHost {
             }
         }
 
+        if let Err(e) = self
+            .db
+            .audit_write(actor.as_str(), "ban", Some(username.as_str()), None)
+            .await
+        {
+            tracing::warn!("audit write failed: {e}");
+        }
+
         warn!(%actor, %username, "user banned");
         Ok(Response::Text(format!(
             "'{}' has been banned.",
@@ -2125,6 +2183,14 @@ impl BbsHost {
         )
         .await
         .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        if let Err(e) = self
+            .db
+            .audit_write(actor.as_str(), "unban", Some(username.as_str()), None)
+            .await
+        {
+            tracing::warn!("audit write failed: {e}");
+        }
 
         info!(%actor, %username, "user unbanned");
         Ok(Response::Text(format!(
@@ -2193,6 +2259,14 @@ impl BbsHost {
         .await
         .map_err(|e| HostError::Storage(format!("create room: {e}")))?;
 
+        if let Err(e) = self
+            .db
+            .audit_write(actor.as_str(), "create_room", Some(name), None)
+            .await
+        {
+            tracing::warn!("audit write failed: {e}");
+        }
+
         info!(%actor, %name, room = room_id.as_i64(), "room created");
         Ok(Response::Text(format!(
             "Room '{}' created (id={}).",
@@ -2236,6 +2310,14 @@ impl BbsHost {
         RoomStore::delete(&self.db, room.id)
             .await
             .map_err(|e| HostError::Storage(format!("delete room: {e}")))?;
+
+        if let Err(e) = self
+            .db
+            .audit_write(actor.as_str(), "delete_room", Some(name), None)
+            .await
+        {
+            tracing::warn!("audit write failed: {e}");
+        }
 
         info!(%actor, %name, "room deleted");
         Ok(Response::Text(format!("Room '{name}' deleted.")))

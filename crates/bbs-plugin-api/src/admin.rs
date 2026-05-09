@@ -162,3 +162,31 @@ pub struct AdminBackupRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_size_bytes: Option<u64>,
 }
+
+/// One entry in the durable audit log.
+///
+/// Written whenever a privileged action is performed: ban, unban, validate,
+/// delete message, create/delete room, or change a user's permission level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAuditEntry {
+    /// Stable auto-increment row ID.
+    pub id: i64,
+    /// Who performed the action.
+    ///
+    /// - BBS username for actions taken via a mesh/CLI session.
+    /// - `"web:<username>"` for actions taken through the admin web UI.
+    /// - `"system"` for host-initiated events.
+    pub actor: String,
+    /// Short action label.
+    ///
+    /// One of: `ban`, `unban`, `validate`, `delete_message`,
+    /// `create_room`, `delete_room`, `set_permission`.
+    pub action: String,
+    /// What was acted on: a username, `"#<id>"` for a message, or a room
+    /// name. `None` when the action has no single target.
+    pub target: Option<String>,
+    /// Optional free-form context (e.g. `"level 10 -> 100"`).
+    pub detail: Option<String>,
+    /// ISO-8601 UTC timestamp when the action was recorded.
+    pub created_at: String,
+}

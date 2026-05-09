@@ -69,6 +69,7 @@ const groups = [
       { to: '/reports', label: 'reports' },
       { to: '/backups', label: 'backups' },
       { to: '/logs', label: 'logs' },
+      { to: '/audit', label: 'audit' },
     ],
   },
 ]

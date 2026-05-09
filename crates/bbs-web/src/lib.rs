@@ -24,6 +24,7 @@
 //! │  │  DELETE /api/v1/rooms/:id          (auth)       │    │
 //! │  │  GET  /api/v1/rooms/:id/messages   (auth)       │    │
 //! │  │  DELETE /api/v1/messages/:id       (auth)       │    │
+//! │  │  GET  /api/v1/audit-log            (auth)       │    │
 //! │  │  GET  /api/v1/stats                (auth)       │    │
 //! │  │  GET  /api/v1/settings             (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
@@ -413,6 +414,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/rooms/:id", delete(api_delete_room))
         .route("/rooms/:id/messages", get(api_list_messages))
         .route("/messages/:id", delete(api_delete_message))
+        .route("/audit-log", get(api_audit_log))
         .route("/stats", get(api_stats))
         .route("/reports", get(api_reports))
         .route("/settings", get(api_settings))
@@ -721,7 +723,35 @@ async fn api_update_user(
         .admin_update_user(&username, body.status, body.permission_level)
         .await
     {
-        Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(()) => {
+            let actor_str = format!("web:{}", caller.username);
+            if let Some(s) = body.status {
+                let action = if s == 1 { "ban" } else { "unban" };
+                if let Err(e) = state
+                    .host
+                    .admin_write_audit(&actor_str, action, Some(username.as_str()), None)
+                    .await
+                {
+                    warn!("audit write failed: {e}");
+                }
+            }
+            if let Some(lvl) = body.permission_level {
+                let detail = format!("level -> {lvl}");
+                if let Err(e) = state
+                    .host
+                    .admin_write_audit(
+                        &actor_str,
+                        "set_permission",
+                        Some(username.as_str()),
+                        Some(&detail),
+                    )
+                    .await
+                {
+                    warn!("audit write failed: {e}");
+                }
+            }
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
         Err(HostError::NotFound(_)) => {
             (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response()
         }
@@ -746,6 +776,7 @@ struct CreateRoomBody {
 
 async fn api_create_room(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
     Json(body): Json<CreateRoomBody>,
 ) -> Response {
     let name = body.name.trim();
@@ -768,14 +799,38 @@ async fn api_create_room(
         .admin_create_room(name, body.description.as_deref())
         .await
     {
-        Ok(room) => (StatusCode::CREATED, Json(room)).into_response(),
+        Ok(room) => {
+            let actor_str = format!("web:{}", caller.username);
+            if let Err(e) = state
+                .host
+                .admin_write_audit(&actor_str, "create_room", Some(name), None)
+                .await
+            {
+                warn!("audit write failed: {e}");
+            }
+            (StatusCode::CREATED, Json(room)).into_response()
+        }
         Err(e) => server_error(&e.to_string()),
     }
 }
 
-async fn api_delete_room(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+async fn api_delete_room(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(id): Path<i64>,
+) -> Response {
     match state.host.admin_delete_room(id).await {
-        Ok(true) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(true) => {
+            let actor_str = format!("web:{}", caller.username);
+            if let Err(e) = state
+                .host
+                .admin_write_audit(&actor_str, "delete_room", Some(&format!("id={id}")), None)
+                .await
+            {
+                warn!("audit write failed: {e}");
+            }
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json_error("room not found or protected")),
@@ -809,10 +864,49 @@ async fn api_list_messages(
     }
 }
 
-async fn api_delete_message(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
+async fn api_delete_message(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(id): Path<i64>,
+) -> Response {
     match state.host.admin_delete_message(id).await {
-        Ok(true) => Json(serde_json::json!({"ok": true})).into_response(),
+        Ok(true) => {
+            let actor_str = format!("web:{}", caller.username);
+            if let Err(e) = state
+                .host
+                .admin_write_audit(&actor_str, "delete_message", Some(&format!("#{id}")), None)
+                .await
+            {
+                warn!("audit write failed: {e}");
+            }
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
         Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("message not found"))).into_response(),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+// ── Audit log ─────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct AuditLogQuery {
+    #[serde(default = "default_page_size")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+    action: Option<String>,
+}
+
+async fn api_audit_log(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<AuditLogQuery>,
+) -> Response {
+    match state
+        .host
+        .admin_audit_log(q.limit, q.offset, q.action.as_deref())
+        .await
+    {
+        Ok(entries) => Json(entries).into_response(),
         Err(e) => server_error(&e.to_string()),
     }
 }
