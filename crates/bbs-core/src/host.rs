@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bbs_plugin_api::advert::AdvertBus;
@@ -112,6 +113,9 @@ pub struct BbsHost {
     sessions: RwLock<HashMap<SessionId, SessionRecord>>,
     next_id: AtomicU64,
     advert_bus: Arc<AdvertBus>,
+    /// Per-username login failure counts (failures, last_attempt).
+    /// Shared across all sessions so parallel sessions can't bypass rate limiting.
+    login_failures: tokio::sync::Mutex<HashMap<String, (u32, Instant)>>,
 }
 
 impl BbsHost {
@@ -124,6 +128,7 @@ impl BbsHost {
             sessions: RwLock::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             advert_bus: Arc::new(AdvertBus::new()),
+            login_failures: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 }
@@ -834,6 +839,8 @@ impl BbsHost {
                     .map_err(|e| HostError::Storage(format!("verify password: {e}")))?;
 
                 if ok {
+                    // Clear failure count on success.
+                    self.login_failures.lock().await.remove(username.as_str());
                     UserStore::update(&self.db, user.id, None, None, None, Some(Timestamp::now()))
                         .await
                         .map_err(|e| HostError::Storage(format!("update last_login: {e}")))?;
@@ -850,11 +857,28 @@ impl BbsHost {
                     info!(%session, %username, "login successful");
                     Ok(Response::LoggedIn { user: username })
                 } else {
-                    // Slow down brute-force attempts regardless of outcome.
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    // Global per-username failure tracking — parallel sessions share this
+                    // counter so they can't bypass the delay by opening fresh connections.
+                    let delay_secs = {
+                        let mut map = self.login_failures.lock().await;
+                        let entry = map
+                            .entry(username.as_str().to_owned())
+                            .or_insert((0, Instant::now()));
+                        // Stale entries (>10 min) reset the counter.
+                        if entry.1.elapsed().as_secs() > 600 {
+                            *entry = (0, Instant::now());
+                        }
+                        entry.0 += 1;
+                        entry.1 = Instant::now();
+                        let failures = entry.0;
+                        // Exponential backoff: 2, 4, 8, 16, 30 s (capped).
+                        u64::min(2u64.saturating_pow(failures), 30)
+                    };
+                    warn!(%session, %username, delay_secs, "login failed: wrong password");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+
                     let new_attempts = attempts + 1;
                     if new_attempts >= 3 {
-                        warn!(%session, %username, "login failed: too many attempts");
                         let mut sessions = self.sessions.write().await;
                         if let Some(r) = sessions.get_mut(&session) {
                             r.workflow = Workflow::None;
@@ -999,12 +1023,19 @@ impl BbsHost {
                     Err(r) => return Ok(r),
                 };
 
-                let display_name: Option<Option<&str>> = if reply.trim() == "-" {
+                let trimmed = reply.trim();
+                let display_name: Option<Option<&str>> = if trimmed == "-" {
                     Some(None) // clear display name
-                } else if reply.trim().is_empty() {
+                } else if trimmed.is_empty() {
                     None // no change
                 } else {
-                    Some(Some(reply.trim()))
+                    if let Err(e) = crate::user::User::validate_display_name(trimmed) {
+                        return Ok(Response::Prompt {
+                            text: format!("Invalid display name: {e}. Try again (- to clear):"),
+                            hide_input: false,
+                        });
+                    }
+                    Some(Some(trimmed))
                 };
 
                 if display_name.is_none() {
@@ -1520,9 +1551,14 @@ impl BbsHost {
         };
 
         // Message must be visible from the current room.
-        let in_room = MessageStore::is_in_room(&self.db, msg_id, room_id)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // DMs live in the Mail room; room messages require a room_messages join.
+        let in_room = if msg.recipient.is_some() {
+            room_id == MAIL_ROOM_ID
+        } else {
+            MessageStore::is_in_room(&self.db, msg_id, room_id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+        };
         if !in_room {
             return Ok(Response::Error(format!("Message #{id} not found.")));
         }
@@ -1654,12 +1690,7 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         let user = match user {
-            None => {
-                return Ok(Response::Error(format!(
-                    "User '{}' not found.",
-                    username.as_str()
-                )))
-            }
+            None => return Ok(Response::Error("User not found.".into())),
             Some(u) => u,
         };
 
@@ -1724,10 +1755,7 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .is_some();
         if !exists {
-            return Ok(Response::Error(format!(
-                "User '{}' not found.",
-                target.as_str()
-            )));
+            return Ok(Response::Error("User not found.".into()));
         }
 
         let blocker = caller.as_str();
@@ -1797,12 +1825,7 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         let user = match user {
-            None => {
-                return Ok(Response::Error(format!(
-                    "User '{}' not found.",
-                    username.as_str()
-                )))
-            }
+            None => return Ok(Response::Error("User not found.".into())),
             Some(u) => u,
         };
 
@@ -1873,12 +1896,7 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         let user = match user {
-            None => {
-                return Ok(Response::Error(format!(
-                    "User '{}' not found.",
-                    username.as_str()
-                )))
-            }
+            None => return Ok(Response::Error("User not found.".into())),
             Some(u) => u,
         };
 
