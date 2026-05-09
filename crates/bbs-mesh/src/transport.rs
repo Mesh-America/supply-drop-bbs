@@ -30,7 +30,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bbs_plugin_api::{
-    error::{PluginError, TransportError},
+    error::{HostError, PluginError, TransportError},
     event::{DomainEvent, Notification, NotifyOutcome},
     identity::SessionId,
     plugin::Plugin,
@@ -588,8 +588,36 @@ async fn dispatch_message(
     debug!(?session, ?cmd, "mesh: dispatching command");
 
     // ── Process through the host ──────────────────────────────────────────────
-    let response = match host.process_command(session, cmd).await {
+    // On UnknownSession (e.g. server restarted while the transport retained a
+    // stale session ID), evict the stale mapping, mint a fresh session, and
+    // retry the command once with the new ID.
+    let response = match host.process_command(session, cmd.clone()).await {
         Ok(r) => r,
+        Err(HostError::UnknownSession(stale)) => {
+            debug!(?stale, "mesh: stale session — refreshing");
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .remove_by_prefix(&sender_prefix);
+            let fresh = match host.create_session("mesh").await {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!("mesh: session refresh failed: {e}");
+                    return;
+                }
+            };
+            let (fresh_sid, _) = state
+                .lock()
+                .expect("state mutex poisoned")
+                .get_or_insert(sender_prefix, fresh);
+            match host.process_command(fresh_sid, cmd).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(?fresh_sid, "mesh: error after session refresh: {e}");
+                    Response::Error(format!("{e}"))
+                }
+            }
+        }
         Err(e) => {
             warn!(?session, "mesh: host returned error: {e}");
             Response::Error(format!("{e}"))

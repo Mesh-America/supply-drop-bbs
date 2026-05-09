@@ -691,11 +691,17 @@ impl BbsHost {
 
         {
             let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.workflow = Workflow::Login {
-                    username,
-                    attempts: 0,
-                };
+            match sessions.get_mut(&session) {
+                Some(r) => {
+                    r.workflow = Workflow::Login {
+                        username,
+                        attempts: 0,
+                    }
+                }
+                // Session unknown — likely a stale ID held by the transport
+                // after a server restart. Surface the error so the transport
+                // can mint a fresh session and retry.
+                None => return Err(HostError::UnknownSession(session)),
             }
         }
         Ok(Response::Prompt {
@@ -711,10 +717,10 @@ impl BbsHost {
     ) -> Result<Response, HostError> {
         let workflow = {
             let sessions = self.sessions.read().await;
-            sessions
-                .get(&session)
-                .map(|r| r.workflow.clone())
-                .unwrap_or(Workflow::None)
+            match sessions.get(&session) {
+                Some(r) => r.workflow.clone(),
+                None => return Err(HostError::UnknownSession(session)),
+            }
         };
 
         match workflow {
