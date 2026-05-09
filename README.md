@@ -1,11 +1,25 @@
-# Supply Drop BBS
+<p align="center">
+  <img src=".github/supply-drop-icon.svg" width="96" height="96" alt="Supply Drop BBS logo" />
+</p>
 
-A bulletin-board system for LoRa mesh networks, built in Rust around a
-small, sharp domain core and a pluggable transport architecture.
+<h1 align="center">Supply Drop BBS</h1>
 
-> **Status:** Pre-1.0, under active design. The repository is being built up
-> from architecture-first principles before code lands. Watch the `docs/`
-> tree for the current shape of the system.
+<p align="center">
+  A bulletin-board system for LoRa mesh networks, built in Rust.<br/>
+  <a href="https://github.com/Mesh-America/supply-drop-bbs/actions/workflows/ci.yml">
+    <img src="https://github.com/Mesh-America/supply-drop-bbs/actions/workflows/ci.yml/badge.svg" alt="CI" />
+  </a>
+  &nbsp;
+  <a href="https://github.com/Mesh-America/supply-drop-bbs/releases/latest">
+    <img src="https://img.shields.io/github/v/release/Mesh-America/supply-drop-bbs?color=3a8ad8" alt="Latest release" />
+  </a>
+  &nbsp;
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-Apache--2.0%20%2B%20Commons%20Clause-lightgrey" alt="License" />
+  </a>
+</p>
+
+---
 
 ## What it is
 
@@ -50,6 +64,20 @@ Specifically, this project bakes in from day 1:
 - Logging that respects config (no silent `--debug` overrides)
 - Audit-logged sysop actions
 - Single static binary, single TOML config file
+
+## Installation
+
+Pre-built binaries for Raspberry Pi (aarch64, armv7) and x86-64 Linux are
+attached to each [GitHub Release](https://github.com/Mesh-America/supply-drop-bbs/releases).
+
+For a one-command Pi setup:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | bash
+```
+
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for full installation and
+configuration instructions.
 
 ## License
 
