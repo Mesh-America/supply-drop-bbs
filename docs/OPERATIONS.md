@@ -360,13 +360,14 @@ sudo systemctl start supply-drop-bbs
 
 ### Lost sysop access
 
-**TBD** — exact subcommand when implemented.
-
 ```sh
 sudo systemctl stop supply-drop-bbs
-sudo -u supply-drop supply-drop-bbs admin reset-sysop --username <name>
+sudo supply-drop-bbs user promote <username> \
+  --config /etc/supply-drop-bbs/config.toml
 sudo systemctl start supply-drop-bbs
 ```
+
+See [CLI.md](CLI.md) for the full `user` subcommand reference.
 
 ## Monitoring
 
