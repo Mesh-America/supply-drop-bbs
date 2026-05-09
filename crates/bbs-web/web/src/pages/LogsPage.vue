@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, nextTick, onUnmounted } from 'vue'
 
 interface LogLine {
   ts: string
@@ -16,8 +16,9 @@ function now(): string {
   return new Date().toTimeString().slice(0, 8)
 }
 
-function connect() {
+function start() {
   if (es) return
+  error.value = null
   try {
     es = new EventSource('/api/v1/sse/logs', { withCredentials: true })
     es.onopen = () => { connected.value = true; error.value = null }
@@ -30,16 +31,16 @@ function connect() {
     }
     es.onerror = () => {
       connected.value = false
-      error.value = 'Connection lost — click reconnect to retry.'
+      error.value = 'Connection lost.'
       es?.close()
       es = null
     }
   } catch (e: any) {
-    error.value = e?.message ?? 'failed to connect to log stream'
+    error.value = e?.message ?? 'failed to connect'
   }
 }
 
-function disconnect() {
+function stop() {
   if (es) { es.close(); es = null }
   connected.value = false
 }
@@ -55,8 +56,7 @@ function lineClass(text: string): string {
   return 'log-event'
 }
 
-onMounted(connect)
-onUnmounted(disconnect)
+onUnmounted(stop)
 </script>
 
 <template>
@@ -65,13 +65,16 @@ onUnmounted(disconnect)
       <h1>logs</h1>
       <div class="controls">
         <span class="indicator" :class="{ live: connected }">
-          {{ connected ? '● live' : '○ offline' }}
+          {{ connected ? '● live' : '○ stopped' }}
         </span>
-        <button v-if="!connected" class="secondary" @click="connect">reconnect</button>
-        <button class="secondary" @click="clear">clear</button>
+        <button v-if="!connected" @click="start">start</button>
+        <button v-else class="secondary" @click="stop">stop</button>
+        <button class="secondary" @click="clear" :disabled="lines.length === 0">clear</button>
       </div>
     </header>
+
     <p v-if="error" class="error small">{{ error }}</p>
+
     <div class="log-box" ref="logBox">
       <div v-if="lines.length" class="log-content">
         <div v-for="(line, i) in lines" :key="i" class="log-line" :class="lineClass(line.text)">
@@ -79,7 +82,10 @@ onUnmounted(disconnect)
           <span class="log-text">{{ line.text }}</span>
         </div>
       </div>
-      <p v-else class="muted empty">Waiting for log events…</p>
+      <div v-else class="empty-state">
+        <p class="muted" v-if="!connected">Press <strong>start</strong> to begin streaming log events.</p>
+        <p class="muted" v-else>Waiting for events…</p>
+      </div>
     </div>
   </div>
 </template>
@@ -88,10 +94,10 @@ onUnmounted(disconnect)
 .page { display: flex; flex-direction: column; gap: 0.7rem; height: calc(100vh - var(--topbar-h) - 3rem); }
 .page-header { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; }
 h1 { margin: 0; }
-.controls { display: flex; align-items: center; gap: 0.8rem; margin-left: auto; }
+.controls { display: flex; flex-direction: row; align-items: center; gap: 0.6rem; margin-left: auto; }
 .indicator { font-size: 0.85em; color: var(--muted); }
 .indicator.live { color: #2a8a2a; }
-.small { font-size: 0.85em; }
+.small { font-size: 0.85em; margin: 0; }
 
 .log-box {
   flex: 1;
@@ -119,13 +125,14 @@ h1 { margin: 0; }
 }
 .log-text { word-break: break-all; white-space: pre-wrap; }
 
-.log-auth   { border-left-color: #2a8a2a; }
+.log-auth    { border-left-color: #2a8a2a; }
 .log-auth .log-ts { color: #2a8a2a; opacity: 0.7; }
-.log-msg    { border-left-color: var(--accent); }
-.log-user   { border-left-color: #7c5cbc; }
-.log-warn   { border-left-color: var(--warning); color: var(--warning); }
+.log-msg     { border-left-color: var(--accent); }
+.log-user    { border-left-color: #7c5cbc; }
+.log-warn    { border-left-color: var(--warning); color: var(--warning); }
 .log-session { border-left-color: var(--muted); }
-.log-event  { opacity: 0.65; }
+.log-event   { opacity: 0.65; }
 
-.empty { padding: 1rem; margin: 0; }
+.empty-state { padding: 1.5rem 1rem; }
+.empty-state p { margin: 0; }
 </style>

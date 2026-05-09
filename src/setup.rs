@@ -32,6 +32,7 @@ struct Existing {
     baud_rate: u32,
     web_enabled: bool,
     web_bind: String,
+    web_backup_dir: Option<String>,
     region_idx: usize,
     hat_idx: usize,
 }
@@ -98,6 +99,11 @@ fn load_existing(out_path: &Path) -> Existing {
         .unwrap_or("0.0.0.0:8080")
         .to_owned();
 
+    let web_backup_dir = web
+        .and_then(|w| w.get("backup_dir"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
     // ── pymc-companion.yaml ───────────────────────────────────────────────────
     let yaml_path = companion_yaml_path(out_path);
     let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
@@ -110,6 +116,7 @@ fn load_existing(out_path: &Path) -> Existing {
         baud_rate,
         web_enabled,
         web_bind,
+        web_backup_dir,
         region_idx: match_region_preset(&yaml),
         hat_idx: match_hat_preset(&yaml),
     }
@@ -264,6 +271,22 @@ pub fn run_wizard(config_out: Option<&Path>) {
         None
     };
 
+    let web_backup_dir = if web_enabled {
+        println!();
+        let default_dir = ex
+            .web_backup_dir
+            .clone()
+            .unwrap_or_else(|| "/var/backup/supply-drop".to_owned());
+        let dir: String = Input::with_theme(&theme)
+            .with_prompt("Backup directory (for database snapshots via VACUUM INTO)")
+            .default(default_dir)
+            .interact_text()
+            .unwrap_or_else(|_| cancelled());
+        Some(dir)
+    } else {
+        None
+    };
+
     // ── Pi HAT: region + model ────────────────────────────────────────────────
     let hat_params = if connection_type == "hat" {
         Some(configure_hat(
@@ -306,6 +329,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         baud_rate,
         web_enabled,
         web_bind: web_bind.as_deref(),
+        web_backup_dir: web_backup_dir.as_deref(),
     });
 
     if let Some(parent) = out_path.parent() {
@@ -326,6 +350,39 @@ pub fn run_wizard(config_out: Option<&Path>) {
     }
 
     println!("\nConfig written to {}.", out_path.display());
+
+    // Create backup directory and set ownership so the service user can write to it.
+    if let Some(ref dir) = web_backup_dir {
+        if !dir.is_empty() {
+            match fs::create_dir_all(dir) {
+                Ok(()) => {
+                    println!("Backup directory created: {dir}");
+                    // On Linux, chown to the service user so it can write backup files.
+                    #[cfg(target_os = "linux")]
+                    {
+                        let status = std::process::Command::new("chown")
+                            .args(["supply-drop:supply-drop", dir])
+                            .status();
+                        match status {
+                            Ok(s) if s.success() => {
+                                println!("  ownership set to supply-drop:supply-drop");
+                            }
+                            _ => {
+                                eprintln!(
+                                    "  warning: could not chown {dir} — you may need to run:\n\
+                                     \n    sudo chown supply-drop:supply-drop {dir}\n"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("warning: could not create backup dir {dir}: {e}");
+                    eprintln!("  Create it manually and ensure the service user can write to it.");
+                }
+            }
+        }
+    }
 
     // Write pymc-companion.yaml if HAT was chosen.
     if let Some(ref hat) = hat_params {
@@ -984,6 +1041,7 @@ struct TomlParams<'a> {
     baud_rate: Option<u32>,
     web_enabled: bool,
     web_bind: Option<&'a str>,
+    web_backup_dir: Option<&'a str>,
 }
 
 fn build_toml(p: &TomlParams<'_>) -> String {
@@ -1037,6 +1095,11 @@ fn build_toml(p: &TomlParams<'_>) -> String {
             }
         }
         writeln!(s, "cookie_secure = false").unwrap();
+        if let Some(dir) = p.web_backup_dir {
+            if !dir.is_empty() {
+                writeln!(s, "backup_dir = {}", toml_str(dir)).unwrap();
+            }
+        }
     }
 
     s

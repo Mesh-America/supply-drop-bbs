@@ -65,7 +65,7 @@ onMounted(load)
 <template>
   <div class="page">
     <header class="page-header">
-      <div>
+      <div class="title-block">
         <h1>backups</h1>
         <p class="muted">SQLite database snapshots via VACUUM INTO</p>
       </div>
@@ -112,10 +112,10 @@ onMounted(load)
 <style scoped>
 .page { display: flex; flex-direction: column; gap: 1rem; }
 .page-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
-.page-header div { display: flex; flex-direction: column; gap: 0.2rem; }
+.page-header .title-block { display: flex; flex-direction: column; gap: 0.2rem; }
 h1 { margin: 0; }
 p { margin: 0; }
-.controls { display: flex; align-items: center; gap: 0.5rem; }
+.controls { display: flex; flex-direction: row; align-items: center; gap: 0.5rem; }
 .small { font-size: 0.85em; }
 .ok { color: #2a8a2a; }
 
