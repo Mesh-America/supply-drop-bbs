@@ -28,8 +28,8 @@ use bbs_plugin_api::advert::AdvertBus;
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
     AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo, AdminStats,
-    AdminUserInfo, Command, DomainEvent, HostError, PermissionCtx, PermissionLevel, Response,
-    SessionId, Username,
+    AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient, PermissionCtx,
+    PermissionLevel, Response, SessionId, Username,
 };
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -988,6 +988,10 @@ impl BbsHost {
                             r.current_room = LOBBY_ROOM_ID;
                         }
                     }
+                    let _ = self.events_tx.send(DomainEvent::SessionAuthenticated {
+                        session,
+                        user: username.clone(),
+                    });
                     info!(%session, %username, "login successful");
                     Ok(Response::LoggedIn { user: username })
                 } else {
@@ -1129,17 +1133,27 @@ impl BbsHost {
                 };
 
                 let now = Timestamp::now();
-                if let Some(ref rcpt) = recipient {
-                    self.db
+                let (msg_id, event_recipient) = if let Some(ref rcpt) = recipient {
+                    let mid = self
+                        .db
                         .post_direct(&sender, rcpt, body, now)
                         .await
                         .map_err(|e| HostError::Storage(format!("post_direct: {e}")))?;
+                    (mid, MessageRecipient::Direct(rcpt.clone()))
                 } else {
-                    self.db
+                    let mid = self
+                        .db
                         .post_to_room(room_id, &sender, body, now)
                         .await
                         .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))?;
-                }
+                    (mid, MessageRecipient::Room(room_id.as_i64().to_string()))
+                };
+
+                let _ = self.events_tx.send(DomainEvent::MessagePosted {
+                    sender: sender.clone(),
+                    recipient: event_recipient,
+                    message_id: msg_id.as_i64() as u64,
+                });
 
                 {
                     let mut sessions = self.sessions.write().await;

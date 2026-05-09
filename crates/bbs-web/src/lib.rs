@@ -25,6 +25,7 @@
 //! │  │  GET  /api/v1/rooms/:id/messages   (auth)       │    │
 //! │  │  DELETE /api/v1/messages/:id       (auth)       │    │
 //! │  │  GET  /api/v1/stats                (auth)       │    │
+//! │  │  GET  /api/v1/settings             (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
 //! │  │  POST /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups              (auth)       │    │
@@ -354,6 +355,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/messages/:id", delete(api_delete_message))
         .route("/stats", get(api_stats))
         .route("/reports", get(api_reports))
+        .route("/settings", get(api_settings))
         .route("/sse/logs", get(api_sse_logs))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
         .route_layer(middleware::from_fn_with_state(
@@ -764,6 +766,19 @@ async fn api_reports(State(state): State<Arc<AppState>>) -> Response {
         Ok(r) => Json(r).into_response(),
         Err(e) => server_error(&e.to_string()),
     }
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SettingsResponse {
+    backup_dir: Option<String>,
+}
+
+async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(SettingsResponse {
+        backup_dir: state.config.backup_dir.clone(),
+    })
 }
 
 // ── SSE log stream ────────────────────────────────────────────────────────────

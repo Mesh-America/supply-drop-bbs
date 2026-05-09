@@ -1,10 +1,20 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, nextTick, onMounted, onUnmounted } from 'vue'
 
-const lines = ref<string[]>([])
+interface LogLine {
+  ts: string
+  text: string
+}
+
+const lines = ref<LogLine[]>([])
 const connected = ref(false)
 const error = ref<string | null>(null)
+const logBox = ref<HTMLElement | null>(null)
 let es: EventSource | null = null
+
+function now(): string {
+  return new Date().toTimeString().slice(0, 8)
+}
 
 function connect() {
   if (es) return
@@ -12,8 +22,11 @@ function connect() {
     es = new EventSource('/api/v1/sse/logs', { withCredentials: true })
     es.onopen = () => { connected.value = true; error.value = null }
     es.onmessage = (e) => {
-      lines.value.push(e.data)
+      lines.value.push({ ts: now(), text: e.data })
       if (lines.value.length > 500) lines.value.shift()
+      nextTick(() => {
+        if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight
+      })
     }
     es.onerror = () => {
       connected.value = false
@@ -33,6 +46,15 @@ function disconnect() {
 
 function clear() { lines.value = [] }
 
+function lineClass(text: string): string {
+  if (text.startsWith('[auth]')) return 'log-auth'
+  if (text.startsWith('[msg]')) return 'log-msg'
+  if (text.startsWith('[user]')) return 'log-user'
+  if (text.startsWith('[warn]')) return 'log-warn'
+  if (text.startsWith('[session]')) return 'log-session'
+  return 'log-event'
+}
+
 onMounted(connect)
 onUnmounted(disconnect)
 </script>
@@ -50,8 +72,13 @@ onUnmounted(disconnect)
       </div>
     </header>
     <p v-if="error" class="error small">{{ error }}</p>
-    <div class="log-box">
-      <pre v-if="lines.length" class="log-content">{{ lines.join('\n') }}</pre>
+    <div class="log-box" ref="logBox">
+      <div v-if="lines.length" class="log-content">
+        <div v-for="(line, i) in lines" :key="i" class="log-line" :class="lineClass(line.text)">
+          <span class="log-ts">{{ line.ts }}</span>
+          <span class="log-text">{{ line.text }}</span>
+        </div>
+      </div>
       <p v-else class="muted empty">Waiting for log events…</p>
     </div>
   </div>
@@ -74,12 +101,31 @@ h1 { margin: 0; }
   background: var(--code-bg);
 }
 .log-content {
-  margin: 0;
-  padding: 0.6rem 0.8rem;
+  padding: 0.4rem 0;
+  font-family: monospace;
   font-size: 0.8em;
-  white-space: pre-wrap;
-  word-break: break-all;
-  background: transparent;
 }
+.log-line {
+  display: flex;
+  gap: 0.75rem;
+  padding: 0.15rem 0.8rem;
+  border-left: 2px solid transparent;
+  line-height: 1.5;
+}
+.log-ts {
+  color: var(--muted);
+  flex-shrink: 0;
+  user-select: none;
+}
+.log-text { word-break: break-all; white-space: pre-wrap; }
+
+.log-auth   { border-left-color: #2a8a2a; }
+.log-auth .log-ts { color: #2a8a2a; opacity: 0.7; }
+.log-msg    { border-left-color: var(--accent); }
+.log-user   { border-left-color: #7c5cbc; }
+.log-warn   { border-left-color: var(--warning); color: var(--warning); }
+.log-session { border-left-color: var(--muted); }
+.log-event  { opacity: 0.65; }
+
 .empty { padding: 1rem; margin: 0; }
 </style>

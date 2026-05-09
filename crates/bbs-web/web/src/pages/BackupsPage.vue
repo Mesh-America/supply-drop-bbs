@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { api } from '../api/client'
 
 interface BackupRecord {
@@ -8,11 +8,18 @@ interface BackupRecord {
   created_at: string
 }
 
+interface Settings {
+  backup_dir: string | null
+}
+
 const backups = ref<BackupRecord[]>([])
+const settings = ref<Settings | null>(null)
 const loading = ref(false)
 const triggering = ref(false)
 const error = ref<string | null>(null)
 const actionOk = ref<string | null>(null)
+
+const backupDirConfigured = computed(() => settings.value?.backup_dir != null)
 
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -24,9 +31,14 @@ async function load() {
   loading.value = true
   error.value = null
   try {
-    backups.value = await api.get<BackupRecord[]>('/api/v1/backups')
+    settings.value = await api.get<Settings>('/api/v1/settings')
+    if (backupDirConfigured.value) {
+      backups.value = await api.get<BackupRecord[]>('/api/v1/backups')
+    } else {
+      backups.value = []
+    }
   } catch (e: any) {
-    error.value = e?.message ?? 'failed to load backups'
+    error.value = e?.message ?? 'failed to load'
   } finally {
     loading.value = false
   }
@@ -59,15 +71,24 @@ onMounted(load)
       </div>
       <div class="controls">
         <button class="secondary" @click="load" :disabled="loading">refresh</button>
-        <button @click="triggerBackup" :disabled="triggering">
+        <button @click="triggerBackup" :disabled="triggering || !backupDirConfigured" :title="!backupDirConfigured ? 'backup_dir not configured' : ''">
           {{ triggering ? 'backing up…' : 'create backup' }}
         </button>
       </div>
     </header>
 
+    <div v-if="settings && !backupDirConfigured" class="config-notice">
+      <strong>backup_dir not configured.</strong>
+      Add <code>backup_dir = "/path/to/backups"</code> to the <code>[plugins.web]</code> section of your
+      config file and restart the server to enable backups.
+    </div>
+
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="actionOk" class="ok">{{ actionOk }}</p>
-    <p v-if="!loading && backups.length === 0 && !error" class="muted">No backups found. Ensure <code>backup_dir</code> is set in <code>[plugins.web]</code>.</p>
+
+    <p v-if="backupDirConfigured && !loading && backups.length === 0 && !error" class="muted">
+      No backups found in <code>{{ settings!.backup_dir }}</code>. Create one above.
+    </p>
 
     <table v-if="backups.length > 0">
       <thead>
@@ -97,4 +118,13 @@ p { margin: 0; }
 .controls { display: flex; align-items: center; gap: 0.5rem; }
 .small { font-size: 0.85em; }
 .ok { color: #2a8a2a; }
+
+.config-notice {
+  padding: 0.9rem 1.1rem;
+  border: 1px solid var(--warning);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--warning) 8%, transparent);
+  font-size: 0.9em;
+  line-height: 1.6;
+}
 </style>
