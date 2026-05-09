@@ -2233,20 +2233,6 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             }
         }
         Some(t) => match t.to_ascii_lowercase().as_str() {
-            // `H all` lists available topic categories — keeps the response
-            // well under the 176-byte mesh payload limit.
-            "all" if logged_in => {
-                let mut topics = "Help topics:\n reading  posting\n navigation  account".to_owned();
-                if is_aide {
-                    topics.push_str("  aide");
-                }
-                if is_sysop {
-                    topics.push_str("  sysop");
-                }
-                topics.push_str("\nH <topic>  H <key> for detail");
-                topics
-            }
-            "all" => HELP_QUICK_ANON.to_owned(),
             "reading" if logged_in => HELP_READING.to_owned(),
             "posting" if logged_in => HELP_POSTING.to_owned(),
             "navigation" | "nav" if logged_in => HELP_NAVIGATION.to_owned(),
@@ -2267,10 +2253,9 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         // ── Always available ─────────────────────────────────────────────
         "h" | "help" | "?" => {
             if logged_in {
-                "H — help (also: ?)\n\
-                 H all = topic list\n\
+                "H — show this help\n\
                  H reading / posting / navigation / account\n\
-                 H <key> for detail on one command"
+                 H <cmd> for detail on one command (eg. H N)"
             } else {
                 "H — show this help."
             }
@@ -2320,7 +2305,12 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".c" if is_sysop => ".C — create a new room\nEnters the room creation workflow.",
         ".dr" if is_sysop => ".DR <name> — delete a room",
 
-        other => return format!("No help for '{other}'. H for menu."),
+        other => {
+            return format!(
+                "No help for '{other}'.\n\
+                 H for commands, H reading/posting/navigation/account for topics."
+            )
+        }
     };
     detail.to_owned()
 }
@@ -2332,14 +2322,15 @@ Q  quit\n\
 H  help";
 
 const HELP_QUICK_LOGGED_IN: &str = "\
-Quick start:\n\
- K  list known rooms\n\
+ K  list rooms\n\
  C  change room\n\
  N  read new messages\n\
  E  enter a message\n\
  G  next unread room\n\
  M  go to Mail\n\
-H all  H <key> for more";
+ W  who's online\n\
+ Q  log out\n\
+H <topic>: reading posting navigation account";
 
 const HELP_READING: &str = "\
 Reading:\n\
