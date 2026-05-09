@@ -518,7 +518,7 @@ fn parse_command(text: &str, awaiting_reply: bool) -> Command {
     let keyword = word.to_ascii_lowercase();
 
     match keyword.as_str() {
-        "help" | "?" => Command::Help {
+        "h" | "help" | "?" => Command::Help {
             topic: rest.map(str::to_owned),
         },
         "register" => match rest.and_then(|s| Username::new(s).ok()) {
@@ -533,8 +533,7 @@ fn parse_command(text: &str, awaiting_reply: bool) -> Command {
                 raw: text.to_owned(),
             },
         },
-        "logout" => Command::Logout,
-        "whoami" => Command::Whoami,
+        "logout" | "q" => Command::Logout,
         _ => Command::Unknown {
             raw: text.to_owned(),
         },

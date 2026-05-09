@@ -145,18 +145,7 @@ impl Host for BbsHost {
         debug!(%session, ?cmd, "processing command");
 
         match cmd {
-            Command::Help { topic: None } => Ok(Response::Text(
-                "Commands: N=new msgs  F=forward  R=reverse  S=scan\n\
-                 E=enter msg  D <id>=delete  K=rooms  G=next unread\n\
-                 C <room>=go to  M=mail  W=who's online  profile\n\
-                 Aide+: PENDING  V <user>=validate  B <user>=ban\n\
-                 Sysop+: UNBAN <user>  .CR <room>  .DR <room>\n\
-                 whoami  logout/Q  help  cancel"
-                    .into(),
-            )),
-            Command::Help { topic: Some(t) } => Ok(Response::Text(format!(
-                "No help for '{t}'. Type 'help' for the command list."
-            ))),
+            Command::Help { topic } => Ok(Response::Text(help_text(topic.as_deref()))),
 
             Command::Whoami => self.handle_whoami(session).await,
             Command::Logout | Command::Quit => {
@@ -174,18 +163,20 @@ impl Host for BbsHost {
             Command::GoNextUnread => self.handle_go_next_unread(session).await,
             Command::ChangeRoom { target } => self.handle_change_room(session, &target).await,
             Command::GoMail => self.handle_change_to_room(session, MAIL_ROOM_ID).await,
+            Command::IgnoreRoom => Ok(Response::Text("Room ignore is not yet implemented.".into())),
 
             // Message reading
             Command::ReadNew => self.handle_read_new(session).await,
             Command::ReadForward { after } => self.handle_read_forward(session, after).await,
             Command::ReadReverse => self.handle_read_reverse(session).await,
             Command::ScanMessages => self.handle_scan(session).await,
+            Command::FastForward => self.handle_fast_forward(session).await,
 
             // Message posting / deletion
             Command::EnterMessage => self.handle_enter_message(session).await,
             Command::DeleteMessage { id } => self.handle_delete(session, id).await,
 
-            // Moderation
+            // Moderation / account
             Command::WhoIsOnline => self.handle_who_is_online(session).await,
             Command::ListPending => self.handle_list_pending(session).await,
             Command::ValidateUser { username } => {
@@ -198,9 +189,15 @@ impl Host for BbsHost {
             Command::EditProfile => self.handle_edit_profile(session).await,
             Command::CreateRoom { name } => self.handle_create_room(session, &name).await,
             Command::DeleteRoom { name } => self.handle_delete_room(session, &name).await,
+            Command::EditRoom => Ok(Response::Text(
+                "Room editing is not yet implemented.".into(),
+            )),
+            Command::EditUser { .. } => Ok(Response::Text(
+                "User editing is not yet implemented.".into(),
+            )),
 
             Command::Unknown { raw } => Ok(Response::Text(format!(
-                "Unknown command: '{raw}'. Type 'help'."
+                "Unknown command: '{raw}'. Type H for help."
             ))),
             _ => Ok(Response::Error("Command not yet supported.".into())),
         }
@@ -1482,6 +1479,29 @@ impl BbsHost {
 
         Ok(Response::Text(format!("Message #{id} deleted.")))
     }
+
+    async fn handle_fast_forward(&self, session: SessionId) -> Result<Response, HostError> {
+        let (_, user_id, _, room_id) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+
+        let recent = self
+            .db
+            .list_recent_in_room(room_id, 1)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        if let Some(latest) = recent.into_iter().next() {
+            self.db
+                .mark_read(user_id, room_id, latest.id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            Ok(Response::Text("Skipped to latest message.".into()))
+        } else {
+            Ok(Response::Text("No messages in this room.".into()))
+        }
+    }
 }
 
 // ── Moderation helpers ────────────────────────────────────────────────────────
@@ -1844,6 +1864,112 @@ impl BbsHost {
         Ok(Response::Text(format!("Room '{name}' deleted.")))
     }
 }
+
+// ── Help text ─────────────────────────────────────────────────────────────────
+
+fn help_text(topic: Option<&str>) -> String {
+    match topic {
+        None => HELP_QUICK.to_owned(),
+        Some(t) => match t.to_ascii_lowercase().as_str() {
+            "all" => format!("{HELP_READING}\n{HELP_POSTING}\n{HELP_NAVIGATION}\n{HELP_ACCOUNT}\n{HELP_AIDE}\n{HELP_SYSOP}"),
+            "reading" => HELP_READING.to_owned(),
+            "posting" => HELP_POSTING.to_owned(),
+            "navigation" | "nav" => HELP_NAVIGATION.to_owned(),
+            "account" => HELP_ACCOUNT.to_owned(),
+            "aide" => HELP_AIDE.to_owned(),
+            "sysop" => HELP_SYSOP.to_owned(),
+            cmd => help_for_command(cmd),
+        },
+    }
+}
+
+fn help_for_command(cmd: &str) -> String {
+    let detail = match cmd {
+        "n" => "N — Read new messages in this room since your last visit.",
+        "f" => "F [id] — Read forward from oldest (or from message id).",
+        "r" => "R — Read in reverse, newest first.",
+        "s" => "S — Scan message headers: ID, sender, first line.",
+        ".ff" => ".FF — Fast-forward past all unread in this room.",
+        "e" => "E — Enter (compose) a message in the current room.",
+        "d" => "D <id> — Delete message by ID. Aides can delete any message.",
+        "g" => "G — Go to next room with unread messages.",
+        "c" => "C <room> — Change to room by name or number.",
+        "k" => "K — List all rooms with unread counts.",
+        "i" => "I — Toggle ignore on this room (skipped by G).",
+        "m" => "M — Go directly to the Mail room.",
+        "h" | "help" | "?" => {
+            "H — Quick-start help. H all=full menu.\n\
+             H <section>: reading posting navigation account aide sysop\n\
+             H <cmd>: detail on a specific command."
+        }
+        "q" => "Q — Quit and end your session.",
+        "w" => "W — List who is currently online.",
+        "cancel" | "stop" => "CANCEL / STOP — Cancel the current workflow.",
+        "v" => "V <user> — Validate (approve) a pending user. Aide+.",
+        "b" => "B <user> — Ban a user. Aide+.",
+        "unban" => "UNBAN <user> — Lift a ban. Sysop+.",
+        "pending" => "PENDING — List users awaiting validation. Aide+.",
+        "profile" => "PROFILE — Edit your display name.",
+        ".er" => ".ER — Edit this room's name or settings. Aide+.",
+        ".eu" => ".EU <user> — Edit a user's name or level. Aide+.",
+        ".c" => ".C <name> — Create a new room. Sysop+.",
+        ".dr" => ".DR <name> — Delete a room. Sysop+.",
+        other => return format!("No help for '{other}'. H all for full menu."),
+    };
+    detail.to_owned()
+}
+
+const HELP_QUICK: &str = "\
+--- Quick start ---\n\
+K  list rooms      C <room>  go to room\n\
+N  read new        E  enter message\n\
+G  next unread     M  mail\n\
+R  reverse         F  forward\n\
+S  scan headers    D <id>  delete\n\
+H all=full menu  H <cmd>=detail  Q=quit";
+
+const HELP_READING: &str = "\
+--- Reading ---\n\
+N       read new messages\n\
+F [id]  forward (oldest first)\n\
+R       reverse (newest first)\n\
+S       scan headers\n\
+.FF     fast-forward past unread";
+
+const HELP_POSTING: &str = "\
+--- Posting ---\n\
+E       enter message\n\
+D <id>  delete message";
+
+const HELP_NAVIGATION: &str = "\
+--- Navigation ---\n\
+G         next unread room\n\
+C <room>  go to room\n\
+K         list rooms\n\
+I         ignore/unignore room\n\
+M         go to mail";
+
+const HELP_ACCOUNT: &str = "\
+--- Account ---\n\
+H / ?   help\n\
+Q       quit\n\
+W       who's online\n\
+PROFILE edit display name\n\
+CANCEL / STOP  cancel workflow";
+
+const HELP_AIDE: &str = "\
+--- Aide ---\n\
+V <user>  validate user\n\
+B <user>  ban user\n\
+PENDING   list pending users\n\
+.ER       edit this room\n\
+.EU <user>  edit user";
+
+const HELP_SYSOP: &str = "\
+--- Sysop ---\n\
+.C <name>   create room\n\
+.DR <name>  delete room\n\
+UNBAN <user>  lift ban";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 

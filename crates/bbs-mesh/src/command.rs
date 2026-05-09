@@ -88,33 +88,23 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
     let keyword = word.to_ascii_lowercase();
 
     match keyword.as_str() {
-        "help" | "?" => Some(Command::Help {
+        "h" | "help" | "?" => Some(Command::Help {
             topic: rest.map(str::to_owned),
         }),
 
-        "register" => {
-            // `register <username>` — username is required.
-            match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Some(Command::Register { username }),
-                None => Some(Command::Unknown {
-                    raw: text.to_owned(),
-                }),
-            }
-        }
+        "register" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::Register { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
 
-        "login" => {
-            // `login <username>` — username is required.
-            match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Some(Command::Login { username }),
-                None => Some(Command::Unknown {
-                    raw: text.to_owned(),
-                }),
-            }
-        }
-
-        "logout" => Some(Command::Logout),
-
-        "whoami" => Some(Command::Whoami),
+        "login" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::Login { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
 
         // ── Room navigation ──────────────────────────────────────────────────
         "k" => Some(Command::ListRooms),
@@ -125,7 +115,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             target: rest.unwrap_or("").to_owned(),
         }),
 
-        "m" | "mail" => Some(Command::GoMail),
+        "m" => Some(Command::GoMail),
+
+        "i" => Some(Command::IgnoreRoom),
 
         // ── Message reading ──────────────────────────────────────────────────
         "n" => Some(Command::ReadNew),
@@ -139,6 +131,8 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "s" => Some(Command::ScanMessages),
 
+        ".ff" => Some(Command::FastForward),
+
         // ── Message posting / deletion ───────────────────────────────────────
         "e" => Some(Command::EnterMessage),
 
@@ -150,23 +144,23 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         },
 
         // ── Session control ──────────────────────────────────────────────────
-        "q" | "quit" => Some(Command::Quit),
+        "q" => Some(Command::Quit),
 
         "cancel" | "stop" => Some(Command::Cancel),
 
-        // ── Moderation ───────────────────────────────────────────────────────
-        "w" | "who" => Some(Command::WhoIsOnline),
+        // ── Moderation / account ─────────────────────────────────────────────
+        "w" => Some(Command::WhoIsOnline),
 
         "pending" => Some(Command::ListPending),
 
-        "v" | "valid" => match rest.and_then(|s| Username::new(s).ok()) {
+        "v" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(username) => Some(Command::ValidateUser { username }),
             None => Some(Command::Unknown {
                 raw: text.to_owned(),
             }),
         },
 
-        "b" | "ban" => match rest.and_then(|s| Username::new(s).ok()) {
+        "b" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(username) => Some(Command::BanUser { username }),
             None => Some(Command::Unknown {
                 raw: text.to_owned(),
@@ -182,7 +176,8 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "profile" => Some(Command::EditProfile),
 
-        ".cr" => match rest {
+        // ── Room management ──────────────────────────────────────────────────
+        ".c" => match rest {
             Some(name) if !name.is_empty() => Some(Command::CreateRoom {
                 name: name.to_owned(),
             }),
@@ -196,6 +191,15 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 name: name.to_owned(),
             }),
             _ => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
+        ".er" => Some(Command::EditRoom),
+
+        ".eu" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::EditUser { username }),
+            None => Some(Command::Unknown {
                 raw: text.to_owned(),
             }),
         },
@@ -344,14 +348,15 @@ mod tests {
     }
 
     #[test]
-    fn logout() {
-        assert_eq!(cmd("logout"), Some(Command::Logout));
-        assert_eq!(cmd("LOGOUT"), Some(Command::Logout));
+    fn quit() {
+        assert_eq!(cmd("q"), Some(Command::Quit));
+        assert_eq!(cmd("Q"), Some(Command::Quit));
     }
 
     #[test]
-    fn whoami() {
-        assert_eq!(cmd("whoami"), Some(Command::Whoami));
+    fn logout_and_whoami_are_unknown_on_mesh() {
+        assert!(matches!(cmd("logout"), Some(Command::Unknown { .. })));
+        assert!(matches!(cmd("whoami"), Some(Command::Unknown { .. })));
     }
 
     #[test]

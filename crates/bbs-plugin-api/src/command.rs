@@ -89,6 +89,9 @@ pub enum Command {
     /// Navigate directly to the Mail room. (M)
     GoMail,
 
+    /// Toggle ignore on the current room. (I)
+    IgnoreRoom,
+
     // ── Message reading ───────────────────────────────────────────────
     /// Read unread messages in the current room (from the last-read
     /// pointer). (N)
@@ -107,6 +110,9 @@ pub enum Command {
     /// Show one-line message summaries (ID, sender, snippet). (S)
     ScanMessages,
 
+    /// Fast-forward past all unread messages in the current room. (.FF)
+    FastForward,
+
     // ── Message posting / deletion ────────────────────────────────────
     /// Begin composing a message for the current room (or Mail). (E)
     EnterMessage,
@@ -121,10 +127,10 @@ pub enum Command {
     /// Quit — log out gracefully. (Q)
     Quit,
 
-    /// Cancel the current workflow without logging out. (cancel)
+    /// Cancel the current workflow without logging out. (CANCEL / STOP)
     Cancel,
 
-    // ── Moderation ────────────────────────────────────────────────────────
+    // ── Moderation / account ──────────────────────────────────────────
     /// List all currently logged-in sessions. (W)
     WhoIsOnline,
 
@@ -137,7 +143,7 @@ pub enum Command {
         username: Username,
     },
 
-    /// Ban a user account, preventing further login (Aide+). (B / BAN)
+    /// Ban a user account, preventing further login (Aide+). (B)
     BanUser {
         /// The username of the account to ban.
         username: Username,
@@ -152,7 +158,8 @@ pub enum Command {
     /// Begin editing the caller's own display name. (PROFILE)
     EditProfile,
 
-    /// Create a new room with the given name (Sysop+). (.CR)
+    // ── Room / user management ────────────────────────────────────────
+    /// Create a new room with the given name (Sysop+). (.C)
     CreateRoom {
         /// Short room name — must pass `Room::validate_name`.
         name: String,
@@ -162,6 +169,15 @@ pub enum Command {
     DeleteRoom {
         /// Name of the room to delete.
         name: String,
+    },
+
+    /// Edit the current room's properties (Aide+). (.ER)
+    EditRoom,
+
+    /// Edit a user's properties (Aide+). (.EU)
+    EditUser {
+        /// The username of the account to edit.
+        username: Username,
     },
 }
 
