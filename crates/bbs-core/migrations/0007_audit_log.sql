@@ -12,6 +12,11 @@
 -- target  : What was acted on (username, "#<message_id>", room name).
 -- detail  : Optional free-form context (e.g. "level 10 -> 100").
 
+-- 0001_initial.sql created a skeleton audit_log table with a different schema
+-- (used 'occurred_at' instead of 'created_at', no actor/action/target/detail).
+-- That table was never populated.  Drop it so we can create the real schema.
+DROP TABLE IF EXISTS audit_log;
+
 CREATE TABLE IF NOT EXISTS audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     actor      TEXT    NOT NULL,
