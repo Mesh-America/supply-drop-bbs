@@ -6,6 +6,9 @@
 #
 # Or download and run directly:
 #   sudo bash install.sh
+#
+# To uninstall:
+#   sudo bash install.sh --uninstall
 
 set -euo pipefail
 
@@ -35,6 +38,94 @@ info()    { echo -e "${BLUE}  →${NC} $*"; }
 success() { echo -e "${GREEN}  ✓${NC} $*"; }
 warn()    { echo -e "${YELLOW}  !${NC} $*"; }
 die()     { echo -e "${RED}  ✗${NC} $*" >&2; exit 1; }
+
+# ── Uninstaller ───────────────────────────────────────────────────────────────
+
+if [[ "${1:-}" == "--uninstall" ]]; then
+    echo
+    echo "╔══════════════════════════════════════════════════╗"
+    echo "║        Supply Drop BBS — Uninstaller             ║"
+    echo "╚══════════════════════════════════════════════════╝"
+    echo
+
+    [[ $EUID -eq 0 ]] || die "Please run with sudo:  sudo bash install.sh --uninstall"
+
+    warn "This will remove Supply Drop BBS and pymc-companion from this system."
+    echo
+    read -r -p "  Continue? [y/N] " _confirm
+    [[ "$_confirm" =~ ^[Yy] ]] || { echo "  Aborted."; exit 0; }
+    echo
+
+    # Stop and disable services.
+    for _svc in supply-drop-bbs pymc-companion; do
+        if systemctl is-active --quiet "$_svc" 2>/dev/null; then
+            info "Stopping $_svc..."
+            systemctl stop "$_svc"
+        fi
+        if systemctl is-enabled --quiet "$_svc" 2>/dev/null; then
+            info "Disabling $_svc..."
+            systemctl disable "$_svc"
+        fi
+    done
+
+    # Remove service unit files.
+    for _unit in \
+        /etc/systemd/system/supply-drop-bbs.service \
+        /etc/systemd/system/pymc-companion.service; do
+        if [[ -f "$_unit" ]]; then
+            rm -f "$_unit"
+            success "Removed $_unit"
+        fi
+    done
+    systemctl daemon-reload
+
+    # Remove binary and source.
+    rm -f "$BIN_PATH" && success "Removed $BIN_PATH"
+    rm -rf /opt/pymc-companion && success "Removed /opt/pymc-companion"
+    rm -rf "$SRC_DIR"          && success "Removed $SRC_DIR"
+
+    # Config directory — ask before deleting.
+    if [[ -d "$CONFIG_DIR" ]]; then
+        echo
+        read -r -p "  Delete config directory $CONFIG_DIR? [y/N] " _del_cfg
+        if [[ "$_del_cfg" =~ ^[Yy] ]]; then
+            rm -rf "$CONFIG_DIR"
+            success "Removed $CONFIG_DIR"
+        else
+            info "Kept $CONFIG_DIR"
+        fi
+    fi
+
+    # Data directory — ask before deleting (contains message store).
+    if [[ -d "$DATA_DIR" ]]; then
+        echo
+        warn "The data directory contains your message store and identity key."
+        read -r -p "  Delete data directory $DATA_DIR? [y/N] " _del_data
+        if [[ "$_del_data" =~ ^[Yy] ]]; then
+            rm -rf "$DATA_DIR"
+            success "Removed $DATA_DIR"
+        else
+            info "Kept $DATA_DIR"
+        fi
+    fi
+
+    # Service user — ask before removing.
+    if id -u "$SERVICE_USER" &>/dev/null; then
+        echo
+        read -r -p "  Remove service user '$SERVICE_USER'? [y/N] " _del_user
+        if [[ "$_del_user" =~ ^[Yy] ]]; then
+            userdel "$SERVICE_USER"
+            success "Removed user '$SERVICE_USER'"
+        else
+            info "Kept user '$SERVICE_USER'"
+        fi
+    fi
+
+    echo
+    success "Supply Drop BBS uninstalled."
+    echo
+    exit 0
+fi
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 
