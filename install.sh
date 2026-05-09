@@ -43,9 +43,13 @@ die()     { echo -e "${RED}  ✗${NC} $*" >&2; exit 1; }
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     echo
-    echo "╔══════════════════════════════════════════════════╗"
-    echo "║        Supply Drop BBS — Uninstaller             ║"
-    echo "╚══════════════════════════════════════════════════╝"
+    if command -v figlet &>/dev/null; then
+        figlet -f slant "Supply Drop" 2>/dev/null || figlet "Supply Drop"
+        figlet -f slant "  BBS" 2>/dev/null || figlet "BBS"
+    else
+        echo "  Supply Drop BBS"
+    fi
+    echo "  uninstaller"
     echo
 
     [[ $EUID -eq 0 ]] || die "Please run with sudo:  sudo bash install.sh --uninstall"
@@ -129,11 +133,33 @@ fi
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 
-echo
-echo "╔══════════════════════════════════════════════════╗"
-echo "║         Supply Drop BBS — Installer              ║"
-echo "╚══════════════════════════════════════════════════╝"
-echo
+print_banner() {
+    echo
+    if command -v figlet &>/dev/null; then
+        figlet -f slant "Supply Drop" 2>/dev/null || figlet "Supply Drop"
+        figlet -f slant "  BBS" 2>/dev/null || figlet "BBS"
+    else
+        cat <<'BANNER'
+   _____                   __         ____
+  / ___/__  ______  ____  / /_  __   / __ \________  ___  ____
+  \__ \/ / / / __ \/ __ \/ / / / /  / / / / ___/ _ \/ _ \/ __ \
+ ___/ / /_/ / /_/ / /_/ / / /_/ /  / /_/ / /  /  __/  __/ /_/ /
+/____/\__,_/ .___/ .___/_/\__, /  /_____/_/   \___/\___/ .___/
+          /_/   /_/       /____/                        /_/
+
+                        ____  ____  _____
+                       / __ )/ __ )/ ___/
+                      / __  / __  /\__ \
+                     / /_/ / /_/ /___/ /
+                    /_____/_____//____/
+
+BANNER
+    fi
+    echo "  mesh radio bulletin board system"
+    echo
+}
+
+print_banner
 
 # ── Root check ────────────────────────────────────────────────────────────────
 
@@ -157,7 +183,7 @@ info "Installing system dependencies..."
 apt-get update -qq
 apt-get install -y -qq \
     build-essential curl git pkg-config libssl-dev \
-    nodejs npm
+    nodejs npm figlet
 success "System dependencies installed"
 
 # ── Rust ─────────────────────────────────────────────────────────────────────
