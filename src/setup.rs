@@ -182,9 +182,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
 /// USB / serial flow: list ports, let operator pick one, ask baud rate.
 ///
 /// Returns `(connection_type, serial_port, baud_rate)`.
-fn configure_serial(
-    theme: &ColorfulTheme,
-) -> (&'static str, Option<String>, Option<u32>) {
+fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Option<u32>) {
     let ports = list_serial_ports();
 
     let serial_port = if ports.is_empty() {
@@ -294,7 +292,7 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 }
             }
         }
-        "hat" => {}  // pymc-companion always runs on 127.0.0.1:5000
+        "hat" => {} // pymc-companion always runs on 127.0.0.1:5000
         _ => {}
     }
 
