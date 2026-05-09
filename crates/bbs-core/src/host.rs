@@ -614,7 +614,7 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?;
         if existing.is_some() {
             return Ok(Response::Error(format!(
-                "Username '{username}' is already taken."
+                "'{username}' is taken. Try: login {username}"
             )));
         }
 
@@ -1994,6 +1994,8 @@ fn help_for_command(cmd: &str) -> String {
         }
         "q" => "Q — Quit or log off.",
         "w" => "W — List active users currently online.",
+        "register" => "REGISTER <username> — Create a new account. Example: register alice",
+        "login" => "LOGIN <username> — Log in to an existing account. Example: login alice",
         "cancel" => "CANCEL — Cancel the current workflow and return to normal command mode.",
         "stop" => "STOP — Stop pending messages as soon as possible.",
         "b" => {
@@ -2016,15 +2018,10 @@ fn help_for_command(cmd: &str) -> String {
 }
 
 const HELP_QUICK: &str = "\
-Quick start:\n\
- K    list known rooms\n\
- C    change room\n\
- N    read new messages\n\
- E    enter a message\n\
- G    next unread room\n\
- M    go to Mail\n\
-\n\
-H all = full menu, H X = help for command X";
+K rooms  C change  N new\n\
+E enter  G unread  M mail\n\
+Q quit   W online  ?=help\n\
+H all | H <key> for more";
 
 const HELP_READING_POSTING: &str = "\
 Reading:\n\

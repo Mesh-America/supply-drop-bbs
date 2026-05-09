@@ -523,14 +523,14 @@ fn parse_command(text: &str, awaiting_reply: bool) -> Command {
         },
         "register" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(u) => Command::Register { username: u },
-            None => Command::Unknown {
-                raw: text.to_owned(),
+            None => Command::Help {
+                topic: Some("register".to_owned()),
             },
         },
         "login" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(u) => Command::Login { username: u },
-            None => Command::Unknown {
-                raw: text.to_owned(),
+            None => Command::Help {
+                topic: Some("login".to_owned()),
             },
         },
         "logout" | "q" => Command::Logout,

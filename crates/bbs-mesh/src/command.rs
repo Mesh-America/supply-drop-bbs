@@ -94,15 +94,15 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "register" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(username) => Some(Command::Register { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
+            None => Some(Command::Help {
+                topic: Some("register".to_owned()),
             }),
         },
 
         "login" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(username) => Some(Command::Login { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
+            None => Some(Command::Help {
+                topic: Some("login".to_owned()),
             }),
         },
 
@@ -337,23 +337,22 @@ mod tests {
     }
 
     #[test]
-    fn register_missing_username_is_unknown() {
+    fn register_missing_username_shows_help() {
         assert_eq!(
             cmd("register"),
-            Some(Command::Unknown {
-                raw: "register".to_owned()
+            Some(Command::Help {
+                topic: Some("register".to_owned())
             })
         );
     }
 
     #[test]
-    fn register_invalid_username_is_unknown() {
-        // Usernames can't have spaces; "register alice bob" → unknown.
+    fn register_invalid_username_shows_help() {
+        // Usernames can't have spaces; "register alice bob" → help for register.
         assert_eq!(
             cmd("register alice bob"),
-            // "alice bob" is not a valid Username (space not allowed)
-            Some(Command::Unknown {
-                raw: "register alice bob".to_owned()
+            Some(Command::Help {
+                topic: Some("register".to_owned())
             })
         );
     }
