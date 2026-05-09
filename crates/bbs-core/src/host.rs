@@ -609,6 +609,11 @@ impl BbsHost {
                         "Already logged in. Use 'logout' first.".into(),
                     ));
                 }
+                if !matches!(r.workflow, Workflow::None) {
+                    return Ok(Response::Error(
+                        "A workflow is already in progress. Type 'cancel' first.".into(),
+                    ));
+                }
             }
         }
 
@@ -649,6 +654,11 @@ impl BbsHost {
                 if r.username.is_some() {
                     return Ok(Response::Error(
                         "Already logged in. Use 'logout' first.".into(),
+                    ));
+                }
+                if !matches!(r.workflow, Workflow::None) {
+                    return Ok(Response::Error(
+                        "A workflow is already in progress. Type 'cancel' first.".into(),
                     ));
                 }
             }
@@ -729,7 +739,7 @@ impl BbsHost {
                 username,
                 stage: RegisterStage::Password { display_name },
             } => {
-                if reply.len() < 8 {
+                if reply.chars().count() < 8 {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.workflow = Workflow::Register {
@@ -781,15 +791,38 @@ impl BbsHost {
                 }
 
                 let now = Timestamp::now();
-                let user_id = UserStore::create(
+                // Promote the very first registrant to Sysop so the system
+                // isn't stuck with no one able to validate new users.
+                let is_first = UserStore::list(&self.db, None, 1, 0)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("list users: {e}")))?
+                    .is_empty();
+                let initial_level = if is_first {
+                    PermissionLevel::Sysop
+                } else {
+                    PermissionLevel::Unvalidated
+                };
+                let user_id = match UserStore::create(
                     &self.db,
                     &username,
                     display_name.as_deref(),
-                    PermissionLevel::Unvalidated,
+                    initial_level,
                     now,
                 )
                 .await
-                .map_err(|e| HostError::Storage(format!("create user: {e}")))?;
+                {
+                    Ok(id) => id,
+                    Err(crate::db::StoreError::Conflict(_)) => {
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::None;
+                        }
+                        return Ok(Response::Error(format!(
+                            "'{username}' was just taken. Try: register <different_username>"
+                        )));
+                    }
+                    Err(e) => return Err(HostError::Storage(format!("create user: {e}"))),
+                };
                 self.db
                     .credentials()
                     .set_password(user_id, &password, now)
@@ -801,7 +834,7 @@ impl BbsHost {
                     if let Some(r) = sessions.get_mut(&session) {
                         r.username = Some(username.clone());
                         r.user_id = Some(user_id);
-                        r.level = PermissionLevel::Unvalidated;
+                        r.level = initial_level;
                         r.workflow = Workflow::None;
                         r.current_room = LOBBY_ROOM_ID;
                     }
@@ -809,7 +842,11 @@ impl BbsHost {
                 let _ = self.events_tx.send(DomainEvent::UserCreated {
                     user: username.clone(),
                 });
-                info!(%session, %username, "registration complete — awaiting validation");
+                if is_first {
+                    info!(%session, %username, "first registration — promoted to Sysop");
+                } else {
+                    info!(%session, %username, "registration complete — awaiting validation");
+                }
                 Ok(Response::LoggedIn { user: username })
             }
 
@@ -1159,19 +1196,18 @@ impl BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        // Walk the room list starting just after the current room.
+        // Walk the room list starting just after the current room,
+        // wrapping around. Skip the current room if encountered during wrap.
         let start = rooms
             .iter()
             .position(|r| r.id == current_room)
             .map(|i| i + 1)
             .unwrap_or(0);
 
-        let candidate = rooms[start..]
-            .iter()
-            .chain(rooms[..start].iter())
-            .find(|r| r.id != current_room);
-
-        for room in candidate.into_iter().chain(rooms.iter()) {
+        for room in rooms[start..].iter().chain(rooms[..start].iter()) {
+            if room.id == current_room {
+                continue;
+            }
             let unread = self
                 .db
                 .unread_count(user_id, room.id)
@@ -1341,10 +1377,10 @@ impl BbsHost {
         for msg in &visible {
             lines.push(format_message(msg));
         }
-        if page.next_cursor.is_some() {
+        if let Some(cursor) = page.next_cursor {
             lines.push(format!(
                 "(more — type N again or F {} to continue)",
-                page.messages.last().map(|m| m.id.as_i64()).unwrap_or(0)
+                cursor.as_i64()
             ));
         }
         Ok(Response::Text(lines.join("\n")))
@@ -1493,17 +1529,28 @@ impl BbsHost {
     }
 
     async fn handle_enter_message(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, _, _, room_id) = match self.session_auth_user(session).await {
+        let (_, _, level, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(r) = sessions.get(&session) {
+                if !matches!(r.workflow, Workflow::None) {
+                    return Ok(Response::Error(
+                        "A workflow is already in progress. Type 'cancel' first.".into(),
+                    ));
+                }
+            }
+        }
 
         let room = RoomStore::get_by_id(&self.db, room_id)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
-        if room.read_only {
+        if room.read_only && level < PermissionLevel::Aide {
             return Ok(Response::Error(format!("'{}' is read-only.", room.name)));
         }
 
@@ -1931,6 +1978,16 @@ impl BbsHost {
             Err(r) => return Ok(r),
         }
         {
+            let sessions = self.sessions.read().await;
+            if let Some(r) = sessions.get(&session) {
+                if !matches!(r.workflow, Workflow::None) {
+                    return Ok(Response::Error(
+                        "A workflow is already in progress. Type 'cancel' first.".into(),
+                    ));
+                }
+            }
+        }
+        {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
                 r.workflow = Workflow::EditProfile;
@@ -2316,9 +2373,9 @@ mod tests {
             }
         );
 
-        // Registration places users in Unvalidated tier (awaiting aide approval).
+        // First registrant is promoted to Sysop automatically.
         let ctx = host.permission_ctx(sid).await.unwrap();
-        assert_eq!(ctx.level, PermissionLevel::Unvalidated);
+        assert_eq!(ctx.level, PermissionLevel::Sysop);
         assert_eq!(ctx.username.as_ref(), Some(&uname));
         let sessions = host.sessions.read().await;
         assert_eq!(sessions[&sid].current_room, LOBBY_ROOM_ID);

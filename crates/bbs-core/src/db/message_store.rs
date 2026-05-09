@@ -50,6 +50,8 @@ fn build_page(mut rows: Vec<Message>, limit: u32) -> MessagePage {
     let has_more = rows.len() > limit as usize;
     rows.truncate(limit as usize);
     rows.sort_by_key(|m| m.id);
+    // Cursor = last item in this page; next call passes it as after_id
+    // (WHERE id > cursor) to continue from where this page left off.
     let next_cursor = if has_more {
         rows.last().map(|m| m.id)
     } else {

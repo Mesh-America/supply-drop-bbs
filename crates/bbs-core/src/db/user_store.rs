@@ -280,18 +280,20 @@ impl UserStore for Database {
     async fn hard_delete(&self, id: UserId) -> Result<(), StoreError> {
         let uid = id.as_i64();
 
+        let mut tx = self.write_pool.begin().await?;
+
         let row = sqlx::query!(
             r#"SELECT username AS "username!" FROM users WHERE id = ?"#,
             uid
         )
-        .fetch_optional(&self.read_pool)
+        .fetch_optional(&mut *tx)
         .await?
         .ok_or(StoreError::NotFound)?;
 
         let sender = row.username;
         let msg_count: i64 =
             sqlx::query_scalar!("SELECT COUNT(*) FROM messages WHERE sender = ?", sender)
-                .fetch_one(&self.read_pool)
+                .fetch_one(&mut *tx)
                 .await?;
 
         if msg_count > 0 {
@@ -301,9 +303,11 @@ impl UserStore for Database {
         }
 
         let rows = sqlx::query!("DELETE FROM users WHERE id = ?", uid)
-            .execute(&self.write_pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+
+        tx.commit().await?;
 
         if rows == 0 {
             return Err(StoreError::NotFound);

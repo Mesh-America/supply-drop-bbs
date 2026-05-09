@@ -395,11 +395,14 @@ impl RoomStore for Database {
             Some(target_id) => {
                 let tid = target_id.as_i64();
 
-                let target_next: Option<i64> =
+                let target_row =
                     sqlx::query_scalar!("SELECT next_neighbor FROM rooms WHERE id = ?", tid)
                         .fetch_optional(&mut *tx)
-                        .await?
-                        .flatten();
+                        .await?;
+                if target_row.is_none() {
+                    return Err(StoreError::NotFound);
+                }
+                let target_next: Option<i64> = target_row.flatten();
 
                 if let Some(tn) = target_next {
                     sqlx::query!("UPDATE rooms SET prev_neighbor = ? WHERE id = ?", rid, tn)
