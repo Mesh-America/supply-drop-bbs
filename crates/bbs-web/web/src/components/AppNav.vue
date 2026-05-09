@@ -157,7 +157,7 @@ const groups = [
   border-bottom: 1px solid var(--border);
 }
 .brand { display: flex; align-items: center; gap: 0.5rem; }
-.brand-logo { height: 32px; width: 32px; object-fit: contain; border-radius: 4px; background: #111; }
+.brand-logo { height: 32px; width: 32px; object-fit: contain; border-radius: 4px; }
 .brand-sub { font-size: 0.75em; font-weight: 400; }
 .user-area { margin-left: auto; display: flex; align-items: center; font-size: 0.85em; }
 

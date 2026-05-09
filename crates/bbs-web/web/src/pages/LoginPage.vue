@@ -79,7 +79,6 @@ async function submit() {
   height: 160px;
   object-fit: contain;
   border-radius: 16px;
-  background: #111;
 }
 .sub { margin: 0; font-size: 0.85em; text-align: center; }
 form { display: flex; flex-direction: column; gap: 0.75rem; }
