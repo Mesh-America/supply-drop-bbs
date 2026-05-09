@@ -109,18 +109,13 @@ jobs:
         with:
           tool: git-cliff
 
-      # Generate release notes for this specific tag only (not full changelog).
+      # Generate release notes for this tag only (not the full changelog).
+      # --latest  : scope to the most recent tag pair (previous..this)
+      # --strip header : omit the "# Changelog" banner — just the section body
       - name: Generate release notes
-        id: cliff
         run: |
-          # Get notes between the previous tag and this one.
-          PREV=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p')
-          if [ -n "$PREV" ]; then
-            git cliff "${PREV}".."${{ github.ref_name }}" --output release-notes.md
-          else
-            git cliff "${{ github.ref_name }}" --output release-notes.md
-          fi
-          echo "notes_file=release-notes.md" >> "$GITHUB_OUTPUT"
+          git cliff --latest --strip header --output release-notes.md
+          cat release-notes.md
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
