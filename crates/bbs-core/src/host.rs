@@ -1145,19 +1145,43 @@ impl BbsHost {
 
     /// Like `session_auth` but also requires `PermissionLevel::User` or above.
     /// Unvalidated accounts get a pending-validation message.
+    ///
+    /// When the cached level is Unvalidated, the DB is re-read once to catch
+    /// out-of-process promotions (e.g. `supply-drop-bbs user promote`) without
+    /// requiring the user to log out and back in.
     async fn session_auth_user(
         &self,
         session: SessionId,
     ) -> Result<(Username, UserId, PermissionLevel, RoomId), Response> {
-        let result = self.session_auth(session).await?;
-        if result.2 < PermissionLevel::User {
-            return Err(Response::Text(
-                "Your account is pending validation by an aide.\n\
-                 Type 'whoami', 'help', 'pending', or 'logout'."
-                    .into(),
-            ));
+        let (username, user_id, level, room_id) = self.session_auth(session).await?;
+
+        if level >= PermissionLevel::User {
+            return Ok((username, user_id, level, room_id));
         }
-        Ok(result)
+
+        // Level is Unvalidated — re-read from DB in case an out-of-process
+        // tool (CLI, direct DB edit) promoted this user since they logged in.
+        let fresh_level = UserStore::get_by_id(&self.db, user_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|u| u.permission_level)
+            .unwrap_or(level);
+
+        if fresh_level >= PermissionLevel::User {
+            // Refresh the in-memory session so subsequent commands don't DB-check again.
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.level = fresh_level;
+            }
+            return Ok((username, user_id, fresh_level, room_id));
+        }
+
+        Err(Response::Text(
+            "Your account is pending validation by an aide.\n\
+             Type 'whoami', 'help', 'pending', or 'logout'."
+                .into(),
+        ))
     }
 
     async fn handle_list_rooms(&self, session: SessionId) -> Result<Response, HostError> {
