@@ -4,7 +4,7 @@ import { useAuthStore } from '../stores/auth'
 import { useRouter } from 'vue-router'
 import { useTheme } from '../composables/useTheme'
 import type { Mode, ColorTheme } from '../composables/useTheme'
-import logoUrl from '../assets/logo.png'
+import logoUrl from '../assets/supply-drop-icon-transparent.svg'
 
 const open = ref(false)
 const menuOpen = ref(false)

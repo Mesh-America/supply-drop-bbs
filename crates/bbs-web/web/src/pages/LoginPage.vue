@@ -75,8 +75,8 @@ async function submit() {
 }
 .logo-wrap { display: flex; justify-content: center; margin-bottom: 0.25rem; }
 .logo {
-  width: 160px;
-  height: 160px;
+  width: 225px;
+  height: 225px;
   object-fit: contain;
   border-radius: 16px;
 }
