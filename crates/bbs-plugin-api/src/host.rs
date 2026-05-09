@@ -228,6 +228,13 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_list_backups".into()))
     }
 
+    /// Delete a backup file (and its associated config snapshot) from `backup_dir`.
+    /// Returns `HostError::NotFound` if the file does not exist.
+    async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
+        let _ = (backup_dir, filename);
+        Err(HostError::NotSupported("admin_delete_backup".into()))
+    }
+
     // ── Mesh node credentials ────────────────────────────────────────────────────
     //
     // These methods implement the persistent node → user binding that lets mesh

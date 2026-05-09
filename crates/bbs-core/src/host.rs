@@ -562,6 +562,8 @@ impl Host for BbsHost {
             filename,
             size_bytes: meta.len(),
             created_at,
+            config_filename: None,
+            config_size_bytes: None,
         })
     }
 
@@ -571,6 +573,13 @@ impl Host for BbsHost {
     ) -> Result<Vec<AdminBackupRecord>, HostError> {
         self.db
             .admin_list_backups(backup_dir)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
+        self.db
+            .admin_delete_backup(backup_dir, filename)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
     }

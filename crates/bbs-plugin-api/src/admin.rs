@@ -155,4 +155,10 @@ pub struct AdminBackupRecord {
     pub size_bytes: u64,
     /// RFC 3339 file modification timestamp.
     pub created_at: String,
+    /// Config file saved alongside this database backup, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_filename: Option<String>,
+    /// Size of the config file in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_size_bytes: Option<u64>,
 }

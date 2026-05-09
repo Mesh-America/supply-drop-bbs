@@ -29,6 +29,8 @@
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
 //! │  │  POST /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups              (auth)       │    │
+//! │  │  GET  /api/v1/backups/:filename    (auth)       │    │
+//! │  │  DELETE /api/v1/backups/:filename  (auth)       │    │
 //! │  │  GET  /*               → rust-embed SPA         │    │
 //! │  └─────────────────────────────────────────────────┘    │
 //! └─────────────────────────────────────────────────────────┘
@@ -59,6 +61,7 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
+use bbs_plugin_api::admin::AdminBackupRecord;
 use bbs_plugin_api::error::{HostError, PluginError};
 use bbs_plugin_api::event::{DomainEvent, MessageRecipient};
 use bbs_plugin_api::host::Host;
@@ -118,6 +121,13 @@ pub struct WebConfig {
     /// When `None`, the backup endpoints return 400 Bad Request.
     #[serde(default)]
     pub backup_dir: Option<String>,
+
+    /// Path to the main config file to include in each backup snapshot.
+    ///
+    /// Defaults to `config.toml` in the current working directory.
+    /// Set to an empty string to disable config backup.
+    #[serde(default = "default_config_path")]
+    pub config_path: Option<String>,
 }
 
 impl Default for WebConfig {
@@ -130,6 +140,7 @@ impl Default for WebConfig {
             prometheus: false,
             csp: None,
             backup_dir: None,
+            config_path: default_config_path(),
         }
     }
 }
@@ -142,6 +153,9 @@ fn default_bind() -> String {
 }
 fn default_cookie_secure() -> bool {
     false
+}
+fn default_config_path() -> Option<String> {
+    Some("config.toml".to_owned())
 }
 
 // ── Web session store ─────────────────────────────────────────────────────────
@@ -358,6 +372,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/settings", get(api_settings))
         .route("/sse/logs", get(api_sse_logs))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
+        .route(
+            "/backups/:filename",
+            get(api_download_backup).delete(api_delete_backup),
+        )
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -816,10 +834,42 @@ async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
                 .into_response()
         }
     };
-    match state.host.admin_trigger_backup(&dir).await {
-        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
-        Err(e) => server_error(&e.to_string()),
-    }
+
+    let record = match state.host.admin_trigger_backup(&dir).await {
+        Ok(r) => r,
+        Err(e) => return server_error(&e.to_string()),
+    };
+
+    // Copy config file alongside the database backup (best-effort).
+    let config_filename = if let Some(ref cfg) = state.config.config_path {
+        if !cfg.is_empty() {
+            let stem = record.filename.trim_end_matches(".db");
+            let config_dest_name = format!("{stem}_config.toml");
+            let config_dest = std::path::Path::new(&dir).join(&config_dest_name);
+            match tokio::fs::copy(cfg, &config_dest).await {
+                Ok(_) => {
+                    let size = tokio::fs::metadata(&config_dest)
+                        .await
+                        .ok()
+                        .map(|m| m.len());
+                    Some((config_dest_name, size))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let full_record = AdminBackupRecord {
+        config_filename: config_filename.as_ref().map(|(n, _)| n.clone()),
+        config_size_bytes: config_filename.and_then(|(_, s)| s),
+        ..record
+    };
+
+    (StatusCode::CREATED, Json(full_record)).into_response()
 }
 
 async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
@@ -835,6 +885,75 @@ async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
     };
     match state.host.admin_list_backups(&dir).await {
         Ok(records) => Json(records).into_response(),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_download_backup(
+    State(state): State<Arc<AppState>>,
+    Path(filename): Path<String>,
+) -> Response {
+    // Path traversal protection.
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("invalid filename")),
+        )
+            .into_response();
+    }
+
+    let dir = match &state.config.backup_dir {
+        Some(d) => d.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("backup_dir not configured")),
+            )
+                .into_response()
+        }
+    };
+
+    let path = std::path::Path::new(&dir).join(&filename);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, Json(json_error("file not found"))).into_response()
+        }
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_delete_backup(
+    State(state): State<Arc<AppState>>,
+    Path(filename): Path<String>,
+) -> Response {
+    let dir = match &state.config.backup_dir {
+        Some(d) => d.clone(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("backup_dir not configured")),
+            )
+                .into_response()
+        }
+    };
+
+    match state.host.admin_delete_backup(&dir, &filename).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(HostError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, Json(json_error("not found"))).into_response()
+        }
         Err(e) => server_error(&e.to_string()),
     }
 }

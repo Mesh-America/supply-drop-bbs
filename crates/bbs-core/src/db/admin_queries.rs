@@ -14,6 +14,7 @@ use bbs_plugin_api::{
 };
 use sqlx::Row;
 use std::path::Path;
+use tracing;
 
 // async_trait rewrites the callers in host.rs into closures that Clippy's
 // dead_code analysis does not follow, so these pub(crate) helpers appear unused.
@@ -268,14 +269,59 @@ impl Database {
                 .unwrap_or("")
                 .to_owned();
 
+            // Check for a matching config snapshot alongside the .db file.
+            let config_name = format!("{}_config.toml", filename.trim_end_matches(".db"));
+            let (config_filename, config_size_bytes) =
+                match tokio::fs::metadata(dir.join(&config_name)).await {
+                    Ok(m) => (Some(config_name), Some(m.len())),
+                    Err(_) => (None, None),
+                };
+
             records.push(AdminBackupRecord {
                 filename,
                 size_bytes,
                 created_at,
+                config_filename,
+                config_size_bytes,
             });
         }
 
         records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
         Ok(records)
+    }
+
+    /// Delete a backup `.db` file (and its associated config snapshot) from
+    /// `backup_dir`.
+    ///
+    /// Returns `StoreError::Decode("invalid filename")` if the filename
+    /// contains path traversal characters (`/`, `\`, `..`).
+    pub(crate) async fn admin_delete_backup(
+        &self,
+        backup_dir: &str,
+        filename: &str,
+    ) -> Result<(), StoreError> {
+        if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+            return Err(StoreError::Decode("invalid filename".into()));
+        }
+
+        let dir = Path::new(backup_dir);
+        let db_path = dir.join(filename);
+
+        tokio::fs::remove_file(&db_path)
+            .await
+            .map_err(|e| StoreError::Decode(format!("delete backup: {e}")))?;
+
+        // Best-effort: also remove the matching config snapshot.
+        let config_name = format!("{}_config.toml", filename.trim_end_matches(".db"));
+        let config_path = dir.join(&config_name);
+        match tokio::fs::remove_file(&config_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!("could not delete config snapshot {config_name}: {e}");
+            }
+        }
+
+        Ok(())
     }
 }
