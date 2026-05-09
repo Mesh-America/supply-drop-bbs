@@ -36,15 +36,15 @@ pub fn run_wizard(config_out: Option<&Path>) {
     section("Radio connection");
 
     let conn_items = &[
-        "USB / serial  (Heltec V3, T-Beam, RAK4631 — no pymc_core required)",
-        "TCP / pymc_core  (Pi HAT or remote pymc_core bridge)",
+        "USB / serial  (Heltec V3, T-Beam, RAK4631 — plug in via USB)",
+        "Pi HAT        (ZebraHat, Waveshare, PiMesh, FemtoFox — SPI on GPIO)",
     ];
 
     let conn_choice = prompt_select(&theme, "How does your radio connect?", conn_items, 0);
 
-    let (connection_type, serial_port, baud_rate, tcp_addr) = match conn_choice {
+    let (connection_type, serial_port, baud_rate) = match conn_choice {
         0 => configure_serial(&theme),
-        _ => configure_tcp(&theme),
+        _ => ("hat", None, None),
     };
 
     // ── BBS identity ──────────────────────────────────────────────────────────
@@ -148,7 +148,6 @@ pub fn run_wizard(config_out: Option<&Path>) {
         connection_type,
         serial_port: serial_port.as_deref(),
         baud_rate,
-        tcp_addr: tcp_addr.as_deref(),
         web_enabled,
         admin_password: admin_password.as_deref(),
         web_bind: web_bind.as_deref(),
@@ -182,10 +181,10 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
 /// USB / serial flow: list ports, let operator pick one, ask baud rate.
 ///
-/// Returns `(connection_type, serial_port, baud_rate, tcp_addr)`.
+/// Returns `(connection_type, serial_port, baud_rate)`.
 fn configure_serial(
     theme: &ColorfulTheme,
-) -> (&'static str, Option<String>, Option<u32>, Option<String>) {
+) -> (&'static str, Option<String>, Option<u32>) {
     let ports = list_serial_ports();
 
     let serial_port = if ports.is_empty() {
@@ -238,46 +237,7 @@ fn configure_serial(
 
     let baud: u32 = baud_str.parse().expect("validated above");
 
-    ("serial", Some(serial_port), Some(baud), None)
-}
-
-/// TCP / HAT flow: choose tcp vs hat, enter address.
-///
-/// Returns `(connection_type, serial_port, baud_rate, tcp_addr)`.
-fn configure_tcp(
-    theme: &ColorfulTheme,
-) -> (&'static str, Option<String>, Option<u32>, Option<String>) {
-    let type_items = &[
-        "tcp  — standalone pymc_core or remote bridge",
-        "hat  — pymc_core managing a Pi HAT (GPIO/SPI) — setup wizard will show HAT hints",
-    ];
-
-    let type_choice = prompt_select(theme, "Connection sub-type", type_items, 0);
-    let connection_type = if type_choice == 0 { "tcp" } else { "hat" };
-
-    let addr: String = Input::with_theme(theme)
-        .with_prompt("pymc_core address (host:port)")
-        .default("127.0.0.1:5000".into())
-        .validate_with(|s: &String| -> Result<(), &str> {
-            if s.parse::<std::net::SocketAddr>().is_ok() {
-                Ok(())
-            } else {
-                Err("enter a valid host:port — e.g. 127.0.0.1:5000")
-            }
-        })
-        .interact_text()
-        .unwrap_or_else(|_| cancelled());
-
-    if connection_type == "hat" {
-        println!();
-        println!("  Pi HAT setup notes:");
-        println!("  • Make sure pymc_core is installed and running as a systemd service.");
-        println!("  • Ensure UART is enabled (raspi-config → Interface Options → Serial Port).");
-        println!("  • The setup wizard does not yet auto-configure pymc_core — see");
-        println!("    docs/OPERATIONS.md for the HAT setup steps.");
-    }
-
-    (connection_type, None, None, Some(addr))
+    ("serial", Some(serial_port), Some(baud))
 }
 
 // ── TOML builder ──────────────────────────────────────────────────────────────
@@ -292,7 +252,6 @@ struct TomlParams<'a> {
     connection_type: &'a str,
     serial_port: Option<&'a str>,
     baud_rate: Option<u32>,
-    tcp_addr: Option<&'a str>,
     web_enabled: bool,
     admin_password: Option<&'a str>,
     web_bind: Option<&'a str>,
@@ -335,13 +294,7 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 }
             }
         }
-        "tcp" | "hat" => {
-            if let Some(addr) = p.tcp_addr {
-                if addr != "127.0.0.1:5000" {
-                    writeln!(s, "addr = {}", toml_str(addr)).unwrap();
-                }
-            }
-        }
+        "hat" => {}  // pymc-companion always runs on 127.0.0.1:5000
         _ => {}
     }
 
@@ -429,16 +382,6 @@ fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: 
             println!("  ls -l {port}");
             println!();
         }
-    }
-
-    // HAT: pymc_core service reminder.
-    if connection_type == "hat" && cfg!(target_os = "linux") {
-        println!("For Pi HAT mode, make sure pymc_core is running:");
-        println!();
-        println!("  sudo systemctl status pymc-core");
-        println!();
-        println!("See docs/OPERATIONS.md for the full HAT setup instructions.");
-        println!();
     }
 
     // systemd (Linux).
