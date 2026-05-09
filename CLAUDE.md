@@ -11,6 +11,9 @@ rustup run 1.88 cargo clippy --workspace -- -D warnings
 rustup run 1.88 cargo doc --workspace --no-deps --all-features
 ```
 
+Be certain to update documentation, where relevant.
+
+
 ## Commit style
 
 All commits must use [Conventional Commits](https://www.conventionalcommits.org/) format:
