@@ -1,4 +1,4 @@
-# ADR-0004: Cargo features for plugin selection (not runtime loading)
+﻿# ADR-0004: Cargo features for plugin selection (not runtime loading)
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -69,7 +69,7 @@ won't be revisited.
   boundary cost ~100ns + serialisation. Acceptable for most
   plugin operations, painful in hot paths.
 - **Genuine value when it lands.** Sandboxed plugins, language-
-  agnostic, no recompilation required — those are real wins.
+  agnostic, no recompilation required - those are real wins.
   Worth doing, but not at the cost of v1 timeline.
 
 ## Consequences
@@ -79,7 +79,7 @@ won't be revisited.
 - Plugin API can evolve quickly because there's no stable ABI
   contract to honour
 - All errors in plugin loading are compile-time errors
-- No supply-chain question — plugins ship as source, are reviewed
+- No supply-chain question - plugins ship as source, are reviewed
   during merge to the workspace, and are compiled by the same CI
   that builds the host
 - Operators get pre-built binaries; no toolchain on the Pi

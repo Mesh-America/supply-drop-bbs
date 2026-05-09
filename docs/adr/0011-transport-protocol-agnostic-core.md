@@ -1,4 +1,4 @@
-# ADR-0011: Transport-protocol agnostic core
+﻿# ADR-0011: Transport-protocol agnostic core
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -9,25 +9,25 @@
 v1 ships with a single mesh transport: MeshCore, via
 `pymc_core`'s CompanionFrameServer. The architecture is built
 around a `TransportEngine` plugin contract that allows other
-transports to be added later — and one of those is almost
+transports to be added later - and one of those is almost
 certainly going to be Meshtastic, which has a substantially
 larger user base than MeshCore today.
 
 Other plausible future transports:
 
-- **Meshtastic** — protobuf over USB / BLE / TCP, no bridge
+- **Meshtastic** - protobuf over USB / BLE / TCP, no bridge
   process needed (the device's firmware speaks the protocol
   directly to the host)
-- **Reticulum / RNS** — a different mesh-network design altogether
-- **Custom packet radio** — AX.25 over an analog HT
-- **Telnet / TCP raw** — for network-attached operators
-- **IRC bridge** — for participating in IRC channels as a
+- **Reticulum / RNS** - a different mesh-network design altogether
+- **Custom packet radio** - AX.25 over an analog HT
+- **Telnet / TCP raw** - for network-attached operators
+- **IRC bridge** - for participating in IRC channels as a
   pseudo-user
-- **Matrix bridge** — same idea via Matrix
-- **Gemini protocol** — for Gemini-served BBS clients
+- **Matrix bridge** - same idea via Matrix
+- **Gemini protocol** - for Gemini-served BBS clients
 
 Each of these is a transport plugin. The architecture already
-permits this — the `TransportEngine` trait abstracts away protocol
+permits this - the `TransportEngine` trait abstracts away protocol
 specifics. But "permits" isn't enough. Without an explicit
 discipline, contributors will accidentally bake protocol-specific
 assumptions into the core ("oh just add a `mesh_node_id` to
@@ -65,7 +65,7 @@ a `User` in `bbs-core` with a username; the MeshCore plugin
 remembers that this user's MeshCore identity is X. If the same
 human later wants to log in via Meshtastic, they go through the
 Meshtastic plugin's account-linking flow, which records the
-Meshtastic identity in *its* table — but the underlying `User`
+Meshtastic identity in *its* table - but the underlying `User`
 is the same row.
 
 ### Rule 3: Sessions identify by `(transport_name, opaque_id)`
@@ -79,8 +79,8 @@ something meaningful into that ID is the transport's business.
 
 The `Command` and `Response` enums in `bbs-core` cannot have
 variants like `MeshCorePostFlood` or `MeshtasticTelemetry`. If a
-feature requires protocol-specific knowledge — e.g., "show signal
-strength" — the relevant data is exposed through a *capability
+feature requires protocol-specific knowledge - e.g., "show signal
+strength" - the relevant data is exposed through a *capability
 extension* that only the transports supporting it implement, not
 through a core variant that's null on every other transport.
 
@@ -96,7 +96,7 @@ push for web) is the transport's concern. The core says
 
 Per-protocol configuration lives in the plugin's own config
 section, not in `bbs-core` config. MeshCore radio params,
-Meshtastic channel PSKs, Telnet line endings — all in their
+Meshtastic channel PSKs, Telnet line endings - all in their
 respective plugin sections. The core's config is concerned with
 domain rules (room defaults, permission levels, rate limits),
 not transport mechanics.
@@ -117,7 +117,7 @@ The cost of protocol-specific drift is paid years later. A
 `mesh_node_id` field added to `User` "just for now" becomes load-
 bearing when other code starts to read it. By the time someone
 wants to add a Meshtastic transport, they discover that core
-tables, queries, and types implicitly assume MeshCore semantics —
+tables, queries, and types implicitly assume MeshCore semantics -
 and untangling it is a months-long refactor.
 
 The mesh-citadel project hit this in microcosm: contact-cache
@@ -212,7 +212,7 @@ sysop-only HTTP endpoint contributed by the plugin), not through
   doesn't pretend to be Meshtastic; vice versa. No
   lowest-common-denominator fight.
 - **Multiple transports can coexist** for the same operator.
-  Run MeshCore + Meshtastic + CLI + web on the same BBS — each
+  Run MeshCore + Meshtastic + CLI + web on the same BBS - each
   is loaded as its own plugin, each owns its own state.
 - **Protocol upgrades isolate to the plugin.** If MeshCore
   ships a v2 protocol, only `bbs-mesh` and `meshcore-companion`
@@ -222,7 +222,7 @@ sysop-only HTTP endpoint contributed by the plugin), not through
 
 - **Some duplication across transport plugins.** Every transport
   with a "user identity" concept maintains its own mapping
-  table. We accept this — the alternative is shared schema that
+  table. We accept this - the alternative is shared schema that
   forces protocol coupling.
 - **Cross-transport features need explicit design.** "Push a
   notification to user X on whatever transport they're logged
@@ -238,7 +238,7 @@ sysop-only HTTP endpoint contributed by the plugin), not through
 
 - This ADR doesn't constrain non-mesh transports. CLI, web,
   and any future Telnet / Matrix / IRC bridge plugins follow
-  the same rules — they're all transports as far as the
+  the same rules - they're all transports as far as the
   architecture is concerned. The fact that some carry over
   radio and others over TCP is a transport-internal detail.
 
@@ -278,6 +278,6 @@ canonical reference; reviewers cite it.
   rendering). May become explicit if we want richer per-transport
   UX without per-transport command logic.
 - **Protocol bridges as plugins.** A "MeshCore ↔ Meshtastic
-  message bridge" is itself a transport-shaped object — it
+  message bridge" is itself a transport-shaped object - it
   consumes domain events from one transport and emits commands
   to another. Possible plugin pattern, not v1.

@@ -1,4 +1,4 @@
-# ADR-0010: OpenAPI generated from Rust via `utoipa`
+﻿# ADR-0010: OpenAPI generated from Rust via `utoipa`
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -58,7 +58,7 @@ compiles, the spec describes what the code does.
 
 - Active development, axum 0.7+ support
 - Derive-macro-driven; types get `#[derive(ToSchema)]` and routes
-  get `#[utoipa::path(...)]` attributes — no separate definitions
+  get `#[utoipa::path(...)]` attributes - no separate definitions
 - Generates valid OpenAPI 3.1
 - Plays well with Swagger UI and Redoc
 - Handles enums, generics, optional fields, custom serialisers
@@ -120,8 +120,8 @@ pub struct ApiDoc;
 
 The plugin's static-file routes:
 
-- `/openapi.json` — live spec
-- `/api/docs` — Swagger UI
+- `/openapi.json` - live spec
+- `/api/docs` - Swagger UI
 
 The CI step: `cargo run --bin gen-openapi -- --check` compares
 the generated spec to the committed one. PR fails on drift.
@@ -146,7 +146,7 @@ the generated spec to the committed one. PR fails on drift.
 ### Negative
 
 - **`utoipa` adds compile time** to the web crate. Acceptable.
-- **Derive macros require careful type design** — types that work
+- **Derive macros require careful type design** - types that work
   for serde may need additional annotations to generate good
   OpenAPI. We document the patterns as we encounter them.
 - **OpenAPI 3.1 is recent.** Some downstream tools still target
@@ -173,13 +173,13 @@ API paths are prefixed `/api/v1/`. Rules:
   to work for at least one minor release with a `Deprecation`
   header pointing at the v2 replacement.
 
-This isn't unlimited backwards-compat — we're not promising
+This isn't unlimited backwards-compat - we're not promising
 twenty years of v1 support. Two release cycles is enough for
 operators to update their clients.
 
 ## Future considerations
 
-- **gRPC for plugin-to-host calls?** Probably not — `Host` is a
+- **gRPC for plugin-to-host calls?** Probably not - `Host` is a
   Rust trait, no need for serialisation. But if WASM plugins
   arrive, we'll need a wire protocol for that boundary.
 - **Generated client SDKs** as part of the release. Currently

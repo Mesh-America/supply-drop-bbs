@@ -1,4 +1,4 @@
-# Operations guide
+﻿# Operations guide
 
 How to install, configure, update, back up, and remove Supply Drop BBS.
 
@@ -21,8 +21,8 @@ If you're a contributor or plugin author, see
 | RAM       | 256 MB available to the BBS process |
 | Disk      | 2 GB free for DB + logs + backups; SD card OK |
 | Radio     | SX1262 Pi HAT **or** USB MeshCore companion device |
-| OS        | Linux — Raspberry Pi OS / Debian tested. Other Unixes likely work. |
-| Python    | 3.10+ — **Pi HAT mode only** (for `pymc_core`) |
+| OS        | Linux - Raspberry Pi OS / Debian tested. Other Unixes likely work. |
+| Python    | 3.10+ - **Pi HAT mode only** (for `pymc_core`) |
 
 The BBS itself is a single static Rust binary with no runtime dependencies.
 Python is only required when using a Pi HAT
@@ -38,7 +38,7 @@ hardware.
 
 ```
    ┌──────────────────────────────────────────────────┐
-   │  supply-drop-bbs  (Rust — one process)           │
+   │  supply-drop-bbs  (Rust - one process)           │
    │                                                  │
    │   bbs-core ── bbs-mesh ── meshcore-companion     │
    │                                 │                │
@@ -58,7 +58,7 @@ No bridge process, no Python. One service to manage.
 ```
    ┌──────────────────────┐         ┌────────────────────────┐
    │  pymc-companion      │         │  supply-drop-bbs       │
-   │  (Python — pymc_core │◄─TCP──► │  (Rust BBS host)       │
+   │  (Python - pymc_core │◄─TCP──► │  (Rust BBS host)       │
    │  CompanionRadio +    │         │                        │
    │  CompanionFrameServer│         │  also exposes:         │
    │                      │         │  - web UI (opt-in)     │
@@ -72,7 +72,7 @@ No bridge process, no Python. One service to manage.
 ```
 
 `pymc-companion` owns the radio hardware. The BBS connects to it over
-`127.0.0.1:5000`. Two independent processes — either can restart without
+`127.0.0.1:5000`. Two independent processes - either can restart without
 breaking the other.
 
 ## Installation
@@ -88,9 +88,9 @@ The script builds from source, installs, and walks you through configuration.
 
 Before running, have ready:
 
-- **Radio type** — USB companion device or Pi HAT
-- **HAT model** — if using a Pi HAT (ZebraHat, Waveshare, PiMesh, etc.)
-- **Region** — US (910.525 MHz) or EU (869.618 MHz), or your local frequency
+- **Radio type** - USB companion device or Pi HAT
+- **HAT model** - if using a Pi HAT (ZebraHat, Waveshare, PiMesh, etc.)
+- **Region** - US (910.525 MHz) or EU (869.618 MHz), or your local frequency
 
 ### What the installer does
 
@@ -107,21 +107,21 @@ Before running, have ready:
 
 ### What the setup wizard asks
 
-1. **Radio connection type** — USB serial or Pi HAT
-2. **Serial port** *(USB only)* — detected automatically; you confirm or enter manually
-3. **BBS name** — displayed to users on connect
-4. **Data directory** — defaults to `/var/lib/supply-drop-bbs`
-5. **Web admin UI** — whether to enable it, and if so, the password and bind address
+1. **Radio connection type** - USB serial or Pi HAT
+2. **Serial port** *(USB only)* - detected automatically; you confirm or enter manually
+3. **BBS name** - displayed to users on connect
+4. **Data directory** - defaults to `/var/lib/supply-drop-bbs`
+5. **Web admin UI** - whether to enable it, and if so, the password and bind address
 
 The wizard writes `/etc/supply-drop-bbs/config.toml`. Run
 `supply-drop-bbs setup` at any time to reconfigure.
 
-### Pi HAT — additional wizard steps (in the installer)
+### Pi HAT - additional wizard steps (in the installer)
 
 After the BBS wizard, the installer asks:
 
-1. **Region / frequency** — US, EU, or enter manually
-2. **HAT model** — choose from the supported list
+1. **Region / frequency** - US, EU, or enter manually
+2. **HAT model** - choose from the supported list
 
 The installer then:
 
@@ -216,7 +216,7 @@ The uninstaller:
 3. Removes the binary (`/usr/local/bin/supply-drop-bbs`)
 4. Removes `/opt/pymc-companion` and `/opt/supply-drop-bbs`
 5. **Asks before deleting** the config directory (`/etc/supply-drop-bbs`)
-6. **Asks before deleting** the data directory (`/var/lib/supply-drop-bbs`) — this contains your message store and identity key
+6. **Asks before deleting** the data directory (`/var/lib/supply-drop-bbs`) - this contains your message store and identity key
 7. **Asks before removing** the `supply-drop` system user
 
 If you answer N to the data directory prompt, your messages and identity are
@@ -224,7 +224,7 @@ preserved and can be used with a fresh install.
 
 ## systemd units
 
-### USB device — one service
+### USB device - one service
 
 **`supply-drop-bbs.service`**
 
@@ -253,13 +253,13 @@ PrivateTmp=yes
 WantedBy=multi-user.target
 ```
 
-### Pi HAT — two services
+### Pi HAT - two services
 
 **`pymc-companion.service`** starts first (the BBS connects to it):
 
 ```ini
 [Unit]
-Description=pymc-companion — LoRa radio bridge for Supply Drop BBS
+Description=pymc-companion - LoRa radio bridge for Supply Drop BBS
 After=network.target
 Before=supply-drop-bbs.service
 
@@ -294,13 +294,13 @@ Wants=network.target
 ...same as USB variant above...
 ```
 
-The two services are independent at the socket level — the BBS reconnects
+The two services are independent at the socket level - the BBS reconnects
 automatically if `pymc-companion` restarts.
 
 ## Update
 
 ```sh
-# Re-run the installer — it pulls the latest source and rebuilds.
+# Re-run the installer - it pulls the latest source and rebuilds.
 curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
   | sudo bash
 ```
@@ -452,10 +452,10 @@ sudo journalctl -u pymc-companion -f
 
 Common causes:
 
-- SPI not enabled — `sudo raspi-config` → Interface Options → SPI
+- SPI not enabled - `sudo raspi-config` → Interface Options → SPI
 - `supply-drop` user not in `spi`/`gpio` groups (installer adds these; a reboot may be needed)
-- Missing Python dependency — `sudo /opt/pymc-companion/venv/bin/pip install spidev lgpio`
-- Wrong HAT selected — edit `/etc/supply-drop-bbs/pymc-companion.yaml` and restart pymc-companion
+- Missing Python dependency - `sudo /opt/pymc-companion/venv/bin/pip install spidev lgpio`
+- Wrong HAT selected - edit `/etc/supply-drop-bbs/pymc-companion.yaml` and restart pymc-companion
 
 ### Database locked
 
@@ -483,7 +483,7 @@ Check `[plugins.web] bind` and `external_origin` in config.
 
 ## Versioning
 
-Pre-1.0: each release may include breaking changes — read the release notes.
+Pre-1.0: each release may include breaking changes - read the release notes.
 
 After 1.0: semver. Major bumps are breaking; minor releases add features
 compatibly; patches are bug fixes only.

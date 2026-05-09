@@ -1,4 +1,4 @@
-# ADR-0012: bbs-core persistence layer
+﻿# ADR-0012: bbs-core persistence layer
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -77,7 +77,7 @@ workflow.
 `include_str!`-style macros, applies them in filename order, and
 records each in the `_sqlx_migrations` table. This is exactly the
 "append-only `.sql` files, applied in order, tracked in a table" model
-specified in ARCHITECTURE.md §4.4 — the only difference is the table
+specified in ARCHITECTURE.md §4.4 - the only difference is the table
 name is `_sqlx_migrations` rather than `schema_migrations`. We adopt
 `_sqlx_migrations` to stay consistent with what sqlx creates.
 
@@ -109,7 +109,7 @@ below.
 Rationale: the architecture document (§5.3) already writes the
 signatures as traits (`fn users(&self, perms: &PermissionCtx) -> &dyn
 UserStore`). Implementing these as traits rather than plain `impl`
-blocks on `Database` preserves testability — unit tests can substitute
+blocks on `Database` preserves testability - unit tests can substitute
 a `FakeUserStore` without spinning up SQLite. A `FakeHost` that returns
 fake stores is cheaper in test setup than a full database.
 
@@ -128,10 +128,10 @@ call. The store traits are `async_trait`-compatible.
 ### Pool wiring
 
 The `Database` struct owns:
-- `read_pool: sqlx::Pool<sqlx::Sqlite>` — sized `cpu_count + 2`,
+- `read_pool: sqlx::Pool<sqlx::Sqlite>` - sized `cpu_count + 2`,
   opened with `SQLITE_OPEN_READ_ONLY` flag via `SqliteConnectOptions`
   to enforce the separation at the file-descriptor level.
-- `write_conn: sqlx::Pool<sqlx::Sqlite>` — max connections 1, opened
+- `write_conn: sqlx::Pool<sqlx::Sqlite>` - max connections 1, opened
   with `SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE`.
 
 Using `Pool` with `max_connections(1)` for the write connection rather
@@ -144,19 +144,19 @@ sqlx's own wait queue, honouring `busy_timeout`.
 
 sqlx provides `SqliteConnectOptions::with_after_connect`. We supply a
 function `after_connect(conn: &mut SqliteConnection) -> impl Future` that
-executes each PRAGMA from ADR-0005 as a `sqlx::query` (no `!` — PRAGMAs
+executes each PRAGMA from ADR-0005 as a `sqlx::query` (no `!` - PRAGMAs
 are not checked against the schema). The hook is registered on both the
 read pool and the write connection's options before the pools are built.
 
 `PRAGMA journal_mode = WAL` returns a result row; the hook must execute
 it with `query().execute()` and discard the result (the return value is
 "wal", confirming the mode, but we don't need to assert it every
-connection — a failed migration would surface the problem more clearly).
+connection - a failed migration would surface the problem more clearly).
 
 ### Password storage: separate `user_credentials` table
 
 The `User` struct (the domain view) must never carry raw password bytes
-or hashes — this is stated as a constraint in the task. The question is
+or hashes - this is stated as a constraint in the task. The question is
 where the hash lives.
 
 **Decision: separate `user_credentials` table, not a column on `users`.**
@@ -171,7 +171,7 @@ Rationale:
 - The `user_credentials` table has exactly one query that reads it:
   `verify_password(username, candidate) -> Result<bool>`. This query
   lives in a `CredentialStore` that is not part of the `UserStore`
-  trait. `CredentialStore` is not exposed through `Host` — only the
+  trait. `CredentialStore` is not exposed through `Host` - only the
   host's internal authentication flow calls it. Plugins never touch
   credentials directly.
 - A future multi-factor or external auth scheme can add a second
@@ -224,9 +224,9 @@ the `Database` handle is returned to callers.**
 
 The function executes two queries against the read pool:
 
-1. Count rooms with `prev_neighbor IS NULL` — must be exactly 0 or 1
+1. Count rooms with `prev_neighbor IS NULL` - must be exactly 0 or 1
    (0 is valid for an empty BBS).
-2. Count rooms with `next_neighbor IS NULL` — must be exactly 0 or 1.
+2. Count rooms with `next_neighbor IS NULL` - must be exactly 0 or 1.
 3. A cycle check: walk the linked list from the head up to
    `(SELECT COUNT(*) FROM rooms) + 1` steps; if the walk hasn't
    terminated at a `next_neighbor IS NULL` row, a cycle exists.
@@ -238,7 +238,7 @@ Startup-time is the right moment because: (a) no user traffic is in
 flight yet, so the error is unambiguous; (b) the check is cheap
 (at most `O(rooms)` reads, a negligible count for any realistic BBS);
 (c) placing it in `Database::open` means any code path that constructs
-a `Database` — including tests — gets the guarantee automatically.
+a `Database` - including tests - gets the guarantee automatically.
 
 A sysop reorder operation (room linked-list mutation) must be wrapped in
 a transaction that maintains the invariant: update both the moved room's

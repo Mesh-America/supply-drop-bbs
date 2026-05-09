@@ -1,8 +1,8 @@
-# Plugin API guide
+﻿# Plugin API guide
 
 This document is the prose introduction to writing plugins for
 Supply Drop BBS. The canonical reference is the rustdoc on the
-`bbs-plugin-api` crate — generate with `cargo doc -p bbs-plugin-api
+`bbs-plugin-api` crate - generate with `cargo doc -p bbs-plugin-api
 --open` once the codebase exists. This file explains the *why* and
 points at the *what*.
 
@@ -42,7 +42,7 @@ rationale.
 
 ## The Plugin trait
 
-Every plugin starts with the base `Plugin` trait. (Sketch — final
+Every plugin starts with the base `Plugin` trait. (Sketch - final
 shape evolves as we implement.)
 
 ```rust
@@ -298,7 +298,7 @@ don't block other plugins.
 
 ## Worked example: a minimal plugin
 
-**TBD** — a complete reference plugin (`crates/bbs-example-hello/`)
+**TBD** - a complete reference plugin (`crates/bbs-example-hello/`)
 that prints a log line every time a message is posted, with a
 configurable log level. About 50 lines of Rust. Published when the
 implementation lands so this section can be filled in with real
@@ -313,7 +313,7 @@ Plugin error types should:
 - Distinguish between *retryable* (transient network errors,
   temporary lock contention) and *fatal* (config invalid, DB
   schema mismatch) variants
-- Carry context for debugging — `tracing::error!()` macros pick
+- Carry context for debugging - `tracing::error!()` macros pick
   this up automatically
 
 Avoid `unwrap()` and `expect()` in plugin code outside of test
@@ -355,7 +355,7 @@ canonical reference.
 - One plugin per crate
 - Crate name: `bbs-<short-name>` for in-tree plugins;
   `<owner>-bbs-<short-name>` for community plugins
-- Public API on the plugin should be minimal — most types are
+- Public API on the plugin should be minimal - most types are
   `pub(crate)`; only the `Plugin`-implementing struct is `pub`
 - Config struct is named `<Plugin>Config`
 - Errors: one enum per plugin, named `<Plugin>Error`

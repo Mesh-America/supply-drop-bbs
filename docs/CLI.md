@@ -1,4 +1,4 @@
-# CLI reference — `supply-drop-bbs`
+﻿# CLI reference - `supply-drop-bbs`
 
 Complete reference for every subcommand and flag.
 
@@ -18,11 +18,11 @@ These options are accepted by every subcommand.
 
 | Flag | Env override | Default | Description |
 |------|-------------|---------|-------------|
-| `--config <PATH>` | — | see below | Path to the TOML config file |
+| `--config <PATH>` | - | see below | Path to the TOML config file |
 | `--data-dir <PATH>` | `SUPPLY_DROP__BBS__DATA_DIR` | `<config data_dir>` | Override the data directory (database, logs, backups) |
 | `--log-level <LEVEL>` | `SUPPLY_DROP__LOGGING__LEVEL` | `INFO` | Log verbosity: `TRACE` `DEBUG` `INFO` `WARN` `ERROR` |
-| `--version` | — | — | Print version and exit |
-| `--help` / `-h` | — | — | Print help and exit |
+| `--version` | - | - | Print version and exit |
+| `--help` / `-h` | - | - | Print help and exit |
 
 ### Config file search order
 
@@ -36,7 +36,7 @@ If none exists, compiled-in defaults are used. An empty or missing config file i
 
 ### `--data-dir` behaviour
 
-Setting `--data-dir` clears any database path, log file path, and backup directory that were set in the config file — they are re-derived under the new data directory. If you need an explicit database path alongside a different data directory, set both `data_dir` and `database.path` in the TOML file instead.
+Setting `--data-dir` clears any database path, log file path, and backup directory that were set in the config file - they are re-derived under the new data directory. If you need an explicit database path alongside a different data directory, set both `data_dir` and `database.path` in the TOML file instead.
 
 ---
 
@@ -48,7 +48,7 @@ Setting `--data-dir` clears any database path, log file path, and backup directo
 supply-drop-bbs run [OPTIONS]
 ```
 
-Start the BBS. This is the default when no subcommand is given — the following two commands are equivalent:
+Start the BBS. This is the default when no subcommand is given - the following two commands are equivalent:
 
 ```sh
 supply-drop-bbs
@@ -69,10 +69,10 @@ supply-drop-bbs run
 **Examples:**
 
 ```sh
-# Systemd service — normal production invocation
+# Systemd service - normal production invocation
 supply-drop-bbs run --config /etc/supply-drop-bbs/config.toml
 
-# Development — verbose logging, local data directory
+# Development - verbose logging, local data directory
 supply-drop-bbs run --data-dir ./dev-data --log-level debug
 
 # Override log level via environment
@@ -87,15 +87,15 @@ SUPPLY_DROP__LOGGING__LEVEL=trace supply-drop-bbs run
 supply-drop-bbs setup [OPTIONS]
 ```
 
-Run the interactive first-run setup wizard. Detects your radio device, asks configuration questions, and writes a `config.toml`. Safe to run on an existing installation — answers are pre-populated from the current config.
+Run the interactive first-run setup wizard. Detects your radio device, asks configuration questions, and writes a `config.toml`. Safe to run on an existing installation - answers are pre-populated from the current config.
 
 The wizard asks:
 
-1. Radio connection type — USB serial or Pi HAT
-2. Serial port *(USB only)* — auto-detected; you confirm or enter manually
-3. BBS name — shown to users on connect
-4. Data directory — defaults to `/var/lib/supply-drop-bbs`
-5. Web admin UI — whether to enable it, bind address, and password
+1. Radio connection type - USB serial or Pi HAT
+2. Serial port *(USB only)* - auto-detected; you confirm or enter manually
+3. BBS name - shown to users on connect
+4. Data directory - defaults to `/var/lib/supply-drop-bbs`
+5. Web admin UI - whether to enable it, bind address, and password
 
 After the wizard completes, restart the service to apply:
 
@@ -141,7 +141,7 @@ supply-drop-bbs config check && sudo systemctl restart supply-drop-bbs
 supply-drop-bbs config show [OPTIONS]
 ```
 
-Print the effective configuration as TOML — compiled-in defaults, config file values, and environment overrides all merged and displayed together. Useful for verifying that overrides are applied correctly.
+Print the effective configuration as TOML - compiled-in defaults, config file values, and environment overrides all merged and displayed together. Useful for verifying that overrides are applied correctly.
 
 ```sh
 supply-drop-bbs config show
@@ -169,7 +169,7 @@ Apply any pending database migrations and exit. The `run` subcommand always migr
 supply-drop-bbs backup [OPTIONS]
 ```
 
-Trigger an immediate database backup (`VACUUM INTO`) and exit. The backup lands in `<data_dir>/backups/` with a timestamp filename. The running BBS service does not need to be stopped — `VACUUM INTO` is non-blocking.
+Trigger an immediate database backup (`VACUUM INTO`) and exit. The backup lands in `<data_dir>/backups/` with a timestamp filename. The running BBS service does not need to be stopped - `VACUUM INTO` is non-blocking.
 
 > **Note:** not yet implemented. The command exits with an error in the current release. Use the **Trigger backup** button in the web admin UI in the meantime.
 
@@ -181,7 +181,7 @@ Trigger an immediate database backup (`VACUUM INTO`) and exit. The backup lands 
 supply-drop-bbs user promote <USERNAME> [OPTIONS]
 ```
 
-Promote a user account to **Sysop** (permission level 100). The BBS service does not need to be restarted — the change takes effect the next time the user logs in or issues a command.
+Promote a user account to **Sysop** (permission level 100). The BBS service does not need to be restarted - the change takes effect the next time the user logs in or issues a command.
 
 | Argument | Description |
 |----------|-------------|

@@ -1,11 +1,11 @@
-# Protocol notes
+﻿# Protocol notes
 
 Two protocols are documented here:
 
-1. **Companion-frame** — the binary TCP protocol between Supply
+1. **Companion-frame** - the binary TCP protocol between Supply
    Drop BBS and the radio bridge process (`pymc_core`'s
    `CompanionFrameServer`)
-2. **BBS-over-mesh** — the application-layer command vocabulary
+2. **BBS-over-mesh** - the application-layer command vocabulary
    that mesh users exchange with the BBS
 
 The HTTP / REST API for the web admin is documented separately as
@@ -23,7 +23,7 @@ committed for diffability).
 ### Purpose
 
 `pymc_core`'s `CompanionFrameServer` exposes a TCP server that
-speaks the MeshCore "companion" wire protocol — the same protocol
+speaks the MeshCore "companion" wire protocol - the same protocol
 a USB or serial-attached MeshCore companion device speaks. This
 abstracts the radio: the BBS doesn't care if the bridge is on a
 local Pi, a remote host, or someday a Rust daemon talking to an
@@ -33,14 +33,14 @@ SX1262.
 
 - TCP, default `127.0.0.1:5000` (configurable on both sides).
 - One persistent connection per BBS process.
-- No TLS at this layer — the protocol is binary, not text-based,
+- No TLS at this layer - the protocol is binary, not text-based,
   and is expected to run on loopback. Operators wanting to run
   the bridge on a different host should use ssh tunnelling or
   WireGuard.
 
 ### Framing
 
-**TBD** — exact framing inherited from MeshCore companion protocol.
+**TBD** - exact framing inherited from MeshCore companion protocol.
 Working hypothesis from `pymc_core` source:
 
 - Each frame is length-prefixed
@@ -56,18 +56,18 @@ examples.
 
 The MeshCore companion protocol defines roughly:
 
-- **Identity / handshake** — establish session, negotiate
+- **Identity / handshake** - establish session, negotiate
   capabilities, sync time
-- **Contact management** — list known nodes, add/remove contacts,
+- **Contact management** - list known nodes, add/remove contacts,
   query by node ID
-- **Outgoing message** — send a packet (DM or flood) to a contact
+- **Outgoing message** - send a packet (DM or flood) to a contact
   or channel
-- **Incoming message** — receive a packet (delivered to the
+- **Incoming message** - receive a packet (delivered to the
   application; we forward as a domain event)
-- **Advert** — announce / heard-from-node events
-- **Status** — radio state, signal strength, battery (for nodes
+- **Advert** - announce / heard-from-node events
+- **Status** - radio state, signal strength, battery (for nodes
   that report it)
-- **Channel ops** — encrypted channel join/leave/list
+- **Channel ops** - encrypted channel join/leave/list
 
 **TBD** for each: full payload schema and semantics. Reference
 implementation: `meshcore_py` (Python client of the same protocol).
@@ -91,15 +91,15 @@ beyond that, oldest are dropped with a WARN log.
 
 The companion-frame protocol surface produces:
 
-- **TCP-level errors** (connection refused, reset, timeout) —
+- **TCP-level errors** (connection refused, reset, timeout) -
   trigger reconnection
 - **Frame-decode errors** (malformed length, unknown type, payload
-  too short) — log + close connection + reconnect. Persistent
+  too short) - log + close connection + reconnect. Persistent
   decode errors after a reconnect indicate a protocol-version
   mismatch, which we surface as a fatal `meshcore-companion`
   error to the operator.
 - **Application-level errors** (radio busy, contact unknown, send
-  failed) — surfaced as `MeshTransportError` variants the
+  failed) - surfaced as `MeshTransportError` variants the
   transport plugin maps to user-visible responses.
 
 ### Versioning
@@ -119,10 +119,10 @@ range is documented in the crate's README and in the BBS's
 - **Fuzz tests** (`cargo fuzz`) of the decoder. This is one of the
   highest-priority fuzz targets because untrusted bytes from the
   network reach our parser here.
-- **Integration tests** against a `MockBridgeServer` — a Rust test
+- **Integration tests** against a `MockBridgeServer` - a Rust test
   harness that imitates the bridge well enough for the BBS to
   exercise its mesh transport without actual radio hardware.
-- **End-to-end tests** against a real `pymc_core` instance — gated
+- **End-to-end tests** against a real `pymc_core` instance - gated
   behind a `--features integration-tests-with-bridge` cargo flag,
   not run in default CI.
 
@@ -133,7 +133,7 @@ range is documented in the crate's README and in the BBS's
 A mesh user with a MeshCore client sends DMs to the BBS's mesh
 node. The BBS interprets those DMs as **commands** and replies
 with one or more DMs containing the response. This is where the
-"BBS personality" lives — what commands users can issue, what
+"BBS personality" lives - what commands users can issue, what
 the BBS sends back, how state is maintained per-user.
 
 ### Conventions
@@ -179,7 +179,7 @@ and response format will be tabulated here. For now, a sketch:
 | `kick <user>`     | sysop             | End user's sessions                          |
 
 This list will be made authoritative when the command processor is
-implemented. **TBD** — argument grammars, response formats, error
+implemented. **TBD** - argument grammars, response formats, error
 codes per command, paging details.
 
 ### Workflows over mesh
@@ -219,7 +219,7 @@ BBS:  Registration submitted. Awaiting sysop validation.
 ```
 SYSOP: pending
 BBS:   Pending validations:
-       1) alice — "I am building mesh repeaters in the PNW."
+       1) alice - "I am building mesh repeaters in the PNW."
 SYSOP: valid alice
 BBS:   alice is now validated. They have been notified.
 ```
@@ -247,7 +247,7 @@ Per-user rate limit (default 60 commands/min, configurable).
 Unknown commands respond with the help topic. Authentication
 failures lock further attempts for a brief cooldown. Authorisation
 failures (insufficient permission level) respond with a clear
-"you can't do that" message — no information leak about the action
+"you can't do that" message - no information leak about the action
 that would have happened.
 
 ## Part 3: Internal command schema
@@ -257,16 +257,16 @@ internal representation. Both are serialisable (mostly for audit
 logging and tests; they don't cross a wire boundary in normal
 operation since plugins are in-process).
 
-**TBD** — full enum variants when the implementation lands.
+**TBD** - full enum variants when the implementation lands.
 
 ## See also
 
-- `crates/meshcore-companion/` — the Rust client implementation
+- `crates/meshcore-companion/` - the Rust client implementation
   (TBD)
-- `crates/bbs-mesh/` — the BBS-side mesh transport plugin (TBD)
-- `crates/bbs-core/src/command.rs` — internal command/response
+- `crates/bbs-mesh/` - the BBS-side mesh transport plugin (TBD)
+- `crates/bbs-core/src/command.rs` - internal command/response
   types (TBD)
-- [`pymc_core`](https://github.com/meshcore-dev/pymc_core) —
+- [`pymc_core`](https://github.com/meshcore-dev/pymc_core) -
   upstream radio bridge
-- [`meshcore_py`](https://github.com/meshcore-dev/meshcore_py) —
+- [`meshcore_py`](https://github.com/meshcore-dev/meshcore_py) -
   Python reference client of the companion-frame protocol

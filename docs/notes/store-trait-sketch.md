@@ -1,7 +1,7 @@
-# Store trait sketch — bbs-core persistence layer
+﻿# Store trait sketch - bbs-core persistence layer
 
 Design-grade pseudocode. Close to compilable but not the final
-implementation — some details (error mapping, `sqlx::FromRow` derives,
+implementation - some details (error mapping, `sqlx::FromRow` derives,
 exact query text) are elided. Records the agreed architectural shape so
 implementation can proceed mechanically.
 
@@ -101,7 +101,7 @@ use sqlx::sqlite::SqliteConnection;
 
 /// Apply SD-card-tuned PRAGMAs on a fresh connection.
 /// Called by the pool's `after_connect` hook.
-/// PRAGMAs use runtime `query` (not `query!`) — they don't map to schema columns.
+/// PRAGMAs use runtime `query` (not `query!`) - they don't map to schema columns.
 pub async fn apply_pragmas(conn: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     // journal_mode returns a result row; execute and discard.
     sqlx::query("PRAGMA journal_mode = WAL").execute(&mut *conn).await?;
@@ -229,7 +229,7 @@ use crate::timestamp::Timestamp;
 use async_trait::async_trait;
 
 /// Read/write access to the users table.
-/// Does NOT include credential operations — those live on `CredentialStore`.
+/// Does NOT include credential operations - those live on `CredentialStore`.
 #[async_trait]
 pub trait UserStore: Send + Sync {
     async fn get_by_id(&self, id: UserId) -> Result<Option<User>, StoreError>;
@@ -494,7 +494,7 @@ pub trait Host: Send + Sync {
     /// Access the user store. The returned reference is backed by the
     /// host's internal `Database`; no allocation per call.
     ///
-    /// Permission enforcement is NOT in the store trait — it lives in
+    /// Permission enforcement is NOT in the store trait - it lives in
     /// `Host::process_command`. Plugins that call store methods directly
     /// bypass the command layer; this is acceptable because plugins are
     /// trusted compiled-in code (ADR-0004).
@@ -568,12 +568,12 @@ async fn post_messages_and_paginate() {
 
 **Case 1: username roundtrip through create → get_by_username**
 
-Strategy: `"[a-z][a-z0-9]{0,30}"` — filter to valid `Username::new` inputs.
+Strategy: `"[a-z][a-z0-9]{0,30}"` - filter to valid `Username::new` inputs.
 Catches silent truncation or character mangling in the store's INSERT/SELECT.
 
 **Case 2: message content roundtrip through post_to_room → get_by_id**
 
-Strategy: `"[^\x00]{1,4096}"` — any non-NUL string up to 4096 bytes.
+Strategy: `"[^\x00]{1,4096}"` - any non-NUL string up to 4096 bytes.
 Catches encoding surprises in free-form text (multi-byte UTF-8,
 apostrophes, backslashes). Widest character range generates inputs
 hand-written tests never would.

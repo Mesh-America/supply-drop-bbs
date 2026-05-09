@@ -1,4 +1,4 @@
-# ADR-0005: DB strategy — disk WAL with SD-card-tuned PRAGMAs
+﻿# ADR-0005: DB strategy - disk WAL with SD-card-tuned PRAGMAs
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -104,7 +104,7 @@ can `scp` these off the box for off-host retention.
 
 `VACUUM INTO` is non-blocking: it runs as a separate transaction
 that doesn't block the live DB. This is the structural fix for the
-mesh-citadel May 8 incident — backup is no longer in the critical
+mesh-citadel May 8 incident - backup is no longer in the critical
 path of any user request.
 
 Old backups are pruned per the retention policy in config (default:
@@ -134,7 +134,7 @@ under any sustained write load, and readers block writers.
 
 ### `synchronous = OFF`
 
-Rejected. We'd lose durability entirely on power loss — not just
+Rejected. We'd lose durability entirely on power loss - not just
 the last few ms but potentially the last several seconds, plus
 some risk of database corruption. Too aggressive.
 

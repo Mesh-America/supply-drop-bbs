@@ -1,4 +1,4 @@
-# ADR-0003: Web admin UI as a plugin
+﻿# ADR-0003: Web admin UI as a plugin
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -19,7 +19,7 @@ c) A plugin against the same `bbs-plugin-api` that third-party
 mesh-citadel took the "first-class" path: the web UI was wired
 directly into the transport manager and shared significant code
 with the BBS core. This worked but it meant the plugin contract
-was theoretical — there was no real example of an extension built
+was theoretical - there was no real example of an extension built
 against it, so the contract drifted from what extensions would
 actually need.
 
@@ -34,14 +34,14 @@ The plugin lives in `crates/bbs-web/`. It's enabled via the
 
 ## Alternatives considered
 
-### Option (a) — first-class
+### Option (a) - first-class
 
 Rejected. The plugin contract becomes vapor if there's no non-trivial
 example. We'd have a `Plugin` trait that no real plugin uses, and
 six months in, the trait would be subtly wrong for the first
 extension someone wrote.
 
-### Option (b) — opt-in but integrated
+### Option (b) - opt-in but integrated
 
 Rejected for the same reason. "Optional" doesn't validate the
 contract; "implemented against the contract" does.
@@ -60,7 +60,7 @@ contract; "implemented against the contract" does.
   Smaller binary, less attack surface.
 - **The web UI doesn't get special privileges.** It can't bypass
   permission checks, can't access the DB directly, can't read
-  session tokens it shouldn't see — because it has the same
+  session tokens it shouldn't see - because it has the same
   `Host` interface as a third-party plugin would.
 - **Third-party UI projects** (mobile app, terminal client,
   alternative web frontend) consume the same OpenAPI surface
@@ -79,7 +79,7 @@ contract; "implemented against the contract" does.
   helps.
 - **Slower iteration in some cases.** A change that affects both
   `bbs-core` and `bbs-web` is a coordinated change across two
-  crates rather than one. In practice this is fine — small,
+  crates rather than one. In practice this is fine - small,
   stable interfaces don't require coordinated changes often.
 
 ### Neutral
@@ -94,5 +94,5 @@ contract; "implemented against the contract" does.
 
 This decision validates by construction. The first time we find
 something the web plugin needs and the plugin API doesn't support,
-that's a signal to extend the API — and that extension benefits
+that's a signal to extend the API - and that extension benefits
 every other plugin.

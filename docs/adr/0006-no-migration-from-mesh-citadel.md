@@ -1,4 +1,4 @@
-# ADR-0006: No migration from mesh-citadel
+﻿# ADR-0006: No migration from mesh-citadel
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -45,7 +45,7 @@ Specific reasons to refuse a migration path:
 
 2. **Migration is a long-term commitment.** If we ship a migrator,
    we own its correctness across all future schema evolutions.
-   The maintenance cost over years is substantial — and it
+   The maintenance cost over years is substantial - and it
    benefits a small number of operators (everyone who's already
    running mesh-citadel) at the expense of every future feature
    decision.

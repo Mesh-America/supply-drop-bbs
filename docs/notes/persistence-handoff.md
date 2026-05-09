@@ -1,9 +1,9 @@
-# Persistence Layer Handoff
+﻿# Persistence Layer Handoff
 
 **Date:** 2026-05-08  
 **Status:** Design complete; implementation pending (commit 7)  
 **Repo:** `D:\Projects\supply-drop-bbs` / `Mesh-America/supply-drop-bbs`  
-**Branch:** `main` @ `bd6731a` — feat(bbs-core): foundation domain types  
+**Branch:** `main` @ `bd6731a` - feat(bbs-core): foundation domain types  
 **Toolchain:** Rust 1.88 (rust-toolchain.toml + CI)
 
 ---
@@ -108,7 +108,7 @@ pub struct Message {
     async fn end_session(&self, session: SessionId) -> Result<(), HostError>;
     async fn permission_ctx(&self, session: SessionId) -> Result<PermissionCtx, HostError>;
     fn events(&self) -> broadcast::Receiver<DomainEvent>;
-    // Domain accessors (users/rooms/messages) NOT YET on trait — land with commit 7
+    // Domain accessors (users/rooms/messages) NOT YET on trait - land with commit 7
 }
 ```
 
@@ -142,7 +142,7 @@ uuid        = { version = "1", features = ["v4", "serde"] }
 
 ---
 
-## Open questions (unresolved — Plan agent must answer)
+## Open questions (unresolved - Plan agent must answer)
 
 1. **`sqlx::query!` macros vs `sqlx::query` runtime:**  
    `query!` compile-time SQL validation requires either `SQLX_OFFLINE=true` with committed `.sqlx/` metadata (run `cargo sqlx prepare` locally), or a live DB at build time. Which does CI use? Offline mode is standard; confirm approach and CI implications.
@@ -157,7 +157,7 @@ uuid        = { version = "1", features = ["v4", "serde"] }
    Which fits `Host::users()` cleanest?
 
 4. **Domain accessors on `Host` trait:**  
-   `host.users()`, `host.rooms()`, `host.messages()` — do they take a `&PermissionCtx` and return permission-filtered views, or do they return the raw store (permission enforcement in callers)?
+   `host.users()`, `host.rooms()`, `host.messages()` - do they take a `&PermissionCtx` and return permission-filtered views, or do they return the raw store (permission enforcement in callers)?
 
 5. **Password storage:**  
    On `User` struct vs separate `user_credentials` table (argon2id hash + salt). Separate is cleaner (security-only state not in domain type); join is one more query.
@@ -166,25 +166,25 @@ uuid        = { version = "1", features = ["v4", "serde"] }
    Same SQLite file as main data vs separate file. Separate means audit log survives a backup restore (which rolls back the main DB). Opine.
 
 7. **Room walk-order invariant at startup:**  
-   On `Database::open()`, should we verify the linked-list (exactly one head, one tail, no cycles)? Where does this live — SQL query check? A `verify_room_order()` fn?
+   On `Database::open()`, should we verify the linked-list (exactly one head, one tail, no cycles)? Where does this live - SQL query check? A `verify_room_order()` fn?
 
 ---
 
 ## Plan agent brief (for `docs/adr/0012-persistence-layer.md`)
 
-**Goal:** Design document only — no `Cargo.toml` edits, no `.rs` file writes. Output an ADR plus DDL and trait sketches the implementer will execute.
+**Goal:** Design document only - no `Cargo.toml` edits, no `.rs` file writes. Output an ADR plus DDL and trait sketches the implementer will execute.
 
 **Read before starting:**
 - `docs/ARCHITECTURE.md` §3 (domain model), §4 (persistence), §5.3 (Host accessors)
-- `docs/adr/0005-db-strategy.md` — PRAGMA settings, two-pool design
-- `docs/adr/0011-transport-protocol-agnostic-core.md` — no protocol fields in schema
-- `crates/bbs-core/src/` — all five modules for exact field shapes
-- `crates/bbs-plugin-api/src/host.rs` — current Host trait
+- `docs/adr/0005-db-strategy.md` - PRAGMA settings, two-pool design
+- `docs/adr/0011-transport-protocol-agnostic-core.md` - no protocol fields in schema
+- `crates/bbs-core/src/` - all five modules for exact field shapes
+- `crates/bbs-plugin-api/src/host.rs` - current Host trait
 
 **Answer the seven open questions above and produce:**
 
-1. `docs/adr/0012-persistence-layer.md` (Context / Decision / Consequences / Alternatives — match existing ADR format)
-2. SQL DDL for `0001_initial.sql` — tables: `users`, `rooms`, `room_messages`, `messages`, `user_room_state`, `audit_log`
+1. `docs/adr/0012-persistence-layer.md` (Context / Decision / Consequences / Alternatives - match existing ADR format)
+2. SQL DDL for `0001_initial.sql` - tables: `users`, `rooms`, `room_messages`, `messages`, `user_room_state`, `audit_log`
 3. Store trait pseudocode (Rust; doesn't need to compile) for `UserStore`, `RoomStore`, `MessageStore`
 4. The `after_connect` sqlx hook pattern for PRAGMAs
 5. How `sqlx::migrate!` (or the custom runner, if preferred) wires into startup
@@ -207,4 +207,4 @@ uuid        = { version = "1", features = ["v4", "serde"] }
 3. Intra-doc links on types that don't exist yet → rustdoc error; use plain backticks
 4. Doc list continuation (clippy 1.88): exactly 2-space indent for continued list items
 5. `dtolnay/rust-toolchain@stable` + `rust-toolchain.toml` pin → cross-build target missing; use `@master` + explicit `toolchain: "1.88"` + `targets:`
-6. `time 0.3.47` MSRV is rustc 1.88 — toolchain floor is 1.88, don't lower it
+6. `time 0.3.47` MSRV is rustc 1.88 - toolchain floor is 1.88, don't lower it

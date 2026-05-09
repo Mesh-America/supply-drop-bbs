@@ -1,4 +1,4 @@
-# ADR-0009: Tracing-based logging that respects config
+﻿# ADR-0009: Tracing-based logging that respects config
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -131,7 +131,7 @@ fn init_logging(config: &LoggingConfig, cli: &CliArgs) -> Result<()> {
 - **`tracing` is a slightly larger dependency** than `log`. Not
   meaningful at our binary size scale.
 - **Slight learning curve** for contributors used to `log!()`
-  macros — but `tracing` provides drop-in compatibility (e.g.,
+  macros - but `tracing` provides drop-in compatibility (e.g.,
   `tracing::info!()` works the same way).
 
 ### Neutral

@@ -1,4 +1,4 @@
-# ADR-0007: Pin pymc_core CompanionFrameServer as the radio bridge for v1
+﻿# ADR-0007: Pin pymc_core CompanionFrameServer as the radio bridge for v1
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -94,7 +94,7 @@ These are real wins. They're not v1 wins.
 
 - The TCP companion-frame protocol is the boundary. If a
   Rust bridge is ever written (by us or anyone else), the BBS
-  code doesn't change — the new bridge speaks the same protocol
+  code doesn't change - the new bridge speaks the same protocol
   on the same port. Switching is purely an operations decision.
 
 ## Future re-evaluation

@@ -1,4 +1,4 @@
-# Configuration reference
+﻿# Configuration reference
 
 Every configuration knob Supply Drop BBS exposes, with type, default,
 and behaviour. The example file at
@@ -75,12 +75,12 @@ The CLI accepts a small set of overrides:
 
 Subcommands:
 
-- `supply-drop-bbs setup` — interactive setup wizard (device type, radio config, systemd install)
-- `supply-drop-bbs config check` — validate config without starting
-- `supply-drop-bbs config show` — print the effective config
-- `supply-drop-bbs migrate` — apply pending DB migrations
-- `supply-drop-bbs backup` — trigger a manual backup
-- `supply-drop-bbs version` — print version + features compiled in
+- `supply-drop-bbs setup` - interactive setup wizard (device type, radio config, systemd install)
+- `supply-drop-bbs config check` - validate config without starting
+- `supply-drop-bbs config show` - print the effective config
+- `supply-drop-bbs migrate` - apply pending DB migrations
+- `supply-drop-bbs backup` - trigger a manual backup
+- `supply-drop-bbs version` - print version + features compiled in
 
 ## Top-level sections
 
@@ -102,7 +102,7 @@ Sections referencing plugins not loaded at compile time are an
 error (typo protection). The compiled-in feature set determines
 which plugin sections are valid.
 
-## `[bbs]` — system identity
+## `[bbs]` - system identity
 
 | Key            | Type   | Default                  | Required | Description                                      |
 |----------------|--------|--------------------------|----------|--------------------------------------------------|
@@ -112,7 +112,7 @@ which plugin sections are valid.
 | `welcome_msg`  | string | `"Welcome to {name}."`   | no       | Banner shown on connect; supports `{name}` substitution |
 | `timezone`     | string | `"UTC"`                  | no       | Display timezone for sysop UI; storage is always UTC |
 
-## `[database]` — persistence
+## `[database]` - persistence
 
 | Key                       | Type    | Default                 | Required | Description                          |
 |---------------------------|---------|-------------------------|----------|--------------------------------------|
@@ -123,7 +123,7 @@ which plugin sections are valid.
 | `wal_autocheckpoint`      | integer | `10000`                 | no       | WAL pages between checkpoints        |
 | `journal_size_limit_bytes`| integer | `67108864`              | no       | Max WAL file size                    |
 
-## `[logging]` — observability
+## `[logging]` - observability
 
 | Key                | Type    | Default                                     | Required | Description                       |
 |--------------------|---------|---------------------------------------------|----------|-----------------------------------|
@@ -146,7 +146,7 @@ Per-target overrides example:
 See [ADR-0009](adr/0009-tracing-config-respected.md) for the
 no-silent-overrides rule.
 
-## `[security]` — authentication and rate limiting
+## `[security]` - authentication and rate limiting
 
 | Key                          | Type    | Default | Required | Description                          |
 |------------------------------|---------|---------|----------|--------------------------------------|
@@ -158,7 +158,7 @@ no-silent-overrides rule.
 | `login_rate_per_min`         | integer | `5`     | no       | Failed login attempts per minute per source |
 | `command_rate_per_min`       | integer | `60`    | no       | Commands per minute per session       |
 
-## `[backup]` — disaster recovery
+## `[backup]` - disaster recovery
 
 | Key                | Type    | Default                       | Required | Description                       |
 |--------------------|---------|-------------------------------|----------|-----------------------------------|
@@ -168,7 +168,7 @@ no-silent-overrides rule.
 | `keep_daily`       | integer | `7`                           | no       | Daily backups to retain           |
 | `keep_weekly`      | integer | `4`                           | no       | Weekly backups to retain          |
 
-## `[plugins.cli]` — CLI transport
+## `[plugins.cli]` - CLI transport
 
 | Key            | Type    | Default                       | Required | Description                       |
 |----------------|---------|-------------------------------|----------|-----------------------------------|
@@ -177,7 +177,7 @@ no-silent-overrides rule.
 | `socket_mode`  | string  | `"0600"`                      | no       | Octal mode of the socket file     |
 | `socket_owner` | string  | (process owner)               | no       | Username/UID to chown socket to   |
 
-## `[plugins.mesh]` — mesh transport
+## `[plugins.mesh]` - mesh transport
 
 ### Connection type
 
@@ -185,7 +185,7 @@ no-silent-overrides rule.
 |--------------------|--------|------------|----------|----------------------------------------------|
 | `enabled`          | bool   | `true`     | no       | Whether to start the mesh transport          |
 | `connection_type`  | enum   | `"serial"` | no       | How to reach the radio: `"serial"`, `"tcp"`, or `"hat"`. See [ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md). |
-| `command_prefix`   | string | `""`       | no       | Optional single-character prefix for BBS commands (e.g., `"!"`). Empty string means no prefix — every message is treated as a command. |
+| `command_prefix`   | string | `""`       | no       | Optional single-character prefix for BBS commands (e.g., `"!"`). Empty string means no prefix - every message is treated as a command. |
 
 ### Serial mode (`connection_type = "serial"`)
 
@@ -218,12 +218,12 @@ populates this from the chosen preset; manual overrides are supported.
 
 | Key                 | Type    | Default | Required | Description                                     |
 |---------------------|---------|---------|----------|-------------------------------------------------|
-| `preset`            | string  | —       | yes (hat)| HAT model: `"zebrahat"`, `"meshadv-mini"`, `"meshadv"`, `"waveshare"`, `"uconsole"`, `"custom"` |
+| `preset`            | string  | -       | yes (hat)| HAT model: `"zebrahat"`, `"meshadv-mini"`, `"meshadv"`, `"waveshare"`, `"uconsole"`, `"custom"` |
 | `bus_id`            | integer | `0`     | no       | SPI bus                                         |
-| `cs_pin`            | integer | —       | custom   | SPI chip-select GPIO (BCM numbering)            |
-| `reset_pin`         | integer | —       | custom   | Radio reset GPIO                                |
-| `busy_pin`          | integer | —       | custom   | Radio busy GPIO                                 |
-| `irq_pin`           | integer | —       | custom   | Radio IRQ GPIO                                  |
+| `cs_pin`            | integer | -       | custom   | SPI chip-select GPIO (BCM numbering)            |
+| `reset_pin`         | integer | -       | custom   | Radio reset GPIO                                |
+| `busy_pin`          | integer | -       | custom   | Radio busy GPIO                                 |
+| `irq_pin`           | integer | -       | custom   | Radio IRQ GPIO                                  |
 | `txen_pin`          | integer | `-1`    | no       | TX-enable GPIO (`-1` = not connected)           |
 | `rxen_pin`          | integer | `-1`    | no       | RX-enable GPIO (`-1` = not connected)           |
 
@@ -238,7 +238,7 @@ your wiring differs from the standard layout):
 | `waveshare`   | 21 | 18    | 20   | 16  | TXEN=13, RXEN=12             |
 | `uconsole`    | -1 | 25    | 24   | 26  | bus_id=1, hardware CS        |
 
-## `[plugins.web]` — admin web (only if `admin-web` feature enabled)
+## `[plugins.web]` - admin web (only if `admin-web` feature enabled)
 
 | Key                     | Type    | Default                | Required | Description                                |
 |-------------------------|---------|------------------------|----------|--------------------------------------------|
@@ -305,8 +305,8 @@ key as the implementation lands. **TBD.**
 
 ## See also
 
-- [ADR-0008](adr/0008-toml-config-with-env-overrides.md) — why
+- [ADR-0008](adr/0008-toml-config-with-env-overrides.md) - why
   TOML, why this overlay model
-- [`config.example.toml`](../config.example.toml) — runnable
+- [`config.example.toml`](../config.example.toml) - runnable
   starting point
-- [OPERATIONS.md](OPERATIONS.md) — install and operations guide
+- [OPERATIONS.md](OPERATIONS.md) - install and operations guide

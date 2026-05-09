@@ -1,4 +1,4 @@
-# ADR-0013: Native serial transport for USB companion devices
+﻿# ADR-0013: Native serial transport for USB companion devices
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -24,7 +24,7 @@ protocol. There is no SX1262 driver to install, no Python needed, no
 `pymc_core` to run.
 
 Requiring `pymc_core` for USB devices would mean asking operators to
-install Python, create a virtualenv, and run a second process — purely
+install Python, create a virtualenv, and run a second process - purely
 to act as a pass-through relay from serial to TCP. That's unnecessary
 friction for a large class of users.
 
@@ -43,7 +43,7 @@ variant) using `tokio-serial`.
 
 ## Why this doesn't contradict ADR-0007
 
-ADR-0007 ruled out writing a Rust-native *radio bridge* — that is,
+ADR-0007 ruled out writing a Rust-native *radio bridge* - that is,
 reimplementing the companion-frame *server* side, the SX1262 driver,
 and the MeshCore protocol logic (flooding, advert handling, contact
 cache, etc.). That work is still explicitly deferred.

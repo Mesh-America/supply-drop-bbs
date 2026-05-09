@@ -1,4 +1,4 @@
-# ADR-0001: Apache 2.0 + Commons Clause license
+﻿# ADR-0001: Apache 2.0 + Commons Clause license
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -19,7 +19,7 @@ The maintainer's stated goals:
 
 These goals are mutually incompatible with OSI-approved open source.
 The OSI definition explicitly forbids "discrimination against fields
-of endeavor" — i.e., you cannot say "you may not use this
+of endeavor" - i.e., you cannot say "you may not use this
 commercially." The license has to live outside the OSI tent.
 
 ## Decision
@@ -50,7 +50,7 @@ lawyers. Forbids any commercial use. Considered closely. Rejected
 as broader than the maintainer's actual concern: PolyForm NC blocks
 "I run this BBS for my coworkers and we are a for-profit company"
 even though no resale is happening. The Commons Clause is narrower
-— it specifically blocks resale, not commercial use generally.
+- it specifically blocks resale, not commercial use generally.
 
 ### Forklift Certified License (mesh-citadel's existing license)
 
@@ -103,18 +103,18 @@ warranted by the stated goal.
 - The CLA in [CONTRIBUTING.md](../../CONTRIBUTING.md) grants the
   project owner the right to relicense contributions under different
   terms in the future. This is the escape hatch if the license
-  proves to be the wrong choice — we can move to PolyForm NC or
+  proves to be the wrong choice - we can move to PolyForm NC or
   full Apache 2.0 (dropping Commons Clause) later.
 
 ## Notes for downstream users
 
 If you want to use Supply Drop BBS for a product or service whose
 value derives substantially from its functionality, and you intend
-to charge for that — contact the licensor for a separate commercial
+to charge for that - contact the licensor for a separate commercial
 arrangement. The Commons Clause text is explicit that this is the
 intended carve-out path.
 
 If you're a hobbyist sysop, a school, a research lab, a mesh-radio
 nonprofit, a co-op, or even a for-profit company using it internally
-without selling access — you're fine under the existing license. No
+without selling access - you're fine under the existing license. No
 separate arrangement required.

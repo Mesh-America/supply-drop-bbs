@@ -1,4 +1,4 @@
-# ADR-0002: BBS-host + radio-bridge as separate processes
+﻿# ADR-0002: BBS-host + radio-bridge as separate processes
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -55,7 +55,7 @@ Future re-evaluation: a Rust-native bridge is plausible (see
   companion-frame protocol's server side. Less to test, less to
   break.
 - **Deployment flexibility.** Operators can run the bridge on a
-  different host than the BBS — useful when the radio is on one
+  different host than the BBS - useful when the radio is on one
   Pi (with the antenna) and the BBS is on another (with more
   storage / RAM).
 
@@ -84,7 +84,7 @@ Future re-evaluation: a Rust-native bridge is plausible (see
 ## Future considerations
 
 If we ever ship a Rust-native radio bridge, the BBS code doesn't
-change — the new bridge speaks the same companion-frame protocol
+change - the new bridge speaks the same companion-frame protocol
 on the same TCP port. The decision to switch bridges is purely an
 operations concern, not an architecture concern. That's the value
 of the protocol-level boundary.

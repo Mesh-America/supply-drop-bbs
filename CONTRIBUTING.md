@@ -1,13 +1,13 @@
-# Contributing to Supply Drop BBS
+﻿# Contributing to Supply Drop BBS
 
 Thanks for the interest. This document covers what you need to know
 before sending a contribution.
 
 ## License grant on contributions
 
-By submitting a contribution to this project — whether a pull request,
+By submitting a contribution to this project - whether a pull request,
 patch, code in an issue, design proposal in a comment, or any other form
-of authored material directed at incorporation — **you agree that your
+of authored material directed at incorporation - **you agree that your
 contribution is licensed to the project under the same license as the
 project itself** (Apache 2.0 with Commons Clause).
 
@@ -31,7 +31,7 @@ your own work elsewhere, or text marked "Not a Contribution" are not
 contributions.
 
 If you want to share an idea without granting the rights above, mark
-your message clearly: e.g. "(Not a Contribution — for discussion
+your message clearly: e.g. "(Not a Contribution - for discussion
 only)." We'll respect that.
 
 ## Reporting bugs
@@ -77,7 +77,7 @@ To be filled in once the Rust workspace is bootstrapped. Watch
 - Rust: `cargo fmt` (no exceptions), `cargo clippy --all-targets
   --all-features -- -D warnings` must pass.
 - SQL: lowercase keywords aren't a hard rule but consistency within a
-  query is. Schema migrations are append-only — never edit a migration
+  query is. Schema migrations are append-only - never edit a migration
   that has been merged to `main`.
 - Markdown: 80-char-ish lines for prose, no hard limit for tables or
   code blocks.

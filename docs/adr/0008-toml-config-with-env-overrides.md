@@ -1,4 +1,4 @@
-# ADR-0008: TOML config with env var + CLI overrides
+﻿# ADR-0008: TOML config with env var + CLI overrides
 
 - **Status:** Accepted
 - **Date:** 2026-05-08
@@ -107,13 +107,13 @@ not the operator's everyday config surface.
 
 The BBS binary ships these subcommands for config workflows:
 
-- **`supply-drop-bbs init`** — interactive first-run that
+- **`supply-drop-bbs init`** - interactive first-run that
   generates a starting config based on prompts. Default for new
   operators.
-- **`supply-drop-bbs config check [--config PATH]`** — validate
+- **`supply-drop-bbs config check [--config PATH]`** - validate
   without starting. Exits 0 on success, non-zero with a clear
   error message on failure. For ops scripts and pre-deploy gates.
-- **`supply-drop-bbs config show [--config PATH]`** — print the
+- **`supply-drop-bbs config show [--config PATH]`** - print the
   effective config (after merging defaults, file, env, CLI). Tells
   operators what's actually in effect, which is often surprising.
 

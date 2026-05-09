@@ -1,9 +1,9 @@
-# Supply Drop BBS — Architecture
+﻿# Supply Drop BBS - Architecture
 
 This document is the canonical description of how Supply Drop BBS is
 put together and why. It is the first thing a contributor should read
 after the README. If you find code that contradicts this document,
-that's a bug — either in the code or in the document. Open an issue
+that's a bug - either in the code or in the document. Open an issue
 either way.
 
 Detailed rationales for individual decisions live as ADRs (architectural
@@ -76,12 +76,12 @@ The topology depends on the radio hardware. Both configurations share
 the same Rust binary and config schema; only the `connection_type`
 setting in `[plugins.mesh]` differs.
 
-#### USB device — single process
+#### USB device - single process
 
 ```
                   ┌──────────────────────────────┐
                   │    supply-drop-bbs            │
-                  │    (Rust — the BBS host)      │
+                  │    (Rust - the BBS host)      │
                   │                               │
                   │    ┌─────────────────────┐   │
                   │    │     bbs-core        │   │ ← domain, db,
@@ -105,13 +105,13 @@ setting in `[plugins.mesh]` differs.
 `bbs-mesh` speaks the companion-frame protocol directly over the USB
 serial port via `meshcore-companion`. No bridge process. No Python.
 
-#### Pi HAT — two processes
+#### Pi HAT - two processes
 
 ```
                   ┌──────────────────────────────┐
                   │    pymc_core                  │
                   │    CompanionFrameServer       │
-                  │    (Python — radio bridge)    │
+                  │    (Python - radio bridge)    │
                   │                               │
                   │    ┌──────────┐               │
                   │    │  SX1262  │ ← physical    │
@@ -122,7 +122,7 @@ serial port via `meshcore-companion`. No bridge process. No Python.
                                 ▼
                   ┌──────────────────────────────┐
                   │    supply-drop-bbs            │
-                  │    (Rust — the BBS host)      │
+                  │    (Rust - the BBS host)      │
                   │                               │
                   │    ┌─────────────────────┐   │
                   │    │     bbs-core        │   │ ← domain, db,
@@ -168,7 +168,7 @@ supply-drop-bbs/
 │   │                         permission system. No I/O concerns.
 │   ├── bbs-plugin-api/     ← Plugin trait, Host interface, event
 │   │                         types. The contract every plugin
-│   │                         compiles against. Tiny crate — types
+│   │                         compiles against. Tiny crate - types
 │   │                         and traits, no logic.
 │   ├── bbs-cli/            ← CLI transport plugin (Unix socket).
 │   ├── bbs-mesh/           ← Mesh transport plugin. Uses
@@ -310,7 +310,7 @@ BBS, this is correct.
 A `schema_migrations` table tracks applied versions. Migrations are
 defined in `bbs-core/migrations/` as `.sql` files numbered
 sequentially. The startup path runs unapplied migrations in order
-inside transactions. Migrations are **append-only after merge** —
+inside transactions. Migrations are **append-only after merge** -
 you don't edit a migration that's been released; you write a new one.
 
 All foreign keys declared in v1 schema include explicit `ON DELETE`
@@ -322,7 +322,7 @@ mesh-citadel's `user_room_state` FK.)
 A separate task runs `VACUUM INTO 'backup-YYYY-MM-DD-HHMMSS.sqlite'`
 on a configurable interval (default: every 6 hours). The result is
 a point-in-time copy on disk that operators can `scp` off the box.
-This is for disaster recovery, not performance — there's no in-memory
+This is for disaster recovery, not performance - there's no in-memory
 DB to flush.
 
 Backup is non-blocking; the live DB keeps serving reads and writes
@@ -346,7 +346,7 @@ talking to users. Each transport:
 4. Translates the resulting `Response` back to the client's protocol
 5. Pushes unsolicited notifications to bound sessions
 
-The BBS-core doesn't care **where** a command came from — just
+The BBS-core doesn't care **where** a command came from - just
 "session X wants action Y." That's what makes transports pluggable:
 a new transport (Telnet, IRC bridge, web-admin) is a new crate that
 implements `TransportEngine`.
@@ -377,7 +377,7 @@ pub trait TransportEngine: Send + Sync + 'static {
     /// Push an unsolicited notification to a session. The
     /// session->user binding lives in the Host. Delivery
     /// semantics (queue if offline / drop / fail) are the
-    /// transport's choice — it knows what its medium can do.
+    /// transport's choice - it knows what its medium can do.
     async fn notify(
         &self,
         session_id: SessionId,
@@ -472,9 +472,9 @@ admin-web      = ["dep:bbs-web"]   # opt-in
 
 CI builds three artefacts per architecture:
 
-- `supply-drop-bbs`           — default features (cli + mesh)
-- `supply-drop-bbs-web`       — default + admin-web
-- `supply-drop-bbs-headless`  — cli only (no mesh, for dev)
+- `supply-drop-bbs`           - default features (cli + mesh)
+- `supply-drop-bbs-web`       - default + admin-web
+- `supply-drop-bbs-headless`  - cli only (no mesh, for dev)
 
 A future ADR may revisit this if we want runtime-loaded WASM
 plugins. Not v1.
@@ -495,7 +495,7 @@ binary via `rust-embed`. Speaks a JSON API documented as OpenAPI.
 - Not a public-facing service. Default-bind is `127.0.0.1`; if the
   operator wants remote access, they put a TLS-terminating reverse
   proxy in front and explicitly bind to `0.0.0.0`.
-- Not always-on. Default off — the binary doesn't even include the
+- Not always-on. Default off - the binary doesn't even include the
   plugin unless built with `--features admin-web`.
 - Not a transport for new users. Sysop accounts must be created
   via `supply-drop-bbs init` or the CLI; the web UI doesn't accept
@@ -511,7 +511,7 @@ binary via `rust-embed`. Speaks a JSON API documented as OpenAPI.
 - Moderate messages: view recent posts, delete with audit trail.
 - View reports: message volume over time, top senders, top rooms,
   activity heatmap, validation funnel, failed login attempts,
-  stale rooms. Aggregations only — no new sampling tables.
+  stale rooms. Aggregations only - no new sampling tables.
 - Manage backups: list, trigger manual backup, download.
 - View logs: tail the structured-log feed live.
 - View audit log: read-only, append-only history of sysop actions.
@@ -571,8 +571,8 @@ is documented in [`PROTOCOL.md`](PROTOCOL.md). It is not OpenAPI;
 it's a binary framing format inherited from `pymc_core` /
 MeshCore upstream.
 
-The application layer on top of mesh — the BBS commands users send
-and receive over the radio — is documented in `PROTOCOL.md` too.
+The application layer on top of mesh - the BBS commands users send
+and receive over the radio - is documented in `PROTOCOL.md` too.
 This is where we encode things like "registration uses the
 `new` command, validation uses `valid`," etc.
 
@@ -622,16 +622,16 @@ key + reason:
 
 ### 8.4 Operator subcommands
 
-- `supply-drop-bbs init` — interactive first-run setup. Creates
+- `supply-drop-bbs init` - interactive first-run setup. Creates
   data dir, generates a default config, prompts for sysop
   credentials, optionally installs the systemd unit.
-- `supply-drop-bbs config check [--config PATH]` — validate without
+- `supply-drop-bbs config check [--config PATH]` - validate without
   starting. Exits 0 if config is valid, non-zero with the error
   message if not.
-- `supply-drop-bbs config show [--config PATH]` — print the
+- `supply-drop-bbs config show [--config PATH]` - print the
   effective config (merged from all sources, defaults filled in).
   Tells the operator what's actually in effect.
-- `supply-drop-bbs migrate` — apply pending schema migrations
+- `supply-drop-bbs migrate` - apply pending schema migrations
   without starting the BBS. For pre-deploy ops scripts.
 
 Full schema: [`CONFIG.md`](CONFIG.md). Example file:
@@ -718,13 +718,13 @@ We design against these adversaries:
   parameters tuned for "~250ms on a Pi 4." Migration path if we
   ever increase parameters: rehash on next successful login.
 - **Session tokens.** 256-bit, generated from `OsRng`. Stored in
-  the DB hashed with SHA-256 (we don't need argon2 for these — they
+  the DB hashed with SHA-256 (we don't need argon2 for these - they
   have high entropy and short lifetimes). Default lifetime: 12 hours
   for web, longer for mesh (mesh users disconnect and reconnect a lot).
-- **SQL injection.** Structurally impossible in `bbs-core` — `sqlx`
+- **SQL injection.** Structurally impossible in `bbs-core` - `sqlx`
   compile-time checking refuses to build queries that don't match
   the live schema. Plugins follow the same rule.
-- **Permission checks** in the `Host` interface — see §5.3.
+- **Permission checks** in the `Host` interface - see §5.3.
 - **CSRF.** All state-changing web endpoints require both the
   session cookie (SameSite=Strict) and an explicit token in a
   request header. Origin header verification as defense in depth.
@@ -815,7 +815,7 @@ and starting again.
 If the live DB is corrupted:
 
 1. Stop the BBS.
-2. Move the corrupted file aside (don't delete — keep for diagnosis).
+2. Move the corrupted file aside (don't delete - keep for diagnosis).
 3. Copy the latest backup to the live DB path.
 4. Start the BBS.
 5. Run `supply-drop-bbs migrate` if the backup is from an older
@@ -866,7 +866,7 @@ Decisions with their own dedicated record:
 
 ---
 
-## Appendix A — Pointers for new contributors
+## Appendix A - Pointers for new contributors
 
 - **Read this document.** Every section is something a contributor
   will eventually need to understand.
@@ -880,5 +880,5 @@ Decisions with their own dedicated record:
   from a wasted PR.
 
 If something here is wrong, contradicted by the code, or just
-unclear — open an issue. Documentation is part of the product, and
+unclear - open an issue. Documentation is part of the product, and
 "the docs lied to me" is a real bug.
