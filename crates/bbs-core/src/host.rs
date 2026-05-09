@@ -1574,12 +1574,12 @@ mod tests {
     use bbs_plugin_api::{Command, Username};
     use tempfile::NamedTempFile;
 
-    async fn make_host() -> Arc<BbsHost> {
+    async fn make_host() -> (Arc<BbsHost>, NamedTempFile) {
         let f = NamedTempFile::new().unwrap();
         let db = Database::open(&f.path().to_string_lossy())
             .await
             .expect("db open");
-        Arc::new(BbsHost::new(db))
+        (Arc::new(BbsHost::new(db)), f)
     }
 
     /// Bypass the validation workflow for a registered user in tests.
@@ -1609,7 +1609,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_and_end_session() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         assert_eq!(host.sessions.read().await.len(), 1);
         host.end_session(sid).await.unwrap();
@@ -1618,14 +1618,14 @@ mod tests {
 
     #[tokio::test]
     async fn end_unknown_session_is_ok() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let fake = SessionId::__internal_new(9999);
         host.end_session(fake).await.unwrap();
     }
 
     #[tokio::test]
     async fn permission_ctx_unknown_session_errors() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let fake = SessionId::__internal_new(9999);
         assert!(matches!(
             host.permission_ctx(fake).await,
@@ -1635,7 +1635,7 @@ mod tests {
 
     #[tokio::test]
     async fn permission_ctx_pre_auth_is_unvalidated() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let ctx = host.permission_ctx(sid).await.unwrap();
         assert_eq!(ctx.level, PermissionLevel::Unvalidated);
@@ -1644,7 +1644,7 @@ mod tests {
 
     #[tokio::test]
     async fn help_command_returns_text() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let resp = host
             .process_command(sid, Command::Help { topic: None })
@@ -1655,7 +1655,7 @@ mod tests {
 
     #[tokio::test]
     async fn whoami_pre_auth() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let resp = host.process_command(sid, Command::Whoami).await.unwrap();
         let Response::Text(text) = resp else {
@@ -1666,7 +1666,7 @@ mod tests {
 
     #[tokio::test]
     async fn logout_ends_session() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let resp = host.process_command(sid, Command::Logout).await.unwrap();
         assert_eq!(resp, Response::LoggedOut);
@@ -1675,7 +1675,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_broadcasts_session_created() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let mut rx = host.events();
         let sid = host.create_session("test").await.unwrap();
         let ev = rx.recv().await.unwrap();
@@ -1684,7 +1684,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_and_login_full_flow() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let uname = Username::new("alice").unwrap();
 
@@ -1741,7 +1741,7 @@ mod tests {
 
     #[tokio::test]
     async fn room_navigation_requires_auth() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
         assert!(matches!(resp, Response::Error(_)));
@@ -1749,7 +1749,7 @@ mod tests {
 
     #[tokio::test]
     async fn list_rooms_after_login() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let uname = Username::new("bob").unwrap();
 
@@ -1799,7 +1799,7 @@ mod tests {
 
     #[tokio::test]
     async fn enter_and_read_message() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let uname = Username::new("carol").unwrap();
 
@@ -1868,7 +1868,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancel_clears_workflow() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
 
         // Start a registration workflow.
@@ -1896,7 +1896,7 @@ mod tests {
 
     #[tokio::test]
     async fn login_wrong_password_lockout() {
-        let host = make_host().await;
+        let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let uname = Username::new("eve").unwrap();
 
