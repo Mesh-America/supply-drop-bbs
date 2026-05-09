@@ -1,43 +1,38 @@
 # Operations guide
 
-How to install, run, update, back up, and recover Supply Drop BBS.
-
-> **Status:** Active. Marked **TBD** where specific commands or
-> service names are not yet finalised.
+How to install, configure, update, back up, and remove Supply Drop BBS.
 
 ## Audience
 
-Sysops running a Supply Drop BBS deployment. Specifically:
+Sysops running a Supply Drop BBS deployment:
 
 - Hobbyist mesh radio operators on a Raspberry Pi
-- Researchers / educators running it for a community
-- Anyone managing a small-scale BBS deployment that uses LoRa mesh
+- Researchers and educators running a community BBS
+- Anyone managing a small-scale BBS deployment over LoRa mesh
 
 If you're a contributor or plugin author, see
-[CONTRIBUTING.md](../CONTRIBUTING.md) and
-[PLUGIN_API.md](PLUGIN_API.md).
+[CONTRIBUTING.md](../CONTRIBUTING.md) and [PLUGIN_API.md](PLUGIN_API.md).
 
 ## System requirements
 
-| Component | Minimum                                                              |
-|-----------|----------------------------------------------------------------------|
-| CPU       | armv7 or better. ARM64 (Pi 4+) recommended.                         |
-| RAM       | 256 MB available to the BBS process                                  |
-| Disk      | 2 GB free for DB + logs + backups; SD card OK                        |
-| Network   | Loopback only (USB mode) or LAN for web UI                           |
-| Radio     | MeshCore-compatible: SX1262 HAT **or** USB companion device          |
-| OS        | Linux — Debian / Raspberry Pi OS tested. Other Unixes likely work.   |
-| Python    | 3.10+ — **HAT mode only** (for `pymc_core`)                         |
+| Component | Minimum |
+|-----------|---------|
+| CPU       | ARMv7 or better. ARM64 (Pi 4+) recommended. |
+| RAM       | 256 MB available to the BBS process |
+| Disk      | 2 GB free for DB + logs + backups; SD card OK |
+| Radio     | SX1262 Pi HAT **or** USB MeshCore companion device |
+| OS        | Linux — Raspberry Pi OS / Debian tested. Other Unixes likely work. |
+| Python    | 3.10+ — **Pi HAT mode only** (for `pymc_core`) |
 
-The BBS itself is a single static Rust binary with no runtime
-dependencies. Python is required **only if you are using a Pi HAT**
-([ADR-0007](adr/0007-bridge-stays-pymc-core.md)). USB device operators
-need nothing else ([ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md)).
+The BBS itself is a single static Rust binary with no runtime dependencies.
+Python is only required when using a Pi HAT
+([ADR-0007](adr/0007-bridge-stays-pymc-core.md)). USB device operators need
+nothing else ([ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md)).
 
 ## Architecture at a glance
 
-Supply Drop BBS supports two deployment topologies depending on your
-radio hardware.
+Supply Drop BBS supports two deployment topologies depending on your radio
+hardware.
 
 ### USB device (single-process)
 
@@ -55,254 +50,281 @@ radio hardware.
                               running MeshCore firmware
 ```
 
-For USB-native MeshCore devices the BBS speaks the companion-frame
-protocol directly over the serial port. No bridge process, no Python.
-One service to manage.
+The BBS speaks the companion-frame protocol directly over the serial port.
+No bridge process, no Python. One service to manage.
 
 ### Pi HAT (two-process)
 
 ```
    ┌──────────────────────┐         ┌────────────────────────┐
-   │  pymc_core           │         │  supply-drop-bbs       │
-   │  CompanionFrame      │ ◄─TCP─► │  (Rust BBS host)       │
-   │  Server (Python)     │         │                        │
-   │                      │         │  also exposes:         │
-   │  manages GPIO/SPI    │         │  - CLI socket          │
-   │  for the LoRa HAT    │         │  - web UI (opt-in)     │
-   └──────────────────────┘         └────────────────────────┘
-            │                                  │
-            ▼                                  ▼
-      SX1262 LoRa HAT                     sysop / users
-      (ZebraHat, MeshAdv, …)
+   │  pymc-companion      │         │  supply-drop-bbs       │
+   │  (Python — pymc_core │◄─TCP──► │  (Rust BBS host)       │
+   │  CompanionRadio +    │         │                        │
+   │  CompanionFrameServer│         │  also exposes:         │
+   │                      │         │  - web UI (opt-in)     │
+   │  manages GPIO/SPI    │         └────────────────────────┘
+   │  for the LoRa HAT    │
+   └──────────────────────┘
+            │
+            ▼
+      SX1262 LoRa HAT
+      (ZebraHat, Waveshare, PiMesh, …)
 ```
 
-`pymc_core` owns the radio hardware. The BBS connects to it over a
-localhost TCP companion-frame connection. Two independent processes —
-either can restart without breaking the other.
+`pymc-companion` owns the radio hardware. The BBS connects to it over
+`127.0.0.1:5000`. Two independent processes — either can restart without
+breaking the other.
 
 ## Installation
 
 ### One-line install (recommended)
 
 ```sh
-curl -fsSL https://get.supply-drop.radio/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
 ```
 
-The install script:
+The script builds from source, installs, and walks you through configuration.
+**Expect 5–15 minutes on a Raspberry Pi** for the Rust build.
 
-1. Detects your CPU architecture and downloads the right binary.
-2. Drops the binary in `/usr/local/bin/supply-drop-bbs`.
-3. Launches the **setup wizard** (`supply-drop-bbs setup`).
+Before running, have ready:
 
-The wizard asks a small set of questions and handles everything from
-there. You only need to know two things before starting:
+- **Radio type** — USB companion device or Pi HAT
+- **HAT model** — if using a Pi HAT (ZebraHat, Waveshare, PiMesh, etc.)
+- **Region** — US (910.525 MHz) or EU (869.618 MHz), or your local frequency
 
-- **What kind of radio device you have** — USB companion device
-  (Heltec V3, T-Beam, etc.) or a Pi HAT (ZebraHat, MeshAdv, etc.)
-- **Your radio's frequency and TX power** — e.g. 910.525 MHz, 22 dBm
-  for US; 869.525 MHz, 14 dBm for EU
+### What the installer does
 
-### What the setup wizard does
+1. Installs system packages (`build-essential`, `git`, `nodejs`, `npm`, Rust)
+2. Clones the repository to `/opt/supply-drop-bbs`
+3. Builds the binary (`cargo build --release`)
+4. Creates the `supply-drop` system user
+5. Installs the binary to `/usr/local/bin/supply-drop-bbs`
+6. Installs the `supply-drop-bbs.service` systemd unit
+7. Runs the **setup wizard** (see below)
+8. **Pi HAT only:** installs `pymc_core` in a Python venv, writes
+   `pymc-companion.yaml`, and enables `pymc-companion.service`
+9. Enables and starts both services
 
-The wizard asks:
+### What the setup wizard asks
 
-1. **BBS name** — displayed to users on connect
-2. **Device type** — USB companion device or Pi HAT
-3. **Serial port or HAT preset** — detected automatically where
-   possible; you confirm or override
-4. **Frequency and TX power** — must match the rest of your mesh
-5. **Sysop username** — the first account; gets promoted to sysop
-6. **Install as a system service?** — if yes, installs the systemd
-   unit(s) and enables them
+1. **Radio connection type** — USB serial or Pi HAT
+2. **Serial port** *(USB only)* — detected automatically; you confirm or enter manually
+3. **BBS name** — displayed to users on connect
+4. **Data directory** — defaults to `/var/lib/supply-drop-bbs`
+5. **Web admin UI** — whether to enable it, and if so, the password and bind address
 
-Based on your answers it:
+The wizard writes `/etc/supply-drop-bbs/config.toml`. Run
+`supply-drop-bbs setup` at any time to reconfigure.
 
-- Writes `/etc/supply-drop-bbs/config.toml` with all settings filled in
-- Runs database migrations
-- For **HAT mode**: installs `pymc_core` (Python), configures SPI/UART,
-  adds your user to the `spi`, `gpio`, and `dialout` groups, and
-  installs a `pymc-core.service` unit alongside `supply-drop-bbs.service`
-- Optionally installs and enables the systemd unit(s)
-- Prints a summary of what changed and whether a reboot is needed
+### Pi HAT — additional wizard steps (in the installer)
 
-### After the wizard
+After the BBS wizard, the installer asks:
 
-**USB device** — no reboot needed. Start immediately:
+1. **Region / frequency** — US, EU, or enter manually
+2. **HAT model** — choose from the supported list
+
+The installer then:
+
+- Enables SPI via `raspi-config` if not already active
+- Creates `/opt/pymc-companion/venv` with `pymc_core`, `spidev`, and `lgpio`
+- Writes `/etc/supply-drop-bbs/pymc-companion.yaml` with your HAT's pin config
+- Installs and enables `pymc-companion.service`
+
+### Supported Pi HATs
+
+| # | Model | Notes |
+|---|-------|-------|
+| 1 | ZebraHat 1W | wehooper4 |
+| 2 | Waveshare SX1262 LoRa HAT | |
+| 3 | PiMesh-1W (V1) | |
+| 4 | PiMesh-1W (V2) | |
+| 5 | MeshAdv Mini | |
+| 6 | MeshAdv | |
+| 7 | FemtoFox SX1262 1W | Uses gpiod backend |
+| 8 | FemtoFox SX1262 2W | Uses gpiod backend |
+| 9 | NebraHat 2W | |
+| 10 | RAK6421 + RAK13300x (Slot 1) | Uses gpiod backend |
+| 11 | RAK6421 + RAK13300x (Slot 2) | Uses gpiod backend |
+| 12 | Zindello UltraPeater E22 | Uses gpiod backend |
+| 13 | Zindello UltraPeater E22P | Uses gpiod backend |
+| 14 | uConsole LoRa Module v1 | |
+| 15 | uConsole LoRa Module v2 | |
+
+### After installation
+
+Check both services are running:
 
 ```sh
-sudo systemctl start supply-drop-bbs
-sudo journalctl -u supply-drop-bbs -f
+sudo systemctl status supply-drop-bbs
+sudo systemctl status pymc-companion   # Pi HAT only
 ```
 
-**Pi HAT** — a reboot is typically required after group and UART
-changes. The wizard tells you if this applies:
+Tail the logs:
 
 ```sh
-sudo reboot
-# After reboot:
-sudo systemctl start pymc-core supply-drop-bbs
 sudo journalctl -u supply-drop-bbs -f
+sudo journalctl -u pymc-companion -f   # Pi HAT only
 ```
 
-### Building from source
+If the web admin UI is enabled, open it at `http://<your-pi-ip>:8080`.
+
+### Reconfigure
+
+Re-run the BBS setup wizard at any time:
+
+```sh
+sudo supply-drop-bbs setup --config /etc/supply-drop-bbs/config.toml
+sudo systemctl restart supply-drop-bbs
+```
+
+To change the HAT or frequency, edit `/etc/supply-drop-bbs/pymc-companion.yaml`
+and restart:
+
+```sh
+sudo systemctl restart pymc-companion
+```
+
+### Building from source (manual)
 
 Required: Rust 1.76+ (`rustup install stable`).
 
 ```sh
 git clone https://github.com/Mesh-America/supply-drop-bbs
 cd supply-drop-bbs
-cargo build --release --features admin-web   # or omit for no web UI
+cargo build --release
 sudo install -m 0755 target/release/supply-drop-bbs /usr/local/bin/
 supply-drop-bbs setup
 ```
 
-Build artifacts depend only on glibc. On a fresh Pi 4 a release build
-takes ~3 minutes.
+## Uninstall
+
+```sh
+sudo bash /opt/supply-drop-bbs/install.sh --uninstall
+```
+
+Or, if you no longer have the source directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
+  | sudo bash -s -- --uninstall
+```
+
+The uninstaller:
+
+1. Stops and disables `supply-drop-bbs` and `pymc-companion`
+2. Removes their systemd unit files
+3. Removes the binary (`/usr/local/bin/supply-drop-bbs`)
+4. Removes `/opt/pymc-companion` and `/opt/supply-drop-bbs`
+5. **Asks before deleting** the config directory (`/etc/supply-drop-bbs`)
+6. **Asks before deleting** the data directory (`/var/lib/supply-drop-bbs`) — this contains your message store and identity key
+7. **Asks before removing** the `supply-drop` system user
+
+If you answer N to the data directory prompt, your messages and identity are
+preserved and can be used with a fresh install.
 
 ## systemd units
 
-The setup wizard installs and enables these for you. They are also
-included in the release tarball under `systemd/` if you want to
-manage them manually.
-
 ### USB device — one service
 
-#### `supply-drop-bbs.service`
+**`supply-drop-bbs.service`**
 
 ```ini
 [Unit]
 Description=Supply Drop BBS
-After=network-online.target
-Wants=network-online.target
+After=network.target
+Wants=network.target
 
 [Service]
 Type=simple
-User=bbs
-Group=bbs
-ExecStart=/usr/local/bin/supply-drop-bbs --config /etc/supply-drop-bbs/config.toml
+User=supply-drop
+Group=supply-drop
+SupplementaryGroups=dialout
+ExecStart=/usr/local/bin/supply-drop-bbs run --config /etc/supply-drop-bbs/config.toml
 Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/supply-drop-bbs /var/log/supply-drop-bbs
-PrivateTmp=true
-MemoryMax=512M
-TasksMax=200
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=supply-drop-bbs
+ReadWritePaths=/var/lib/supply-drop-bbs
+NoNewPrivileges=yes
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
 ```
-
-Note: the `bbs` user must be in the `dialout` group to open the
-serial port. The setup wizard handles this.
 
 ### Pi HAT — two services
 
-#### `pymc-core.service`
+**`pymc-companion.service`** starts first (the BBS connects to it):
 
 ```ini
 [Unit]
-Description=pymc_core CompanionFrameServer (LoRa radio bridge)
-After=network-online.target
-Wants=network-online.target
+Description=pymc-companion — LoRa radio bridge for Supply Drop BBS
+After=network.target
+Before=supply-drop-bbs.service
 
 [Service]
 Type=simple
-User=bbs
-Group=bbs
-WorkingDirectory=/opt/pymc-core
-ExecStart=/opt/pymc-core/venv/bin/python -m pymc_core.server
+User=supply-drop
+Group=supply-drop
+SupplementaryGroups=dialout spi gpio
+ExecStart=/opt/pymc-companion/venv/bin/python \
+    /opt/pymc-companion/pymc-companion.py \
+    --config /etc/supply-drop-bbs/pymc-companion.yaml
 Restart=on-failure
-RestartSec=10
+RestartSec=5s
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=pymc-companion
+ReadWritePaths=/var/lib/supply-drop-bbs
 
 [Install]
 WantedBy=multi-user.target
 ```
 
-#### `supply-drop-bbs.service` (HAT variant)
+**`supply-drop-bbs.service`** (HAT variant) waits for pymc-companion:
 
 ```ini
 [Unit]
 Description=Supply Drop BBS
-After=network-online.target pymc-core.service
-Wants=network-online.target
-Requires=pymc-core.service
+After=network.target pymc-companion.service
+Wants=network.target
 
 [Service]
-Type=simple
-User=bbs
-Group=bbs
-ExecStart=/usr/local/bin/supply-drop-bbs --config /etc/supply-drop-bbs/config.toml
-Restart=on-failure
-RestartSec=5
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/supply-drop-bbs /var/log/supply-drop-bbs
-PrivateTmp=true
-MemoryMax=512M
-TasksMax=200
-
-[Install]
-WantedBy=multi-user.target
+...same as USB variant above...
 ```
 
-The two services are independent at the socket level — the BBS
-reconnects automatically if `pymc-core` restarts.
+The two services are independent at the socket level — the BBS reconnects
+automatically if `pymc-companion` restarts.
 
 ## Update
 
-The update flow:
+```sh
+# Re-run the installer — it pulls the latest source and rebuilds.
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
+  | sudo bash
+```
 
-1. **Stop the BBS** (the bridge can stay running):
+The installer detects an existing installation and updates in-place without
+touching your config or data. If you answer N when asked to reconfigure, the
+existing `config.toml` is left unchanged.
 
-   ```sh
-   sudo systemctl stop supply-drop-bbs
-   ```
+For a manual binary-only update:
 
-2. **Replace the binary.**
-
-   ```sh
-   sudo install -m 0755 supply-drop-bbs /usr/local/bin/
-   ```
-
-3. **Apply pending migrations.**
-
-   ```sh
-   sudo -u bbs supply-drop-bbs migrate
-   ```
-
-   Migrations are forward-only. We do not ship downgrades.
-
-4. **Start the BBS.**
-
-   ```sh
-   sudo systemctl start supply-drop-bbs
-   ```
-
-5. **Tail the logs** to confirm clean startup:
-
-   ```sh
-   sudo journalctl -u supply-drop-bbs -f
-   ```
-
-For minor patch releases, the binary swap is enough — no migration
-runs. The `migrate` step is fast no-op when there's nothing to do.
+```sh
+sudo systemctl stop supply-drop-bbs
+cd /opt/supply-drop-bbs && sudo git pull && sudo cargo build --release
+sudo install -m 0755 target/release/supply-drop-bbs /usr/local/bin/
+sudo systemctl start supply-drop-bbs
+```
 
 ## Backups
 
 ### Automatic backups
 
 If `[backup] enabled = true` (default), the BBS runs
-`VACUUM INTO 'backup-YYYY-MM-DD-HHMMSS.sqlite'` on the configured
-interval. Backups land in `[backup] directory` (default
-`<data_dir>/backups`).
-
-`VACUUM INTO` is non-blocking — the live DB keeps serving while
-the backup runs.
+`VACUUM INTO 'backup-YYYY-MM-DD-HHMMSS.sqlite'` on the configured interval.
+Backups land in `<data_dir>/backups`. `VACUUM INTO` is non-blocking.
 
 Retention defaults: 7 daily + 4 weekly. Configurable.
 
@@ -312,81 +334,39 @@ Retention defaults: 7 daily + 4 weekly. Configurable.
 supply-drop-bbs backup
 ```
 
-Triggers an immediate backup. Useful before risky operations
-(major upgrades, schema changes, etc.). Or via the web admin UI's
-"Trigger backup" button.
+Or use the **Trigger backup** button in the web admin UI.
 
 ### Off-host backups
 
-The BBS doesn't push backups anywhere. That's deliberate — no
-phone-home. Operators handle off-host retention themselves:
-
 ```sh
-# Cron: every night, copy the latest backup to a remote host
+# Cron: copy the latest backup nightly to a remote host
 0 3 * * *  rsync -a /var/lib/supply-drop-bbs/backups/ \
               backup-host:/srv/bbs-backups/$(hostname)/
 ```
 
 ## Disaster recovery
 
-### Live DB is corrupted
-
-1. **Stop the BBS.**
-
-   ```sh
-   sudo systemctl stop supply-drop-bbs
-   ```
-
-2. **Move the corrupted file aside.** Don't delete it; future
-   diagnosis may benefit.
-
-   ```sh
-   sudo mv /var/lib/supply-drop-bbs/bbs.sqlite /var/lib/supply-drop-bbs/bbs.sqlite.corrupt
-   sudo mv /var/lib/supply-drop-bbs/bbs.sqlite-wal /var/lib/supply-drop-bbs/bbs.sqlite-wal.corrupt 2>/dev/null
-   sudo mv /var/lib/supply-drop-bbs/bbs.sqlite-shm /var/lib/supply-drop-bbs/bbs.sqlite-shm.corrupt 2>/dev/null
-   ```
-
-3. **Identify the latest viable backup.**
-
-   ```sh
-   ls -lt /var/lib/supply-drop-bbs/backups/
-   ```
-
-4. **Restore.**
-
-   ```sh
-   sudo cp /var/lib/supply-drop-bbs/backups/backup-2026-05-08-030000.sqlite \
-           /var/lib/supply-drop-bbs/bbs.sqlite
-   sudo chown bbs:bbs /var/lib/supply-drop-bbs/bbs.sqlite
-   ```
-
-5. **If the backup is from an older schema version, migrate.**
-
-   ```sh
-   sudo -u bbs supply-drop-bbs migrate
-   ```
-
-6. **Start the BBS.**
-
-   ```sh
-   sudo systemctl start supply-drop-bbs
-   ```
-
-### Lost sysop access
-
-If the only sysop account is locked out:
+### Corrupted database
 
 ```sh
 sudo systemctl stop supply-drop-bbs
-sudo -u bbs supply-drop-bbs admin reset-sysop --username <name>
+sudo mv /var/lib/supply-drop-bbs/bbs.sqlite /var/lib/supply-drop-bbs/bbs.sqlite.corrupt
+sudo mv /var/lib/supply-drop-bbs/bbs.sqlite-wal /var/lib/supply-drop-bbs/bbs.sqlite-wal.corrupt 2>/dev/null || true
+ls -lt /var/lib/supply-drop-bbs/backups/
+sudo cp /var/lib/supply-drop-bbs/backups/<latest>.sqlite /var/lib/supply-drop-bbs/bbs.sqlite
+sudo chown supply-drop:supply-drop /var/lib/supply-drop-bbs/bbs.sqlite
 sudo systemctl start supply-drop-bbs
 ```
 
-This prompts for a new password. **TBD** — exact subcommand name
-when implemented.
+### Lost sysop access
 
-This requires direct access to the DB file, so it can only be done
-on the host where the BBS runs.
+**TBD** — exact subcommand when implemented.
+
+```sh
+sudo systemctl stop supply-drop-bbs
+sudo -u supply-drop supply-drop-bbs admin reset-sysop --username <name>
+sudo systemctl start supply-drop-bbs
+```
 
 ## Monitoring
 
@@ -400,59 +380,33 @@ If the web admin plugin is enabled, `GET /health` returns:
   "uptime_seconds": 1234567,
   "version": "0.1.0",
   "bridge_connected": true,
-  "transports": {
-    "cli": "running",
-    "mesh": "running",
-    "web": "running"
-  },
+  "transports": { "mesh": "running", "web": "running" },
   "db": { "size_bytes": 12345678, "last_backup": "2026-05-08T03:00:00Z" }
 }
 ```
 
-`status` is `"healthy"` only if every transport reports running
-and the bridge is connected. Otherwise `"degraded"` with a
-description of what's wrong.
-
-### Prometheus metrics
-
-Off by default. Enable with `[plugins.web] prometheus = true`.
-Endpoint: `GET /metrics`.
-
-Exposed metrics (**TBD** — full list when implemented):
-
-- `supply_drop_uptime_seconds` (gauge)
-- `supply_drop_db_pool_active` / `_idle` / `_waiting` (gauges)
-- `supply_drop_transport_connections{transport=...}` (gauge)
-- `supply_drop_commands_processed_total{transport=...}` (counter)
-- `supply_drop_messages_posted_total` (counter)
-- `supply_drop_login_failures_total{source=...}` (counter)
-- `supply_drop_bridge_connected` (gauge: 0 or 1)
-- `supply_drop_backup_last_success_timestamp_seconds` (gauge)
+`status` is `"healthy"` only if every transport reports running and the bridge
+is connected; otherwise `"degraded"`.
 
 ### Logs
 
-Default location: `<data_dir>/log/bbs.log`. Rotated automatically.
-
-For systemd deployments:
-
 ```sh
-journalctl -u supply-drop-bbs -f          # tail
-journalctl -u supply-drop-bbs --since "1 hour ago" -p err  # errors only
+journalctl -u supply-drop-bbs -f                             # tail
+journalctl -u supply-drop-bbs --since "1 hour ago" -p err   # errors only
+journalctl -u pymc-companion -f                              # Pi HAT radio bridge
 ```
 
 ## Reverse-proxy setup (HTTPS)
 
-The web admin plugin doesn't terminate TLS. Use nginx or caddy:
+The web admin plugin doesn't terminate TLS. Use nginx or Caddy:
 
-### Caddy example
+### Caddy
 
 ```
 admin.bbs.example.com {
     reverse_proxy 127.0.0.1:8080
 }
 ```
-
-Set the BBS config:
 
 ```toml
 [plugins.web]
@@ -461,98 +415,74 @@ external_origin = "https://admin.bbs.example.com"
 cookie_secure = true
 ```
 
-Caddy handles cert issuance + renewal via Let's Encrypt
-automatically.
+### nginx
 
-### nginx example
-
-**TBD** — full config snippet with HSTS, CSP-passthrough, etc.
+**TBD**
 
 ## Troubleshooting
 
 ### BBS won't start
 
-Run `supply-drop-bbs config check`. Most startup failures come
-from invalid config.
-
-If config is valid but the BBS still fails:
-
 ```sh
+supply-drop-bbs config check
 sudo journalctl -u supply-drop-bbs -n 100 --no-pager
 ```
 
-Look for the first ERROR line. Subsequent errors are usually
-cascading consequences of the first.
+Look for the first `ERROR` line. Subsequent errors are usually cascading from it.
 
-### Radio connection keeps dropping
+### Radio bridge disconnected
 
 **USB device:**
 
 ```sh
-ls -la /dev/ttyACM* /dev/ttyUSB*          # confirm device is visible
-sudo journalctl -u supply-drop-bbs -f     # look for serial errors
+ls -la /dev/ttyACM* /dev/ttyUSB*
+sudo journalctl -u supply-drop-bbs -f
 ```
 
-Common causes:
-- Device not in `dialout` group: `sudo usermod -aG dialout bbs`
-- Wrong serial port configured — check `[plugins.mesh] serial_port`
-- Firmware crashed — unplug and replug the device
+Common causes: wrong `serial_port` in config; device not in `dialout` group
+(`sudo usermod -aG dialout supply-drop`); firmware crashed (unplug and replug).
 
 **Pi HAT:**
 
 ```sh
-sudo systemctl status pymc-core
-sudo journalctl -u pymc-core -f
+sudo systemctl status pymc-companion
+sudo journalctl -u pymc-companion -f
 ```
 
 Common causes:
-- SPI or GPIO not enabled — run `sudo raspi-config` → Interface Options
-- `bbs` user not in `spi`/`gpio` groups — the setup wizard adds
-  these; a re-login or reboot is required after the change
-- Wrong HAT preset or pin override — check `[plugins.mesh.hat]` in config
-- `pymc_core` version mismatch — check its own logs for protocol errors
 
-### Database is locked
+- SPI not enabled — `sudo raspi-config` → Interface Options → SPI
+- `supply-drop` user not in `spi`/`gpio` groups (installer adds these; a reboot may be needed)
+- Missing Python dependency — `sudo /opt/pymc-companion/venv/bin/pip install spidev lgpio`
+- Wrong HAT selected — edit `/etc/supply-drop-bbs/pymc-companion.yaml` and restart pymc-companion
 
-Almost always indicates two BBS instances running against the same
-DB. Check:
+### Database locked
+
+Almost always means two BBS instances are running against the same DB:
 
 ```sh
 sudo systemctl status supply-drop-bbs
 ps -ef | grep supply-drop-bbs
 ```
 
-If clean, but you still see `database is locked`, investigate
-file permissions on the DB and the WAL files (they must all be
-owned by the BBS process user).
+### Web UI returns 502
 
-### Web UI returns 502 / connection refused
+```sh
+systemctl status supply-drop-bbs
+ss -ltnp | grep supply-drop-bbs
+```
 
-- Verify the BBS is running: `systemctl status supply-drop-bbs`
-- Verify it's listening: `ss -ltnp | grep supply-drop-bbs`
-- Verify the reverse proxy points at the right address
-- Check `[plugins.web] external_origin` matches what the browser
-  actually requests
-
-### Lost messages after a restart
-
-Should not happen with the disk-WAL DB strategy. If it does:
-
-- Check `[database] synchronous` setting (`OFF` is the only setting
-  that can lose meaningful data)
-- Check disk health (`dmesg | grep -i error`)
-- Check for filesystem-level issues (`fsck`)
+Check `[plugins.web] bind` and `external_origin` in config.
 
 ## Where to get help
 
-- **Bugs:** GitHub issues
+- **Bugs:** GitHub Issues
 - **Security:** see [SECURITY.md](../SECURITY.md)
-- **General questions:** GitHub Discussions (when enabled)
+- **General questions:** GitHub Discussions
 
-## Versioning and stability
+## Versioning
 
-Pre-1.0: assume each release may include breaking changes. Always
-read the release notes. We document upgrade caveats prominently.
+Pre-1.0: each release may include breaking changes — read the release notes.
 
-After 1.0: semver. Major version bumps include breaking changes;
-minor releases add features compatibly; patches are bug fixes only.
+After 1.0: semver. Major bumps are breaking; minor releases add features
+compatibly; patches are bug fixes only.
