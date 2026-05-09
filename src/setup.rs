@@ -19,6 +19,162 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// ── Existing-config loader ────────────────────────────────────────────────────
+
+/// Values read from any already-existing config files.
+/// All fields fall back to the same hard-coded defaults the wizard previously
+/// used when no config existed.
+struct Existing {
+    bbs_name: String,
+    data_dir: String,
+    connection_type: String, // "serial" | "hat" | "tcp"
+    serial_port: Option<String>,
+    baud_rate: u32,
+    web_enabled: bool,
+    web_bind: String,
+    region_idx: usize,
+    hat_idx: usize,
+}
+
+/// Load defaults from existing `config.toml` and `pymc-companion.yaml`.
+/// Missing files or parse errors are silently ignored; compiled-in defaults
+/// are used for anything that can't be read.
+fn load_existing(out_path: &Path) -> Existing {
+    // ── config.toml ───────────────────────────────────────────────────────────
+    let toml_raw = fs::read_to_string(out_path).unwrap_or_default();
+    let toml_val: toml::Value = toml_raw
+        .parse()
+        .unwrap_or(toml::Value::Table(Default::default()));
+
+    let bbs = toml_val.get("bbs");
+    let mesh = toml_val.get("plugins").and_then(|p| p.get("mesh"));
+    let web = toml_val.get("plugins").and_then(|p| p.get("web"));
+
+    let bbs_name = bbs
+        .and_then(|b| b.get("name"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Supply Drop BBS")
+        .to_owned();
+
+    let data_dir = bbs
+        .and_then(|b| b.get("data_dir"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if cfg!(target_os = "linux") {
+                "/var/lib/supply-drop-bbs".to_owned()
+            } else {
+                dirs::data_local_dir()
+                    .map(|d| d.join("supply-drop-bbs").to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "/var/lib/supply-drop-bbs".to_owned())
+            }
+        });
+
+    let connection_type = mesh
+        .and_then(|m| m.get("connection_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("serial")
+        .to_owned();
+
+    let serial_port = mesh
+        .and_then(|m| m.get("serial_port"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    let baud_rate = mesh
+        .and_then(|m| m.get("baud_rate"))
+        .and_then(|v| v.as_integer())
+        .map(|v| v as u32)
+        .unwrap_or(115_200);
+
+    let web_enabled = web
+        .and_then(|w| w.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let web_bind = web
+        .and_then(|w| w.get("bind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("0.0.0.0:8080")
+        .to_owned();
+
+    // ── pymc-companion.yaml ───────────────────────────────────────────────────
+    let yaml_path = companion_yaml_path(out_path);
+    let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
+
+    Existing {
+        bbs_name,
+        data_dir,
+        connection_type,
+        serial_port,
+        baud_rate,
+        web_enabled,
+        web_bind,
+        region_idx: match_region_preset(&yaml),
+        hat_idx: match_hat_preset(&yaml),
+    }
+}
+
+/// Extract a scalar value from a flat YAML file by key name.
+fn yaml_value(yaml: &str, key: &str) -> Option<String> {
+    for line in yaml.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(key) {
+            if let Some(rest) = rest.strip_prefix(':') {
+                let val = rest.trim().trim_matches('"').trim_matches('\'');
+                if !val.is_empty() {
+                    return Some(val.to_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Find the index in `REGION_PRESETS` whose frequency + bandwidth +
+/// spreading_factor matches the YAML.  Falls back to USA/Canada (14).
+fn match_region_preset(yaml: &str) -> usize {
+    let freq = yaml_value(yaml, "frequency").and_then(|s| s.parse::<u64>().ok());
+    let bw = yaml_value(yaml, "bandwidth").and_then(|s| s.parse::<u32>().ok());
+    let sf = yaml_value(yaml, "spreading_factor").and_then(|s| s.parse::<u8>().ok());
+    if let (Some(freq), Some(bw), Some(sf)) = (freq, bw, sf) {
+        for (i, r) in REGION_PRESETS.iter().enumerate() {
+            if r.frequency_hz == freq && r.bandwidth_hz == bw && r.spreading_factor == sf {
+                return i;
+            }
+        }
+    }
+    14 // USA/Canada
+}
+
+/// Find the index in `HAT_PRESETS` whose key GPIO pins match the YAML.
+/// Falls back to 0 (ZebraHat).
+fn match_hat_preset(yaml: &str) -> usize {
+    let get_i32 = |key: &str| yaml_value(yaml, key).and_then(|s| s.parse::<i32>().ok());
+    let bus = get_i32("bus_id");
+    let cs = get_i32("cs_pin");
+    let reset = get_i32("reset_pin");
+    let busy = get_i32("busy_pin");
+    let irq = get_i32("irq_pin");
+    let txen = get_i32("txen_pin");
+    let rxen = get_i32("rxen_pin");
+    if let (Some(bus), Some(cs), Some(reset), Some(busy), Some(irq)) = (bus, cs, reset, busy, irq) {
+        for (i, h) in HAT_PRESETS.iter().enumerate() {
+            if h.bus == bus
+                && h.cs == cs
+                && h.reset == reset
+                && h.busy == busy
+                && h.irq == irq
+                && txen.is_none_or(|v| v == h.txen)
+                && rxen.is_none_or(|v| v == h.rxen)
+            {
+                return i;
+            }
+        }
+    }
+    0
+}
+
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -33,6 +189,13 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     let theme = ColorfulTheme::default();
 
+    // Determine output path early so we can read the existing config from it.
+    let out_path = config_out
+        .map(|p| p.to_owned())
+        .unwrap_or_else(|| PathBuf::from("config.toml"));
+
+    let ex = load_existing(&out_path);
+
     // ── Radio connection ──────────────────────────────────────────────────────
     section("Radio connection");
 
@@ -41,10 +204,16 @@ pub fn run_wizard(config_out: Option<&Path>) {
         "Pi HAT        (ZebraHat, Waveshare, PiMesh, FemtoFox — SPI on GPIO)",
     ];
 
-    let conn_choice = prompt_select(&theme, "How does your radio connect?", conn_items, 0);
+    let conn_default = if ex.connection_type == "hat" { 1 } else { 0 };
+    let conn_choice = prompt_select(
+        &theme,
+        "How does your radio connect?",
+        conn_items,
+        conn_default,
+    );
 
     let (connection_type, serial_port, baud_rate) = match conn_choice {
-        0 => configure_serial(&theme),
+        0 => configure_serial(&theme, ex.serial_port.as_deref(), ex.baud_rate),
         _ => ("hat", None, None),
     };
 
@@ -53,24 +222,16 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     let bbs_name: String = Input::with_theme(&theme)
         .with_prompt("BBS name")
-        .default("Supply Drop BBS".into())
+        .default(ex.bbs_name.clone())
         .interact_text()
         .unwrap_or_else(|_| cancelled());
 
     // ── Data storage ──────────────────────────────────────────────────────────
     section("Data storage");
 
-    let default_data_dir = if cfg!(target_os = "linux") {
-        PathBuf::from("/var/lib/supply-drop-bbs")
-    } else {
-        dirs::data_local_dir()
-            .map(|d| d.join("supply-drop-bbs"))
-            .unwrap_or_else(|| PathBuf::from("/var/lib/supply-drop-bbs"))
-    };
-
     let data_dir_str: String = Input::with_theme(&theme)
         .with_prompt("Data directory")
-        .default(default_data_dir.to_string_lossy().into_owned())
+        .default(ex.data_dir.clone())
         .interact_text()
         .unwrap_or_else(|_| cancelled());
 
@@ -86,7 +247,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     let web_enabled = Confirm::with_theme(&theme)
         .with_prompt("Enable the web admin UI?")
-        .default(true)
+        .default(ex.web_enabled)
         .interact()
         .unwrap_or_else(|_| cancelled());
 
@@ -94,7 +255,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         println!();
         let bind: String = Input::with_theme(&theme)
             .with_prompt("Web admin bind address")
-            .default("0.0.0.0:8080".into())
+            .default(ex.web_bind.clone())
             .interact_text()
             .unwrap_or_else(|_| cancelled());
         Some(bind)
@@ -105,17 +266,19 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     // ── Pi HAT: region + model ────────────────────────────────────────────────
     let hat_params = if connection_type == "hat" {
-        Some(configure_hat(&theme, &bbs_name, &data_dir))
+        Some(configure_hat(
+            &theme,
+            &bbs_name,
+            &data_dir,
+            ex.region_idx,
+            ex.hat_idx,
+        ))
     } else {
         None
     };
 
     // ── Confirm & write ───────────────────────────────────────────────────────
     section("Write config");
-
-    let out_path = config_out
-        .map(|p| p.to_owned())
-        .unwrap_or_else(|| PathBuf::from("config.toml"));
 
     println!("\nConfig will be written to: {}", out_path.display());
     if hat_params.is_some() {
@@ -182,17 +345,22 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
 // ── Connection type configuration ─────────────────────────────────────────────
 
-fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Option<u32>) {
+fn configure_serial(
+    theme: &ColorfulTheme,
+    existing_port: Option<&str>,
+    existing_baud: u32,
+) -> (&'static str, Option<String>, Option<u32>) {
     let ports = list_serial_ports();
 
     let serial_port = if ports.is_empty() {
         println!("\nNo serial ports detected. Make sure your device is connected.");
         println!("You can enter the path manually.\n");
-        let path: String = Input::with_theme(theme)
-            .with_prompt("Serial port path (e.g. /dev/ttyACM0 or COM3)")
-            .interact_text()
-            .unwrap_or_else(|_| cancelled());
-        path
+        let mut prompt =
+            Input::with_theme(theme).with_prompt("Serial port path (e.g. /dev/ttyACM0 or COM3)");
+        if let Some(p) = existing_port {
+            prompt = prompt.default(p.to_owned());
+        }
+        prompt.interact_text().unwrap_or_else(|_| cancelled())
     } else {
         let mut items: Vec<String> = ports
             .iter()
@@ -206,13 +374,19 @@ fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Opt
             .collect();
         items.push("Enter path manually…".into());
 
-        let choice = prompt_select(theme, "Select serial port", &items, 0);
+        // Pre-select the existing port if it appears in the detected list.
+        let port_default = existing_port
+            .and_then(|ep| ports.iter().position(|p| p.name == ep))
+            .unwrap_or(0);
+
+        let choice = prompt_select(theme, "Select serial port", &items, port_default);
 
         if choice == ports.len() {
-            Input::with_theme(theme)
-                .with_prompt("Serial port path")
-                .interact_text()
-                .unwrap_or_else(|_| cancelled())
+            let mut prompt = Input::with_theme(theme).with_prompt("Serial port path");
+            if let Some(p) = existing_port {
+                prompt = prompt.default(p.to_owned());
+            }
+            prompt.interact_text().unwrap_or_else(|_| cancelled())
         } else {
             ports[choice].name.clone()
         }
@@ -220,7 +394,7 @@ fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Opt
 
     let baud_str: String = Input::with_theme(theme)
         .with_prompt("Baud rate")
-        .default("115200".into())
+        .default(existing_baud.to_string())
         .validate_with(|s: &String| -> Result<(), &str> {
             if s.parse::<u32>().is_ok() {
                 Ok(())
@@ -703,7 +877,13 @@ struct HatParams {
     preset: usize,
 }
 
-fn configure_hat(theme: &ColorfulTheme, bbs_name: &str, data_dir: &Path) -> HatParams {
+fn configure_hat(
+    theme: &ColorfulTheme,
+    bbs_name: &str,
+    data_dir: &Path,
+    existing_region: usize,
+    existing_hat: usize,
+) -> HatParams {
     section("Pi HAT — region");
 
     let region_names: Vec<String> = REGION_PRESETS
@@ -717,12 +897,12 @@ fn configure_hat(theme: &ColorfulTheme, bbs_name: &str, data_dir: &Path) -> HatP
         })
         .collect();
 
-    let region_choice = prompt_select(theme, "Select your region", &region_names, 14); // default: USA/Canada
+    let region_choice = prompt_select(theme, "Select your region", &region_names, existing_region);
 
     section("Pi HAT — model");
 
     let hat_names: Vec<&str> = HAT_PRESETS.iter().map(|h| h.name).collect();
-    let hat_choice = prompt_select(theme, "Select your Pi HAT", &hat_names, 0);
+    let hat_choice = prompt_select(theme, "Select your Pi HAT", &hat_names, existing_hat);
 
     HatParams {
         bbs_name: bbs_name.to_owned(),
