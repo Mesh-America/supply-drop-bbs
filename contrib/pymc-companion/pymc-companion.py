@@ -106,6 +106,11 @@ async def run(config: dict) -> None:
     }
     if "dio3_tcxo_voltage" in radio_cfg:
         radio_kwargs["dio3_tcxo_voltage"] = float(radio_cfg["dio3_tcxo_voltage"])
+    for _opt_int in ("gpio_chip", "cs_id", "en_pin", "tx_led", "rx_led"):
+        if _opt_int in radio_cfg:
+            radio_kwargs[_opt_int] = int(radio_cfg[_opt_int])
+    if radio_cfg.get("use_gpiod_backend"):
+        radio_kwargs["use_gpiod_backend"] = True
 
     radio = SX1262Radio(**radio_kwargs)
     if radio.begin() is False:
