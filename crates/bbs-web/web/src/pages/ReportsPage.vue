@@ -99,6 +99,13 @@ const areaPoints = computed(() => {
 
 const yTicks = computed(() => {
   const data = reports.value?.daily_volume ?? []
+  if (data.length === 0) {
+    // Show placeholder ticks so grid is visible even with no data
+    return [0, 5, 10].map((v, i) => ({
+      y: PAD.top + plotH - (i / 2) * plotH,
+      label: String(v),
+    }))
+  }
   const max = Math.max(...data.map(d => d.count), 1)
   return [0, Math.ceil(max / 2), max].map(v => ({
     y: PAD.top + plotH - (v / max) * plotH,
@@ -138,10 +145,10 @@ function maxCount(items: { message_count: number }[]) {
 }
 
 function pct(n: number, max: number) {
-  if (max === 0) return 0
+  if (max === 0) return 3
   const p = Math.round((n / max) * 100)
-  // Always show at least a hairline so the bar chart structure is visible
-  return p === 0 ? 1 : p
+  // Always show at least a sliver so bar structure is visible
+  return p === 0 ? 3 : p
 }
 
 function fmtDate(iso: string | null) {
@@ -209,17 +216,13 @@ onMounted(load)
           </div>
         </div>
 
-        <div v-if="(reports.daily_volume?.length ?? 0) === 0" class="muted empty">
-          No messages yet — chart will appear once traffic flows through the BBS.
-        </div>
         <svg
-          v-else
           :viewBox="`0 0 ${CHART_W} ${CHART_H}`"
           class="line-chart"
           role="img"
           aria-label="Daily message volume"
         >
-          <!-- Y grid lines + labels -->
+          <!-- Y grid lines + labels (always shown) -->
           <g v-for="tick in yTicks" :key="tick.label">
             <line
               :x1="PAD.left" :y1="tick.y"
@@ -231,31 +234,55 @@ onMounted(load)
             </text>
           </g>
 
-          <!-- X axis labels -->
-          <text
-            v-for="xl in xLabels"
-            :key="xl.label"
-            :x="xl.x" :y="CHART_H - 4"
-            text-anchor="middle"
-            class="axis-label"
-          >{{ xl.label }}</text>
+          <!-- X axis baseline -->
+          <line
+            :x1="PAD.left" :y1="PAD.top + plotH"
+            :x2="CHART_W - PAD.right" :y2="PAD.top + plotH"
+            class="grid-line"
+          />
 
-          <!-- Area fill -->
-          <polygon :points="areaPoints" class="area-fill" />
+          <!-- No-data state -->
+          <template v-if="(reports.daily_volume?.length ?? 0) === 0">
+            <line
+              :x1="PAD.left" :y1="PAD.top + plotH"
+              :x2="CHART_W - PAD.right" :y2="PAD.top + plotH"
+              class="data-line no-data-line"
+            />
+            <text
+              :x="CHART_W / 2" :y="PAD.top + plotH / 2 + 4"
+              text-anchor="middle"
+              class="no-data-label"
+            >no messages yet</text>
+          </template>
 
-          <!-- Line -->
-          <polyline :points="linePoints" class="data-line" />
+          <!-- Data state -->
+          <template v-else>
+            <!-- X axis labels -->
+            <text
+              v-for="xl in xLabels"
+              :key="xl.label"
+              :x="xl.x" :y="CHART_H - 4"
+              text-anchor="middle"
+              class="axis-label"
+            >{{ xl.label }}</text>
 
-          <!-- Dots with native hover tooltips -->
-          <circle
-            v-for="p in dailyPoints"
-            :key="p.day"
-            :cx="p.x" :cy="p.y"
-            r="3.5"
-            class="data-dot"
-          >
-            <title>{{ p.day }}: {{ p.count }} messages</title>
-          </circle>
+            <!-- Area fill -->
+            <polygon :points="areaPoints" class="area-fill" />
+
+            <!-- Line -->
+            <polyline :points="linePoints" class="data-line" />
+
+            <!-- Dots with native hover tooltips -->
+            <circle
+              v-for="p in dailyPoints"
+              :key="p.day"
+              :cx="p.x" :cy="p.y"
+              r="3.5"
+              class="data-dot"
+            >
+              <title>{{ p.day }}: {{ p.count }} messages</title>
+            </circle>
+          </template>
         </svg>
       </section>
 
@@ -372,8 +399,10 @@ p { margin: 0; }
 .grid-line { stroke: var(--border); stroke-width: 1; }
 .area-fill { fill: var(--accent); opacity: 0.13; }
 .data-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.no-data-line { opacity: 0.25; stroke-dasharray: 4 4; }
 .data-dot { fill: var(--accent); cursor: default; }
 .axis-label { fill: var(--muted); font-size: 10px; font-family: inherit; }
+.no-data-label { fill: var(--muted); font-size: 11px; font-family: inherit; font-style: italic; }
 
 /* Horizontal bar chart */
 .bar-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.85em; }
