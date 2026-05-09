@@ -84,6 +84,8 @@ pub struct MeshTransport {
     shutdown_tx: watch::Sender<bool>,
     /// Optional command prefix from config (e.g. `'!'`).
     command_prefix: Option<char>,
+    /// Greeting sent to a node the first time it contacts the BBS.
+    welcome_message: String,
 }
 
 #[async_trait]
@@ -152,6 +154,7 @@ impl Plugin for MeshTransport {
             client_slot: Mutex::new(Some(client)),
             shutdown_tx,
             command_prefix: config.command_prefix,
+            welcome_message: config.welcome_message,
         })
     }
 
@@ -172,6 +175,7 @@ impl Plugin for MeshTransport {
         let state = Arc::clone(&self.state);
         let shutdown_rx = self.shutdown_tx.subscribe();
         let prefix = self.command_prefix;
+        let welcome = self.welcome_message.clone();
 
         // Watch for advert-send requests from the web UI.
         let mut advert_send_rx = host.advert_bus().subscribe_send();
@@ -202,7 +206,15 @@ impl Plugin for MeshTransport {
             }
         });
 
-        tokio::spawn(event_loop(client, host, cmd_tx, state, shutdown_rx, prefix));
+        tokio::spawn(event_loop(
+            client,
+            host,
+            cmd_tx,
+            state,
+            shutdown_rx,
+            prefix,
+            welcome,
+        ));
 
         info!("mesh transport started");
         Ok(())
@@ -277,6 +289,7 @@ async fn event_loop(
     state: Arc<Mutex<SessionState>>,
     mut shutdown_rx: watch::Receiver<bool>,
     command_prefix: Option<char>,
+    welcome_message: String,
 ) {
     loop {
         tokio::select! {
@@ -302,7 +315,7 @@ async fn event_loop(
                         }
                     }
                     Some(ClientEvent::Frame(frame)) => {
-                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix).await;
+                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message).await;
                     }
                 }
             }
@@ -321,6 +334,7 @@ async fn handle_frame(
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
     command_prefix: Option<char>,
+    welcome_message: &str,
 ) {
     use meshcore_companion::frame::InboundFrame;
 
@@ -343,6 +357,7 @@ async fn handle_frame(
                 cmd_tx,
                 state,
                 command_prefix,
+                welcome_message,
             )
             .await;
         }
@@ -389,12 +404,29 @@ async fn dispatch_message(
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
     command_prefix: Option<char>,
+    welcome_message: &str,
 ) {
     // ── Get or create a session for this node ─────────────────────────────────
     let (session, is_new) = get_or_create_session(sender_prefix, host, state).await;
 
     if is_new {
         debug!(?session, prefix = ?sender_prefix, "mesh: new session minted");
+        if !welcome_message.is_empty()
+            && cmd_tx
+                .send(OutboundFrame::SendTxtMsg {
+                    txt_type: TXT_TYPE_PLAIN,
+                    attempt: 0,
+                    pubkey_prefix: sender_prefix,
+                    text: welcome_message.to_owned(),
+                })
+                .await
+                .is_err()
+        {
+            warn!(
+                ?session,
+                "mesh: could not enqueue welcome — cmd channel closed"
+            );
+        }
     }
 
     // ── Determine if we're awaiting a workflow reply ──────────────────────────

@@ -107,6 +107,7 @@ async fn make_transport(host: Arc<MockHost>, prefix: Option<char>) -> (MeshTrans
     let config = MeshConfig {
         addr,
         command_prefix: prefix,
+        welcome_message: String::new(), // suppressed in tests
         reconnect_delay_initial_ms: 20,
         reconnect_delay_max_ms: 50,
         ..MeshConfig::default()

@@ -97,6 +97,12 @@ pub struct MeshConfig {
     pub baud_rate: u32,
 
     // ── Common fields ─────────────────────────────────────────────────
+    /// Message sent to a node the first time it contacts the BBS.
+    ///
+    /// Defaults to a standard welcome prompt. Set to an empty string to disable.
+    #[serde(default = "default_welcome")]
+    pub welcome_message: String,
+
     /// Optional single-character prefix that marks a message as a BBS command.
     ///
     /// When set, only messages beginning with this character are interpreted
@@ -147,6 +153,7 @@ impl Default for MeshConfig {
             addr: default_addr(),
             serial_port: None,
             baud_rate: default_baud_rate(),
+            welcome_message: default_welcome(),
             command_prefix: None,
             app_target_version: default_app_ver(),
             reconnect_delay_initial_ms: default_reconnect_initial_ms(),
@@ -167,6 +174,10 @@ fn default_baud_rate() -> u32 {
 
 fn default_app_ver() -> u8 {
     APP_TARGET_VER_V3
+}
+
+fn default_welcome() -> String {
+    "Welcome to Supply Drop BBS!\nType 'register <username>' to create an account\nor 'login <username>' if you already have one.\nType 'help' for a list of commands.".into()
 }
 
 fn default_reconnect_initial_ms() -> u64 {
