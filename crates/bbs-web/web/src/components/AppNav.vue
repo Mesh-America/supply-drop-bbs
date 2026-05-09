@@ -137,6 +137,7 @@ const groups = [
     </nav>
     <div class="sidebar-footer muted">
       <span>supply drop bbs</span>
+      open source project by <a href="http://meshamerica.com">Mesh America</a>
     </div>
   </aside>
 

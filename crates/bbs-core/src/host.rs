@@ -219,9 +219,9 @@ impl Host for BbsHost {
                 "User editing is not yet implemented.".into(),
             )),
 
-            Command::Unknown { raw } => Ok(Response::Text(format!(
-                "Unknown command: '{raw}'. Type H for help."
-            ))),
+            Command::Unknown { .. } => {
+                Ok(Response::Text("Unknown command. Type H for help.".into()))
+            }
             _ => Ok(Response::Error("Command not yet supported.".into())),
         }
     }

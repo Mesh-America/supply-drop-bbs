@@ -612,12 +612,34 @@ async fn dispatch_message(
         .expect("state mutex poisoned")
         .is_awaiting_reply(&sender_prefix);
 
+    // ── Dedup mesh retransmissions of workflow replies ────────────────────────
+    // The mesh protocol retransmits packets; a retransmitted password can arrive
+    // after login completes (awaiting_reply=false). Drop it silently if it
+    // matches the most recently processed WorkflowReply within the dedup window.
+    if !awaiting_reply
+        && state
+            .lock()
+            .expect("state mutex poisoned")
+            .is_recent_workflow_reply(&sender_prefix, text)
+    {
+        debug!("mesh: dropping retransmitted workflow reply (dedup)");
+        return;
+    }
+
     // ── Parse the command ─────────────────────────────────────────────────────
     let Some(cmd) = parse_command(text, command_prefix, awaiting_reply) else {
         // Message doesn't match prefix and no workflow active — silently ignore.
         debug!("mesh: message ignored (no prefix match, no active workflow)");
         return;
     };
+
+    // Record workflow reply text for retransmission deduplication.
+    if awaiting_reply {
+        state
+            .lock()
+            .expect("state mutex poisoned")
+            .set_last_workflow_reply(&sender_prefix, text.to_owned());
+    }
 
     debug!(?session, ?cmd, "mesh: dispatching command");
 
