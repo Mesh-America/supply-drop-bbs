@@ -787,11 +787,20 @@ async fn api_sse_logs(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.log_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+
+    // Prepend a one-shot "[system] connected" event so the client can
+    // immediately verify the stream is delivering data (not just keeping
+    // the connection alive with empty comments).
+    let connect_msg = Ok(Event::default().data("[system] log stream connected"));
+    let init = tokio_stream::once(connect_msg);
+
+    let live = BroadcastStream::new(rx).filter_map(|result| match result {
         Ok(line) => Some(Ok(Event::default().data(line))),
         Err(_lagged) => None,
     });
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+
+    Sse::new(tokio_stream::StreamExt::chain(init, live))
+        .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── Backups ───────────────────────────────────────────────────────────────────

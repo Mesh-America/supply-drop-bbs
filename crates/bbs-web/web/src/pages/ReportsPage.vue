@@ -138,7 +138,10 @@ function maxCount(items: { message_count: number }[]) {
 }
 
 function pct(n: number, max: number) {
-  return Math.round((n / max) * 100)
+  if (max === 0) return 0
+  const p = Math.round((n / max) * 100)
+  // Always show at least a hairline so the bar chart structure is visible
+  return p === 0 ? 1 : p
 }
 
 function fmtDate(iso: string | null) {
@@ -206,7 +209,9 @@ onMounted(load)
           </div>
         </div>
 
-        <div v-if="(reports.daily_volume?.length ?? 0) === 0" class="muted empty">no messages in this period</div>
+        <div v-if="(reports.daily_volume?.length ?? 0) === 0" class="muted empty">
+          No messages yet — chart will appear once traffic flows through the BBS.
+        </div>
         <svg
           v-else
           :viewBox="`0 0 ${CHART_W} ${CHART_H}`"
@@ -257,7 +262,7 @@ onMounted(load)
       <!-- Top senders -->
       <section class="panel">
         <h2 class="panel-title">top senders</h2>
-        <div v-if="reports.top_senders.length === 0" class="muted empty">no data</div>
+        <div v-if="reports.top_senders.length === 0" class="muted empty">No messages yet.</div>
         <div v-for="(s, i) in reports.top_senders" :key="s.username" class="bar-row">
           <span class="bar-rank">{{ i + 1 }}</span>
           <span class="bar-label">{{ s.username }}</span>

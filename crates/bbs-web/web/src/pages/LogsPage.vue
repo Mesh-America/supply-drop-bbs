@@ -53,6 +53,7 @@ function lineClass(text: string): string {
   if (text.startsWith('[user]')) return 'log-user'
   if (text.startsWith('[warn]')) return 'log-warn'
   if (text.startsWith('[session]')) return 'log-session'
+  if (text.startsWith('[system]')) return 'log-system'
   return 'log-event'
 }
 
@@ -131,6 +132,7 @@ h1 { margin: 0; }
 .log-user    { border-left-color: #7c5cbc; }
 .log-warn    { border-left-color: var(--warning); color: var(--warning); }
 .log-session { border-left-color: var(--muted); }
+.log-system  { border-left-color: var(--border); opacity: 0.5; font-style: italic; }
 .log-event   { opacity: 0.65; }
 
 .empty-state { padding: 1.5rem 1rem; }
