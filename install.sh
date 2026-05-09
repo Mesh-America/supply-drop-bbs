@@ -44,8 +44,8 @@ die()     { echo -e "${RED}  ✗${NC} $*" >&2; exit 1; }
 if [[ "${1:-}" == "--uninstall" ]]; then
     echo
     if command -v figlet &>/dev/null; then
-        echo -e "${GREEN}$(figlet -f slant "Supply Drop" 2>/dev/null || figlet "Supply Drop")${NC}"
-        echo -e "${GREEN}$(figlet -f slant "  BBS" 2>/dev/null || figlet "BBS")${NC}"
+        echo -e "${GREEN}$(figlet -f big "Supply Drop" 2>/dev/null || figlet "Supply Drop")${NC}"
+        echo -e "${GREEN}$(figlet -f big "  BBS" 2>/dev/null || figlet "BBS")${NC}"
     else
         echo -e "${GREEN}  Supply Drop BBS${NC}"
     fi
@@ -136,8 +136,8 @@ fi
 print_banner() {
     echo
     if command -v figlet &>/dev/null; then
-        echo -e "${GREEN}$(figlet -f slant "Supply Drop" 2>/dev/null || figlet "Supply Drop")${NC}"
-        echo -e "${GREEN}$(figlet -f slant "  BBS" 2>/dev/null || figlet "BBS")${NC}"
+        echo -e "${GREEN}$(figlet -f big "Supply Drop" 2>/dev/null || figlet "Supply Drop")${NC}"
+        echo -e "${GREEN}$(figlet -f big "  BBS" 2>/dev/null || figlet "BBS")${NC}"
     else
         echo -e "${GREEN}   _____                   __         ____"
         echo    "  / ___/__  ______  ____  / /_  __   / __ \________  ___  ____"
