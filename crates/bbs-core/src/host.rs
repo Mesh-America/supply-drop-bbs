@@ -1987,10 +1987,9 @@ fn help_for_command(cmd: &str) -> String {
         "i" => "I — Toggle ignore on the current room. Ignored rooms are skipped during navigation and don't count toward unread.",
         "m" => "M — Go directly to the Mail room to send/receive private messages.",
         "h" | "help" | "?" => {
-            "H — Show help. With no arg, shows the quick-start menu.\n\
-             'H all' for the full categorized menu.\n\
-             'H reading' / 'H posting' / 'H navigation' / 'H account' / 'H aide' / 'H sysop' for one category.\n\
-             'H X' for detail on command X."
+            "H — quick menu. H all = full menu.\n\
+             H reading/nav/account/aide/sysop\n\
+             H <key> for one command."
         }
         "q" => "Q — Quit or log off.",
         "w" => "W — List active users currently online.",
@@ -1999,9 +1998,8 @@ fn help_for_command(cmd: &str) -> String {
         "cancel" => "CANCEL — Cancel the current workflow and return to normal command mode.",
         "stop" => "STOP — Stop pending messages as soon as possible.",
         "b" => {
-            "B <user> — Block or unblock another user. Specify a username after the command letter; \
-             prefix with '+' to force-block or '-' to force-unblock, or omit the prefix to toggle. \
-             Blocking hides the target's messages from you (they can still see yours)."
+            "B <user> — toggle block. +user force-block,\n\
+             -user unblock. Hides their posts from you."
         }
         "v" => "V <user> — Validate (approve) a pending user. Aide+.",
         "ban" => "BAN <user> — Ban a user account, preventing further login. Aide+.",
@@ -2025,15 +2023,11 @@ H all | H <key> for more";
 
 const HELP_READING_POSTING: &str = "\
 Reading:\n\
- F    forward-read (oldest first)\n\
- N    read new messages\n\
- R    reverse-read (newest first)\n\
- S    scan message headers\n\
- .FF  fast-forward past unread\n\
-\n\
+ F  oldest first  N  new\n\
+ R  newest first  S  scan\n\
+ .FF  skip to latest\n\
 Posting:\n\
- D    delete a message\n\
- E    enter a message";
+ D  delete  E  enter";
 
 const HELP_NAVIGATION: &str = "\
 Navigation:\n\
