@@ -72,6 +72,57 @@ pub enum Command {
         /// The raw command string the user sent.
         raw: String,
     },
+
+    // ── Room navigation ───────────────────────────────────────────────
+    /// List all accessible rooms with unread-message markers. (K)
+    ListRooms,
+
+    /// Jump to the next room that has unread messages. (G)
+    GoNextUnread,
+
+    /// Change to a room by name or numeric ID. (C)
+    ChangeRoom {
+        /// Room name or numeric ID string supplied by the user.
+        target: String,
+    },
+
+    /// Navigate directly to the Mail room. (M)
+    GoMail,
+
+    // ── Message reading ───────────────────────────────────────────────
+    /// Read unread messages in the current room (from the last-read
+    /// pointer). (N)
+    ReadNew,
+
+    /// Browse messages oldest-first, optionally starting after a
+    /// given message ID. (F)
+    ReadForward {
+        /// Start cursor; `None` means from the beginning.
+        after: Option<i64>,
+    },
+
+    /// Browse the most recent messages newest-first. (R)
+    ReadReverse,
+
+    /// Show one-line message summaries (ID, sender, snippet). (S)
+    ScanMessages,
+
+    // ── Message posting / deletion ────────────────────────────────────
+    /// Begin composing a message for the current room (or Mail). (E)
+    EnterMessage,
+
+    /// Delete a message by its numeric ID. (D)
+    DeleteMessage {
+        /// The numeric message ID to delete.
+        id: i64,
+    },
+
+    // ── Session control ───────────────────────────────────────────────
+    /// Quit — log out gracefully. (Q)
+    Quit,
+
+    /// Cancel the current workflow without logging out. (cancel)
+    Cancel,
 }
 
 /// A protocol-neutral response from the BBS to a session.

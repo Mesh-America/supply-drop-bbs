@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT last_read_message_id FROM user_room_state\n               WHERE user_id = ? AND room_id = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "last_read_message_id",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "54fe3de4eab21393d6c7f826901352e52a5bc386d4ceb7a187f9b0eb6e8ca42c"
+}

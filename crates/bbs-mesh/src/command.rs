@@ -50,6 +50,11 @@ use bbs_plugin_api::{event::Notification, identity::Username, Command, Response}
 pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> Option<Command> {
     let text = text.trim();
 
+    // ── Cancel / stop always break out of any workflow ───────────────────────
+    if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {
+        return Some(Command::Cancel);
+    }
+
     // ── Workflow continuations take priority ─────────────────────────────────
     // If the host is waiting for a reply, treat the whole message as one
     // regardless of whether it looks like a command keyword.
@@ -110,6 +115,44 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         "logout" => Some(Command::Logout),
 
         "whoami" => Some(Command::Whoami),
+
+        // ── Room navigation ──────────────────────────────────────────────────
+        "k" => Some(Command::ListRooms),
+
+        "g" => Some(Command::GoNextUnread),
+
+        "c" => Some(Command::ChangeRoom {
+            target: rest.unwrap_or("").to_owned(),
+        }),
+
+        "m" | "mail" => Some(Command::GoMail),
+
+        // ── Message reading ──────────────────────────────────────────────────
+        "n" => Some(Command::ReadNew),
+
+        "f" => {
+            let after = rest.and_then(|s| s.parse::<i64>().ok());
+            Some(Command::ReadForward { after })
+        }
+
+        "r" => Some(Command::ReadReverse),
+
+        "s" => Some(Command::ScanMessages),
+
+        // ── Message posting / deletion ───────────────────────────────────────
+        "e" => Some(Command::EnterMessage),
+
+        "d" => match rest.and_then(|s| s.parse::<i64>().ok()) {
+            Some(id) => Some(Command::DeleteMessage { id }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
+        // ── Session control ──────────────────────────────────────────────────
+        "q" | "quit" => Some(Command::Quit),
+
+        "cancel" | "stop" => Some(Command::Cancel),
 
         _ => Some(Command::Unknown {
             raw: text.to_owned(),

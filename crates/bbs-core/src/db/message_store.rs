@@ -126,6 +126,21 @@ pub trait MessageStore: Send + Sync {
 
     /// Count unread messages in a room for a user.
     async fn unread_count(&self, user_id: UserId, room_id: RoomId) -> Result<u64, StoreError>;
+
+    /// Return the user's last-read message ID in a room, or `None`
+    /// if they have never visited it.
+    async fn get_last_read(
+        &self,
+        user_id: UserId,
+        room_id: RoomId,
+    ) -> Result<Option<MessageId>, StoreError>;
+
+    /// Return the `limit` most recent messages in a room, newest first.
+    async fn list_recent_in_room(
+        &self,
+        room_id: RoomId,
+        limit: u32,
+    ) -> Result<Vec<Message>, StoreError>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────
@@ -340,5 +355,54 @@ impl MessageStore for Database {
         .await?;
 
         Ok(count as u64)
+    }
+
+    async fn get_last_read(
+        &self,
+        user_id: UserId,
+        room_id: RoomId,
+    ) -> Result<Option<MessageId>, StoreError> {
+        let uid = user_id.as_i64();
+        let rid = room_id.as_i64();
+
+        let row = sqlx::query_scalar!(
+            r#"SELECT last_read_message_id FROM user_room_state
+               WHERE user_id = ? AND room_id = ?"#,
+            uid,
+            rid
+        )
+        .fetch_optional(&self.read_pool)
+        .await?;
+
+        Ok(row.flatten().map(MessageId::new))
+    }
+
+    async fn list_recent_in_room(
+        &self,
+        room_id: RoomId,
+        limit: u32,
+    ) -> Result<Vec<Message>, StoreError> {
+        let rid = room_id.as_i64();
+        let lim = limit as i64;
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT m.id AS "id!", m.sender AS "sender!", m.recipient,
+                   m.content AS "content!", m.timestamp AS "timestamp!"
+            FROM messages m
+            JOIN room_messages rm ON rm.message_id = m.id
+            WHERE rm.room_id = ?
+            ORDER BY m.id DESC
+            LIMIT ?
+            "#,
+            rid,
+            lim
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| map_message_row(r.id, r.sender, r.recipient, r.content, r.timestamp))
+            .collect()
     }
 }
