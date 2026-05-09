@@ -484,9 +484,9 @@ async fn handle_frame(
             // While draining, discard queued messages and request the next one
             // so we flush the entire backlog before serving live traffic.
             if draining.load(Ordering::Relaxed) {
-                debug!(
-                    "mesh: discarding stale queued message from {}",
-                    msg.sender_key_prefix[0]
+                info!(
+                    prefix = msg.sender_key_prefix[0],
+                    "mesh: discarding stale queued message (draining)"
                 );
                 let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
                 return;
@@ -495,12 +495,19 @@ async fn handle_frame(
             // Only handle plain-text messages; CLI data and signed frames are
             // not BBS commands.
             if msg.txt_type != meshcore_companion::constants::TXT_TYPE_PLAIN {
-                debug!(
-                    "mesh: ignoring non-plain-text ContactMsg (txt_type={})",
-                    msg.txt_type
+                info!(
+                    txt_type = msg.txt_type,
+                    "mesh: ignoring non-plain-text ContactMsg"
                 );
                 return;
             }
+
+            info!(
+                prefix = msg.sender_key_prefix[0],
+                txt_type = msg.txt_type,
+                len = msg.text.len(),
+                "mesh: inbound message received"
+            );
             dispatch_message(
                 msg.sender_key_prefix,
                 &msg.text,
@@ -517,7 +524,7 @@ async fn handle_frame(
         // ── Queued message notification ───────────────────────────────────────
         // The bridge has a message waiting; fetch it with SyncNextMessage.
         InboundFrame::MsgWaiting => {
-            debug!("mesh: MsgWaiting — fetching next queued message");
+            info!("mesh: MsgWaiting — fetching next queued message");
             if cmd_tx.send(OutboundFrame::SyncNextMessage).await.is_err() {
                 warn!("mesh: could not enqueue SyncNextMessage — cmd channel closed");
             }
@@ -641,7 +648,7 @@ async fn dispatch_message(
             .set_last_workflow_reply(&sender_prefix, text.to_owned());
     }
 
-    debug!(?session, ?cmd, "mesh: dispatching command");
+    info!(?session, ?cmd, "mesh: dispatching command");
 
     // ── Process through the host ──────────────────────────────────────────────
     // On UnknownSession (e.g. server restarted while the transport retained a
@@ -650,7 +657,7 @@ async fn dispatch_message(
     let response = match host.process_command(session, cmd.clone()).await {
         Ok(r) => r,
         Err(HostError::UnknownSession(stale)) => {
-            debug!(?stale, "mesh: stale session — refreshing");
+            info!(?stale, "mesh: stale session — refreshing");
             state
                 .lock()
                 .expect("state mutex poisoned")
@@ -717,6 +724,12 @@ async fn dispatch_message(
     let Some(reply_text) = format_response(&response) else {
         return;
     };
+
+    info!(
+        ?session,
+        len = reply_text.len(),
+        "mesh: sending reply to node"
+    );
 
     if cmd_tx
         .send(OutboundFrame::SendTxtMsg {
