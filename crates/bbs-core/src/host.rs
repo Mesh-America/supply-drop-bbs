@@ -10,13 +10,13 @@
 //! Sessions are held in memory; they are not persisted across restarts. The
 //! session map is a `RwLock<HashMap<SessionId, SessionRecord>>` so concurrent
 //! reads (from multiple transport plugins) don't block each other. The write
-//! lock is taken only on `create_session` / `end_session`.
+//! lock is taken only on mutations.
 //!
-//! ## Command processing
+//! ## Auth workflow
 //!
-//! For now only the basic meta-commands (Help, Whoami, Logout, Unknown) are
-//! implemented. The authentication flow (Register / Login / WorkflowReply)
-//! will be wired in once the credential store is exposed via the public API.
+//! Registration and login are multi-step workflows tracked per-session in the
+//! `Workflow` enum stored alongside each `SessionRecord`. The mesh transport's
+//! `awaiting_reply` flag is driven naturally by `Response::Prompt` returns.
 //!
 //! ## Event bus
 //!
@@ -35,9 +35,41 @@ use bbs_plugin_api::{
     Command, DomainEvent, HostError, PermissionCtx, PermissionLevel, Response, SessionId,
 };
 use tokio::sync::{broadcast, RwLock};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
-use crate::db::Database;
+use crate::db::{Database, UserStore};
+use crate::timestamp::Timestamp;
+use crate::user::UserStatus;
+
+// ── Workflow state ────────────────────────────────────────────────────────────
+
+/// Multi-step auth workflow in progress for a session.
+#[derive(Clone, Debug, Default)]
+enum Workflow {
+    #[default]
+    None,
+    Register {
+        username: bbs_plugin_api::Username,
+        stage: RegisterStage,
+    },
+    Login {
+        username: bbs_plugin_api::Username,
+        attempts: u32,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum RegisterStage {
+    /// Awaiting the user's chosen display name.
+    DisplayName,
+    /// Awaiting the user's chosen password.
+    Password { display_name: Option<String> },
+    /// Awaiting password confirmation.
+    Confirm {
+        display_name: Option<String>,
+        password: String,
+    },
+}
 
 // ── Session record ────────────────────────────────────────────────────────────
 
@@ -46,6 +78,7 @@ struct SessionRecord {
     transport: String,
     username: Option<bbs_plugin_api::Username>,
     level: PermissionLevel,
+    workflow: Workflow,
 }
 
 // ── BbsHost ───────────────────────────────────────────────────────────────────
@@ -60,7 +93,6 @@ struct SessionRecord {
 /// ```
 pub struct BbsHost {
     /// Persistence handle (Clone + Send + Sync).
-    #[allow(dead_code)]
     db: Database,
     /// Event fanout channel. Capacity 256: slow consumers get `Lagged`.
     events_tx: broadcast::Sender<DomainEvent>,
@@ -103,14 +135,12 @@ impl Host for BbsHost {
 
         match cmd {
             Command::Help { topic: None } => Ok(Response::Text(
-                "Available commands: help, whoami, logout\n\
-                 Type 'help <topic>' for more information on a command."
-                    .into(),
+                "Commands: register <username>, login <username>, logout, whoami, help".into(),
             )),
 
-            Command::Help { topic: Some(t) } => Ok(Response::Text(format!(
-                "No help available for '{t}' yet. Try 'help' for the command list."
-            ))),
+            Command::Help { topic: Some(t) } => {
+                Ok(Response::Text(format!("No help available for '{t}' yet.")))
+            }
 
             Command::Whoami => {
                 let sessions = self.sessions.read().await;
@@ -131,16 +161,14 @@ impl Host for BbsHost {
                 Ok(Response::LoggedOut)
             }
 
-            // Auth flow — placeholder until credential store is wired in.
-            Command::Register { .. } | Command::Login { .. } | Command::WorkflowReply { .. } => Ok(
-                Response::Error("Authentication not yet implemented.".into()),
-            ),
+            Command::Register { username } => self.handle_register(session, username).await,
+            Command::Login { username } => self.handle_login(session, username).await,
+            Command::WorkflowReply { reply } => self.handle_workflow_reply(session, reply).await,
 
             Command::Unknown { raw } => Ok(Response::Text(format!(
                 "Unknown command: '{raw}'. Type 'help' for the command list."
             ))),
 
-            // Non-exhaustive catch-all: new Command variants land here.
             _ => Ok(Response::Error("Command not yet supported.".into())),
         }
     }
@@ -154,6 +182,7 @@ impl Host for BbsHost {
                 transport: transport.to_owned(),
                 username: None,
                 level: PermissionLevel::Unvalidated,
+                workflow: Workflow::None,
             },
         );
 
@@ -200,6 +229,315 @@ impl Host for BbsHost {
     }
 }
 
+// ── Auth helpers ──────────────────────────────────────────────────────────────
+
+impl BbsHost {
+    async fn handle_register(
+        &self,
+        session: SessionId,
+        username: bbs_plugin_api::Username,
+    ) -> Result<Response, HostError> {
+        // Reject if already logged in.
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(r) = sessions.get(&session) {
+                if r.username.is_some() {
+                    return Ok(Response::Error(
+                        "Already logged in. Use 'logout' first.".into(),
+                    ));
+                }
+            }
+        }
+
+        // Check availability.
+        let existing = self
+            .db
+            .get_by_username(&username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        if existing.is_some() {
+            return Ok(Response::Error(format!(
+                "Username '{username}' is already taken. Choose another."
+            )));
+        }
+
+        // Start registration workflow.
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::Register {
+                    username,
+                    stage: RegisterStage::DisplayName,
+                };
+            }
+        }
+
+        Ok(Response::Prompt {
+            text: "Choose a display name (or press Enter to use your username):".into(),
+            hide_input: false,
+        })
+    }
+
+    async fn handle_login(
+        &self,
+        session: SessionId,
+        username: bbs_plugin_api::Username,
+    ) -> Result<Response, HostError> {
+        // Reject if already logged in.
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(r) = sessions.get(&session) {
+                if r.username.is_some() {
+                    return Ok(Response::Error(
+                        "Already logged in. Use 'logout' first.".into(),
+                    ));
+                }
+            }
+        }
+
+        // Check that the account exists and is active.
+        let user = self
+            .db
+            .get_by_username(&username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        match &user {
+            None => {
+                return Ok(Response::Error(format!(
+                    "No account found for '{username}'."
+                )))
+            }
+            Some(u) if u.status != UserStatus::Active => {
+                return Ok(Response::Error("Account is not active.".into()))
+            }
+            Some(_) => {}
+        }
+
+        // Start login workflow.
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::Login {
+                    username,
+                    attempts: 0,
+                };
+            }
+        }
+
+        Ok(Response::Prompt {
+            text: "Enter your password:".into(),
+            hide_input: true,
+        })
+    }
+
+    async fn handle_workflow_reply(
+        &self,
+        session: SessionId,
+        reply: String,
+    ) -> Result<Response, HostError> {
+        // Clone the current workflow so we can release the lock before async DB ops.
+        let workflow = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .get(&session)
+                .map(|r| r.workflow.clone())
+                .unwrap_or(Workflow::None)
+        };
+
+        match workflow {
+            Workflow::None => Ok(Response::Error(
+                "No active workflow. Type 'help' for the command list.".into(),
+            )),
+
+            Workflow::Register {
+                username,
+                stage: RegisterStage::DisplayName,
+            } => {
+                let display_name = if reply.trim().is_empty() {
+                    None
+                } else {
+                    Some(reply.trim().to_owned())
+                };
+                let mut sessions = self.sessions.write().await;
+                if let Some(r) = sessions.get_mut(&session) {
+                    r.workflow = Workflow::Register {
+                        username,
+                        stage: RegisterStage::Password { display_name },
+                    };
+                }
+                Ok(Response::Prompt {
+                    text: "Choose a password (min 8 characters):".into(),
+                    hide_input: true,
+                })
+            }
+
+            Workflow::Register {
+                username,
+                stage: RegisterStage::Password { display_name },
+            } => {
+                if reply.len() < 8 {
+                    // Keep stage at Password; re-prompt.
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::Register {
+                            username,
+                            stage: RegisterStage::Password { display_name },
+                        };
+                    }
+                    return Ok(Response::Prompt {
+                        text: "Password must be at least 8 characters. Try again:".into(),
+                        hide_input: true,
+                    });
+                }
+                let mut sessions = self.sessions.write().await;
+                if let Some(r) = sessions.get_mut(&session) {
+                    r.workflow = Workflow::Register {
+                        username,
+                        stage: RegisterStage::Confirm {
+                            display_name,
+                            password: reply,
+                        },
+                    };
+                }
+                Ok(Response::Prompt {
+                    text: "Confirm your password:".into(),
+                    hide_input: true,
+                })
+            }
+
+            Workflow::Register {
+                username,
+                stage:
+                    RegisterStage::Confirm {
+                        display_name,
+                        password,
+                    },
+            } => {
+                if reply != password {
+                    // Passwords don't match — restart from password entry.
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::Register {
+                            username,
+                            stage: RegisterStage::Password { display_name },
+                        };
+                    }
+                    return Ok(Response::Prompt {
+                        text: "Passwords don't match. Choose a password:".into(),
+                        hide_input: true,
+                    });
+                }
+
+                let now = Timestamp::now();
+                let user_id = self
+                    .db
+                    .create(
+                        &username,
+                        display_name.as_deref(),
+                        PermissionLevel::User,
+                        now,
+                    )
+                    .await
+                    .map_err(|e| HostError::Storage(format!("create user: {e}")))?;
+
+                self.db
+                    .credentials()
+                    .set_password(user_id, &password, now)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("set password: {e}")))?;
+
+                {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.username = Some(username.clone());
+                        r.level = PermissionLevel::User;
+                        r.workflow = Workflow::None;
+                    }
+                }
+
+                info!(%session, %username, "registration complete");
+                Ok(Response::LoggedIn { user: username })
+            }
+
+            Workflow::Login { username, attempts } => {
+                let user = self
+                    .db
+                    .get_by_username(&username)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+                let user = match user {
+                    None => {
+                        // Account deleted between Login command and password entry.
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::None;
+                        }
+                        return Ok(Response::Error("Account no longer exists.".into()));
+                    }
+                    Some(u) => u,
+                };
+
+                let ok = self
+                    .db
+                    .credentials()
+                    .verify_password(user.id, &reply, Timestamp::now())
+                    .await
+                    .map_err(|e| HostError::Storage(format!("verify password: {e}")))?;
+
+                if ok {
+                    self.db
+                        .update(user.id, None, None, None, Some(Timestamp::now()))
+                        .await
+                        .map_err(|e| HostError::Storage(format!("update last_login: {e}")))?;
+
+                    {
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.username = Some(username.clone());
+                            r.level = user.permission_level;
+                            r.workflow = Workflow::None;
+                        }
+                    }
+
+                    info!(%session, %username, "login successful");
+                    Ok(Response::LoggedIn { user: username })
+                } else {
+                    let new_attempts = attempts + 1;
+                    if new_attempts >= 3 {
+                        warn!(%session, %username, "login failed: too many attempts");
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::None;
+                        }
+                        Ok(Response::Error(
+                            "Too many failed attempts. Type 'login <username>' to try again."
+                                .into(),
+                        ))
+                    } else {
+                        let remaining = 3 - new_attempts;
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::Login {
+                                username,
+                                attempts: new_attempts,
+                            };
+                        }
+                        Ok(Response::Prompt {
+                            text: format!(
+                                "Incorrect password ({remaining} attempt(s) remaining). Try again:"
+                            ),
+                            hide_input: true,
+                        })
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -207,7 +545,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use bbs_plugin_api::Command;
+    use bbs_plugin_api::{Command, Username};
     use tempfile::NamedTempFile;
 
     async fn make_host() -> Arc<BbsHost> {
@@ -231,7 +569,6 @@ mod tests {
     async fn end_unknown_session_is_ok() {
         let host = make_host().await;
         let fake = SessionId::__internal_new(9999);
-        // end_session is documented as idempotent — must not return Err.
         host.end_session(fake).await.unwrap();
     }
 
@@ -292,5 +629,208 @@ mod tests {
         let sid = host.create_session("test").await.unwrap();
         let ev = rx.recv().await.unwrap();
         assert!(matches!(ev, DomainEvent::SessionCreated { session, .. } if session == sid));
+    }
+
+    #[tokio::test]
+    async fn register_and_login_full_flow() {
+        let host = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+
+        // Step 1: register
+        let r = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: uname.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Prompt { .. }),
+            "expected display-name prompt"
+        );
+
+        // Step 2: display name
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "Alice".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                r,
+                Response::Prompt {
+                    hide_input: true,
+                    ..
+                }
+            ),
+            "expected password prompt"
+        );
+
+        // Step 3: password
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "s3cr3t!!".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                r,
+                Response::Prompt {
+                    hide_input: true,
+                    ..
+                }
+            ),
+            "expected confirm prompt"
+        );
+
+        // Step 4: confirm
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "s3cr3t!!".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            Response::LoggedIn {
+                user: uname.clone()
+            }
+        );
+
+        // Should be logged in now
+        let ctx = host.permission_ctx(sid).await.unwrap();
+        assert_eq!(ctx.username.as_ref(), Some(&uname));
+        assert_eq!(ctx.level, PermissionLevel::User);
+
+        // Logout and log back in
+        host.process_command(sid, Command::Logout).await.unwrap();
+
+        let sid2 = host.create_session("test").await.unwrap();
+        let r = host
+            .process_command(
+                sid2,
+                Command::Login {
+                    username: uname.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            r,
+            Response::Prompt {
+                hide_input: true,
+                ..
+            }
+        ));
+
+        let r = host
+            .process_command(
+                sid2,
+                Command::WorkflowReply {
+                    reply: "s3cr3t!!".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            Response::LoggedIn {
+                user: uname.clone()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn login_wrong_password_lockout() {
+        let host = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("bob").unwrap();
+
+        // Register bob
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: "password1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: "password1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(sid, Command::Logout).await.unwrap();
+
+        // Login with wrong password 3 times
+        let sid2 = host.create_session("test").await.unwrap();
+        host.process_command(
+            sid2,
+            Command::Login {
+                username: uname.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            let r = host
+                .process_command(
+                    sid2,
+                    Command::WorkflowReply {
+                        reply: "wrong".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(matches!(r, Response::Prompt { .. }), "should re-prompt");
+        }
+
+        let r = host
+            .process_command(
+                sid2,
+                Command::WorkflowReply {
+                    reply: "wrong".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Error(_)),
+            "should error after 3 failures"
+        );
     }
 }
