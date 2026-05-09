@@ -77,6 +77,20 @@ pub enum DomainEvent {
         /// The user who was validated.
         user: Username,
     },
+
+    /// A command was dispatched through the host (every call to
+    /// `process_command`, except `WorkflowReply` to avoid logging passwords).
+    ///
+    /// Intended for admin log streams; other plugins should ignore this via
+    /// the required `_ => {}` catch-all.
+    CommandExecuted {
+        /// The session that sent the command.
+        session: SessionId,
+        /// Short label for the command type (e.g. `"Help"`, `"ReadNew"`).
+        command: String,
+        /// The username bound to the session, if any.
+        user: Option<Username>,
+    },
 }
 
 /// Where a message is going.

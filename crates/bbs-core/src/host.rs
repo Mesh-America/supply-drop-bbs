@@ -149,6 +149,22 @@ impl Host for BbsHost {
     ) -> Result<Response, HostError> {
         debug!(%session, ?cmd, "processing command");
 
+        // Emit a CommandExecuted event for every non-WorkflowReply command so
+        // the web admin log view shows live BBS activity.
+        // WorkflowReply is excluded to avoid logging passwords.
+        if !matches!(cmd, Command::WorkflowReply { .. }) {
+            let label = cmd_label(&cmd).to_owned();
+            let user = {
+                let sessions = self.sessions.read().await;
+                sessions.get(&session).and_then(|s| s.username.clone())
+            };
+            let _ = self.events_tx.send(DomainEvent::CommandExecuted {
+                session,
+                command: label,
+                user,
+            });
+        }
+
         match cmd {
             Command::Help { topic } => {
                 let level = {
@@ -2223,6 +2239,45 @@ impl BbsHost {
 
         info!(%actor, %name, "room deleted");
         Ok(Response::Text(format!("Room '{name}' deleted.")))
+    }
+}
+
+// ── Command label (for log events) ───────────────────────────────────────────
+
+fn cmd_label(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Help { .. } => "Help",
+        Command::Login { .. } => "Login",
+        Command::Register { .. } => "Register",
+        Command::WorkflowReply { .. } => "WorkflowReply",
+        Command::Cancel => "Cancel",
+        Command::Logout | Command::Quit => "Logout",
+        Command::Whoami => "Whoami",
+        Command::ListRooms => "ListRooms",
+        Command::GoNextUnread => "GoNextUnread",
+        Command::ChangeRoom { .. } => "ChangeRoom",
+        Command::GoMail => "GoMail",
+        Command::IgnoreRoom => "IgnoreRoom",
+        Command::ReadNew => "ReadNew",
+        Command::ReadForward { .. } => "ReadForward",
+        Command::ReadReverse => "ReadReverse",
+        Command::ScanMessages => "ScanMessages",
+        Command::FastForward => "FastForward",
+        Command::EnterMessage => "EnterMessage",
+        Command::DeleteMessage { .. } => "DeleteMessage",
+        Command::WhoIsOnline => "WhoIsOnline",
+        Command::ListPending => "ListPending",
+        Command::ValidateUser { .. } => "ValidateUser",
+        Command::BlockUser { .. } => "BlockUser",
+        Command::BanUser { .. } => "BanUser",
+        Command::UnbanUser { .. } => "UnbanUser",
+        Command::EditProfile => "EditProfile",
+        Command::EditRoom => "EditRoom",
+        Command::EditUser { .. } => "EditUser",
+        Command::CreateRoom { .. } => "CreateRoom",
+        Command::DeleteRoom { .. } => "DeleteRoom",
+        Command::Unknown { .. } => "Unknown",
+        _ => "Other",
     }
 }
 

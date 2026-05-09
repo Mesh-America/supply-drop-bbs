@@ -163,6 +163,46 @@ fn default_config_path() -> Option<String> {
 const SESSION_COOKIE: &str = "bbs_web_session";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60; // 12 h
 const LOG_CHANNEL_CAP: usize = 256;
+const LOG_BUF_CAP: usize = 500;
+
+// ── In-memory log ring buffer ─────────────────────────────────────────────────
+
+/// A monotonically-sequenced ring buffer for recent log lines.
+///
+/// Each line gets a unique `seq` number. Clients send `?after=N` to receive
+/// only lines with `seq >= N`, enabling efficient incremental polling.
+struct LogBuffer {
+    lines: std::collections::VecDeque<(u64, String)>,
+    next_seq: u64,
+}
+
+impl LogBuffer {
+    fn new() -> Self {
+        Self {
+            lines: std::collections::VecDeque::new(),
+            next_seq: 0,
+        }
+    }
+
+    fn push(&mut self, text: String) {
+        self.lines.push_back((self.next_seq, text));
+        self.next_seq += 1;
+        while self.lines.len() > LOG_BUF_CAP {
+            self.lines.pop_front();
+        }
+    }
+
+    /// Return all lines with `seq >= after` and the next cursor value.
+    fn since(&self, after: u64) -> (u64, Vec<String>) {
+        let lines = self
+            .lines
+            .iter()
+            .filter(|(seq, _)| *seq >= after)
+            .map(|(_, text)| text.clone())
+            .collect();
+        (self.next_seq, lines)
+    }
+}
 
 #[derive(Debug)]
 struct WebSession {
@@ -186,6 +226,7 @@ struct AppState {
     sessions: Mutex<HashMap<String, WebSession>>,
     started_at: Instant,
     log_tx: broadcast::Sender<String>,
+    log_buf: std::sync::Arc<Mutex<LogBuffer>>,
 }
 
 impl AppState {
@@ -197,6 +238,7 @@ impl AppState {
             sessions: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             log_tx,
+            log_buf: std::sync::Arc::new(Mutex::new(LogBuffer::new())),
         }
     }
 
@@ -300,18 +342,22 @@ impl Plugin for WebPlugin {
             .take()
             .ok_or_else(|| PluginError::StartFailed("web admin already started".into()))?;
 
-        // Spawn domain-event → SSE log bridge.
+        // Spawn domain-event → SSE + ring-buffer log bridge.
         let log_tx = self.state.log_tx.clone();
+        let log_buf = std::sync::Arc::clone(&self.state.log_buf);
         let mut events = self.state.host.events();
         tokio::spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(event) => {
                         let line = format_domain_event(&event);
+                        log_buf.lock().expect("log_buf poisoned").push(line.clone());
                         let _ = log_tx.send(line);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                        let _ = log_tx.send(format!("[warn] event stream lagged by {n}"));
+                        let warn = format!("[warn] event stream lagged by {n}");
+                        log_buf.lock().expect("log_buf poisoned").push(warn.clone());
+                        let _ = log_tx.send(warn);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -370,6 +416,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/stats", get(api_stats))
         .route("/reports", get(api_reports))
         .route("/settings", get(api_settings))
+        .route("/logs", get(api_logs))
         .route("/sse/logs", get(api_sse_logs))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
         .route(
@@ -799,6 +846,29 @@ async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     })
 }
 
+// ── HTTP log poll ─────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct LogsQuery {
+    after: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct LogsResponse {
+    /// Next cursor value to send as `?after=N` on the following request.
+    cursor: u64,
+    lines: Vec<String>,
+}
+
+async fn api_logs(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<LogsQuery>,
+) -> impl IntoResponse {
+    let after = q.after.unwrap_or(0);
+    let (cursor, lines) = state.log_buf.lock().expect("log_buf poisoned").since(after);
+    Json(LogsResponse { cursor, lines })
+}
+
 // ── SSE log stream ────────────────────────────────────────────────────────────
 
 async fn api_sse_logs(
@@ -1019,6 +1089,17 @@ fn format_domain_event(event: &DomainEvent) -> String {
         }
         DomainEvent::UserCreated { user } => format!("[user] {user} registered"),
         DomainEvent::UserValidated { user } => format!("[user] {user} validated"),
+        DomainEvent::CommandExecuted {
+            session,
+            command,
+            user,
+        } => {
+            let who = user
+                .as_ref()
+                .map(|u| u.as_str().to_owned())
+                .unwrap_or_else(|| format!("#{}", session.as_u64()));
+            format!("[cmd] {who} → {command}")
+        }
         _ => format!("[event] {event:?}"),
     }
 }

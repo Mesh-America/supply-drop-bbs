@@ -1,51 +1,64 @@
 <script setup lang="ts">
-import { ref, nextTick, onUnmounted } from 'vue'
+import { ref, nextTick, onMounted, onUnmounted } from 'vue'
+import { api } from '../api/client'
 
 interface LogLine {
   ts: string
   text: string
 }
 
+interface LogsResponse {
+  cursor: number
+  lines: string[]
+}
+
 const lines = ref<LogLine[]>([])
-const connected = ref(false)
+const running = ref(false)
 const error = ref<string | null>(null)
 const logBox = ref<HTMLElement | null>(null)
-let es: EventSource | null = null
+let cursor = 0
+let timer: ReturnType<typeof setInterval> | null = null
 
 function now(): string {
   return new Date().toTimeString().slice(0, 8)
 }
 
-function start() {
-  if (es) return
-  error.value = null
+async function poll() {
   try {
-    es = new EventSource('/api/v1/sse/logs', { withCredentials: true })
-    es.onopen = () => { connected.value = true; error.value = null }
-    es.onmessage = (e) => {
-      lines.value.push({ ts: now(), text: e.data })
-      if (lines.value.length > 500) lines.value.shift()
+    const resp = await api.get<LogsResponse>(`/api/v1/logs?after=${cursor}`)
+    if (resp.lines.length > 0) {
+      for (const text of resp.lines) {
+        lines.value.push({ ts: now(), text })
+      }
+      if (lines.value.length > 500) lines.value.splice(0, lines.value.length - 500)
+      cursor = resp.cursor
       nextTick(() => {
         if (logBox.value) logBox.value.scrollTop = logBox.value.scrollHeight
       })
     }
-    es.onerror = () => {
-      connected.value = false
-      error.value = 'Connection lost.'
-      es?.close()
-      es = null
-    }
+    error.value = null
   } catch (e: any) {
-    error.value = e?.message ?? 'failed to connect'
+    error.value = e?.message ?? 'poll failed'
   }
 }
 
-function stop() {
-  if (es) { es.close(); es = null }
-  connected.value = false
+function start() {
+  if (running.value) return
+  running.value = true
+  error.value = null
+  poll() // immediate first fetch
+  timer = setInterval(poll, 3000)
 }
 
-function clear() { lines.value = [] }
+function stop() {
+  running.value = false
+  if (timer !== null) { clearInterval(timer); timer = null }
+}
+
+function clear() {
+  lines.value = []
+  cursor = 0
+}
 
 function lineClass(text: string): string {
   if (text.startsWith('[auth]')) return 'log-auth'
@@ -57,6 +70,7 @@ function lineClass(text: string): string {
   return 'log-event'
 }
 
+onMounted(start)
 onUnmounted(stop)
 </script>
 
@@ -65,10 +79,10 @@ onUnmounted(stop)
     <header class="page-header">
       <h1>logs</h1>
       <div class="controls">
-        <span class="indicator" :class="{ live: connected }">
-          {{ connected ? '● live' : '○ stopped' }}
+        <span class="indicator" :class="{ live: running }">
+          {{ running ? '● live' : '○ stopped' }}
         </span>
-        <button v-if="!connected" @click="start">start</button>
+        <button v-if="!running" @click="start">start</button>
         <button v-else class="secondary" @click="stop">stop</button>
         <button class="secondary" @click="clear" :disabled="lines.length === 0">clear</button>
       </div>
@@ -84,7 +98,7 @@ onUnmounted(stop)
         </div>
       </div>
       <div v-else class="empty-state">
-        <p class="muted" v-if="!connected">Press <strong>start</strong> to begin streaming log events.</p>
+        <p class="muted" v-if="!running">Press <strong>start</strong> to begin streaming log events.</p>
         <p class="muted" v-else>Waiting for events…</p>
       </div>
     </div>
