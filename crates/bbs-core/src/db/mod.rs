@@ -8,6 +8,7 @@
 //! are implemented directly on `Database` so callers can use it as a
 //! single handle for all persistence operations.
 
+mod admin_queries;
 mod credential_store;
 mod error;
 mod invariants;

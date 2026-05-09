@@ -1,6 +1,5 @@
 import { createRouter, createWebHashHistory } from 'vue-router'
 
-// Hash history: works from any path layout without server-side routing config.
 const router = createRouter({
   history: createWebHashHistory(),
   routes: [
@@ -9,6 +8,10 @@ const router = createRouter({
     { path: '/adverts', name: 'adverts', component: () => import('./pages/AdvertsPage.vue') },
     { path: '/sessions', name: 'sessions', component: () => import('./pages/SessionsPage.vue') },
     { path: '/users', name: 'users', component: () => import('./pages/UsersPage.vue') },
+    { path: '/rooms', name: 'rooms', component: () => import('./pages/RoomsPage.vue') },
+    { path: '/messages', name: 'messages', component: () => import('./pages/MessagesPage.vue') },
+    { path: '/reports', name: 'reports', component: () => import('./pages/ReportsPage.vue') },
+    { path: '/backups', name: 'backups', component: () => import('./pages/BackupsPage.vue') },
     { path: '/logs', name: 'logs', component: () => import('./pages/LogsPage.vue') },
     { path: '/:pathMatch(.*)*', redirect: { name: 'dashboard' } },
   ],

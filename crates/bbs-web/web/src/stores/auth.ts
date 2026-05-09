@@ -13,7 +13,8 @@ export const useAuthStore = defineStore('auth', {
     loading: false,
   }),
   getters: {
-    isSysop: (state) => state.user?.is_sysop ?? false,
+    isSysop: (state) => (state.user?.permission_level ?? 0) >= 100,
+    isAide:  (state) => (state.user?.permission_level ?? 0) >= 50,
   },
   actions: {
     async whoami() {
@@ -29,7 +30,11 @@ export const useAuthStore = defineStore('auth', {
         '/api/v1/auth/login',
         { username, password },
       )
-      this.user = { username: result.username, is_sysop: result.permission_level >= 4, permission_level: result.permission_level }
+      this.user = {
+        username: result.username,
+        is_sysop: result.permission_level >= 100,
+        permission_level: result.permission_level,
+      }
       return this.user
     },
     async logout() {

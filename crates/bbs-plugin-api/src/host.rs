@@ -25,11 +25,15 @@
 use std::sync::Arc;
 
 use crate::advert::AdvertBus;
+use crate::admin::{
+    AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo, AdminStats,
+    AdminUserInfo,
+};
 use crate::command::{Command, Response};
 use crate::error::HostError;
 use crate::event::DomainEvent;
 use crate::identity::SessionId;
-use crate::permissions::PermissionCtx;
+use crate::permissions::{PermissionCtx, PermissionLevel};
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
@@ -105,4 +109,120 @@ pub trait Host: Send + Sync {
     /// `WebPlugin` reads the list and triggers sends on behalf of
     /// the sysop.
     fn advert_bus(&self) -> Arc<AdvertBus>;
+
+    // ── Admin / web-UI operations ────────────────────────────────────────────
+    //
+    // These methods are called by the web admin plugin.  Minimal `Host`
+    // implementations (e.g. `MockHost` for plugin unit tests) can rely on the
+    // default impls, which return `HostError::NotSupported`.
+
+    /// Verify a BBS username + password for web-UI login.
+    ///
+    /// Returns the user's `PermissionLevel` on success.  Returns
+    /// `HostError::NotFound` when the username is unknown,
+    /// `HostError::PermissionDenied` when the credentials are wrong or the
+    /// account is inactive, and `HostError::NotSupported` in minimal impls.
+    async fn admin_verify_credentials(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<PermissionLevel, HostError> {
+        let _ = (username, password);
+        Err(HostError::NotSupported("admin_verify_credentials".into()))
+    }
+
+    /// Return info about every currently-live BBS session.
+    async fn admin_list_sessions(&self) -> Result<Vec<AdminSessionInfo>, HostError> {
+        Err(HostError::NotSupported("admin_list_sessions".into()))
+    }
+
+    /// List user accounts.
+    ///
+    /// `status_filter`: `None` = all; `Some(0)` = Active; `Some(1)` = Banned.
+    async fn admin_list_users(
+        &self,
+        status_filter: Option<u8>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<AdminUserInfo>, HostError> {
+        let _ = (status_filter, limit, offset);
+        Err(HostError::NotSupported("admin_list_users".into()))
+    }
+
+    /// Update a user's status and/or permission level.
+    ///
+    /// Pass `None` for either field to leave it unchanged.
+    async fn admin_update_user(
+        &self,
+        username: &str,
+        status: Option<u8>,
+        permission_level: Option<u8>,
+    ) -> Result<(), HostError> {
+        let _ = (username, status, permission_level);
+        Err(HostError::NotSupported("admin_update_user".into()))
+    }
+
+    /// List all rooms with message counts.
+    async fn admin_list_rooms(&self) -> Result<Vec<AdminRoomSummary>, HostError> {
+        Err(HostError::NotSupported("admin_list_rooms".into()))
+    }
+
+    /// Create a new room and return its summary.
+    async fn admin_create_room(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<AdminRoomSummary, HostError> {
+        let _ = (name, description);
+        Err(HostError::NotSupported("admin_create_room".into()))
+    }
+
+    /// Delete a room by ID.  Returns `false` if the room did not exist or is
+    /// a protected system room.
+    async fn admin_delete_room(&self, room_id: i64) -> Result<bool, HostError> {
+        let _ = room_id;
+        Err(HostError::NotSupported("admin_delete_room".into()))
+    }
+
+    /// List messages in a room, cursor-paginated.
+    async fn admin_list_messages(
+        &self,
+        room_id: i64,
+        limit: u32,
+        after_id: Option<i64>,
+    ) -> Result<Vec<AdminMessageRecord>, HostError> {
+        let _ = (room_id, limit, after_id);
+        Err(HostError::NotSupported("admin_list_messages".into()))
+    }
+
+    /// Delete a message by ID.  Returns `false` if it did not exist.
+    async fn admin_delete_message(&self, message_id: i64) -> Result<bool, HostError> {
+        let _ = message_id;
+        Err(HostError::NotSupported("admin_delete_message".into()))
+    }
+
+    /// Return aggregate BBS statistics.
+    async fn admin_stats(&self) -> Result<AdminStats, HostError> {
+        Err(HostError::NotSupported("admin_stats".into()))
+    }
+
+    /// Trigger a `VACUUM INTO` backup written to `backup_dir`.
+    ///
+    /// The filename is auto-generated with a UTC timestamp.
+    async fn admin_trigger_backup(
+        &self,
+        backup_dir: &str,
+    ) -> Result<AdminBackupRecord, HostError> {
+        let _ = backup_dir;
+        Err(HostError::NotSupported("admin_trigger_backup".into()))
+    }
+
+    /// List `.db` backup files found in `backup_dir`.
+    async fn admin_list_backups(
+        &self,
+        backup_dir: &str,
+    ) -> Result<Vec<AdminBackupRecord>, HostError> {
+        let _ = backup_dir;
+        Err(HostError::NotSupported("admin_list_backups".into()))
+    }
 }

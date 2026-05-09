@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useRouter } from 'vue-router'
+import { useTheme } from '../composables/useTheme'
 
 const open = ref(false)
 const auth = useAuthStore()
 const router = useRouter()
+const { theme, toggle, label } = useTheme()
 
 function close() { open.value = false }
 
@@ -13,6 +15,8 @@ async function logout() {
   await auth.logout()
   router.replace({ name: 'login' })
 }
+
+const themeLabel = computed(() => label[theme.value])
 
 const groups = [
   {
@@ -29,11 +33,19 @@ const groups = [
   },
   {
     title: 'admin',
-    items: [{ to: '/users', label: 'users' }],
+    items: [
+      { to: '/users', label: 'users' },
+      { to: '/rooms', label: 'rooms' },
+      { to: '/messages', label: 'messages' },
+    ],
   },
   {
     title: 'ops',
-    items: [{ to: '/logs', label: 'logs' }],
+    items: [
+      { to: '/reports', label: 'reports' },
+      { to: '/backups', label: 'backups' },
+      { to: '/logs', label: 'logs' },
+    ],
   },
 ]
 </script>
@@ -48,6 +60,7 @@ const groups = [
       <span class="brand-sub muted">admin</span>
     </div>
     <div class="user-area">
+      <button class="secondary small-btn theme-btn" @click="toggle" :title="`theme: ${theme}`">{{ themeLabel }}</button>
       <span class="muted small">{{ auth.user?.username }}</span>
       <button class="secondary small-btn" @click="logout">logout</button>
     </div>
@@ -89,6 +102,7 @@ const groups = [
 .brand-sub { font-size: 0.75em; font-weight: 400; }
 .user-area { margin-left: auto; display: flex; align-items: center; gap: 0.8rem; font-size: 0.85em; }
 .small-btn { padding: 0.25rem 0.6rem; font-size: 0.85em; }
+.theme-btn { font-size: 0.78em; min-width: 4.5rem; }
 
 .menu-toggle {
   display: none;

@@ -25,6 +25,7 @@ axum-extra.workspace     = true
 tower-http.workspace     = true
 rust-embed.workspace     = true
 mime_guess.workspace     = true
+tokio-stream.workspace   = true
 
 [lints]
 workspace = true

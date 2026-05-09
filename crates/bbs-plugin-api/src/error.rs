@@ -103,6 +103,14 @@ pub enum HostError {
     /// state.
     #[error("internal host error: {0}")]
     Internal(String),
+
+    /// The operation is not supported by this `Host` implementation.
+    ///
+    /// Default implementations of admin methods on the `Host` trait return
+    /// this variant so `MockHost` and other minimal implementations compile
+    /// without implementing every admin method.
+    #[error("operation not supported: {0}")]
+    NotSupported(String),
 }
 
 /// Errors a `TransportEngine` capability impl can produce.

@@ -26,7 +26,9 @@ use async_trait::async_trait;
 use bbs_plugin_api::advert::AdvertBus;
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
-    Command, DomainEvent, HostError, PermissionCtx, PermissionLevel, Response, SessionId, Username,
+    AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo, AdminStats,
+    AdminUserInfo, Command, DomainEvent, HostError, PermissionCtx, PermissionLevel, Response,
+    SessionId, Username,
 };
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -1544,6 +1546,297 @@ impl BbsHost {
 
         info!(%actor, %name, "room deleted");
         Ok(Response::Text(format!("Room '{name}' deleted.")))
+    }
+
+    // ── Admin / web-UI operations ─────────────────────────────────────────────
+
+    async fn admin_verify_credentials(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<PermissionLevel, HostError> {
+        let uname = Username::new(username)
+            .map_err(|_| HostError::NotFound(format!("user {username:?}")))?;
+
+        let user = UserStore::get_by_username(&self.db, &uname)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+            .ok_or_else(|| HostError::NotFound(format!("user {username:?}")))?;
+
+        if !user.is_active() {
+            return Err(HostError::PermissionDenied {
+                required: PermissionLevel::Aide,
+            });
+        }
+
+        if user.permission_level < PermissionLevel::Aide {
+            return Err(HostError::PermissionDenied {
+                required: PermissionLevel::Aide,
+            });
+        }
+
+        let ok = self
+            .db
+            .credentials()
+            .verify_password(user.id, password, Timestamp::now())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        if !ok {
+            return Err(HostError::PermissionDenied {
+                required: PermissionLevel::Aide,
+            });
+        }
+
+        Ok(user.permission_level)
+    }
+
+    async fn admin_list_sessions(&self) -> Result<Vec<AdminSessionInfo>, HostError> {
+        let sessions = self.sessions.read().await;
+        Ok(sessions
+            .iter()
+            .map(|(sid, r)| AdminSessionInfo {
+                session_id: sid.as_u64(),
+                transport: r.transport.clone(),
+                username: r.username.as_ref().map(|u| u.as_str().to_owned()),
+                permission_level: r.level as u8,
+            })
+            .collect())
+    }
+
+    async fn admin_list_users(
+        &self,
+        status_filter: Option<u8>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<AdminUserInfo>, HostError> {
+        let filter = match status_filter {
+            None => None,
+            Some(0) => Some(UserStatus::Active),
+            Some(1) => Some(UserStatus::Banned),
+            Some(2) => Some(UserStatus::Deleted),
+            Some(other) => {
+                return Err(HostError::PreconditionFailed(format!(
+                    "unknown status filter {other}"
+                )))
+            }
+        };
+
+        let users = UserStore::list(&self.db, filter, limit, offset)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        Ok(users
+            .into_iter()
+            .map(|u| AdminUserInfo {
+                id: u.id.as_i64(),
+                username: u.username.as_str().to_owned(),
+                display_name: u.display_name,
+                status: u.status.to_string(),
+                permission_level: u.permission_level as u8,
+                created_at: u.created_at.to_rfc3339(),
+                last_login_at: u.last_login_at.map(|t| t.to_rfc3339()),
+            })
+            .collect())
+    }
+
+    async fn admin_update_user(
+        &self,
+        username: &str,
+        status: Option<u8>,
+        permission_level: Option<u8>,
+    ) -> Result<(), HostError> {
+        let uname = Username::new(username)
+            .map_err(|_| HostError::NotFound(format!("user {username:?}")))?;
+
+        let user = UserStore::get_by_username(&self.db, &uname)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+            .ok_or_else(|| HostError::NotFound(format!("user {username:?}")))?;
+
+        let new_status = match status {
+            None => None,
+            Some(0) => Some(UserStatus::Active),
+            Some(1) => Some(UserStatus::Banned),
+            Some(2) => Some(UserStatus::Deleted),
+            Some(other) => {
+                return Err(HostError::PreconditionFailed(format!(
+                    "unknown status {other}"
+                )))
+            }
+        };
+
+        let new_level = match permission_level {
+            None => None,
+            Some(0) => Some(PermissionLevel::Unvalidated),
+            Some(10) => Some(PermissionLevel::User),
+            Some(50) => Some(PermissionLevel::Aide),
+            Some(100) => Some(PermissionLevel::Sysop),
+            Some(other) => {
+                return Err(HostError::PreconditionFailed(format!(
+                    "unknown permission_level {other}"
+                )))
+            }
+        };
+
+        UserStore::update(&self.db, user.id, None, new_status, new_level, None)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        // If banning, kick any live sessions for this user.
+        if matches!(new_status, Some(UserStatus::Banned)) {
+            let mut sessions = self.sessions.write().await;
+            for r in sessions.values_mut() {
+                if r.username.as_ref().map(|u| u.as_str()) == Some(username) {
+                    r.workflow = crate::host::Workflow::None;
+                }
+            }
+        }
+
+        // If validating (level change from Unvalidated → something higher), update live sessions.
+        if let Some(level) = new_level {
+            let mut sessions = self.sessions.write().await;
+            for r in sessions.values_mut() {
+                if r.username.as_ref().map(|u| u.as_str()) == Some(username) {
+                    r.level = level;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn admin_list_rooms(&self) -> Result<Vec<AdminRoomSummary>, HostError> {
+        self.db
+            .admin_list_rooms()
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_create_room(
+        &self,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<AdminRoomSummary, HostError> {
+        RoomStore::create(
+            &self.db,
+            name,
+            description,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        // Fetch the just-created room by name.
+        let rooms = self
+            .db
+            .admin_list_rooms()
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        rooms
+            .into_iter()
+            .find(|r| r.name == name)
+            .ok_or_else(|| HostError::Internal("created room not found".into()))
+    }
+
+    async fn admin_delete_room(&self, room_id: i64) -> Result<bool, HostError> {
+        // Protect system rooms.
+        if room_id <= 3 {
+            return Err(HostError::PreconditionFailed(
+                "system rooms cannot be deleted".into(),
+            ));
+        }
+        let rid = crate::ids::RoomId::new(room_id);
+        match RoomStore::delete(&self.db, rid).await {
+            Ok(()) => Ok(true),
+            Err(crate::db::StoreError::NotFound) => Ok(false),
+            Err(e) => Err(HostError::Storage(format!("{e}"))),
+        }
+    }
+
+    async fn admin_list_messages(
+        &self,
+        room_id: i64,
+        limit: u32,
+        after_id: Option<i64>,
+    ) -> Result<Vec<AdminMessageRecord>, HostError> {
+        use crate::ids::MessageId;
+        let rid = crate::ids::RoomId::new(room_id);
+        let after = after_id.map(MessageId::new);
+        let page = crate::db::MessageStore::list_in_room(&self.db, rid, after, limit)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        Ok(page
+            .messages
+            .into_iter()
+            .map(|m| AdminMessageRecord {
+                id: m.id.as_i64(),
+                sender: m.sender.as_str().to_owned(),
+                recipient: m.recipient.as_ref().map(|u| u.as_str().to_owned()),
+                content: m.content,
+                timestamp: m.timestamp.to_rfc3339(),
+            })
+            .collect())
+    }
+
+    async fn admin_delete_message(&self, message_id: i64) -> Result<bool, HostError> {
+        use crate::ids::MessageId;
+        crate::db::MessageStore::delete(&self.db, MessageId::new(message_id))
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_stats(&self) -> Result<AdminStats, HostError> {
+        let active_sessions = self.sessions.read().await.len();
+        self.db
+            .admin_stats(active_sessions)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_trigger_backup(
+        &self,
+        backup_dir: &str,
+    ) -> Result<AdminBackupRecord, HostError> {
+        use time::format_description::well_known::Rfc3339;
+
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = now
+            .format(&time::format_description::parse("[year][month][day]_[hour][minute][second]").unwrap())
+            .unwrap_or_else(|_| "backup".to_owned());
+        let filename = format!("backup_{stamp}.db");
+        let dest = std::path::Path::new(backup_dir).join(&filename);
+
+        self.db
+            .admin_backup(&dest.to_string_lossy())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let meta = tokio::fs::metadata(&dest)
+            .await
+            .map_err(|e| HostError::Storage(format!("read backup metadata: {e}")))?;
+
+        let created_at = now.format(&Rfc3339).unwrap_or_default();
+
+        Ok(AdminBackupRecord {
+            filename,
+            size_bytes: meta.len(),
+            created_at,
+        })
+    }
+
+    async fn admin_list_backups(
+        &self,
+        backup_dir: &str,
+    ) -> Result<Vec<AdminBackupRecord>, HostError> {
+        self.db
+            .admin_list_backups(backup_dir)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
     }
 }
 
