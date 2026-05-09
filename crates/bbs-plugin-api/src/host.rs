@@ -227,4 +227,48 @@ pub trait Host: Send + Sync {
         let _ = backup_dir;
         Err(HostError::NotSupported("admin_list_backups".into()))
     }
+
+    // ── Mesh node credentials ────────────────────────────────────────────────────
+    //
+    // These methods implement the persistent node → user binding that lets mesh
+    // nodes auto-login without re-entering credentials across server restarts.
+    // The binding is stored in the `node_credentials` table (migration 0006).
+    //
+    // Minimal `Host` implementations can rely on the default no-op impls.
+
+    /// Check whether a mesh node has a valid stored credential and, if so,
+    /// auto-bind the session to that user.
+    ///
+    /// `prefix` is the first 6 bytes of the node's Ed25519 public key.
+    /// `ttl_days` is the maximum age of a valid credential.
+    ///
+    /// Returns `Some(username)` on a successful restore (the session is now
+    /// authenticated as that user).  Returns `None` when no binding exists,
+    /// it has expired, or the bound user no longer exists / is banned.
+    async fn mesh_node_restore(
+        &self,
+        session: SessionId,
+        prefix: [u8; 6],
+        ttl_days: u32,
+    ) -> Result<Option<crate::identity::Username>, HostError> {
+        let _ = (session, prefix, ttl_days);
+        Ok(None)
+    }
+
+    /// Persist a node → current-session-user binding after a successful login.
+    ///
+    /// Called by the mesh transport immediately after it receives
+    /// `Response::LoggedIn`.  Idempotent: calling again refreshes `last_auth`.
+    async fn mesh_node_bind(&self, session: SessionId, prefix: [u8; 6]) -> Result<(), HostError> {
+        let _ = (session, prefix);
+        Ok(())
+    }
+
+    /// Remove the stored binding for a node prefix on explicit logout.
+    ///
+    /// Called by the mesh transport when it receives `Response::LoggedOut`.
+    async fn mesh_node_unbind(&self, prefix: [u8; 6]) -> Result<(), HostError> {
+        let _ = prefix;
+        Ok(())
+    }
 }

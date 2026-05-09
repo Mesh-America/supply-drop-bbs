@@ -14,6 +14,7 @@ mod credential_store;
 mod error;
 mod invariants;
 mod message_store;
+mod node_credential_store;
 mod pragmas;
 mod room_store;
 mod user_store;
@@ -92,6 +93,11 @@ impl Database {
     #[allow(dead_code)]
     pub(crate) fn credentials(&self) -> credential_store::CredentialStore<'_> {
         credential_store::CredentialStore::new(self)
+    }
+
+    /// Borrow the node-credential store (persistent mesh node → user binding).
+    pub(crate) fn node_credentials(&self) -> node_credential_store::NodeCredentialStore<'_> {
+        node_credential_store::NodeCredentialStore::new(self)
     }
 }
 

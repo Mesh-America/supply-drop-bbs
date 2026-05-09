@@ -132,6 +132,14 @@ pub struct MeshConfig {
     /// Maximum reconnect / reopen backoff, in milliseconds.
     #[serde(default = "default_reconnect_max_ms")]
     pub reconnect_delay_max_ms: u64,
+
+    /// How many days a stored node credential remains valid.
+    ///
+    /// After this many days without a successful login the binding expires
+    /// and the node must re-authenticate with a password.  Set to `0` to
+    /// disable persistent node credentials entirely.
+    #[serde(default = "default_node_credential_ttl_days")]
+    pub node_credential_ttl_days: u32,
 }
 
 impl MeshConfig {
@@ -158,6 +166,7 @@ impl Default for MeshConfig {
             app_target_version: default_app_ver(),
             reconnect_delay_initial_ms: default_reconnect_initial_ms(),
             reconnect_delay_max_ms: default_reconnect_max_ms(),
+            node_credential_ttl_days: default_node_credential_ttl_days(),
         }
     }
 }
@@ -186,4 +195,8 @@ fn default_reconnect_initial_ms() -> u64 {
 
 fn default_reconnect_max_ms() -> u64 {
     60_000
+}
+
+fn default_node_credential_ttl_days() -> u32 {
+    14
 }

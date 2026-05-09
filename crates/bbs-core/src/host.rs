@@ -574,6 +574,82 @@ impl Host for BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
+
+    async fn mesh_node_restore(
+        &self,
+        session: SessionId,
+        prefix: [u8; 6],
+        ttl_days: u32,
+    ) -> Result<Option<Username>, HostError> {
+        // Look up a still-valid binding.
+        let user_id = self
+            .db
+            .node_credentials()
+            .lookup(&prefix, ttl_days)
+            .await
+            .map_err(|e| HostError::Storage(format!("node_credential lookup: {e}")))?;
+
+        let Some(user_id) = user_id else {
+            return Ok(None);
+        };
+
+        // Fetch the user — bail out silently if deleted or banned.
+        let user = match UserStore::get_by_id(&self.db, user_id)
+            .await
+            .map_err(|e| HostError::Storage(format!("get user by id: {e}")))?
+        {
+            Some(u) if u.status == crate::user::UserStatus::Active => u,
+            _ => return Ok(None),
+        };
+
+        // Bind the session exactly like a normal login.
+        UserStore::update(&self.db, user.id, None, None, None, Some(Timestamp::now()))
+            .await
+            .map_err(|e| HostError::Storage(format!("update last_login: {e}")))?;
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.username = Some(user.username.clone());
+                r.user_id = Some(user.id);
+                r.level = user.permission_level;
+                r.workflow = Workflow::None;
+                r.current_room = LOBBY_ROOM_ID;
+            }
+        }
+
+        // Refresh last_auth so the TTL clock resets on each successful auto-login.
+        self.db
+            .node_credentials()
+            .upsert(&prefix, user_id, Timestamp::now())
+            .await
+            .map_err(|e| HostError::Storage(format!("node_credential upsert: {e}")))?;
+
+        info!(%session, username = %user.username, "mesh: auto-login via stored node credential");
+        Ok(Some(user.username))
+    }
+
+    async fn mesh_node_bind(&self, session: SessionId, prefix: [u8; 6]) -> Result<(), HostError> {
+        let user_id = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&session).and_then(|r| r.user_id)
+        };
+        let Some(user_id) = user_id else {
+            return Ok(());
+        };
+        self.db
+            .node_credentials()
+            .upsert(&prefix, user_id, Timestamp::now())
+            .await
+            .map_err(|e| HostError::Storage(format!("node_credential upsert: {e}")))
+    }
+
+    async fn mesh_node_unbind(&self, prefix: [u8; 6]) -> Result<(), HostError> {
+        self.db
+            .node_credentials()
+            .delete(&prefix)
+            .await
+            .map_err(|e| HostError::Storage(format!("node_credential delete: {e}")))
+    }
 }
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────

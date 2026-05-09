@@ -87,6 +87,8 @@ pub struct MeshTransport {
     command_prefix: Option<char>,
     /// Greeting sent to a node the first time it contacts the BBS.
     welcome_message: String,
+    /// How many days a stored node credential stays valid (0 = disabled).
+    node_credential_ttl_days: u32,
     /// Set to `true` while draining stale queued messages on (re)connect.
     /// Cleared when the bridge signals `NoMoreMessages`.
     draining: Arc<AtomicBool>,
@@ -159,6 +161,7 @@ impl Plugin for MeshTransport {
             shutdown_tx,
             command_prefix: config.command_prefix,
             welcome_message: config.welcome_message,
+            node_credential_ttl_days: config.node_credential_ttl_days,
             draining: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -181,6 +184,7 @@ impl Plugin for MeshTransport {
         let shutdown_rx = self.shutdown_tx.subscribe();
         let prefix = self.command_prefix;
         let welcome = self.welcome_message.clone();
+        let ttl_days = self.node_credential_ttl_days;
 
         // Watch for advert-send requests from the web UI.
         let mut advert_send_rx = host.advert_bus().subscribe_send();
@@ -251,6 +255,7 @@ impl Plugin for MeshTransport {
             shutdown_rx,
             prefix,
             welcome,
+            ttl_days,
             draining,
         ));
 
@@ -409,6 +414,7 @@ async fn event_loop(
     mut shutdown_rx: watch::Receiver<bool>,
     command_prefix: Option<char>,
     welcome_message: String,
+    node_credential_ttl_days: u32,
     draining: Arc<AtomicBool>,
 ) {
     loop {
@@ -439,7 +445,7 @@ async fn event_loop(
                         }
                     }
                     Some(ClientEvent::Frame(frame)) => {
-                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, &draining).await;
+                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining).await;
                     }
                 }
             }
@@ -452,6 +458,7 @@ async fn event_loop(
 }
 
 /// Dispatch a single inbound frame from the radio bridge.
+#[allow(clippy::too_many_arguments)]
 async fn handle_frame(
     frame: meshcore_companion::frame::InboundFrame,
     host: &Arc<dyn Host>,
@@ -459,6 +466,7 @@ async fn handle_frame(
     state: &Arc<Mutex<SessionState>>,
     command_prefix: Option<char>,
     welcome_message: &str,
+    node_credential_ttl_days: u32,
     draining: &Arc<AtomicBool>,
 ) {
     use meshcore_companion::frame::InboundFrame;
@@ -501,6 +509,7 @@ async fn handle_frame(
                 state,
                 command_prefix,
                 welcome_message,
+                node_credential_ttl_days,
             )
             .await;
         }
@@ -540,6 +549,7 @@ async fn handle_frame(
 }
 
 /// Parse a direct message text, route it through the host, and send the reply.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_message(
     sender_prefix: [u8; 6],
     text: &str,
@@ -548,19 +558,43 @@ async fn dispatch_message(
     state: &Arc<Mutex<SessionState>>,
     command_prefix: Option<char>,
     welcome_message: &str,
+    node_credential_ttl_days: u32,
 ) {
     // ── Get or create a session for this node ─────────────────────────────────
     let (session, is_new) = get_or_create_session(sender_prefix, host, state).await;
 
     if is_new {
         debug!(?session, prefix = ?sender_prefix, "mesh: new session minted");
-        if !welcome_message.is_empty()
+
+        // Attempt auto-login via stored node credential (skip when TTL = 0).
+        let auto_username = if node_credential_ttl_days > 0 {
+            match host
+                .mesh_node_restore(session, sender_prefix, node_credential_ttl_days)
+                .await
+            {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(?session, "mesh: node_restore error: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let greeting = if let Some(ref username) = auto_username {
+            format!("Welcome back, {username}! Type 'help' for commands.")
+        } else {
+            welcome_message.to_owned()
+        };
+
+        if !greeting.is_empty()
             && cmd_tx
                 .send(OutboundFrame::SendTxtMsg {
                     txt_type: TXT_TYPE_PLAIN,
                     attempt: 0,
                     pubkey_prefix: sender_prefix,
-                    text: welcome_message.to_owned(),
+                    text: greeting,
                 })
                 .await
                 .is_err()
@@ -610,6 +644,15 @@ async fn dispatch_message(
                 .lock()
                 .expect("state mutex poisoned")
                 .get_or_insert(sender_prefix, fresh);
+            // Attempt auto-login on the refreshed session before replaying the command.
+            if node_credential_ttl_days > 0 {
+                if let Err(e) = host
+                    .mesh_node_restore(fresh_sid, sender_prefix, node_credential_ttl_days)
+                    .await
+                {
+                    warn!(?fresh_sid, "mesh: node_restore on refresh error: {e}");
+                }
+            }
             match host.process_command(fresh_sid, cmd).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -623,6 +666,23 @@ async fn dispatch_message(
             Response::Error(format!("{e}"))
         }
     };
+
+    // ── Persist / clear node credential on auth state changes ────────────────
+    if node_credential_ttl_days > 0 {
+        match &response {
+            Response::LoggedIn { .. } => {
+                if let Err(e) = host.mesh_node_bind(session, sender_prefix).await {
+                    warn!(?session, "mesh: node_bind error: {e}");
+                }
+            }
+            Response::LoggedOut => {
+                if let Err(e) = host.mesh_node_unbind(sender_prefix).await {
+                    warn!("mesh: node_unbind error: {e}");
+                }
+            }
+            _ => {}
+        }
+    }
 
     // ── Update workflow-reply flag ────────────────────────────────────────────
     let is_prompt = matches!(response, Response::Prompt { .. });
