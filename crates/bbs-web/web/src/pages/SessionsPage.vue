@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { api } from '../api/client'
 
 interface Session {
@@ -32,7 +32,9 @@ async function load() {
   }
 }
 
-onMounted(load)
+let timer: ReturnType<typeof setInterval> | null = null
+onMounted(() => { load(); timer = setInterval(load, 10_000) })
+onUnmounted(() => { if (timer !== null) clearInterval(timer) })
 </script>
 
 <template>

@@ -223,7 +223,7 @@ impl Database {
         Ok(())
     }
 
-    /// List `.db` files in `backup_dir`.
+    /// List `.zip` and legacy `.db` backup files in `backup_dir`.
     pub(crate) async fn admin_list_backups(
         &self,
         backup_dir: &str,
@@ -240,7 +240,16 @@ impl Database {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext != "db" {
+            // Accept zip (new) and db (legacy); skip _config.toml sidecar files.
+            if ext != "zip" && ext != "db" {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_owned();
+            if name.ends_with("_config.toml") {
                 continue;
             }
             let Ok(meta) = tokio::fs::metadata(&path).await else {
@@ -263,22 +272,20 @@ impl Database {
                 })
                 .unwrap_or_default();
 
-            let filename = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_owned();
-
-            // Check for a matching config snapshot alongside the .db file.
-            let config_name = format!("{}_config.toml", filename.trim_end_matches(".db"));
-            let (config_filename, config_size_bytes) =
+            // For legacy .db files check for a sidecar _config.toml.
+            // For .zip files the config is already inside the archive.
+            let (config_filename, config_size_bytes) = if name.ends_with(".db") {
+                let config_name = format!("{}_config.toml", name.trim_end_matches(".db"));
                 match tokio::fs::metadata(dir.join(&config_name)).await {
                     Ok(m) => (Some(config_name), Some(m.len())),
                     Err(_) => (None, None),
-                };
+                }
+            } else {
+                (None, None)
+            };
 
             records.push(AdminBackupRecord {
-                filename,
+                filename: name,
                 size_bytes,
                 created_at,
                 config_filename,
@@ -311,14 +318,17 @@ impl Database {
             .await
             .map_err(|e| StoreError::Decode(format!("delete backup: {e}")))?;
 
-        // Best-effort: also remove the matching config snapshot.
-        let config_name = format!("{}_config.toml", filename.trim_end_matches(".db"));
-        let config_path = dir.join(&config_name);
-        match tokio::fs::remove_file(&config_path).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                tracing::warn!("could not delete config snapshot {config_name}: {e}");
+        // Best-effort: for legacy .db backups also remove the sidecar _config.toml.
+        // .zip backups are self-contained so there is nothing extra to clean up.
+        if filename.ends_with(".db") {
+            let config_name = format!("{}_config.toml", filename.trim_end_matches(".db"));
+            let config_path = dir.join(&config_name);
+            match tokio::fs::remove_file(&config_path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!("could not delete config snapshot {config_name}: {e}");
+                }
             }
         }
 

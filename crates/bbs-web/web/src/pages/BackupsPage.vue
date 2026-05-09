@@ -61,8 +61,7 @@ async function triggerBackup() {
   actionOk.value = null
   try {
     const record = await api.post<BackupRecord>('/api/v1/backups')
-    const cfg = record.config_filename ? ` + config` : ''
-    actionOk.value = `Backup created: ${record.filename} (${fmtSize(record.size_bytes)}${cfg})`
+    actionOk.value = `Backup created: ${record.filename} (${fmtSize(record.size_bytes)})`
     await load()
   } catch (e: any) {
     error.value = e?.message ?? 'backup failed'
@@ -96,7 +95,6 @@ onMounted(load)
         <p class="muted">SQLite database + config snapshots</p>
       </div>
       <div class="controls">
-        <button class="secondary" @click="load" :disabled="loading">refresh</button>
         <button @click="triggerBackup" :disabled="triggering || !backupDirConfigured"
           :title="!backupDirConfigured ? 'backup_dir not configured' : ''">
           {{ triggering ? 'backing up…' : 'create backup' }}

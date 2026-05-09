@@ -29,7 +29,10 @@ use std::time::{Duration, Instant};
 use bbs_plugin_api::SessionId;
 
 /// How long a workflow reply is remembered for deduplication.
-const WORKFLOW_REPLY_DEDUP_SECS: u64 = 60;
+/// Meshtastic retransmissions happen within a few seconds; 10 s is generous.
+/// 60 s caused false-positive drops when a user typed a short string (e.g. "h")
+/// as a workflow reply and then immediately sent "h" for help.
+const WORKFLOW_REPLY_DEDUP_SECS: u64 = 10;
 
 /// Per-node state tracked inside [`SessionState`].
 #[derive(Debug)]

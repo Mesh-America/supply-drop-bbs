@@ -824,6 +824,9 @@ async fn api_sse_logs(
 // ── Backups ───────────────────────────────────────────────────────────────────
 
 async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
+    use std::io::Write as _;
+    use zip::{write::SimpleFileOptions, CompressionMethod};
+
     let dir = match &state.config.backup_dir {
         Some(d) => d.clone(),
         None => {
@@ -835,41 +838,72 @@ async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
         }
     };
 
+    // Step 1: VACUUM INTO a temporary .db file.
     let record = match state.host.admin_trigger_backup(&dir).await {
         Ok(r) => r,
         Err(e) => return server_error(&e.to_string()),
     };
 
-    // Copy config file alongside the database backup (best-effort).
-    let config_filename = if let Some(ref cfg) = state.config.config_path {
-        if !cfg.is_empty() {
-            let stem = record.filename.trim_end_matches(".db");
-            let config_dest_name = format!("{stem}_config.toml");
-            let config_dest = std::path::Path::new(&dir).join(&config_dest_name);
-            match tokio::fs::copy(cfg, &config_dest).await {
-                Ok(_) => {
-                    let size = tokio::fs::metadata(&config_dest)
-                        .await
-                        .ok()
-                        .map(|m| m.len());
-                    Some((config_dest_name, size))
+    // Step 2: Bundle the .db (and config if available) into a single .zip.
+    let db_path = std::path::Path::new(&dir).join(&record.filename);
+    let zip_name = record.filename.trim_end_matches(".db").to_owned() + ".zip";
+    let zip_path = std::path::Path::new(&dir).join(&zip_name);
+    let config_path_opt = state.config.config_path.clone();
+    let db_entry_name = record.filename.clone();
+
+    let zip_result = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let file = std::fs::File::create(&zip_path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+
+        // Add database.
+        zip.start_file(&db_entry_name, opts)?;
+        zip.write_all(&std::fs::read(&db_path)?)?;
+
+        // Add config (best-effort — log a warning if the path doesn't exist).
+        if let Some(ref cfg) = config_path_opt {
+            if !cfg.is_empty() {
+                match std::fs::read(cfg) {
+                    Ok(bytes) => {
+                        zip.start_file("config.toml", opts)?;
+                        zip.write_all(&bytes)?;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "backup: could not include config file '{}': {} \
+                             — set config_path in [plugins.web] to the full \
+                             path of your config.toml",
+                            cfg,
+                            e
+                        );
+                    }
                 }
-                Err(_) => None,
             }
-        } else {
-            None
         }
-    } else {
-        None
-    };
 
-    let full_record = AdminBackupRecord {
-        config_filename: config_filename.as_ref().map(|(n, _)| n.clone()),
-        config_size_bytes: config_filename.and_then(|(_, s)| s),
-        ..record
-    };
+        zip.finish()?;
 
-    (StatusCode::CREATED, Json(full_record)).into_response()
+        // Remove the raw .db now that it is inside the zip.
+        let _ = std::fs::remove_file(&db_path);
+
+        Ok(std::fs::metadata(&zip_path)?.len())
+    })
+    .await;
+
+    match zip_result {
+        Ok(Ok(zip_size)) => {
+            let zip_record = AdminBackupRecord {
+                filename: zip_name,
+                size_bytes: zip_size,
+                created_at: record.created_at,
+                config_filename: None,
+                config_size_bytes: None,
+            };
+            (StatusCode::CREATED, Json(zip_record)).into_response()
+        }
+        Ok(Err(e)) => server_error(&e.to_string()),
+        Err(e) => server_error(&e.to_string()),
+    }
 }
 
 async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
