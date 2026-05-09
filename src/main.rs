@@ -251,7 +251,28 @@ async fn cmd_run(cli: &Cli) {
     let mesh_transport = init_mesh_plugin(&cfg.plugins.mesh, Arc::clone(&host)).await;
 
     #[cfg(feature = "admin-web")]
-    let web_plugin = init_web_plugin(&cfg.plugins.web, Arc::clone(&host)).await;
+    let web_plugin = {
+        // Resolve the config file to an absolute path so the web plugin can
+        // bundle the correct config.toml into backup zips regardless of the
+        // process working directory (e.g. systemd starts from /).
+        let cfg_abs: Option<String> = if let Some(ref p) = cli.config {
+            p.canonicalize()
+                .ok()
+                .map(|abs| abs.to_string_lossy().into_owned())
+        } else {
+            // No --config flag: try the same search order as config::load so
+            // we can still find the file that was actually loaded.
+            [
+                std::path::PathBuf::from("config.toml"),
+                std::path::PathBuf::from("/etc/supply-drop-bbs/config.toml"),
+            ]
+            .iter()
+            .find(|p| p.exists())
+            .and_then(|p| p.canonicalize().ok())
+            .map(|abs| abs.to_string_lossy().into_owned())
+        };
+        init_web_plugin(&cfg.plugins.web, Arc::clone(&host), cfg_abs).await
+    };
 
     // ── 7. Wait for shutdown signal ───────────────────────────────────────────
     info!("supply-drop-bbs ready — press Ctrl-C to stop");
@@ -353,6 +374,11 @@ async fn init_cli_plugin(
 
 /// Initialise and start the web admin plugin.
 ///
+/// `config_file_path` is the absolute path of the config file that was
+/// loaded at startup. When `Some`, it overrides the web config's default
+/// `config_path` so backup zips always include the correct config.toml
+/// regardless of the process working directory.
+///
 /// Returns `None` when the plugin is disabled in config or fails to
 /// initialise (error is logged and the process exits).  On success returns
 /// the running `WebPlugin` handle so the supervisor can stop it on
@@ -361,6 +387,7 @@ async fn init_cli_plugin(
 async fn init_web_plugin(
     web_cfg: &bbs_web::WebConfig,
     host: Arc<dyn bbs_plugin_api::Host>,
+    config_file_path: Option<String>,
 ) -> Option<bbs_web::WebPlugin> {
     use bbs_plugin_api::Plugin;
 
@@ -369,7 +396,15 @@ async fn init_web_plugin(
         return None;
     }
 
-    let plugin = match bbs_web::WebPlugin::init(web_cfg.clone(), host).await {
+    // Inject the resolved absolute config path so backup zips always bundle
+    // the correct file, even when running from a different working directory
+    // (e.g. systemd services that start from /).
+    let mut web_cfg = web_cfg.clone();
+    if let Some(abs_path) = config_file_path {
+        web_cfg.config_path = Some(abs_path);
+    }
+
+    let plugin = match bbs_web::WebPlugin::init(web_cfg, host).await {
         Ok(p) => p,
         Err(e) => {
             error!("web admin init failed: {e}");
