@@ -143,7 +143,19 @@ pub enum Command {
         username: Username,
     },
 
-    /// Ban a user account, preventing further login (Aide+). (B)
+    /// Block or unblock another user — hides their messages from the caller. (B)
+    ///
+    /// `force = Some(true)` → force-block, `Some(false)` → force-unblock,
+    /// `None` → toggle.  Prefix the username with `+` to force-block or `-`
+    /// to force-unblock from the mesh transport.
+    BlockUser {
+        /// The username to block or unblock.
+        target: Username,
+        /// Explicit direction, or `None` for toggle.
+        force: Option<bool>,
+    },
+
+    /// Ban a user account, preventing further login (Aide+). (BAN)
     BanUser {
         /// The username of the account to ban.
         username: Username,

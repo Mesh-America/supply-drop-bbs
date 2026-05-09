@@ -182,6 +182,9 @@ impl Host for BbsHost {
             Command::ValidateUser { username } => {
                 self.handle_validate_user(session, username).await
             }
+            Command::BlockUser { target, force } => {
+                self.handle_block_user(session, target, force).await
+            }
             Command::BanUser { username } => self.handle_ban_user(session, username).await,
             Command::UnbanUser { username } => self.handle_unban_user(session, username).await,
 
@@ -1645,6 +1648,83 @@ impl BbsHost {
         )))
     }
 
+    async fn handle_block_user(
+        &self,
+        session: SessionId,
+        target: Username,
+        force: Option<bool>,
+    ) -> Result<Response, HostError> {
+        let (caller, _, _, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+
+        if caller == target {
+            return Ok(Response::Error("You cannot block yourself.".into()));
+        }
+
+        let exists = self
+            .db
+            .get_by_username(&target)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+            .is_some();
+        if !exists {
+            return Ok(Response::Error(format!(
+                "User '{}' not found.",
+                target.as_str()
+            )));
+        }
+
+        let blocker = caller.as_str();
+        let blocked = target.as_str();
+        let currently = self
+            .db
+            .is_blocking(blocker, blocked)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        match force {
+            Some(true) => {
+                if currently {
+                    return Ok(Response::Text(format!("'{blocked}' is already blocked.")));
+                }
+                self.db
+                    .block_user(blocker, blocked)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("{e}")))?;
+                Ok(Response::Text(format!("'{blocked}' is now blocked.")))
+            }
+            Some(false) => {
+                if !currently {
+                    return Ok(Response::Text(format!(
+                        "'{blocked}' is not currently blocked."
+                    )));
+                }
+                self.db
+                    .unblock_user(blocker, blocked)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("{e}")))?;
+                Ok(Response::Text(format!("'{blocked}' is no longer blocked.")))
+            }
+            None => {
+                if currently {
+                    self.db
+                        .unblock_user(blocker, blocked)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?;
+                    Ok(Response::Text(format!("'{blocked}' is no longer blocked.")))
+                } else {
+                    self.db
+                        .block_user(blocker, blocked)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?;
+                    Ok(Response::Text(format!("'{blocked}' is now blocked.")))
+                }
+            }
+        }
+    }
+
     async fn handle_ban_user(
         &self,
         session: SessionId,
@@ -1878,9 +1958,11 @@ fn help_text(topic: Option<&str>) -> String {
     match topic {
         None => HELP_QUICK.to_owned(),
         Some(t) => match t.to_ascii_lowercase().as_str() {
-            "all" => format!("{HELP_READING}\n{HELP_POSTING}\n{HELP_NAVIGATION}\n{HELP_ACCOUNT}\n{HELP_AIDE}\n{HELP_SYSOP}"),
-            "reading" => HELP_READING.to_owned(),
-            "posting" => HELP_POSTING.to_owned(),
+            "all" => format!(
+                "{HELP_READING_POSTING}\n\n{HELP_NAVIGATION}\n\n{HELP_ACCOUNT}\n\n{HELP_AIDE}\n\n{HELP_SYSOP}"
+            ),
+            "reading" => HELP_READING_POSTING.to_owned(),
+            "posting" => HELP_READING_POSTING.to_owned(),
             "navigation" | "nav" => HELP_NAVIGATION.to_owned(),
             "account" => HELP_ACCOUNT.to_owned(),
             "aide" => HELP_AIDE.to_owned(),
@@ -1892,91 +1974,100 @@ fn help_text(topic: Option<&str>) -> String {
 
 fn help_for_command(cmd: &str) -> String {
     let detail = match cmd {
-        "n" => "N — Read new messages in this room since your last visit.",
-        "f" => "F [id] — Read forward from oldest (or from message id).",
-        "r" => "R — Read in reverse, newest first.",
-        "s" => "S — Scan message headers: ID, sender, first line.",
-        ".ff" => ".FF — Fast-forward past all unread in this room.",
-        "e" => "E — Enter (compose) a message in the current room.",
-        "d" => "D <id> — Delete message by ID. Aides can delete any message.",
-        "g" => "G — Go to next room with unread messages.",
-        "c" => "C <room> — Change to room by name or number.",
-        "k" => "K — List all rooms with unread counts.",
-        "i" => "I — Toggle ignore on this room (skipped by G).",
-        "m" => "M — Go directly to the Mail room.",
+        "n" => "N — Read new messages since last visit. Starts with the oldest message you haven't read yet in this room.",
+        "f" => "F — Read messages in the current room, starting with the oldest and moving forward.",
+        "r" => "R — Read messages in the current room, starting with the most recent and moving backwards.",
+        "s" => "S — Show message summaries in the current room.",
+        ".ff" => ".FF — Fast-forward to the latest message in the current room, skipping over unread messages. This resets your last-read pointer to the latest message.",
+        "e" => "E — Compose and post a message to the current room.",
+        "d" => "D <id> — Delete a message ID specified after the command letter. Only Aides and Sysops can delete others' messages.",
+        "g" => "G — Go to the next room with unread messages. This skips over rooms you've already read completely.",
+        "c" => "C <name> — Change to a room by name or number. Specify the room name or ID after the command letter.",
+        "k" => "K — List all rooms known to you.",
+        "i" => "I — Toggle ignore on the current room. Ignored rooms are skipped during navigation and don't count toward unread.",
+        "m" => "M — Go directly to the Mail room to send/receive private messages.",
         "h" | "help" | "?" => {
-            "H — Quick-start help. H all=full menu.\n\
-             H <section>: reading posting navigation account aide sysop\n\
-             H <cmd>: detail on a specific command."
+            "H — Show help. With no arg, shows the quick-start menu.\n\
+             'H all' for the full categorized menu.\n\
+             'H reading' / 'H posting' / 'H navigation' / 'H account' / 'H aide' / 'H sysop' for one category.\n\
+             'H X' for detail on command X."
         }
-        "q" => "Q — Quit and end your session.",
-        "w" => "W — List who is currently online.",
-        "cancel" | "stop" => "CANCEL / STOP — Cancel the current workflow.",
+        "q" => "Q — Quit or log off.",
+        "w" => "W — List active users currently online.",
+        "cancel" => "CANCEL — Cancel the current workflow and return to normal command mode.",
+        "stop" => "STOP — Stop pending messages as soon as possible.",
+        "b" => {
+            "B <user> — Block or unblock another user. Specify a username after the command letter; \
+             prefix with '+' to force-block or '-' to force-unblock, or omit the prefix to toggle. \
+             Blocking hides the target's messages from you (they can still see yours)."
+        }
         "v" => "V <user> — Validate (approve) a pending user. Aide+.",
-        "b" => "B <user> — Ban a user. Aide+.",
-        "unban" => "UNBAN <user> — Lift a ban. Sysop+.",
+        "ban" => "BAN <user> — Ban a user account, preventing further login. Aide+.",
+        "unban" => "UNBAN <user> — Lift a ban on a previously banned user. Sysop+.",
         "pending" => "PENDING — List users awaiting validation. Aide+.",
         "profile" => "PROFILE — Edit your display name.",
-        ".er" => ".ER — Edit this room's name or settings. Aide+.",
-        ".eu" => ".EU <user> — Edit a user's name or level. Aide+.",
-        ".c" => ".C <name> — Create a new room. Sysop+.",
-        ".dr" => ".DR <name> — Delete a room. Sysop+.",
+        ".er" => ".ER — Edit the current room's name, description, read-only flag, or required permission level. Aide+.",
+        ".eu" => ".EU <user> — Edit a user's display name, password, permission level, or status. Aides cannot promote to Sysop.",
+        ".c" => ".C — Create a new room. Sysop+.",
+        ".dr" => ".DR <name> — Delete a room by name. Sysop+.",
         other => return format!("No help for '{other}'. H all for full menu."),
     };
     detail.to_owned()
 }
 
 const HELP_QUICK: &str = "\
---- Quick start ---\n\
-K  list rooms      C <room>  go to room\n\
-N  read new        E  enter message\n\
-G  next unread     M  mail\n\
-R  reverse         F  forward\n\
-S  scan headers    D <id>  delete\n\
-H all=full menu  H <cmd>=detail  Q=quit";
+Quick start:\n\
+ K    list known rooms\n\
+ C    change room\n\
+ N    read new messages\n\
+ E    enter a message\n\
+ G    next unread room\n\
+ M    go to Mail\n\
+\n\
+H all = full menu, H X = help for command X";
 
-const HELP_READING: &str = "\
---- Reading ---\n\
-N       read new messages\n\
-F [id]  forward (oldest first)\n\
-R       reverse (newest first)\n\
-S       scan headers\n\
-.FF     fast-forward past unread";
-
-const HELP_POSTING: &str = "\
---- Posting ---\n\
-E       enter message\n\
-D <id>  delete message";
+const HELP_READING_POSTING: &str = "\
+Reading:\n\
+ F    forward-read (oldest first)\n\
+ N    read new messages\n\
+ R    reverse-read (newest first)\n\
+ S    scan message headers\n\
+ .FF  fast-forward past unread\n\
+\n\
+Posting:\n\
+ D    delete a message\n\
+ E    enter a message";
 
 const HELP_NAVIGATION: &str = "\
---- Navigation ---\n\
-G         next unread room\n\
-C <room>  go to room\n\
-K         list rooms\n\
-I         ignore/unignore room\n\
-M         go to mail";
+Navigation:\n\
+ .C   create a new room\n\
+ C    change room\n\
+ G    next unread room\n\
+ I    ignore this room\n\
+ K    list known rooms\n\
+ M    go to Mail";
 
 const HELP_ACCOUNT: &str = "\
---- Account ---\n\
-H / ?   help\n\
-Q       quit\n\
-W       who's online\n\
-PROFILE edit display name\n\
-CANCEL / STOP  cancel workflow";
+Account:\n\
+ B    block / unblock user\n\
+ H    help (also: ?)\n\
+ Q    log out\n\
+ W    who's online\n\
+\n\
+H <letter> for details. 'cancel' to bail out.";
 
 const HELP_AIDE: &str = "\
---- Aide ---\n\
-V <user>  validate user\n\
-B <user>  ban user\n\
-PENDING   list pending users\n\
-.ER       edit this room\n\
-.EU <user>  edit user";
+Aide:\n\
+ .ER  edit current room\n\
+ .EU  edit a user\n\
+ V    validate pending users";
 
 const HELP_SYSOP: &str = "\
---- Sysop ---\n\
-.C <name>   create room\n\
-.DR <name>  delete room\n\
-UNBAN <user>  lift ban";
+Sysop:\n\
+ .C   create a new room\n\
+ .DR  delete a room\n\
+ BAN  ban a user\n\
+ UNBAN  lift a ban";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 

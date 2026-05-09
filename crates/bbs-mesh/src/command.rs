@@ -160,7 +160,24 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
-        "b" => match rest.and_then(|s| Username::new(s).ok()) {
+        "b" => {
+            let raw_arg = rest.unwrap_or("").trim();
+            let (force, name) = if let Some(s) = raw_arg.strip_prefix('+') {
+                (Some(true), s.trim())
+            } else if let Some(s) = raw_arg.strip_prefix('-') {
+                (Some(false), s.trim())
+            } else {
+                (None, raw_arg)
+            };
+            match Username::new(name) {
+                Ok(target) => Some(Command::BlockUser { target, force }),
+                Err(_) => Some(Command::Unknown {
+                    raw: text.to_owned(),
+                }),
+            }
+        }
+
+        "ban" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(username) => Some(Command::BanUser { username }),
             None => Some(Command::Unknown {
                 raw: text.to_owned(),
