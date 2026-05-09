@@ -654,16 +654,9 @@ impl BbsHost {
             .get_by_username(&username)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
-        match &user {
-            None => {
-                return Ok(Response::Error(format!(
-                    "No account found for '{username}'."
-                )))
-            }
-            Some(u) if u.status != UserStatus::Active => {
-                return Ok(Response::Error("Account is not active.".into()))
-            }
-            _ => {}
+        match user {
+            Some(u) if u.status == UserStatus::Active => {}
+            _ => return Ok(Response::Error("Login failed.".into())),
         }
 
         {
@@ -702,10 +695,17 @@ impl BbsHost {
                 username,
                 stage: RegisterStage::DisplayName,
             } => {
-                let display_name = if reply.trim().is_empty() {
+                let trimmed = reply.trim();
+                let display_name = if trimmed.is_empty() {
                     None
                 } else {
-                    Some(reply.trim().to_owned())
+                    if let Err(e) = crate::user::User::validate_display_name(trimmed) {
+                        return Ok(Response::Prompt {
+                            text: format!("Invalid display name: {e}. Try again:"),
+                            hide_input: false,
+                        });
+                    }
+                    Some(trimmed.to_owned())
                 };
                 let mut sessions = self.sessions.write().await;
                 if let Some(r) = sessions.get_mut(&session) {
@@ -850,6 +850,8 @@ impl BbsHost {
                     info!(%session, %username, "login successful");
                     Ok(Response::LoggedIn { user: username })
                 } else {
+                    // Slow down brute-force attempts regardless of outcome.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     let new_attempts = attempts + 1;
                     if new_attempts >= 3 {
                         warn!(%session, %username, "login failed: too many attempts");
@@ -1258,7 +1260,7 @@ impl BbsHost {
 
 impl BbsHost {
     async fn handle_read_new(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, _, room_id) = match self.session_auth_user(session).await {
+        let (username, user_id, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1280,11 +1282,19 @@ impl BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        if page.messages.is_empty() {
-            return Ok(Response::Text(format!("No new messages in {}.", room.name)));
-        }
+        let blocked = self
+            .db
+            .blocks_by(username.as_str())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let visible: Vec<_> = page
+            .messages
+            .iter()
+            .filter(|m| !blocked.contains(m.sender.as_str()))
+            .collect();
 
-        // Advance read pointer to last message in page.
+        // Advance read pointer to last message in the raw page (including
+        // blocked messages) so N doesn't re-deliver them on the next call.
         if let Some(last) = page.messages.last() {
             self.db
                 .mark_read(user_id, room_id, last.id)
@@ -1292,8 +1302,12 @@ impl BbsHost {
                 .map_err(|e| HostError::Storage(format!("{e}")))?;
         }
 
+        if visible.is_empty() {
+            return Ok(Response::Text(format!("No new messages in {}.", room.name)));
+        }
+
         let mut lines = vec![format!("[{} — new messages]", room.name)];
-        for msg in &page.messages {
+        for msg in &visible {
             lines.push(format_message(msg));
         }
         if page.next_cursor.is_some() {
@@ -1310,7 +1324,7 @@ impl BbsHost {
         session: SessionId,
         after: Option<i64>,
     ) -> Result<Response, HostError> {
-        let (_, user_id, _, room_id) = match self.session_auth_user(session).await {
+        let (username, user_id, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1327,9 +1341,16 @@ impl BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        if page.messages.is_empty() {
-            return Ok(Response::Text(format!("No messages in {}.", room.name)));
-        }
+        let blocked = self
+            .db
+            .blocks_by(username.as_str())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let visible: Vec<_> = page
+            .messages
+            .iter()
+            .filter(|m| !blocked.contains(m.sender.as_str()))
+            .collect();
 
         if let Some(last) = page.messages.last() {
             self.db
@@ -1338,8 +1359,12 @@ impl BbsHost {
                 .map_err(|e| HostError::Storage(format!("{e}")))?;
         }
 
+        if visible.is_empty() {
+            return Ok(Response::Text(format!("No messages in {}.", room.name)));
+        }
+
         let mut lines = vec![format!("[{} — forward read]", room.name)];
-        for msg in &page.messages {
+        for msg in &visible {
             lines.push(format_message(msg));
         }
         if let Some(cursor) = page.next_cursor {
@@ -1349,7 +1374,7 @@ impl BbsHost {
     }
 
     async fn handle_read_reverse(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, _, _, room_id) = match self.session_auth_user(session).await {
+        let (username, _, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1365,19 +1390,29 @@ impl BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        if messages.is_empty() {
+        let blocked = self
+            .db
+            .blocks_by(username.as_str())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let visible: Vec<_> = messages
+            .iter()
+            .filter(|m| !blocked.contains(m.sender.as_str()))
+            .collect();
+
+        if visible.is_empty() {
             return Ok(Response::Text(format!("No messages in {}.", room.name)));
         }
 
         let mut lines = vec![format!("[{} — newest first]", room.name)];
-        for msg in &messages {
+        for msg in &visible {
             lines.push(format_message(msg));
         }
         Ok(Response::Text(lines.join("\n")))
     }
 
     async fn handle_scan(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, _, _, room_id) = match self.session_auth_user(session).await {
+        let (username, _, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1393,12 +1428,23 @@ impl BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        if page.messages.is_empty() {
+        let blocked = self
+            .db
+            .blocks_by(username.as_str())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let visible: Vec<_> = page
+            .messages
+            .iter()
+            .filter(|m| !blocked.contains(m.sender.as_str()))
+            .collect();
+
+        if visible.is_empty() {
             return Ok(Response::Text(format!("No messages in {}.", room.name)));
         }
 
         let mut lines = vec![format!("[{} — scan]", room.name)];
-        for msg in &page.messages {
+        for msg in &visible {
             let snippet: String = msg.content.chars().take(40).collect();
             let ellipsis = if msg.content.len() > 40 { "…" } else { "" };
             lines.push(format!(
@@ -1458,7 +1504,7 @@ impl BbsHost {
     }
 
     async fn handle_delete(&self, session: SessionId, id: i64) -> Result<Response, HostError> {
-        let (username, _, level, _) = match self.session_auth_user(session).await {
+        let (username, _, level, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1472,6 +1518,14 @@ impl BbsHost {
             None => return Ok(Response::Error(format!("Message #{id} not found."))),
             Some(m) => m,
         };
+
+        // Message must be visible from the current room.
+        let in_room = MessageStore::is_in_room(&self.db, msg_id, room_id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        if !in_room {
+            return Ok(Response::Error(format!("Message #{id} not found.")));
+        }
 
         let can_delete = level >= PermissionLevel::Aide
             || msg.sender == username

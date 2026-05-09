@@ -1,5 +1,7 @@
 //! User block-list operations.
 
+use std::collections::HashSet;
+
 use super::{error::StoreError, Database};
 
 #[allow(dead_code)]
@@ -28,6 +30,16 @@ impl Database {
             .execute(&self.write_pool)
             .await?;
         Ok(())
+    }
+
+    /// Return the set of usernames blocked by `blocker`.
+    pub(crate) async fn blocks_by(&self, blocker: &str) -> Result<HashSet<String>, StoreError> {
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT blocked FROM user_blocks WHERE blocker = ?")
+                .bind(blocker)
+                .fetch_all(&self.read_pool)
+                .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Return `true` if `blocker` has blocked `blocked`.

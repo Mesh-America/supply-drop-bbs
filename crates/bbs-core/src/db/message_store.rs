@@ -109,6 +109,9 @@ pub trait MessageStore: Send + Sync {
         timestamp: Timestamp,
     ) -> Result<MessageId, StoreError>;
 
+    /// Return `true` if `message_id` exists in `room_id`'s join table.
+    async fn is_in_room(&self, message_id: MessageId, room_id: RoomId) -> Result<bool, StoreError>;
+
     /// Delete a message by ID. Returns `Ok(false)` if the row did not
     /// exist (idempotent). Cascades to `room_messages`; the
     /// `user_room_state` pointer goes NULL (ON DELETE SET NULL).
@@ -294,6 +297,19 @@ impl MessageStore for Database {
         .await?;
 
         Ok(MessageId::new(result.last_insert_rowid()))
+    }
+
+    async fn is_in_room(&self, message_id: MessageId, room_id: RoomId) -> Result<bool, StoreError> {
+        let mid = message_id.as_i64();
+        let rid = room_id.as_i64();
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM room_messages WHERE message_id = ? AND room_id = ?",
+        )
+        .bind(mid)
+        .bind(rid)
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(count > 0)
     }
 
     async fn delete(&self, id: MessageId) -> Result<bool, StoreError> {
