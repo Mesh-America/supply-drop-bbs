@@ -8,7 +8,10 @@
 //! `cargo sqlx prepare` on every addition.
 
 use super::{error::StoreError, Database};
-use bbs_plugin_api::{AdminBackupRecord, AdminRoomSummary, AdminStats};
+use bbs_plugin_api::{
+    AdminBackupRecord, AdminDailyVolume, AdminReports, AdminRoomSummary, AdminStaleRoom,
+    AdminStats, AdminTopRoom, AdminTopSender,
+};
 use sqlx::Row;
 use std::path::Path;
 
@@ -85,6 +88,111 @@ impl Database {
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(StoreError::Db)
+    }
+
+    /// Aggregate analytics: top senders, top rooms, daily volume, stale rooms.
+    pub(crate) async fn admin_reports(&self) -> Result<AdminReports, StoreError> {
+        // Top 10 senders by message count.
+        let top_sender_rows = sqlx::query(
+            "SELECT sender, COUNT(*) AS cnt FROM messages GROUP BY sender ORDER BY cnt DESC LIMIT 10",
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        let top_senders = top_sender_rows
+            .into_iter()
+            .map(|r| {
+                Ok(AdminTopSender {
+                    username: r.try_get("sender")?,
+                    message_count: r.try_get("cnt")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Db)?;
+
+        // Top 10 rooms by message count.
+        let top_room_rows = sqlx::query(
+            r#"
+            SELECT r.id, r.name, COUNT(rm.message_id) AS cnt
+            FROM rooms r
+            LEFT JOIN room_messages rm ON rm.room_id = r.id
+            GROUP BY r.id
+            ORDER BY cnt DESC
+            LIMIT 10
+            "#,
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        let top_rooms = top_room_rows
+            .into_iter()
+            .map(|r| {
+                Ok(AdminTopRoom {
+                    room_id: r.try_get("id")?,
+                    room_name: r.try_get("name")?,
+                    message_count: r.try_get("cnt")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Db)?;
+
+        // Daily message volume for the past 30 days (ascending).
+        let volume_rows = sqlx::query(
+            r#"
+            SELECT substr(timestamp, 1, 10) AS day, COUNT(*) AS cnt
+            FROM messages
+            WHERE timestamp >= datetime('now', '-30 days')
+            GROUP BY day
+            ORDER BY day ASC
+            "#,
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        let daily_volume = volume_rows
+            .into_iter()
+            .map(|r| {
+                Ok(AdminDailyVolume {
+                    day: r.try_get("day")?,
+                    count: r.try_get("cnt")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Db)?;
+
+        // Rooms with no messages in the last 30 days (or ever), oldest-first.
+        let stale_rows = sqlx::query(
+            r#"
+            SELECT r.id, r.name, MAX(m.timestamp) AS last_msg
+            FROM rooms r
+            LEFT JOIN room_messages rm ON rm.room_id = r.id
+            LEFT JOIN messages m ON m.id = rm.message_id
+            GROUP BY r.id
+            HAVING last_msg IS NULL OR last_msg < datetime('now', '-30 days')
+            ORDER BY last_msg ASC
+            "#,
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        let stale_rooms = stale_rows
+            .into_iter()
+            .map(|r| {
+                Ok(AdminStaleRoom {
+                    room_id: r.try_get("id")?,
+                    room_name: r.try_get("name")?,
+                    last_message_at: r.try_get("last_msg")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Db)?;
+
+        Ok(AdminReports {
+            top_senders,
+            top_rooms,
+            daily_volume,
+            stale_rooms,
+        })
     }
 
     /// Run `VACUUM INTO dest_path` to create a backup copy of the database.

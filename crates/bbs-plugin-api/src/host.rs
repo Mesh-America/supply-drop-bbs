@@ -25,8 +25,8 @@
 use std::sync::Arc;
 
 use crate::admin::{
-    AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo, AdminStats,
-    AdminUserInfo,
+    AdminBackupRecord, AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo,
+    AdminStats, AdminUserInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -204,6 +204,11 @@ pub trait Host: Send + Sync {
     /// Return aggregate BBS statistics.
     async fn admin_stats(&self) -> Result<AdminStats, HostError> {
         Err(HostError::NotSupported("admin_stats".into()))
+    }
+
+    /// Return analytics reports: top senders, top rooms, daily volume, stale rooms.
+    async fn admin_reports(&self) -> Result<AdminReports, HostError> {
+        Err(HostError::NotSupported("admin_reports".into()))
     }
 
     /// Trigger a `VACUUM INTO` backup written to `backup_dir`.

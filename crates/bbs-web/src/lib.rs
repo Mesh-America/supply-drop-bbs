@@ -353,6 +353,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/rooms/:id/messages", get(api_list_messages))
         .route("/messages/:id", delete(api_delete_message))
         .route("/stats", get(api_stats))
+        .route("/reports", get(api_reports))
         .route("/sse/logs", get(api_sse_logs))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
         .route_layer(middleware::from_fn_with_state(
@@ -754,6 +755,13 @@ async fn api_delete_message(State(state): State<Arc<AppState>>, Path(id): Path<i
 async fn api_stats(State(state): State<Arc<AppState>>) -> Response {
     match state.host.admin_stats().await {
         Ok(s) => Json(s).into_response(),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_reports(State(state): State<Arc<AppState>>) -> Response {
+    match state.host.admin_reports().await {
+        Ok(r) => Json(r).into_response(),
         Err(e) => server_error(&e.to_string()),
     }
 }

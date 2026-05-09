@@ -90,6 +90,59 @@ pub struct AdminStats {
     pub active_sessions: usize,
 }
 
+/// One entry in the top-senders report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminTopSender {
+    /// BBS username of the sender.
+    pub username: String,
+    /// Total messages sent by this user.
+    pub message_count: i64,
+}
+
+/// One entry in the top-rooms report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminTopRoom {
+    /// Stable room row ID.
+    pub room_id: i64,
+    /// Room name.
+    pub room_name: String,
+    /// Total messages posted to this room.
+    pub message_count: i64,
+}
+
+/// Message count for a single calendar day (YYYY-MM-DD).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminDailyVolume {
+    /// Calendar day in `YYYY-MM-DD` format.
+    pub day: String,
+    /// Number of messages posted on this day.
+    pub count: i64,
+}
+
+/// A room that has had no messages recently (or ever).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminStaleRoom {
+    /// Stable room row ID.
+    pub room_id: i64,
+    /// Room name.
+    pub room_name: String,
+    /// RFC 3339 timestamp of the last message, or `None` if the room is empty.
+    pub last_message_at: Option<String>,
+}
+
+/// Bundled analytics returned by [`Host::admin_reports`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminReports {
+    /// Top 10 users by total message count.
+    pub top_senders: Vec<AdminTopSender>,
+    /// Top 10 rooms by total message count.
+    pub top_rooms: Vec<AdminTopRoom>,
+    /// Daily message counts for the last 30 days (ascending).
+    pub daily_volume: Vec<AdminDailyVolume>,
+    /// Rooms with no messages in the last 30 days (or ever), oldest-first.
+    pub stale_rooms: Vec<AdminStaleRoom>,
+}
+
 /// A database backup file record.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminBackupRecord {

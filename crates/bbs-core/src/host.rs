@@ -504,6 +504,13 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    async fn admin_reports(&self) -> Result<bbs_plugin_api::AdminReports, HostError> {
+        self.db
+            .admin_reports()
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
     async fn admin_trigger_backup(&self, backup_dir: &str) -> Result<AdminBackupRecord, HostError> {
         use time::format_description::well_known::Rfc3339;
 
