@@ -1,0 +1,38 @@
+# cargo-release configuration — https://github.com/crate-ci/cargo-release
+#
+# Usage:
+#   cargo release minor          # bump 0.2.0 → 0.3.0
+#   cargo release patch          # bump 0.2.0 → 0.2.1
+#   cargo release --execute      # dry-run by default; add --execute to actually do it
+#
+# What it does:
+#   1. Bumps [workspace.package] version in Cargo.toml (and all workspace refs).
+#   2. Runs `git cliff --output CHANGELOG.md` to regenerate the changelog.
+#   3. Commits with "chore(release): v{{version}}".
+#   4. Creates an annotated git tag "v{{version}}".
+#   5. Pushes the commit + tag — GitHub Actions release.yml then fires.
+
+# ── Version tag & commit ────────────────────────────────────────────
+tag         = true
+tag-name    = "v{{version}}"
+tag-message = "Release v{{version}}"
+
+push        = true
+push-remote = "origin"
+
+# ── Commit message ──────────────────────────────────────────────────
+pre-release-commit-message  = "chore(release): v{{version}}"
+# No post-release dev bump — we don't use alpha/dev suffixes.
+post-release-commit-message = ""
+
+# ── CHANGELOG via git-cliff ─────────────────────────────────────────
+pre-release-hook = [
+  "git cliff --tag v{{version}} --output CHANGELOG.md",
+  "git add CHANGELOG.md",
+]
+
+# ── Don't publish to crates.io ──────────────────────────────────────
+publish = false
+
+# ── Shared across all workspace members ─────────────────────────────
+shared-version = true

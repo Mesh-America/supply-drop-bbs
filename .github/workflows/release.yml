@@ -1,0 +1,143 @@
+name: Release
+
+# Fires when cargo-release pushes a version tag (e.g. v0.2.0).
+on:
+  push:
+    tags:
+      - "v[0-9]*"
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+  # Release builds must be warning-free.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # ─── Build release binaries for all deployment targets ─────────────
+  build:
+    name: Build · ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - armv7-unknown-linux-gnueabihf
+          - x86_64-unknown-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so git-cliff can generate release notes.
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compile toolchain
+        run: |
+          sudo apt-get update
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              ;;
+            armv7-unknown-linux-gnueabihf)
+              sudo apt-get install -y gcc-arm-linux-gnueabihf
+              ;;
+            x86_64-unknown-linux-gnu)
+              # native on the runner — no extra toolchain needed
+              ;;
+          esac
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      # ── Build variants ─────────────────────────────────────────────
+      # 1. Full (default features = cli + mesh + admin-web)
+      - name: Build — full (default features)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 2. Headless — no admin web UI, smaller binary for resource-constrained hardware
+      - name: Build — headless (cli + mesh, no web)
+        run: |
+          cargo build --release --target ${{ matrix.target }} \
+            --no-default-features --features transport-cli,transport-mesh
+
+      # ── Rename & stage artifacts ───────────────────────────────────
+      - name: Stage artifacts
+        run: |
+          TARGET="${{ matrix.target }}"
+          TAG="${{ github.ref_name }}"
+
+          mkdir -p dist
+
+          # Full binary
+          cp "target/${TARGET}/release/supply-drop-bbs" \
+             "dist/supply-drop-bbs-${TAG}-${TARGET}"
+
+          # Headless binary
+          cp "target/${TARGET}/release/supply-drop-bbs" \
+             "dist/supply-drop-bbs-${TAG}-${TARGET}-headless"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  # ─── Create the GitHub Release ─────────────────────────────────────
+  release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: write   # needed to create the release and upload assets
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        uses: taiki-e/install-action@v2
+        with:
+          tool: git-cliff
+
+      # Generate release notes for this specific tag only (not full changelog).
+      - name: Generate release notes
+        id: cliff
+        run: |
+          # Get notes between the previous tag and this one.
+          PREV=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p')
+          if [ -n "$PREV" ]; then
+            git cliff "${PREV}".."${{ github.ref_name }}" --output release-notes.md
+          else
+            git cliff "${{ github.ref_name }}" --output release-notes.md
+          fi
+          echo "notes_file=release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "supply-drop-bbs ${{ github.ref_name }}"
+          body_path: release-notes.md
+          draft: false
+          prerelease: false
+          files: |
+            dist/*
