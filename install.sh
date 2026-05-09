@@ -44,12 +44,12 @@ die()     { echo -e "${RED}  ✗${NC} $*" >&2; exit 1; }
 if [[ "${1:-}" == "--uninstall" ]]; then
     echo
     if command -v figlet &>/dev/null; then
-        figlet -f slant "Supply Drop" 2>/dev/null || figlet "Supply Drop"
-        figlet -f slant "  BBS" 2>/dev/null || figlet "BBS"
+        echo -e "${GREEN}$(figlet -f slant "Supply Drop" 2>/dev/null || figlet "Supply Drop")${NC}"
+        echo -e "${GREEN}$(figlet -f slant "  BBS" 2>/dev/null || figlet "BBS")${NC}"
     else
-        echo "  Supply Drop BBS"
+        echo -e "${GREEN}  Supply Drop BBS${NC}"
     fi
-    echo "  uninstaller"
+    echo -e "  ${GREEN}uninstaller${NC}"
     echo
 
     [[ $EUID -eq 0 ]] || die "Please run with sudo:  sudo bash install.sh --uninstall"
@@ -136,26 +136,24 @@ fi
 print_banner() {
     echo
     if command -v figlet &>/dev/null; then
-        figlet -f slant "Supply Drop" 2>/dev/null || figlet "Supply Drop"
-        figlet -f slant "  BBS" 2>/dev/null || figlet "BBS"
+        echo -e "${GREEN}$(figlet -f slant "Supply Drop" 2>/dev/null || figlet "Supply Drop")${NC}"
+        echo -e "${GREEN}$(figlet -f slant "  BBS" 2>/dev/null || figlet "BBS")${NC}"
     else
-        cat <<'BANNER'
-   _____                   __         ____
-  / ___/__  ______  ____  / /_  __   / __ \________  ___  ____
-  \__ \/ / / / __ \/ __ \/ / / / /  / / / / ___/ _ \/ _ \/ __ \
- ___/ / /_/ / /_/ / /_/ / / /_/ /  / /_/ / /  /  __/  __/ /_/ /
-/____/\__,_/ .___/ .___/_/\__, /  /_____/_/   \___/\___/ .___/
-          /_/   /_/       /____/                        /_/
-
-                        ____  ____  _____
-                       / __ )/ __ )/ ___/
-                      / __  / __  /\__ \
-                     / /_/ / /_/ /___/ /
-                    /_____/_____//____/
-
-BANNER
+        echo -e "${GREEN}   _____                   __         ____"
+        echo    "  / ___/__  ______  ____  / /_  __   / __ \________  ___  ____"
+        echo    "  \__ \/ / / / __ \/ __ \/ / / / /  / / / / ___/ _ \/ _ \/ __ \\"
+        echo    " ___/ / /_/ / /_/ / /_/ / / /_/ /  / /_/ / /  /  __/  __/ /_/ /"
+        echo    "/____/\__,_/ .___/ .___/_/\__, /  /_____/_/   \___/\___/ .___/"
+        echo    "          /_/   /_/       /____/                        /_/"
+        echo    ""
+        echo    "                        ____  ____  _____"
+        echo    "                       / __ )/ __ )/ ___/"
+        echo    "                      / __  / __  /\__ \\"
+        echo    "                     / /_/ / /_/ /___/ /"
+        echo -e "                    /_____/_____//____/${NC}"
+        echo
     fi
-    echo "  mesh radio bulletin board system"
+    echo -e "  ${GREEN}mesh radio bulletin board system${NC}"
     echo
 }
 
