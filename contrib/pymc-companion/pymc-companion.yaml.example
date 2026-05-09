@@ -1,0 +1,73 @@
+# pymc-companion configuration
+# Copy to /etc/supply-drop-bbs/pymc-companion.yaml and edit for your hardware.
+
+companion:
+  # Node name advertised on the mesh.
+  node_name: "Supply Drop BBS"
+
+  # Persist the identity (key pair) across restarts. Without this your
+  # public key changes every boot and contacts break.
+  identity_path: "/var/lib/supply-drop-bbs/companion.key"
+
+  # TCP port supply-drop-bbs connects to. Must match connection_type = "hat"
+  # addr in supply-drop-bbs config (default 127.0.0.1:5000).
+  tcp_port: 5000
+  bind_address: "127.0.0.1"
+
+  # Auto-add bitmask: 0x01=overwrite_oldest 0x02=chat 0x04=repeater 0x08=room
+  # 0x0F adds all types and evicts the oldest when the contact list is full.
+  autoadd_config: 0x0F
+
+radio:
+  # ── Frequency ─────────────────────────────────────────────────────────────
+  # Must match the mesh network you're joining.
+  # US default: 910525000 (910.525 MHz)
+  # EU default: 869618000 (869.618 MHz)
+  frequency: 910525000
+
+  # ── Modulation ────────────────────────────────────────────────────────────
+  # These must match the rest of the mesh — wrong values = no packets.
+  bandwidth: 62500         # Hz  (62.5 kHz)
+  spreading_factor: 7
+  coding_rate: 5
+  tx_power: 22             # dBm
+  preamble_length: 17
+  sync_word: 0x3444        # MeshCore network ID
+
+  # ── Hardware pins (BCM GPIO) ───────────────────────────────────────────────
+  # Uncomment the block for your hardware.
+
+  # RAK6421 + RAK13300X — IO Slot 1 (most common)
+  bus_id: 0
+  cs_pin: -1        # hardware CS via spidev
+  reset_pin: 16
+  busy_pin: 24
+  irq_pin: 22
+  txen_pin: -1
+  rxen_pin: -1
+  use_dio2_rf: true
+  use_dio3_tcxo: true
+  dio3_tcxo_voltage: 1.8
+
+  # RAK6421 + RAK13300X — IO Slot 2
+  # bus_id: 0
+  # cs_pin: -1
+  # reset_pin: 24
+  # busy_pin: 19
+  # irq_pin: 18
+  # txen_pin: -1
+  # rxen_pin: -1
+  # use_dio2_rf: true
+  # use_dio3_tcxo: true
+  # dio3_tcxo_voltage: 1.8
+
+  # Waveshare SX1262 LoRa HAT
+  # bus_id: 0
+  # cs_pin: 21
+  # reset_pin: 18
+  # busy_pin: 20
+  # irq_pin: 16
+  # txen_pin: 13
+  # rxen_pin: 12
+  # use_dio2_rf: false
+  # use_dio3_tcxo: false

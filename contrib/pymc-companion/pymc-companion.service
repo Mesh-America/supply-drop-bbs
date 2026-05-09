@@ -1,0 +1,25 @@
+[Unit]
+Description=pymc-companion — LoRa radio bridge for Supply Drop BBS
+Documentation=https://github.com/Mesh-America/supply-drop-bbs
+After=network.target
+# BBS connects to us, so we must start first.
+Before=supply-drop-bbs.service
+
+[Service]
+Type=simple
+User=supply-drop
+Group=supply-drop
+SupplementaryGroups=dialout spi gpio
+ExecStart=/opt/pymc-companion/venv/bin/python \
+    /opt/pymc-companion/pymc-companion.py \
+    --config /etc/supply-drop-bbs/pymc-companion.yaml
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=pymc-companion
+
+ReadWritePaths=/var/lib/supply-drop-bbs
+
+[Install]
+WantedBy=multi-user.target

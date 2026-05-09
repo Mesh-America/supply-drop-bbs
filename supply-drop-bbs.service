@@ -1,8 +1,10 @@
 [Unit]
 Description=Supply Drop BBS
 Documentation=https://github.com/Mesh-America/supply-drop-bbs
-After=network.target
+After=network.target pymc-companion.service
 Wants=network.target
+# If using the HAT connection type, pymc-companion must be running first.
+# Remove the After= line above if using a USB serial radio instead.
 
 [Service]
 Type=simple
