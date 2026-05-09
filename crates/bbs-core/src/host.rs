@@ -139,7 +139,9 @@ impl Host for BbsHost {
             Command::Help { topic: None } => Ok(Response::Text(
                 "Commands: N=new msgs  F=forward  R=reverse  S=scan\n\
                  E=enter msg  D <id>=delete  K=rooms  G=next unread\n\
-                 C <room>=go to  M=mail  whoami  logout/Q  help  cancel"
+                 C <room>=go to  M=mail  W=who's online\n\
+                 Aide+: PENDING  V <user>=validate  B <user>=ban\n\
+                 whoami  logout/Q  help  cancel"
                     .into(),
             )),
             Command::Help { topic: Some(t) } => Ok(Response::Text(format!(
@@ -172,6 +174,14 @@ impl Host for BbsHost {
             // Message posting / deletion
             Command::EnterMessage => self.handle_enter_message(session).await,
             Command::DeleteMessage { id } => self.handle_delete(session, id).await,
+
+            // Moderation
+            Command::WhoIsOnline => self.handle_who_is_online(session).await,
+            Command::ListPending => self.handle_list_pending(session).await,
+            Command::ValidateUser { username } => {
+                self.handle_validate_user(session, username).await
+            }
+            Command::BanUser { username } => self.handle_ban_user(session, username).await,
 
             Command::Unknown { raw } => Ok(Response::Text(format!(
                 "Unknown command: '{raw}'. Type 'help'."
@@ -456,7 +466,7 @@ impl BbsHost {
                     &self.db,
                     &username,
                     display_name.as_deref(),
-                    PermissionLevel::User,
+                    PermissionLevel::Unvalidated,
                     now,
                 )
                 .await
@@ -472,12 +482,12 @@ impl BbsHost {
                     if let Some(r) = sessions.get_mut(&session) {
                         r.username = Some(username.clone());
                         r.user_id = Some(user_id);
-                        r.level = PermissionLevel::User;
+                        r.level = PermissionLevel::Unvalidated;
                         r.workflow = Workflow::None;
                         r.current_room = LOBBY_ROOM_ID;
                     }
                 }
-                info!(%session, %username, "registration complete");
+                info!(%session, %username, "registration complete — awaiting validation");
                 Ok(Response::LoggedIn { user: username })
             }
 
@@ -688,8 +698,25 @@ impl BbsHost {
         }
     }
 
+    /// Like `session_auth` but also requires `PermissionLevel::User` or above.
+    /// Unvalidated accounts get a pending-validation message.
+    async fn session_auth_user(
+        &self,
+        session: SessionId,
+    ) -> Result<(Username, UserId, PermissionLevel, RoomId), Response> {
+        let result = self.session_auth(session).await?;
+        if result.2 < PermissionLevel::User {
+            return Err(Response::Text(
+                "Your account is pending validation by an aide.\n\
+                 Type 'whoami', 'help', 'pending', or 'logout'."
+                    .into(),
+            ));
+        }
+        Ok(result)
+    }
+
     async fn handle_list_rooms(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, level, current_room) = match self.session_auth(session).await {
+        let (_, user_id, level, current_room) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -728,7 +755,7 @@ impl BbsHost {
     }
 
     async fn handle_go_next_unread(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, level, current_room) = match self.session_auth(session).await {
+        let (_, user_id, level, current_room) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -778,7 +805,7 @@ impl BbsHost {
             return Ok(Response::Text("Usage: C <room name or number>".into()));
         }
 
-        let (_, user_id, level, _) = match self.session_auth(session).await {
+        let (_, user_id, level, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -827,7 +854,7 @@ impl BbsHost {
         session: SessionId,
         room_id: RoomId,
     ) -> Result<Response, HostError> {
-        let (_, user_id, level, _) = match self.session_auth(session).await {
+        let (_, user_id, level, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -871,7 +898,7 @@ impl BbsHost {
 
 impl BbsHost {
     async fn handle_read_new(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, _, room_id) = match self.session_auth(session).await {
+        let (_, user_id, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -923,7 +950,7 @@ impl BbsHost {
         session: SessionId,
         after: Option<i64>,
     ) -> Result<Response, HostError> {
-        let (_, user_id, _, room_id) = match self.session_auth(session).await {
+        let (_, user_id, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -962,7 +989,7 @@ impl BbsHost {
     }
 
     async fn handle_read_reverse(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, _, _, room_id) = match self.session_auth(session).await {
+        let (_, _, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -990,7 +1017,7 @@ impl BbsHost {
     }
 
     async fn handle_scan(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, _, _, room_id) = match self.session_auth(session).await {
+        let (_, _, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1029,7 +1056,7 @@ impl BbsHost {
     }
 
     async fn handle_enter_message(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, _, _, room_id) = match self.session_auth(session).await {
+        let (_, _, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1071,7 +1098,7 @@ impl BbsHost {
     }
 
     async fn handle_delete(&self, session: SessionId, id: i64) -> Result<Response, HostError> {
-        let (username, _, level, _) = match self.session_auth(session).await {
+        let (username, _, level, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1101,6 +1128,210 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         Ok(Response::Text(format!("Message #{id} deleted.")))
+    }
+}
+
+// ── Moderation helpers ────────────────────────────────────────────────────────
+
+impl BbsHost {
+    async fn handle_who_is_online(&self, session: SessionId) -> Result<Response, HostError> {
+        match self.session_auth_user(session).await {
+            Ok(_) => {}
+            Err(r) => return Ok(r),
+        }
+
+        let sessions = self.sessions.read().await;
+        let mut names: Vec<String> = sessions
+            .values()
+            .filter_map(|r| {
+                r.username
+                    .as_ref()
+                    .map(|u| format!("{} [{}]", u.as_str(), r.level))
+            })
+            .collect();
+        let anon = sessions.values().filter(|r| r.username.is_none()).count();
+        drop(sessions);
+
+        names.sort();
+        let mut lines = vec![format!(
+            "Online ({} user{}):",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" }
+        )];
+        lines.extend(names);
+        if anon > 0 {
+            lines.push(format!("(+{anon} unauthenticated)"));
+        }
+        Ok(Response::Text(lines.join("\n")))
+    }
+
+    async fn handle_list_pending(&self, session: SessionId) -> Result<Response, HostError> {
+        let (_, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Aide {
+            return Ok(Response::Error("Aide access required.".into()));
+        }
+
+        let all_active = UserStore::list(&self.db, Some(UserStatus::Active), 200, 0)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let pending: Vec<_> = all_active
+            .iter()
+            .filter(|u| u.permission_level == PermissionLevel::Unvalidated)
+            .collect();
+
+        if pending.is_empty() {
+            return Ok(Response::Text("No accounts pending validation.".into()));
+        }
+
+        let mut lines = vec![format!("Pending validation ({}):", pending.len())];
+        for u in &pending {
+            lines.push(format!(
+                "  {} (joined {})",
+                u.username.as_str(),
+                u.created_at
+            ));
+        }
+        lines.push("Use V <username> to validate, B <username> to ban.".into());
+        Ok(Response::Text(lines.join("\n")))
+    }
+
+    async fn handle_validate_user(
+        &self,
+        session: SessionId,
+        username: Username,
+    ) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Aide {
+            return Ok(Response::Error("Aide access required.".into()));
+        }
+
+        let user = UserStore::get_by_username(&self.db, &username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let user = match user {
+            None => {
+                return Ok(Response::Error(format!(
+                    "User '{}' not found.",
+                    username.as_str()
+                )))
+            }
+            Some(u) => u,
+        };
+
+        if user.permission_level != PermissionLevel::Unvalidated {
+            return Ok(Response::Error(format!(
+                "'{}' is already {} — not pending validation.",
+                username.as_str(),
+                user.permission_level
+            )));
+        }
+
+        UserStore::update(
+            &self.db,
+            user.id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        // Promote any active sessions for this user immediately.
+        {
+            let mut sessions = self.sessions.write().await;
+            for r in sessions.values_mut() {
+                if r.username.as_ref() == Some(&username) {
+                    r.level = PermissionLevel::User;
+                }
+            }
+        }
+
+        info!(%actor, %username, "user validated");
+        Ok(Response::Text(format!(
+            "'{}' validated — account is now active.",
+            username.as_str()
+        )))
+    }
+
+    async fn handle_ban_user(
+        &self,
+        session: SessionId,
+        username: Username,
+    ) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Aide {
+            return Ok(Response::Error("Aide access required.".into()));
+        }
+
+        let user = UserStore::get_by_username(&self.db, &username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let user = match user {
+            None => {
+                return Ok(Response::Error(format!(
+                    "User '{}' not found.",
+                    username.as_str()
+                )))
+            }
+            Some(u) => u,
+        };
+
+        if user.status == UserStatus::Banned {
+            return Ok(Response::Error(format!(
+                "'{}' is already banned.",
+                username.as_str()
+            )));
+        }
+
+        if user.permission_level >= level {
+            return Ok(Response::Error(format!(
+                "Cannot ban '{}' — equal or higher permission tier.",
+                username.as_str()
+            )));
+        }
+
+        UserStore::update(
+            &self.db,
+            user.id,
+            None,
+            Some(UserStatus::Banned),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        // Force-end any active sessions for this user.
+        {
+            let mut sessions = self.sessions.write().await;
+            let to_end: Vec<SessionId> = sessions
+                .iter()
+                .filter(|(_, r)| r.username.as_ref() == Some(&username))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in to_end {
+                sessions.remove(&id);
+            }
+        }
+
+        warn!(%actor, %username, "user banned");
+        Ok(Response::Text(format!(
+            "'{}' has been banned.",
+            username.as_str()
+        )))
     }
 }
 
@@ -1137,6 +1368,31 @@ mod tests {
             .await
             .expect("db open");
         Arc::new(BbsHost::new(db))
+    }
+
+    /// Bypass the validation workflow for a registered user in tests.
+    async fn force_validate(host: &BbsHost, username: &Username) {
+        let user = UserStore::get_by_username(&host.db, username)
+            .await
+            .unwrap()
+            .unwrap();
+        UserStore::update(
+            &host.db,
+            user.id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+        // Also update any active sessions.
+        let mut sessions = host.sessions.write().await;
+        for r in sessions.values_mut() {
+            if r.username.as_ref() == Some(username) {
+                r.level = PermissionLevel::User;
+            }
+        }
     }
 
     #[tokio::test]
@@ -1263,9 +1519,9 @@ mod tests {
             }
         );
 
-        // Verify session has Lobby room and User level.
+        // Registration places users in Unvalidated tier (awaiting aide approval).
         let ctx = host.permission_ctx(sid).await.unwrap();
-        assert_eq!(ctx.level, PermissionLevel::User);
+        assert_eq!(ctx.level, PermissionLevel::Unvalidated);
         assert_eq!(ctx.username.as_ref(), Some(&uname));
         let sessions = host.sessions.read().await;
         assert_eq!(sessions[&sid].current_room, LOBBY_ROOM_ID);
@@ -1319,6 +1575,9 @@ mod tests {
         .await
         .unwrap();
 
+        // Validate bob so he can use room commands.
+        force_validate(&host, &uname).await;
+
         let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
         let Response::Text(text) = resp else {
             panic!("expected Text")
@@ -1365,6 +1624,9 @@ mod tests {
         )
         .await
         .unwrap();
+
+        // Validate carol so she can post messages.
+        force_validate(&host, &uname).await;
 
         // Enter a message.
         let r = host

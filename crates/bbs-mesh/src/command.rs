@@ -154,6 +154,25 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "cancel" | "stop" => Some(Command::Cancel),
 
+        // ── Moderation ───────────────────────────────────────────────────────
+        "w" | "who" => Some(Command::WhoIsOnline),
+
+        "pending" => Some(Command::ListPending),
+
+        "v" | "valid" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::ValidateUser { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
+        "b" | "ban" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::BanUser { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
         }),

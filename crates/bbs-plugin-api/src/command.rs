@@ -123,6 +123,25 @@ pub enum Command {
 
     /// Cancel the current workflow without logging out. (cancel)
     Cancel,
+
+    // ── Moderation ────────────────────────────────────────────────────────
+    /// List all currently logged-in sessions. (W)
+    WhoIsOnline,
+
+    /// List users whose accounts are awaiting aide validation. (PENDING)
+    ListPending,
+
+    /// Promote an unvalidated user to full User tier (Aide+). (V)
+    ValidateUser {
+        /// The username of the account to validate.
+        username: Username,
+    },
+
+    /// Ban a user account, preventing further login (Aide+). (B / BAN)
+    BanUser {
+        /// The username of the account to ban.
+        username: Username,
+    },
 }
 
 /// A protocol-neutral response from the BBS to a session.
