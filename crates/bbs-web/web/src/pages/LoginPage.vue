@@ -74,7 +74,13 @@ async function submit() {
   gap: 1rem;
 }
 .logo-wrap { display: flex; justify-content: center; margin-bottom: 0.25rem; }
-.logo { width: 160px; height: 160px; object-fit: contain; }
+.logo {
+  width: 160px;
+  height: 160px;
+  object-fit: contain;
+  border-radius: 16px;
+  background: #111;
+}
 .sub { margin: 0; font-size: 0.85em; text-align: center; }
 form { display: flex; flex-direction: column; gap: 0.75rem; }
 .field { display: flex; flex-direction: column; gap: 0.25rem; }
