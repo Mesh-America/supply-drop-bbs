@@ -362,7 +362,7 @@ async fn push_domain_notification(
                             attempt: 0,
                             pubkey_prefix: prefix,
                             text: "Your account has been validated. \
-                                   You now have full access. Type 'help'."
+                                   You now have full access. Type 'H'."
                                 .to_owned(),
                         })
                         .await;
@@ -583,7 +583,7 @@ async fn dispatch_message(
         };
 
         let greeting = if let Some(ref username) = auto_username {
-            format!("Welcome back, {username}! Type 'help' for commands.")
+            format!("Welcome back, {username}! Type 'H' for commands.")
         } else {
             welcome_message.to_owned()
         };

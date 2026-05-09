@@ -186,7 +186,7 @@ fn default_app_ver() -> u8 {
 }
 
 fn default_welcome() -> String {
-    "Welcome to Supply Drop BBS!\nType 'register <username>' to create an account\nor 'login <username>' if you already have one.\nType 'help' for a list of commands.".into()
+    "Welcome to Supply Drop BBS!\nType 'register <username>' to create an account\nor 'login <username>' if you already have one.\nType 'H' for a list of commands.".into()
 }
 
 fn default_reconnect_initial_ms() -> u64 {

@@ -411,7 +411,7 @@ async fn session_loop(
 
     // ── Welcome banner ────────────────────────────────────────────────────────
     let banner = format!(
-        "Supply Drop BBS v{} — type 'help' for commands\n",
+        "Supply Drop BBS v{} — type 'H' for commands\n",
         env!("CARGO_PKG_VERSION")
     );
     if writer.write_all(banner.as_bytes()).await.is_err() {
@@ -568,7 +568,7 @@ fn format_response(response: &Response) -> Option<String> {
             }
         }
         Response::LoggedIn { user } => Some(format!(
-            "Welcome, {}. Type 'help' for commands.",
+            "Welcome, {}. Type 'H' for commands.",
             user.as_str()
         )),
         Response::LoggedOut => Some("Goodbye. Your session has ended.".to_owned()),

@@ -809,7 +809,7 @@ impl BbsHost {
         };
 
         match workflow {
-            Workflow::None => Ok(Response::Error("No active workflow. Type 'help'.".into())),
+            Workflow::None => Ok(Response::Error("No active workflow. Type 'H'.".into())),
 
             // ── Registration ─────────────────────────────────────────────────
             Workflow::Register {

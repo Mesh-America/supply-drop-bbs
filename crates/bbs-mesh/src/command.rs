@@ -259,7 +259,7 @@ pub fn format_response(response: &Response) -> Option<String> {
         Response::Prompt { text, .. } => Some(text.clone()),
 
         Response::LoggedIn { user } => Some(format!(
-            "Welcome, {}. Type 'help' for commands.",
+            "Welcome, {}. Type 'H' for commands.",
             user.as_str()
         )),
 
