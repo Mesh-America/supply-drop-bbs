@@ -18,6 +18,7 @@ const error = ref<string | null>(null)
 const statusFilter = ref<string>('')
 const actionError = ref<string | null>(null)
 const actionOk = ref<string | null>(null)
+const acting = ref(false)
 
 function levelLabel(l: number): string {
   if (l >= 100) return 'sysop'
@@ -39,41 +40,25 @@ async function load() {
   }
 }
 
-async function validate(username: string) {
+async function doAction(username: string, body: object, okMsg: string) {
+  if (acting.value) return
+  acting.value = true
   actionError.value = null
   actionOk.value = null
   try {
-    await api.patch(`/api/v1/users/${encodeURIComponent(username)}`, { status: 0, permission_level: 10 })
-    actionOk.value = `${username} validated`
+    await api.patch(`/api/v1/users/${encodeURIComponent(username)}`, body)
+    actionOk.value = okMsg
     await load()
   } catch (e: any) {
     actionError.value = e?.message ?? 'action failed'
+  } finally {
+    acting.value = false
   }
 }
 
-async function ban(username: string) {
-  actionError.value = null
-  actionOk.value = null
-  try {
-    await api.patch(`/api/v1/users/${encodeURIComponent(username)}`, { status: 1 })
-    actionOk.value = `${username} banned`
-    await load()
-  } catch (e: any) {
-    actionError.value = e?.message ?? 'action failed'
-  }
-}
-
-async function unban(username: string) {
-  actionError.value = null
-  actionOk.value = null
-  try {
-    await api.patch(`/api/v1/users/${encodeURIComponent(username)}`, { status: 0 })
-    actionOk.value = `${username} unbanned`
-    await load()
-  } catch (e: any) {
-    actionError.value = e?.message ?? 'action failed'
-  }
-}
+const validate = (u: string) => doAction(u, { status: 0, permission_level: 10 }, `${u} validated`)
+const ban      = (u: string) => doAction(u, { status: 1 }, `${u} banned`)
+const unban    = (u: string) => doAction(u, { status: 0 }, `${u} unbanned`)
 
 onMounted(load)
 </script>
@@ -122,16 +107,19 @@ onMounted(load)
             <button
               v-if="u.status !== 'banned' && u.permission_level === 0"
               class="small-btn"
+              :disabled="acting"
               @click="validate(u.username)"
             >validate</button>
             <button
               v-if="u.status !== 'banned'"
               class="small-btn danger"
+              :disabled="acting"
               @click="ban(u.username)"
             >ban</button>
             <button
               v-if="u.status === 'banned'"
               class="small-btn secondary"
+              :disabled="acting"
               @click="unban(u.username)"
             >unban</button>
           </td>

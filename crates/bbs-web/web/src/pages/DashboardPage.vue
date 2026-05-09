@@ -18,6 +18,7 @@ interface Stats {
 
 const status = ref<Status | null>(null)
 const stats = ref<Stats | null>(null)
+const error = ref<string | null>(null)
 
 function fmtUptime(secs: number): string {
   const h = Math.floor(secs / 3600)
@@ -29,8 +30,8 @@ function fmtUptime(secs: number): string {
 }
 
 onMounted(async () => {
-  try { status.value = await api.get<Status>('/api/v1/status') } catch {}
-  try { stats.value = await api.get<Stats>('/api/v1/stats') } catch {}
+  try { status.value = await api.get<Status>('/api/v1/status') } catch (e: any) { error.value = e?.message ?? 'failed to load status' }
+  try { stats.value = await api.get<Stats>('/api/v1/stats') } catch (e: any) { if (!error.value) error.value = e?.message ?? 'failed to load stats' }
 })
 </script>
 
@@ -40,6 +41,8 @@ onMounted(async () => {
       <h1>dashboard</h1>
       <p class="muted">supply drop bbs — admin panel</p>
     </header>
+
+    <p v-if="error" class="error">{{ error }}</p>
 
     <section class="stat-row">
       <div class="stat-card" v-if="status">

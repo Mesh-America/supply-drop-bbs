@@ -130,6 +130,11 @@ impl BbsHost {
 
 // ── Host impl ─────────────────────────────────────────────────────────────────
 
+// async_trait rewrites async fn bodies into Box::pin(async move { … }) closures.
+// Clippy's dead_code analysis doesn't follow those closures back to pub(crate)
+// helpers, so it incorrectly flags the admin methods as unused. All of them are
+// reachable via dyn Host trait dispatch from bbs-web.
+#[allow(dead_code)]
 #[async_trait]
 impl Host for BbsHost {
     async fn process_command(
@@ -1550,6 +1555,7 @@ impl BbsHost {
 
     // ── Admin / web-UI operations ─────────────────────────────────────────────
 
+    #[allow(dead_code)]
     async fn admin_verify_credentials(
         &self,
         username: &str,
@@ -1591,6 +1597,7 @@ impl BbsHost {
         Ok(user.permission_level)
     }
 
+    #[allow(dead_code)]
     async fn admin_list_sessions(&self) -> Result<Vec<AdminSessionInfo>, HostError> {
         let sessions = self.sessions.read().await;
         Ok(sessions
@@ -1604,6 +1611,7 @@ impl BbsHost {
             .collect())
     }
 
+    #[allow(dead_code)]
     async fn admin_list_users(
         &self,
         status_filter: Option<u8>,
@@ -1640,6 +1648,7 @@ impl BbsHost {
             .collect())
     }
 
+    #[allow(dead_code)]
     async fn admin_update_user(
         &self,
         username: &str,
@@ -1706,6 +1715,7 @@ impl BbsHost {
         Ok(())
     }
 
+    #[allow(dead_code)]
     async fn admin_list_rooms(&self) -> Result<Vec<AdminRoomSummary>, HostError> {
         self.db
             .admin_list_rooms()
@@ -1713,6 +1723,7 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    #[allow(dead_code)]
     async fn admin_create_room(
         &self,
         name: &str,
@@ -1742,6 +1753,7 @@ impl BbsHost {
             .ok_or_else(|| HostError::Internal("created room not found".into()))
     }
 
+    #[allow(dead_code)]
     async fn admin_delete_room(&self, room_id: i64) -> Result<bool, HostError> {
         // Protect system rooms.
         if room_id <= 3 {
@@ -1757,6 +1769,7 @@ impl BbsHost {
         }
     }
 
+    #[allow(dead_code)]
     async fn admin_list_messages(
         &self,
         room_id: i64,
@@ -1783,6 +1796,7 @@ impl BbsHost {
             .collect())
     }
 
+    #[allow(dead_code)]
     async fn admin_delete_message(&self, message_id: i64) -> Result<bool, HostError> {
         use crate::ids::MessageId;
         crate::db::MessageStore::delete(&self.db, MessageId::new(message_id))
@@ -1790,6 +1804,7 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    #[allow(dead_code)]
     async fn admin_stats(&self) -> Result<AdminStats, HostError> {
         let active_sessions = self.sessions.read().await.len();
         self.db
@@ -1798,15 +1813,16 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
-    async fn admin_trigger_backup(
-        &self,
-        backup_dir: &str,
-    ) -> Result<AdminBackupRecord, HostError> {
+    #[allow(dead_code)]
+    async fn admin_trigger_backup(&self, backup_dir: &str) -> Result<AdminBackupRecord, HostError> {
         use time::format_description::well_known::Rfc3339;
 
         let now = time::OffsetDateTime::now_utc();
         let stamp = now
-            .format(&time::format_description::parse("[year][month][day]_[hour][minute][second]").unwrap())
+            .format(
+                &time::format_description::parse("[year][month][day]_[hour][minute][second]")
+                    .unwrap(),
+            )
             .unwrap_or_else(|_| "backup".to_owned());
         let filename = format!("backup_{stamp}.db");
         let dest = std::path::Path::new(backup_dir).join(&filename);
@@ -1829,6 +1845,7 @@ impl BbsHost {
         })
     }
 
+    #[allow(dead_code)]
     async fn admin_list_backups(
         &self,
         backup_dir: &str,

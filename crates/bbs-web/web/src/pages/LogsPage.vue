@@ -17,7 +17,9 @@ function connect() {
     }
     es.onerror = () => {
       connected.value = false
-      error.value = 'Connection lost — retrying…'
+      error.value = 'Connection lost — click reconnect to retry.'
+      es?.close()
+      es = null
     }
   } catch (e: any) {
     error.value = e?.message ?? 'failed to connect to log stream'
@@ -43,6 +45,7 @@ onUnmounted(disconnect)
         <span class="indicator" :class="{ live: connected }">
           {{ connected ? '● live' : '○ offline' }}
         </span>
+        <button v-if="!connected" class="secondary" @click="connect">reconnect</button>
         <button class="secondary" @click="clear">clear</button>
       </div>
     </header>

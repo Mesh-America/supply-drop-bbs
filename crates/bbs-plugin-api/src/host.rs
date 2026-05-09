@@ -24,11 +24,11 @@
 
 use std::sync::Arc;
 
-use crate::advert::AdvertBus;
 use crate::admin::{
     AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo, AdminStats,
     AdminUserInfo,
 };
+use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
 use crate::error::HostError;
 use crate::event::DomainEvent;
@@ -209,10 +209,7 @@ pub trait Host: Send + Sync {
     /// Trigger a `VACUUM INTO` backup written to `backup_dir`.
     ///
     /// The filename is auto-generated with a UTC timestamp.
-    async fn admin_trigger_backup(
-        &self,
-        backup_dir: &str,
-    ) -> Result<AdminBackupRecord, HostError> {
+    async fn admin_trigger_backup(&self, backup_dir: &str) -> Result<AdminBackupRecord, HostError> {
         let _ = backup_dir;
         Err(HostError::NotSupported("admin_trigger_backup".into()))
     }

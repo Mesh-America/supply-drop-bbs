@@ -2,10 +2,10 @@ import { ref, watchEffect } from 'vue'
 
 type Theme = 'light' | 'dark' | 'system'
 
-const theme = ref<Theme>((localStorage.getItem('bbs_theme') as Theme) ?? 'system')
+const theme = ref<Theme>((localStorage.getItem('bbs-theme') as Theme) ?? 'system')
 
 watchEffect(() => {
-  localStorage.setItem('bbs_theme', theme.value)
+  localStorage.setItem('bbs-theme', theme.value)
   const html = document.documentElement
   if (theme.value === 'system') {
     html.removeAttribute('data-theme')

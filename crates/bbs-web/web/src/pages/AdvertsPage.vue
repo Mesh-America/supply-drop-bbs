@@ -56,8 +56,11 @@ async function sendAdvert() {
 }
 
 function fmtCoord(lat: number, lon: number): string {
-  if (!lat && !lon) return ''
   return `${lat.toFixed(4)}, ${lon.toFixed(4)}`
+}
+
+function hasCoord(lat: number, lon: number): boolean {
+  return lat !== 0 || lon !== 0
 }
 
 function shortKey(k: string): string {
@@ -144,7 +147,7 @@ const columns = [
         <code :title="row.pubkey">{{ shortKey(row.pubkey) }}</code>
       </template>
       <template #[`cell:location`]="{ row }">
-        <span v-if="row.lat || row.lon">{{ fmtCoord(row.lat, row.lon) }}</span>
+        <span v-if="hasCoord(row.lat, row.lon)">{{ fmtCoord(row.lat, row.lon) }}</span>
         <span v-else class="muted">—</span>
       </template>
     </DataTable>

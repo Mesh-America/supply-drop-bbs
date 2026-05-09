@@ -113,7 +113,7 @@ onMounted(load)
         <tr v-for="r in rooms" :key="r.id">
           <td class="muted small">{{ r.id }}</td>
           <td>
-            <router-link :to="`/messages?room=${r.id}&name=${encodeURIComponent(r.name)}`">{{ r.name }}</router-link>
+            <router-link :to="{ name: 'messages', query: { room: r.id, name: r.name } }">{{ r.name }}</router-link>
           </td>
           <td class="muted small">{{ r.description ?? '—' }}</td>
           <td>{{ r.message_count }}</td>

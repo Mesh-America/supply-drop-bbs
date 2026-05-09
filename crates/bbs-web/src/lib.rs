@@ -609,7 +609,11 @@ async fn api_list_users(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ListUsersQuery>,
 ) -> Response {
-    match state.host.admin_list_users(q.status, q.limit, q.offset).await {
+    match state
+        .host
+        .admin_list_users(q.status, q.limit, q.offset)
+        .await
+    {
         Ok(u) => Json(u).into_response(),
         Err(e) => server_error(&e.to_string()),
     }
@@ -623,20 +627,36 @@ struct UpdateUserBody {
 
 async fn api_update_user(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
     Path(username): Path<String>,
     Json(body): Json<UpdateUserBody>,
 ) -> Response {
+    if body.status.is_none() && body.permission_level.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "at least one of status or permission_level is required",
+            )),
+        )
+            .into_response();
+    }
+    // Only Sysop (level 100) may change permission levels.
+    if body.permission_level.is_some() && caller.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop required to change permission level")),
+        )
+            .into_response();
+    }
     match state
         .host
         .admin_update_user(&username, body.status, body.permission_level)
         .await
     {
         Ok(()) => Json(serde_json::json!({"ok": true})).into_response(),
-        Err(HostError::NotFound(_)) => (
-            StatusCode::NOT_FOUND,
-            Json(json_error("user not found")),
-        )
-            .into_response(),
+        Err(HostError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response()
+        }
         Err(e) => server_error(&e.to_string()),
     }
 }
@@ -660,9 +680,24 @@ async fn api_create_room(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CreateRoomBody>,
 ) -> Response {
+    let name = body.name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("room name must be 1–64 characters")),
+        )
+            .into_response();
+    }
+    if body.description.as_deref().map(str::len).unwrap_or(0) > 512 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("description max 512 characters")),
+        )
+            .into_response();
+    }
     match state
         .host
-        .admin_create_room(&body.name, body.description.as_deref())
+        .admin_create_room(name, body.description.as_deref())
         .await
     {
         Ok(room) => (StatusCode::CREATED, Json(room)).into_response(),
@@ -706,17 +741,10 @@ async fn api_list_messages(
     }
 }
 
-async fn api_delete_message(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<i64>,
-) -> Response {
+async fn api_delete_message(State(state): State<Arc<AppState>>, Path(id): Path<i64>) -> Response {
     match state.host.admin_delete_message(id).await {
         Ok(true) => Json(serde_json::json!({"ok": true})).into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(json_error("message not found")),
-        )
-            .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("message not found"))).into_response(),
         Err(e) => server_error(&e.to_string()),
     }
 }
@@ -842,10 +870,11 @@ fn json_error(msg: &str) -> serde_json::Value {
     serde_json::json!({ "error": { "message": msg } })
 }
 
-fn server_error(msg: &str) -> Response {
+fn server_error(internal_msg: &str) -> Response {
+    warn!("admin API internal error: {internal_msg}");
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        Json(json_error(msg)),
+        Json(json_error("internal server error")),
     )
         .into_response()
 }

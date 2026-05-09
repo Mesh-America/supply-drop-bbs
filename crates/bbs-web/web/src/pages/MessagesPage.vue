@@ -33,8 +33,12 @@ async function loadRooms() {
   loadingRooms.value = true
   try {
     rooms.value = await api.get<Room[]>('/api/v1/rooms')
+    // If no room is pre-selected, default to the first one.
+    // If one was pre-selected from query params, just load its messages.
     if (!selectedRoomId.value && rooms.value.length > 0) {
       selectRoom(rooms.value[0])
+    } else if (selectedRoomId.value) {
+      loadMessages()
     }
   } catch (e: any) {
     error.value = e?.message ?? 'failed to load rooms'
@@ -87,7 +91,9 @@ async function deleteMessage(id: number) {
 }
 
 onMounted(async () => {
-  // Support ?room=ID&name=NAME from rooms page links
+  // Support ?room=ID&name=NAME query params from rooms page links.
+  // loadRooms() calls selectRoom() which calls loadMessages(), so we only
+  // pre-set the ID here to avoid a duplicate fetch.
   const roomParam = route.query.room
   const nameParam = route.query.name
   if (roomParam) {
@@ -95,7 +101,6 @@ onMounted(async () => {
     selectedRoomName.value = String(nameParam ?? '')
   }
   await loadRooms()
-  if (selectedRoomId.value) loadMessages()
 })
 </script>
 

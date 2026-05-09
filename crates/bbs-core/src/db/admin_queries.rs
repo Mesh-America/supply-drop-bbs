@@ -12,6 +12,9 @@ use bbs_plugin_api::{AdminBackupRecord, AdminRoomSummary, AdminStats};
 use sqlx::Row;
 use std::path::Path;
 
+// async_trait rewrites the callers in host.rs into closures that Clippy's
+// dead_code analysis does not follow, so these pub(crate) helpers appear unused.
+#[allow(dead_code)]
 impl Database {
     /// Aggregate BBS statistics.  `active_sessions` is passed in because the
     /// session count lives in `BbsHost`, not the DB.
@@ -31,10 +34,9 @@ impl Database {
         .fetch_one(&self.read_pool)
         .await?;
 
-        let banned: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE status = 1")
-                .fetch_one(&self.read_pool)
-                .await?;
+        let banned: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE status = 1")
+            .fetch_one(&self.read_pool)
+            .await?;
 
         let total_messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
             .fetch_one(&self.read_pool)
