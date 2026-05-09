@@ -1,31 +1,37 @@
 import { ref, watchEffect } from 'vue'
 
-type Theme = 'light' | 'dark' | 'system'
+export type Mode = 'light' | 'dark' | 'system'
+export type ColorTheme = 'blue' | 'green' | 'purple'
 
-const theme = ref<Theme>((localStorage.getItem('bbs-theme') as Theme) ?? 'system')
+const mode = ref<Mode>((localStorage.getItem('bbs-theme') as Mode) ?? 'system')
+const color = ref<ColorTheme>((localStorage.getItem('bbs-color') as ColorTheme) ?? 'blue')
 
 watchEffect(() => {
-  localStorage.setItem('bbs-theme', theme.value)
+  localStorage.setItem('bbs-theme', mode.value)
   const html = document.documentElement
-  if (theme.value === 'system') {
+  if (mode.value === 'system') {
     html.removeAttribute('data-theme')
   } else {
-    html.setAttribute('data-theme', theme.value)
+    html.setAttribute('data-theme', mode.value)
+  }
+})
+
+watchEffect(() => {
+  localStorage.setItem('bbs-color', color.value)
+  const html = document.documentElement
+  if (color.value === 'blue') {
+    html.removeAttribute('data-color')
+  } else {
+    html.setAttribute('data-color', color.value)
   }
 })
 
 export function useTheme() {
-  function toggle() {
-    if (theme.value === 'light') theme.value = 'dark'
-    else if (theme.value === 'dark') theme.value = 'system'
-    else theme.value = 'light'
-  }
-
-  const label = {
+  const modeLabel: Record<Mode, string> = {
     light: '☀ light',
     dark: '● dark',
     system: '◐ auto',
-  } satisfies Record<Theme, string>
+  }
 
-  return { theme, toggle, label }
+  return { mode, color, modeLabel }
 }

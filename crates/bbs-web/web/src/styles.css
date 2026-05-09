@@ -51,6 +51,50 @@
   --code-bg: #1c1c1c;
 }
 
+/* ── Green theme ─────────────────────────────────────────────────────────── */
+
+[data-color="green"] {
+  --accent: #00a550;
+  --accent-bg: #e6f5ec;
+  --accent-fg: #000;
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-color="green"]:not([data-theme="light"]) {
+    --accent: #39e96e;
+    --accent-bg: #0a2010;
+    --accent-fg: #000;
+  }
+}
+
+[data-color="green"][data-theme="dark"] {
+  --accent: #39e96e;
+  --accent-bg: #0a2010;
+  --accent-fg: #000;
+}
+
+/* ── Purple theme ────────────────────────────────────────────────────────── */
+
+[data-color="purple"] {
+  --accent: #7c3aed;
+  --accent-bg: #ede9fe;
+  --accent-fg: #fff;
+}
+
+@media (prefers-color-scheme: dark) {
+  [data-color="purple"]:not([data-theme="light"]) {
+    --accent: #a78bfa;
+    --accent-bg: #2d1b69;
+    --accent-fg: #fff;
+  }
+}
+
+[data-color="purple"][data-theme="dark"] {
+  --accent: #a78bfa;
+  --accent-bg: #2d1b69;
+  --accent-fg: #fff;
+}
+
 * { box-sizing: border-box; }
 
 html, body, #app {

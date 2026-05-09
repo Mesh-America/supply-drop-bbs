@@ -1,22 +1,45 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useRouter } from 'vue-router'
 import { useTheme } from '../composables/useTheme'
+import type { Mode, ColorTheme } from '../composables/useTheme'
 
 const open = ref(false)
+const menuOpen = ref(false)
+const menuRef = ref<HTMLElement>()
 const auth = useAuthStore()
 const router = useRouter()
-const { theme, toggle, label } = useTheme()
+const { mode, color, modeLabel } = useTheme()
 
 function close() { open.value = false }
 
 async function logout() {
+  menuOpen.value = false
   await auth.logout()
   router.replace({ name: 'login' })
 }
 
-const themeLabel = computed(() => label[theme.value])
+function handleClickOutside(e: MouseEvent) {
+  if (menuRef.value && !menuRef.value.contains(e.target as Node)) {
+    menuOpen.value = false
+  }
+}
+
+onMounted(() => document.addEventListener('click', handleClickOutside))
+onUnmounted(() => document.removeEventListener('click', handleClickOutside))
+
+const colors: { value: ColorTheme; label: string }[] = [
+  { value: 'blue',   label: 'Blue' },
+  { value: 'green',  label: 'Green' },
+  { value: 'purple', label: 'Purple' },
+]
+
+const modes: { value: Mode; label: string }[] = [
+  { value: 'light',  label: modeLabel.light },
+  { value: 'dark',   label: modeLabel.dark },
+  { value: 'system', label: modeLabel.system },
+]
 
 const groups = [
   {
@@ -60,9 +83,43 @@ const groups = [
       <span class="brand-sub muted">admin</span>
     </div>
     <div class="user-area">
-      <button class="secondary small-btn theme-btn" @click="toggle" :title="`theme: ${theme}`">{{ themeLabel }}</button>
-      <span class="muted small">{{ auth.user?.username }}</span>
-      <button class="secondary small-btn" @click="logout">logout</button>
+      <div class="user-menu" ref="menuRef">
+        <button
+          class="secondary small-btn user-btn"
+          @click.stop="menuOpen = !menuOpen"
+          :aria-expanded="menuOpen"
+        >
+          {{ auth.user?.username }} <span class="caret">▾</span>
+        </button>
+        <div v-if="menuOpen" class="dropdown" role="menu">
+          <div class="dropdown-section">
+            <div class="dropdown-label">Theme</div>
+            <button
+              v-for="c in colors"
+              :key="c.value"
+              class="dropdown-item"
+              :class="{ active: color === c.value }"
+              @click="color = c.value"
+            >
+              <span class="dot" :data-color-swatch="c.value"></span>{{ c.label }}
+            </button>
+          </div>
+          <div class="dropdown-section">
+            <div class="dropdown-label">Mode</div>
+            <button
+              v-for="m in modes"
+              :key="m.value"
+              class="dropdown-item"
+              :class="{ active: mode === m.value }"
+              @click="mode = m.value"
+            >
+              {{ m.label }}
+            </button>
+          </div>
+          <div class="dropdown-divider"></div>
+          <button class="dropdown-item logout-item" @click="logout">logout</button>
+        </div>
+      </div>
     </div>
   </header>
 
@@ -100,10 +157,80 @@ const groups = [
 }
 .brand { display: flex; align-items: baseline; gap: 0.5rem; font-weight: 700; }
 .brand-sub { font-size: 0.75em; font-weight: 400; }
-.user-area { margin-left: auto; display: flex; align-items: center; gap: 0.8rem; font-size: 0.85em; }
-.small-btn { padding: 0.25rem 0.6rem; font-size: 0.85em; }
-.theme-btn { font-size: 0.78em; min-width: 4.5rem; }
+.user-area { margin-left: auto; display: flex; align-items: center; font-size: 0.85em; }
 
+/* ── Username button ─────────────────────────────────────────────────────── */
+.user-menu { position: relative; }
+
+.user-btn {
+  padding: 0.25rem 0.6rem;
+  font-size: 0.85em;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.caret { font-size: 0.75em; opacity: 0.7; }
+
+/* ── Dropdown ────────────────────────────────────────────────────────────── */
+.dropdown {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 170px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+  padding: 0.25rem 0;
+}
+
+.dropdown-section { padding: 0.25rem 0; }
+.dropdown-section + .dropdown-section { border-top: 1px solid var(--border); }
+
+.dropdown-label {
+  font-size: 0.7em;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  padding: 0.3rem 0.9rem 0.15rem;
+}
+
+.dropdown-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  color: var(--fg);
+  padding: 0.35rem 0.9rem;
+  font-size: 0.88em;
+  cursor: pointer;
+  border-radius: 0;
+}
+.dropdown-item:hover { background: var(--row-alt); filter: none; }
+.dropdown-item.active { color: var(--accent); font-weight: 600; }
+
+.dropdown-divider { border-top: 1px solid var(--border); margin: 0.15rem 0; }
+
+.logout-item { color: var(--error); }
+.logout-item:hover { background: var(--row-alt); }
+
+/* ── Color swatches ──────────────────────────────────────────────────────── */
+.dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot[data-color-swatch="blue"]   { background: #0066cc; }
+.dot[data-color-swatch="green"]  { background: #00a550; }
+.dot[data-color-swatch="purple"] { background: #7c3aed; }
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────── */
 .menu-toggle {
   display: none;
   background: transparent;
