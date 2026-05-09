@@ -37,29 +37,16 @@ radio:
   # ── Hardware pins (BCM GPIO) ───────────────────────────────────────────────
   # Uncomment the block for your hardware.
 
-  # RAK6421 + RAK13300X — IO Slot 1 (most common)
+  # ZebraHat 1W (SX1262) — wehooper4
   bus_id: 0
-  cs_pin: -1        # hardware CS via spidev
-  reset_pin: 16
-  busy_pin: 24
+  cs_pin: 24
+  reset_pin: 17
+  busy_pin: 27
   irq_pin: 22
   txen_pin: -1
   rxen_pin: -1
   use_dio2_rf: true
   use_dio3_tcxo: true
-  dio3_tcxo_voltage: 1.8
-
-  # RAK6421 + RAK13300X — IO Slot 2
-  # bus_id: 0
-  # cs_pin: -1
-  # reset_pin: 24
-  # busy_pin: 19
-  # irq_pin: 18
-  # txen_pin: -1
-  # rxen_pin: -1
-  # use_dio2_rf: true
-  # use_dio3_tcxo: true
-  # dio3_tcxo_voltage: 1.8
 
   # Waveshare SX1262 LoRa HAT
   # bus_id: 0
