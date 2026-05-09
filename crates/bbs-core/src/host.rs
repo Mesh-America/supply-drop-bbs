@@ -2385,6 +2385,7 @@ LOGIN <user>     log in to your account\n\
 Q  quit\n\
 H  help";
 
+// 173 bytes — must stay ≤ 176 (MeshCore plain-text payload limit).
 const HELP_QUICK_LOGGED_IN: &str = "\
  K  list rooms\n\
  C  change room\n\
@@ -2394,7 +2395,7 @@ const HELP_QUICK_LOGGED_IN: &str = "\
  M  go to Mail\n\
  W  who's online\n\
  Q  log out\n\
-H <topic>: reading posting navigation account";
+H <topic>: reading posting nav acct";
 
 const HELP_READING: &str = "\
 Reading:\n\
@@ -2465,6 +2466,30 @@ mod tests {
     use super::*;
     use bbs_plugin_api::{Command, Username};
     use tempfile::NamedTempFile;
+
+    /// MeshCore silently drops plain-text payloads over 176 bytes.
+    /// Every canned help string must stay under that limit.
+    #[test]
+    fn help_strings_fit_mesh_payload() {
+        const MESH_MAX: usize = 176;
+        let cases = [
+            ("HELP_QUICK_ANON", HELP_QUICK_ANON),
+            ("HELP_QUICK_LOGGED_IN", HELP_QUICK_LOGGED_IN),
+            ("HELP_READING", HELP_READING),
+            ("HELP_POSTING", HELP_POSTING),
+            ("HELP_NAVIGATION", HELP_NAVIGATION),
+            ("HELP_ACCOUNT", HELP_ACCOUNT),
+            ("HELP_AIDE", HELP_AIDE),
+            ("HELP_SYSOP", HELP_SYSOP),
+        ];
+        for (name, s) in cases {
+            assert!(
+                s.len() <= MESH_MAX,
+                "{name} is {} bytes — exceeds {MESH_MAX}-byte MeshCore payload limit",
+                s.len()
+            );
+        }
+    }
 
     async fn make_host() -> (Arc<BbsHost>, NamedTempFile) {
         let f = NamedTempFile::new().unwrap();
