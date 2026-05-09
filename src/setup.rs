@@ -236,6 +236,172 @@ fn configure_serial(theme: &ColorfulTheme) -> (&'static str, Option<String>, Opt
     ("serial", Some(serial_port), Some(baud))
 }
 
+// ── Region presets ────────────────────────────────────────────────────────────
+
+struct RegionPreset {
+    name: &'static str,
+    frequency_hz: u64,
+    bandwidth_hz: u32,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power_dbm: i32,
+}
+
+const REGION_PRESETS: &[RegionPreset] = &[
+    RegionPreset {
+        name: "Australia",
+        frequency_hz: 915_800_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "Australia (Narrow)",
+        frequency_hz: 916_575_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "Australia SA, WA, QLD",
+        frequency_hz: 923_125_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "Czech Republic",
+        frequency_hz: 869_432_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RegionPreset {
+        name: "EU 433MHz",
+        frequency_hz: 433_650_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "EU/UK (Long Range)",
+        frequency_hz: 869_525_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RegionPreset {
+        name: "EU/UK (Medium Range)",
+        frequency_hz: 869_525_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RegionPreset {
+        name: "EU/UK (Narrow)",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RegionPreset {
+        name: "New Zealand",
+        frequency_hz: 917_375_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "New Zealand (Narrow)",
+        frequency_hz: 917_375_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "Portugal 433",
+        frequency_hz: 433_375_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 9,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "Portugal 869",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RegionPreset {
+        name: "Switzerland",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RegionPreset {
+        name: "USA Arizona",
+        frequency_hz: 908_205_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "USA/Canada",
+        frequency_hz: 910_525_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "Vietnam",
+        frequency_hz: 920_250_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "Off-Grid 433",
+        frequency_hz: 433_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 20,
+    },
+    RegionPreset {
+        name: "Off-Grid 869",
+        frequency_hz: 869_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 14,
+    },
+    RegionPreset {
+        name: "Off-Grid 918",
+        frequency_hz: 918_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 20,
+    },
+];
+
 // ── Pi HAT configuration ──────────────────────────────────────────────────────
 
 struct HatPreset {
@@ -249,7 +415,6 @@ struct HatPreset {
     rxen: i32,
     dio2: bool,
     dio3: bool,
-    power: i32,
     gpiod: bool,
     gpio_chip: i32,
     en_pin: Option<i32>,
@@ -270,7 +435,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: -1,
         dio2: true,
         dio3: true,
-        power: 18,
         gpiod: false,
         gpio_chip: 0,
         en_pin: None,
@@ -289,7 +453,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: 12,
         dio2: false,
         dio3: false,
-        power: 22,
         gpiod: false,
         gpio_chip: 0,
         en_pin: None,
@@ -308,7 +471,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: 12,
         dio2: false,
         dio3: true,
-        power: 22,
         gpiod: false,
         gpio_chip: 0,
         en_pin: None,
@@ -327,7 +489,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: -1,
         dio2: true,
         dio3: true,
-        power: 22,
         gpiod: false,
         gpio_chip: 0,
         en_pin: Some(26),
@@ -346,7 +507,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: 12,
         dio2: false,
         dio3: false,
-        power: 22,
         gpiod: false,
         gpio_chip: 0,
         en_pin: None,
@@ -365,7 +525,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: 12,
         dio2: false,
         dio3: true,
-        power: 22,
         gpiod: false,
         gpio_chip: 0,
         en_pin: None,
@@ -384,7 +543,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: 24,
         dio2: false,
         dio3: true,
-        power: 30,
         gpiod: true,
         gpio_chip: 1,
         en_pin: None,
@@ -403,7 +561,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: 24,
         dio2: true,
         dio3: true,
-        power: 8,
         gpiod: true,
         gpio_chip: 1,
         en_pin: None,
@@ -422,7 +579,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: 25,
         dio2: true,
         dio3: true,
-        power: 8,
         gpiod: false,
         gpio_chip: 0,
         en_pin: None,
@@ -441,7 +597,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: -1,
         dio2: true,
         dio3: true,
-        power: 22,
         gpiod: true,
         gpio_chip: 1,
         en_pin: Some(12),
@@ -460,7 +615,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: -1,
         dio2: true,
         dio3: true,
-        power: 22,
         gpiod: true,
         gpio_chip: 1,
         en_pin: Some(26),
@@ -479,7 +633,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: 21,
         dio2: false,
         dio3: true,
-        power: 22,
         gpiod: true,
         gpio_chip: 1,
         en_pin: None,
@@ -498,7 +651,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: -1,
         dio2: false,
         dio3: true,
-        power: 22,
         gpiod: true,
         gpio_chip: 1,
         en_pin: Some(21),
@@ -517,7 +669,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: -1,
         dio2: false,
         dio3: false,
-        power: 22,
         gpiod: false,
         gpio_chip: 0,
         en_pin: None,
@@ -536,7 +687,6 @@ const HAT_PRESETS: &[HatPreset] = &[
         rxen: -1,
         dio2: true,
         dio3: true,
-        power: 22,
         gpiod: false,
         gpio_chip: 0,
         en_pin: None,
@@ -549,40 +699,25 @@ const HAT_PRESETS: &[HatPreset] = &[
 struct HatParams {
     bbs_name: String,
     identity_path: String,
-    frequency_hz: u64,
+    region: usize,
     preset: usize,
 }
 
 fn configure_hat(theme: &ColorfulTheme, bbs_name: &str, data_dir: &Path) -> HatParams {
     section("Pi HAT — region");
 
-    let region_items = &[
-        "United States  (910.525 MHz)",
-        "Europe         (869.618 MHz)",
-        "Enter frequency manually",
-    ];
+    let region_names: Vec<String> = REGION_PRESETS
+        .iter()
+        .map(|r| {
+            format!(
+                "{:<26} ({:.3} MHz)",
+                r.name,
+                r.frequency_hz as f64 / 1_000_000.0
+            )
+        })
+        .collect();
 
-    let region_choice = prompt_select(theme, "Select your region", region_items, 0);
-
-    let frequency_hz: u64 = match region_choice {
-        1 => 869_618_000,
-        2 => {
-            let hz_str: String = Input::with_theme(theme)
-                .with_prompt("Frequency in Hz (e.g. 910525000)")
-                .default("910525000".into())
-                .validate_with(|s: &String| -> Result<(), &str> {
-                    if s.parse::<u64>().is_ok() {
-                        Ok(())
-                    } else {
-                        Err("must be a positive integer")
-                    }
-                })
-                .interact_text()
-                .unwrap_or_else(|_| cancelled());
-            hz_str.parse().expect("validated above")
-        }
-        _ => 910_525_000,
-    };
+    let region_choice = prompt_select(theme, "Select your region", &region_names, 14); // default: USA/Canada
 
     section("Pi HAT — model");
 
@@ -595,7 +730,7 @@ fn configure_hat(theme: &ColorfulTheme, bbs_name: &str, data_dir: &Path) -> HatP
             .join("companion.key")
             .to_string_lossy()
             .into_owned(),
-        frequency_hz,
+        region: region_choice,
         preset: hat_choice,
     }
 }
@@ -609,6 +744,7 @@ fn companion_yaml_path(config_out: &Path) -> PathBuf {
 
 fn build_companion_yaml(p: &HatParams) -> String {
     let h = &HAT_PRESETS[p.preset];
+    let r = &REGION_PRESETS[p.region];
     let mut s = String::new();
 
     writeln!(s, "# pymc-companion configuration").unwrap();
@@ -622,11 +758,11 @@ fn build_companion_yaml(p: &HatParams) -> String {
     writeln!(s, "  autoadd_config: 0x0F").unwrap();
     writeln!(s).unwrap();
     writeln!(s, "radio:").unwrap();
-    writeln!(s, "  frequency: {}", p.frequency_hz).unwrap();
-    writeln!(s, "  bandwidth: 62500").unwrap();
-    writeln!(s, "  spreading_factor: 7").unwrap();
-    writeln!(s, "  coding_rate: 5").unwrap();
-    writeln!(s, "  tx_power: {}", h.power).unwrap();
+    writeln!(s, "  frequency: {}", r.frequency_hz).unwrap();
+    writeln!(s, "  bandwidth: {}", r.bandwidth_hz).unwrap();
+    writeln!(s, "  spreading_factor: {}", r.spreading_factor).unwrap();
+    writeln!(s, "  coding_rate: {}", r.coding_rate).unwrap();
+    writeln!(s, "  tx_power: {}", r.tx_power_dbm).unwrap();
     writeln!(s, "  preamble_length: 17").unwrap();
     writeln!(s, "  sync_word: 0x3444").unwrap();
     writeln!(s, "  bus_id: {}", h.bus).unwrap();
