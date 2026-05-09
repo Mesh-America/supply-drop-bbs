@@ -30,11 +30,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bbs_plugin_api::{
     error::{PluginError, TransportError},
-    event::{Notification, NotifyOutcome},
+    event::{DomainEvent, Notification, NotifyOutcome},
     identity::SessionId,
     plugin::Plugin,
     transport::TransportEngine,
-    Host, Response,
+    Host, PermissionLevel, Response,
 };
 use meshcore_companion::{
     client::{ClientConfig, ClientEvent, CompanionClient, SerialConfig},
@@ -206,6 +206,37 @@ impl Plugin for MeshTransport {
             }
         });
 
+        // Subscribe to domain events and push notifications to online nodes.
+        let mut domain_rx = host.events();
+        let notif_state = Arc::clone(&self.state);
+        let notif_cmd_tx = self.cmd_tx.clone();
+        let notif_host = Arc::clone(&self.host);
+        let mut notif_shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = domain_rx.recv() => {
+                        match result {
+                            Ok(event) => {
+                                push_domain_notification(
+                                    event,
+                                    &notif_host,
+                                    &notif_cmd_tx,
+                                    &notif_state,
+                                )
+                                .await;
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("mesh: domain event stream lagged by {n}");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    _ = notif_shutdown_rx.changed() => break,
+                }
+            }
+        });
+
         tokio::spawn(event_loop(
             client,
             host,
@@ -278,6 +309,86 @@ impl TransportEngine for MeshTransport {
 }
 
 // ── Event loop ────────────────────────────────────────────────────────────────
+
+/// React to a host [`DomainEvent`] by pushing a notification to affected nodes.
+///
+/// - `UserValidated`: tells the validated user their account is active.
+/// - `UserCreated`: alerts all online aides and sysops of the new registration.
+async fn push_domain_notification(
+    event: DomainEvent,
+    host: &Arc<dyn Host>,
+    cmd_tx: &mpsc::Sender<OutboundFrame>,
+    state: &Arc<Mutex<SessionState>>,
+) {
+    let sessions: Vec<SessionId> = state
+        .lock()
+        .expect("state mutex poisoned")
+        .by_session
+        .keys()
+        .copied()
+        .collect();
+
+    match event {
+        DomainEvent::UserValidated { user } => {
+            for sid in sessions {
+                let Ok(ctx) = host.permission_ctx(sid).await else {
+                    continue;
+                };
+                if ctx.username.as_ref() != Some(&user) {
+                    continue;
+                }
+                let prefix = state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .by_session
+                    .get(&sid)
+                    .copied();
+                if let Some(prefix) = prefix {
+                    let _ = cmd_tx
+                        .send(OutboundFrame::SendTxtMsg {
+                            txt_type: TXT_TYPE_PLAIN,
+                            attempt: 0,
+                            pubkey_prefix: prefix,
+                            text: "Your account has been validated. \
+                                   You now have full access. Type 'help'."
+                                .to_owned(),
+                        })
+                        .await;
+                }
+            }
+        }
+        DomainEvent::UserCreated { user } => {
+            for sid in sessions {
+                let Ok(ctx) = host.permission_ctx(sid).await else {
+                    continue;
+                };
+                if ctx.level < PermissionLevel::Aide {
+                    continue;
+                }
+                let prefix = state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .by_session
+                    .get(&sid)
+                    .copied();
+                if let Some(prefix) = prefix {
+                    let _ = cmd_tx
+                        .send(OutboundFrame::SendTxtMsg {
+                            txt_type: TXT_TYPE_PLAIN,
+                            attempt: 0,
+                            pubkey_prefix: prefix,
+                            text: format!(
+                                "New registration: {} — type PENDING to review.",
+                                user.as_str()
+                            ),
+                        })
+                        .await;
+                }
+            }
+        }
+        _ => {}
+    }
+}
 
 /// Background task: receive [`ClientEvent`]s and dispatch them.
 ///

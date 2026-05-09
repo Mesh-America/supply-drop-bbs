@@ -64,6 +64,8 @@ enum Workflow {
         room_id: RoomId,
         stage: ComposeStage,
     },
+    /// Editing the user's own display name (PROFILE command).
+    EditProfile,
 }
 
 #[derive(Clone, Debug)]
@@ -139,8 +141,9 @@ impl Host for BbsHost {
             Command::Help { topic: None } => Ok(Response::Text(
                 "Commands: N=new msgs  F=forward  R=reverse  S=scan\n\
                  E=enter msg  D <id>=delete  K=rooms  G=next unread\n\
-                 C <room>=go to  M=mail  W=who's online\n\
+                 C <room>=go to  M=mail  W=who's online  profile\n\
                  Aide+: PENDING  V <user>=validate  B <user>=ban\n\
+                 Sysop+: UNBAN <user>  .CR <room>  .DR <room>\n\
                  whoami  logout/Q  help  cancel"
                     .into(),
             )),
@@ -182,6 +185,12 @@ impl Host for BbsHost {
                 self.handle_validate_user(session, username).await
             }
             Command::BanUser { username } => self.handle_ban_user(session, username).await,
+            Command::UnbanUser { username } => self.handle_unban_user(session, username).await,
+
+            // Profile / room management
+            Command::EditProfile => self.handle_edit_profile(session).await,
+            Command::CreateRoom { name } => self.handle_create_room(session, &name).await,
+            Command::DeleteRoom { name } => self.handle_delete_room(session, &name).await,
 
             Command::Unknown { raw } => Ok(Response::Text(format!(
                 "Unknown command: '{raw}'. Type 'help'."
@@ -487,6 +496,9 @@ impl BbsHost {
                         r.current_room = LOBBY_ROOM_ID;
                     }
                 }
+                let _ = self.events_tx.send(DomainEvent::UserCreated {
+                    user: username.clone(),
+                });
                 info!(%session, %username, "registration complete — awaiting validation");
                 Ok(Response::LoggedIn { user: username })
             }
@@ -671,6 +683,49 @@ impl BbsHost {
                     }
                 }
                 Ok(Response::Text("Message posted.".into()))
+            }
+
+            // ── Profile edit ─────────────────────────────────────────────────
+            Workflow::EditProfile => {
+                let (_, user_id, _, _) = match self.session_auth(session).await {
+                    Ok(t) => t,
+                    Err(r) => return Ok(r),
+                };
+
+                let display_name: Option<Option<&str>> = if reply.trim() == "-" {
+                    Some(None) // clear display name
+                } else if reply.trim().is_empty() {
+                    None // no change
+                } else {
+                    Some(Some(reply.trim()))
+                };
+
+                if display_name.is_none() {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                    }
+                    return Ok(Response::Text("No change made.".into()));
+                }
+
+                UserStore::update(
+                    &self.db,
+                    user_id,
+                    display_name.map(|d| d.map(|s| s as &str)),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .map_err(|e| HostError::Storage(format!("update profile: {e}")))?;
+
+                {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                    }
+                }
+                Ok(Response::Text("Display name updated.".into()))
             }
         }
     }
@@ -1255,6 +1310,9 @@ impl BbsHost {
             }
         }
 
+        let _ = self.events_tx.send(DomainEvent::UserValidated {
+            user: username.clone(),
+        });
         info!(%actor, %username, "user validated");
         Ok(Response::Text(format!(
             "'{}' validated — account is now active.",
@@ -1332,6 +1390,160 @@ impl BbsHost {
             "'{}' has been banned.",
             username.as_str()
         )))
+    }
+}
+
+// ── Additional command handlers ───────────────────────────────────────────────
+
+impl BbsHost {
+    async fn handle_unban_user(
+        &self,
+        session: SessionId,
+        username: Username,
+    ) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Sysop {
+            return Ok(Response::Error("Sysop access required.".into()));
+        }
+
+        let user = UserStore::get_by_username(&self.db, &username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let user = match user {
+            None => {
+                return Ok(Response::Error(format!(
+                    "User '{}' not found.",
+                    username.as_str()
+                )))
+            }
+            Some(u) => u,
+        };
+
+        if user.status != UserStatus::Banned {
+            return Ok(Response::Error(format!(
+                "'{}' is not currently banned.",
+                username.as_str()
+            )));
+        }
+
+        UserStore::update(
+            &self.db,
+            user.id,
+            None,
+            Some(UserStatus::Active),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        info!(%actor, %username, "user unbanned");
+        Ok(Response::Text(format!(
+            "'{}' has been unbanned.",
+            username.as_str()
+        )))
+    }
+
+    async fn handle_edit_profile(&self, session: SessionId) -> Result<Response, HostError> {
+        match self.session_auth_user(session).await {
+            Ok(_) => {}
+            Err(r) => return Ok(r),
+        }
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::EditProfile;
+            }
+        }
+        Ok(Response::Prompt {
+            text: "Enter your new display name (or '-' to clear, Enter to cancel):".into(),
+            hide_input: false,
+        })
+    }
+
+    async fn handle_create_room(
+        &self,
+        session: SessionId,
+        name: &str,
+    ) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Sysop {
+            return Ok(Response::Error("Sysop access required.".into()));
+        }
+
+        let existing = self
+            .db
+            .get_by_name(name)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        if existing.is_some() {
+            return Ok(Response::Error(format!("Room '{name}' already exists.")));
+        }
+
+        let room_id = RoomStore::create(
+            &self.db,
+            name,
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("create room: {e}")))?;
+
+        info!(%actor, %name, room = room_id.as_i64(), "room created");
+        Ok(Response::Text(format!(
+            "Room '{}' created (id={}).",
+            name,
+            room_id.as_i64()
+        )))
+    }
+
+    async fn handle_delete_room(
+        &self,
+        session: SessionId,
+        name: &str,
+    ) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Sysop {
+            return Ok(Response::Error("Sysop access required.".into()));
+        }
+
+        let room = self
+            .db
+            .get_by_name(name)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let room = match room {
+            None => return Ok(Response::Error(format!("Room '{name}' not found."))),
+            Some(r) => r,
+        };
+
+        // Protect the three built-in system rooms.
+        if room.id == LOBBY_ROOM_ID || room.id == MAIL_ROOM_ID || room.id == RoomId::new(3) {
+            return Ok(Response::Error(format!(
+                "Cannot delete system room '{}'.",
+                room.name
+            )));
+        }
+
+        RoomStore::delete(&self.db, room.id)
+            .await
+            .map_err(|e| HostError::Storage(format!("delete room: {e}")))?;
+
+        info!(%actor, %name, "room deleted");
+        Ok(Response::Text(format!("Room '{name}' deleted.")))
     }
 }
 

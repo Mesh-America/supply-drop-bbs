@@ -142,6 +142,27 @@ pub enum Command {
         /// The username of the account to ban.
         username: Username,
     },
+
+    /// Lift a ban on a previously banned user (Sysop+). (UNBAN)
+    UnbanUser {
+        /// The username of the account to unban.
+        username: Username,
+    },
+
+    /// Begin editing the caller's own display name. (PROFILE)
+    EditProfile,
+
+    /// Create a new room with the given name (Sysop+). (.CR)
+    CreateRoom {
+        /// Short room name — must pass `Room::validate_name`.
+        name: String,
+    },
+
+    /// Delete a room by name (Sysop+). (.DR)
+    DeleteRoom {
+        /// Name of the room to delete.
+        name: String,
+    },
 }
 
 /// A protocol-neutral response from the BBS to a session.

@@ -173,6 +173,33 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
+        "unban" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::UnbanUser { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
+        "profile" => Some(Command::EditProfile),
+
+        ".cr" => match rest {
+            Some(name) if !name.is_empty() => Some(Command::CreateRoom {
+                name: name.to_owned(),
+            }),
+            _ => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
+        ".dr" => match rest {
+            Some(name) if !name.is_empty() => Some(Command::DeleteRoom {
+                name: name.to_owned(),
+            }),
+            _ => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
         }),
