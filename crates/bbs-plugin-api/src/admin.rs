@@ -130,7 +130,7 @@ pub struct AdminStaleRoom {
     pub last_message_at: Option<String>,
 }
 
-/// Bundled analytics returned by [`Host::admin_reports`].
+/// Bundled analytics returned by [`crate::host::Host::admin_reports`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminReports {
     /// Top 10 users by total message count.
