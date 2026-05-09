@@ -3,7 +3,7 @@ import { ref, watchEffect } from 'vue'
 export type Mode = 'light' | 'dark' | 'system'
 export type ColorTheme = 'blue' | 'green' | 'purple'
 
-const mode = ref<Mode>((localStorage.getItem('bbs-theme') as Mode) ?? 'system')
+const mode = ref<Mode>((localStorage.getItem('bbs-theme') as Mode) ?? 'dark')
 const color = ref<ColorTheme>((localStorage.getItem('bbs-color') as ColorTheme) ?? 'blue')
 
 watchEffect(() => {

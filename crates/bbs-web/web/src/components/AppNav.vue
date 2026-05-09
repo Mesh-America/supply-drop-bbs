@@ -4,6 +4,7 @@ import { useAuthStore } from '../stores/auth'
 import { useRouter } from 'vue-router'
 import { useTheme } from '../composables/useTheme'
 import type { Mode, ColorTheme } from '../composables/useTheme'
+import logoUrl from '../assets/logo.png'
 
 const open = ref(false)
 const menuOpen = ref(false)
@@ -79,7 +80,7 @@ const groups = [
       <span></span><span></span><span></span>
     </button>
     <div class="brand">
-      <span class="brand-text">supply drop bbs</span>
+      <img :src="logoUrl" alt="Supply Drop BBS" class="brand-logo" />
       <span class="brand-sub muted">admin</span>
     </div>
     <div class="user-area">
@@ -155,7 +156,8 @@ const groups = [
   background: var(--row-alt);
   border-bottom: 1px solid var(--border);
 }
-.brand { display: flex; align-items: baseline; gap: 0.5rem; font-weight: 700; }
+.brand { display: flex; align-items: center; gap: 0.5rem; }
+.brand-logo { height: 32px; width: 32px; object-fit: contain; }
 .brand-sub { font-size: 0.75em; font-weight: 400; }
 .user-area { margin-left: auto; display: flex; align-items: center; font-size: 0.85em; }
 

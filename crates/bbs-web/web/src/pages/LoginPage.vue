@@ -3,6 +3,7 @@ import { ref } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { useAuthStore } from '../stores/auth'
 import { ApiError } from '../api/client'
+import logoUrl from '../assets/logo.png'
 
 const router = useRouter()
 const route = useRoute()
@@ -35,7 +36,9 @@ async function submit() {
 <template>
   <div class="login-wrap">
     <div class="login-box">
-      <h1 class="brand">supply drop bbs</h1>
+      <div class="logo-wrap">
+        <img :src="logoUrl" alt="Supply Drop BBS" class="logo" />
+      </div>
       <p class="muted sub">admin panel</p>
       <form @submit.prevent="submit">
         <div class="field">
@@ -70,8 +73,9 @@ async function submit() {
   flex-direction: column;
   gap: 1rem;
 }
-.brand { margin: 0; font-size: 1.4em; letter-spacing: 0.04em; }
-.sub { margin: 0; font-size: 0.85em; }
+.logo-wrap { display: flex; justify-content: center; margin-bottom: 0.25rem; }
+.logo { width: 160px; height: 160px; object-fit: contain; }
+.sub { margin: 0; font-size: 0.85em; text-align: center; }
 form { display: flex; flex-direction: column; gap: 0.75rem; }
 .field { display: flex; flex-direction: column; gap: 0.25rem; }
 label { font-size: 0.8em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; }
