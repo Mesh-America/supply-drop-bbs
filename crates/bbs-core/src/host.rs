@@ -97,12 +97,23 @@ enum RegisterStage {
     },
 }
 
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug)]
 enum ComposeStage {
     /// Mail room only: waiting for the recipient username.
     AwaitingRecipient,
     /// Waiting for the message body.
     AwaitingBody { recipient: Option<Username> },
+    /// Body is staged; waiting for a lone "." to confirm the send.
+    ///
+    /// Used by the inline `E <text>` path. The separate confirmation
+    /// step makes sends idempotent on lossy links: if "Message posted."
+    /// is not received, the user sends "." again and gets the same
+    /// confirmation without a duplicate post.
+    AwaitingConfirmation {
+        recipient: Option<Username>,
+        body: String,
+    },
 }
 
 // ── Session record ────────────────────────────────────────────────────────────
@@ -1321,6 +1332,71 @@ impl BbsHost {
                 Ok(Response::Text("Message posted.".into()))
             }
 
+            // ── Draft confirmation ────────────────────────────────────────────
+            Workflow::Compose {
+                room_id,
+                stage: ComposeStage::AwaitingConfirmation { recipient, body },
+            } => {
+                if reply.trim() != "." {
+                    // Re-show the staged draft — the confirmation prompt may have
+                    // been lost on the first send.
+                    let preview = if let Some(ref rcpt) = recipient {
+                        format!("To {}: {}\nType . to send", rcpt.as_str(), body)
+                    } else {
+                        format!("{body}\nType . to send")
+                    };
+                    // Keep workflow state unchanged.
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::Compose {
+                            room_id,
+                            stage: ComposeStage::AwaitingConfirmation { recipient, body },
+                        };
+                    }
+                    return Ok(Response::Prompt {
+                        text: preview,
+                        hide_input: false,
+                    });
+                }
+
+                // "." received — post the staged message.
+                let sender = {
+                    let sessions = self.sessions.read().await;
+                    sessions
+                        .get(&session)
+                        .and_then(|r| r.username.clone())
+                        .ok_or(HostError::NotAuthenticated)?
+                };
+                let now = Timestamp::now();
+                let (msg_id, event_recipient) = if let Some(ref rcpt) = recipient {
+                    let mid = self
+                        .db
+                        .post_direct(&sender, rcpt, &body, now)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("post_direct: {e}")))?;
+                    (mid, MessageRecipient::Direct(rcpt.clone()))
+                } else {
+                    let mid = self
+                        .db
+                        .post_to_room(room_id, &sender, &body, now)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))?;
+                    (mid, MessageRecipient::Room(room_id.as_i64().to_string()))
+                };
+                let _ = self.events_tx.send(DomainEvent::MessagePosted {
+                    sender,
+                    recipient: event_recipient,
+                    message_id: msg_id.as_i64() as u64,
+                });
+                {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                    }
+                }
+                Ok(Response::Text("Message posted.".into()))
+            }
+
             // ── Profile edit ─────────────────────────────────────────────────
             Workflow::EditProfile => {
                 let (_, user_id, _, _) = match self.session_auth(session).await {
@@ -1950,7 +2026,7 @@ impl BbsHost {
         session: SessionId,
         inline_body: Option<String>,
     ) -> Result<Response, HostError> {
-        let (sender, _, level, room_id) = match self.session_auth_user(session).await {
+        let (_sender, _, level, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1976,6 +2052,9 @@ impl BbsHost {
         }
 
         // ── Inline mode: body (and optional @recipient) supplied on the same line ──
+        // Stage as a draft (AwaitingConfirmation) rather than posting immediately.
+        // The user must send a lone "." to confirm. This makes the send idempotent
+        // on lossy links: if "Message posted." is lost, retrying "." is safe.
         if let Some(raw) = inline_body {
             let raw = raw.trim();
             if raw.is_empty() {
@@ -2009,18 +2088,21 @@ impl BbsHost {
                                 hide_input: false,
                             });
                         }
-                        let now = Timestamp::now();
-                        let msg_id = self
-                            .db
-                            .post_direct(&sender, &recipient, body, now)
-                            .await
-                            .map_err(|e| HostError::Storage(format!("post_direct: {e}")))?;
-                        let _ = self.events_tx.send(DomainEvent::MessagePosted {
-                            sender,
-                            recipient: MessageRecipient::Direct(recipient),
-                            message_id: msg_id.as_i64() as u64,
+                        let body = body.to_owned();
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::Compose {
+                                room_id,
+                                stage: ComposeStage::AwaitingConfirmation {
+                                    recipient: Some(recipient.clone()),
+                                    body: body.clone(),
+                                },
+                            };
+                        }
+                        return Ok(Response::Prompt {
+                            text: format!("To {}: {}\nType . to send", recipient.as_str(), body),
+                            hide_input: false,
                         });
-                        return Ok(Response::Text("Message posted.".into()));
                     }
                     Err(_) => {
                         return Ok(Response::Prompt {
@@ -2030,19 +2112,22 @@ impl BbsHost {
                     }
                 }
             } else {
-                // Room inline: "E message text" → post immediately.
-                let now = Timestamp::now();
-                let msg_id = self
-                    .db
-                    .post_to_room(room_id, &sender, raw, now)
-                    .await
-                    .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))?;
-                let _ = self.events_tx.send(DomainEvent::MessagePosted {
-                    sender,
-                    recipient: MessageRecipient::Room(room_id.as_i64().to_string()),
-                    message_id: msg_id.as_i64() as u64,
+                // Room inline: "E message text" → stage draft.
+                let body = raw.to_owned();
+                let mut sessions = self.sessions.write().await;
+                if let Some(r) = sessions.get_mut(&session) {
+                    r.workflow = Workflow::Compose {
+                        room_id,
+                        stage: ComposeStage::AwaitingConfirmation {
+                            recipient: None,
+                            body: body.clone(),
+                        },
+                    };
+                }
+                return Ok(Response::Prompt {
+                    text: format!("{body}\nType . to send"),
+                    hide_input: false,
                 });
-                return Ok(Response::Text("Message posted.".into()));
             }
         }
 
