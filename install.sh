@@ -24,6 +24,7 @@ fi
 # ── Config ────────────────────────────────────────────────────────────────────
 
 REPO="https://github.com/Mesh-America/supply-drop-bbs.git"
+GITHUB_API="https://api.github.com/repos/Mesh-America/supply-drop-bbs"
 SRC_DIR="/opt/supply-drop-bbs"
 BIN_PATH="/usr/local/bin/supply-drop-bbs"
 SERVICE_USER="supply-drop"
@@ -175,32 +176,21 @@ else
     warn "Cannot detect OS — proceeding anyway."
 fi
 
-# ── System packages ───────────────────────────────────────────────────────────
+# ── Minimal system packages (always needed) ───────────────────────────────────
+# curl and git are required regardless of install method.
+# figlet is optional (banner only) — failure is fine.
 
-info "Installing system dependencies..."
+info "Installing base dependencies..."
 apt-get update -qq
-apt-get install -y -qq \
-    build-essential curl git pkg-config libssl-dev \
-    nodejs npm figlet
-success "System dependencies installed"
-
-# ── Rust ─────────────────────────────────────────────────────────────────────
-
-if command -v cargo &>/dev/null; then
-    success "Rust already installed ($(cargo --version))"
-else
-    info "Installing Rust (this is quick)..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --no-modify-path
-    export PATH="$HOME/.cargo/bin:$PATH"
-    success "Rust installed"
-fi
-
-# Make sure cargo is on PATH for the rest of the script
-export PATH="${HOME}/.cargo/bin:/root/.cargo/bin:$PATH"
-command -v cargo &>/dev/null || die "cargo not found after install — open a new shell and re-run."
+apt-get install -y -qq curl git figlet 2>/dev/null || \
+    apt-get install -y -qq curl git
+success "Base dependencies installed"
 
 # ── Clone or update source ────────────────────────────────────────────────────
+# Always clone/pull — we need the source tree for:
+#   • systemd unit files
+#   • pymc-companion scripts and service file
+# Even when installing a pre-built binary we still want these up to date.
 
 if [[ -d "$SRC_DIR/.git" ]]; then
     info "Updating Supply Drop BBS source..."
@@ -212,21 +202,170 @@ else
     success "Source cloned to $SRC_DIR"
 fi
 
-# ── Build ─────────────────────────────────────────────────────────────────────
+# ── Try pre-built binary download ─────────────────────────────────────────────
+# Maps uname -m → GitHub release target triple.
+# Downloads the binary and verifies its SHA256 checksum.
+# Returns 0 on success (binary installed), 1 to fall back to source build.
+
+_installed_from_binary=false
+
+try_download_binary() {
+    local arch
+    arch=$(uname -m)
+
+    local target
+    case "$arch" in
+        aarch64)       target="aarch64-unknown-linux-gnu" ;;
+        armv7l|armv7)  target="armv7-unknown-linux-gnueabihf" ;;
+        x86_64)        target="x86_64-unknown-linux-gnu" ;;
+        *)
+            warn "No pre-built binary available for arch '$arch'."
+            return 1
+            ;;
+    esac
+
+    info "Checking GitHub releases for a pre-built binary ($arch → $target)..."
+
+    # Fetch latest release metadata from the GitHub API.
+    local release_json
+    if ! release_json=$(curl -sSf --max-time 15 "${GITHUB_API}/releases/latest" 2>/dev/null); then
+        warn "Could not reach GitHub — will build from source."
+        return 1
+    fi
+
+    # Parse the tag name using python3 (always available on Raspberry Pi OS).
+    local tag
+    tag=$(echo "$release_json" | python3 -c \
+        "import sys,json; d=json.load(sys.stdin); print(d['tag_name'])" 2>/dev/null) || true
+    if [[ -z "$tag" ]]; then
+        warn "Could not parse release tag — will build from source."
+        return 1
+    fi
+
+    local binary_name="supply-drop-bbs-${tag}-${target}"
+
+    # Find the download URL for this binary in the release assets.
+    local binary_url
+    binary_url=$(echo "$release_json" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+name = sys.argv[1]
+for a in d.get('assets', []):
+    if a['name'] == name:
+        print(a['browser_download_url'])
+        break
+" "$binary_name" 2>/dev/null) || true
+
+    if [[ -z "$binary_url" ]]; then
+        warn "No pre-built binary for $target in release $tag — will build from source."
+        return 1
+    fi
+
+    # Also find the SHA256SUMS asset URL.
+    local sums_url
+    sums_url=$(echo "$release_json" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+for a in d.get('assets', []):
+    if a['name'] == 'SHA256SUMS':
+        print(a['browser_download_url'])
+        break
+" 2>/dev/null) || true
+
+    # Download the binary to a temp file.
+    info "Downloading $binary_name ($tag)..."
+    local tmp_bin
+    tmp_bin=$(mktemp /tmp/supply-drop-bin-XXXXXX)
+    # shellcheck disable=SC2064
+    trap "rm -f '$tmp_bin'" RETURN
+
+    if ! curl -sSfL --max-time 120 --progress-bar "$binary_url" -o "$tmp_bin"; then
+        warn "Download failed — will build from source."
+        rm -f "$tmp_bin"
+        return 1
+    fi
+
+    # Verify SHA256 checksum if the sums file is available.
+    if [[ -n "$sums_url" ]]; then
+        local tmp_sums
+        tmp_sums=$(mktemp /tmp/supply-drop-sums-XXXXXX)
+        # shellcheck disable=SC2064
+        trap "rm -f '$tmp_bin' '$tmp_sums'" RETURN
+
+        if curl -sSfL --max-time 15 "$sums_url" -o "$tmp_sums" 2>/dev/null; then
+            info "Verifying checksum..."
+            local expected actual
+            expected=$(grep -F "$binary_name" "$tmp_sums" | awk '{print $1}')
+            actual=$(sha256sum "$tmp_bin" | awk '{print $1}')
+            rm -f "$tmp_sums"
+
+            if [[ -z "$expected" ]]; then
+                warn "Binary not listed in SHA256SUMS — skipping verification."
+            elif [[ "$expected" != "$actual" ]]; then
+                warn "Checksum mismatch! (expected: $expected, got: $actual)"
+                warn "Refusing to install a corrupted binary — will build from source."
+                rm -f "$tmp_bin"
+                return 1
+            else
+                success "Checksum verified"
+            fi
+        else
+            warn "Could not fetch SHA256SUMS — skipping checksum verification."
+        fi
+    fi
+
+    # Install the verified binary.
+    install -m 755 "$tmp_bin" "$BIN_PATH"
+    rm -f "$tmp_bin"
+    success "Installed pre-built binary $tag"
+    return 0
+}
 
 echo
-echo "  Building Supply Drop BBS."
-echo "  This takes 5–15 minutes on a Pi — please wait."
+echo "─── Binary acquisition ─────────────────────────────────────────────────────"
 echo
-info "Running cargo build --release..."
-cargo build --release --manifest-path "$SRC_DIR/Cargo.toml"
-success "Build complete"
 
-# ── Install binary ────────────────────────────────────────────────────────────
+if try_download_binary; then
+    _installed_from_binary=true
+else
+    # ── Fallback: build from source ───────────────────────────────────────────
 
-info "Installing binary to $BIN_PATH..."
-install -m 755 "$SRC_DIR/target/release/supply-drop-bbs" "$BIN_PATH"
-success "Binary installed"
+    echo
+    echo "  Falling back to building from source."
+    echo "  This takes 5–15 minutes on a Pi — please wait."
+    echo
+
+    # Build-only system packages.
+    info "Installing build dependencies..."
+    apt-get install -y -qq \
+        build-essential pkg-config libssl-dev \
+        nodejs npm
+    success "Build dependencies installed"
+
+    # Rust.
+    if command -v cargo &>/dev/null; then
+        success "Rust already installed ($(cargo --version))"
+    else
+        info "Installing Rust (this is quick)..."
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --no-modify-path
+        export PATH="$HOME/.cargo/bin:$PATH"
+        success "Rust installed"
+    fi
+
+    # Make sure cargo is on PATH for the rest of the script.
+    export PATH="${HOME}/.cargo/bin:/root/.cargo/bin:$PATH"
+    command -v cargo &>/dev/null || \
+        die "cargo not found after install — open a new shell and re-run."
+
+    info "Running cargo build --release..."
+    cargo build --release --manifest-path "$SRC_DIR/Cargo.toml"
+    success "Build complete"
+
+    info "Installing binary to $BIN_PATH..."
+    install -m 755 "$SRC_DIR/target/release/supply-drop-bbs" "$BIN_PATH"
+    success "Binary installed"
+fi
 
 # ── Service user ──────────────────────────────────────────────────────────────
 
@@ -238,14 +377,14 @@ else
     success "Service user created"
 fi
 
-# Add service user to dialout for serial port access
+# Add service user to dialout for serial port access.
 usermod -aG dialout "$SERVICE_USER"
 
 # ── Directories ───────────────────────────────────────────────────────────────
 
 mkdir -p "$CONFIG_DIR" "$DATA_DIR"
 chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
-# Config dir stays root-owned but readable by the service user
+# Config dir stays root-owned but readable by the service user.
 chmod 755 "$CONFIG_DIR"
 
 success "Directories created"
