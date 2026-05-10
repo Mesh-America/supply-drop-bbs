@@ -14,6 +14,7 @@ const router = createRouter({
     { path: '/backups', name: 'backups', component: () => import('./pages/BackupsPage.vue') },
     { path: '/logs', name: 'logs', component: () => import('./pages/LogsPage.vue') },
     { path: '/audit', name: 'audit', component: () => import('./pages/AuditPage.vue') },
+    { path: '/settings', name: 'settings', component: () => import('./pages/SettingsPage.vue') },
     { path: '/:pathMatch(.*)*', redirect: { name: 'dashboard' } },
   ],
 })

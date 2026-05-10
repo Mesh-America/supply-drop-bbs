@@ -27,6 +27,8 @@
 //! │  │  GET  /api/v1/audit-log            (auth)       │    │
 //! │  │  GET  /api/v1/stats                (auth)       │    │
 //! │  │  GET  /api/v1/settings             (auth)       │    │
+//! │  │  GET  /api/v1/config               (auth)       │    │
+//! │  │  PATCH /api/v1/config              (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
 //! │  │  POST /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups              (auth)       │    │
@@ -418,6 +420,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/stats", get(api_stats))
         .route("/reports", get(api_reports))
         .route("/settings", get(api_settings))
+        .route("/config", get(api_get_config).patch(api_patch_config))
         .route("/logs", get(api_logs))
         .route("/sse/logs", get(api_sse_logs))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
@@ -938,6 +941,325 @@ async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(SettingsResponse {
         backup_dir: state.config.backup_dir.clone(),
     })
+}
+
+// ── Config read / write ───────────────────────────────────────────────────────
+
+/// Editable subset of the BBS configuration, returned by GET /api/v1/config.
+///
+/// Only fields that are safe to change via the web UI are included.
+/// All fields are `Option` so the frontend can distinguish "not set in file"
+/// from "explicitly set to the default value".
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ConfigResponse {
+    config_file: Option<String>,
+    /// Whether the config file is writable by this process.
+    writable: bool,
+    bbs_name: Option<String>,
+    bbs_starting_room: Option<String>,
+    bbs_welcome_msg: Option<String>,
+    bbs_timezone: Option<String>,
+    location_latitude: Option<f64>,
+    location_longitude: Option<f64>,
+    backup_enabled: Option<bool>,
+    backup_interval_hours: Option<u32>,
+    backup_keep_daily: Option<u32>,
+    backup_keep_weekly: Option<u32>,
+    security_session_web_secs: Option<u64>,
+    security_session_mesh_secs: Option<u64>,
+    security_login_rate_per_min: Option<u32>,
+    security_command_rate_per_min: Option<u32>,
+    logging_level: Option<String>,
+}
+
+/// Fields accepted by PATCH /api/v1/config.
+/// `None` means "leave this field unchanged".
+#[derive(Debug, Deserialize)]
+struct ConfigPatch {
+    bbs_name: Option<String>,
+    bbs_starting_room: Option<String>,
+    bbs_welcome_msg: Option<String>,
+    bbs_timezone: Option<String>,
+    location_latitude: Option<serde_json::Value>, // null clears, number sets
+    location_longitude: Option<serde_json::Value>,
+    backup_enabled: Option<bool>,
+    backup_interval_hours: Option<u32>,
+    backup_keep_daily: Option<u32>,
+    backup_keep_weekly: Option<u32>,
+    security_session_web_secs: Option<u64>,
+    security_session_mesh_secs: Option<u64>,
+    security_login_rate_per_min: Option<u32>,
+    security_command_rate_per_min: Option<u32>,
+    logging_level: Option<String>,
+}
+
+fn read_config_toml(path: &str) -> Result<toml::Value, String> {
+    let raw =
+        std::fs::read_to_string(path).map_err(|e| format!("could not read config file: {e}"))?;
+    raw.parse::<toml::Value>()
+        .map_err(|e| format!("could not parse config file: {e}"))
+}
+
+fn toml_str_field(val: &toml::Value, section: &str, key: &str) -> Option<String> {
+    val.get(section)?.get(key)?.as_str().map(str::to_owned)
+}
+
+fn toml_bool_field(val: &toml::Value, section: &str, key: &str) -> Option<bool> {
+    val.get(section)?.get(key)?.as_bool()
+}
+
+fn toml_u32_field(val: &toml::Value, section: &str, key: &str) -> Option<u32> {
+    val.get(section)?.get(key)?.as_integer().map(|i| i as u32)
+}
+
+fn toml_u64_field(val: &toml::Value, section: &str, key: &str) -> Option<u64> {
+    val.get(section)?.get(key)?.as_integer().map(|i| i as u64)
+}
+
+fn toml_f64_field(val: &toml::Value, section: &str, key: &str) -> Option<f64> {
+    val.get(section)?.get(key)?.as_float()
+}
+
+/// Set a string value inside a TOML Value tree, creating sections as needed.
+fn toml_set_str(root: &mut toml::Value, section: &str, key: &str, v: String) {
+    let tbl = root
+        .as_table_mut()
+        .expect("toml root is a table")
+        .entry(section)
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    tbl.as_table_mut()
+        .expect("section is a table")
+        .insert(key.to_owned(), toml::Value::String(v));
+}
+
+fn toml_set_bool(root: &mut toml::Value, section: &str, key: &str, v: bool) {
+    let tbl = root
+        .as_table_mut()
+        .expect("toml root is a table")
+        .entry(section)
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    tbl.as_table_mut()
+        .expect("section is a table")
+        .insert(key.to_owned(), toml::Value::Boolean(v));
+}
+
+fn toml_set_u64(root: &mut toml::Value, section: &str, key: &str, v: u64) {
+    let tbl = root
+        .as_table_mut()
+        .expect("toml root is a table")
+        .entry(section)
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    tbl.as_table_mut()
+        .expect("section is a table")
+        .insert(key.to_owned(), toml::Value::Integer(v as i64));
+}
+
+fn toml_set_f64(root: &mut toml::Value, section: &str, key: &str, v: f64) {
+    let tbl = root
+        .as_table_mut()
+        .expect("toml root is a table")
+        .entry(section)
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    tbl.as_table_mut()
+        .expect("section is a table")
+        .insert(key.to_owned(), toml::Value::Float(v));
+}
+
+fn toml_remove_key(root: &mut toml::Value, section: &str, key: &str) {
+    if let Some(tbl) = root
+        .as_table_mut()
+        .and_then(|t| t.get_mut(section))
+        .and_then(|s| s.as_table_mut())
+    {
+        tbl.remove(key);
+    }
+}
+
+async fn api_get_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    let path = match &state.config.config_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error(
+                    "config_path not set in [plugins.web] — cannot read config",
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let val = match read_config_toml(&path) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
+    };
+
+    let writable = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
+
+    let resp = ConfigResponse {
+        config_file: Some(path),
+        writable,
+        bbs_name: toml_str_field(&val, "bbs", "name"),
+        bbs_starting_room: toml_str_field(&val, "bbs", "starting_room"),
+        bbs_welcome_msg: toml_str_field(&val, "bbs", "welcome_msg"),
+        bbs_timezone: toml_str_field(&val, "bbs", "timezone"),
+        location_latitude: toml_f64_field(&val, "location", "latitude"),
+        location_longitude: toml_f64_field(&val, "location", "longitude"),
+        backup_enabled: toml_bool_field(&val, "backup", "enabled"),
+        backup_interval_hours: toml_u32_field(&val, "backup", "interval_hours"),
+        backup_keep_daily: toml_u32_field(&val, "backup", "keep_daily"),
+        backup_keep_weekly: toml_u32_field(&val, "backup", "keep_weekly"),
+        security_session_web_secs: toml_u64_field(&val, "security", "session_lifetime_web_secs"),
+        security_session_mesh_secs: toml_u64_field(&val, "security", "session_lifetime_mesh_secs"),
+        security_login_rate_per_min: toml_u32_field(&val, "security", "login_rate_per_min"),
+        security_command_rate_per_min: toml_u32_field(&val, "security", "command_rate_per_min"),
+        logging_level: toml_str_field(&val, "logging", "level"),
+    };
+
+    Json(resp).into_response()
+}
+
+async fn api_patch_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(patch): Json<ConfigPatch>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    let path = match &state.config.config_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error(
+                    "config_path not set in [plugins.web] — cannot write config",
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let mut val = match read_config_toml(&path) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
+    };
+
+    // Validate logging level before mutating anything.
+    if let Some(ref level) = patch.logging_level {
+        match level.to_ascii_uppercase().as_str() {
+            "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR" => {}
+            _ => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error(
+                        "logging_level must be one of TRACE, DEBUG, INFO, WARN, ERROR",
+                    )),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Apply patches — only touch keys explicitly present in the request.
+    if let Some(v) = patch.bbs_name {
+        toml_set_str(&mut val, "bbs", "name", v);
+    }
+    if let Some(v) = patch.bbs_starting_room {
+        toml_set_str(&mut val, "bbs", "starting_room", v);
+    }
+    if let Some(v) = patch.bbs_welcome_msg {
+        toml_set_str(&mut val, "bbs", "welcome_msg", v);
+    }
+    if let Some(v) = patch.bbs_timezone {
+        toml_set_str(&mut val, "bbs", "timezone", v);
+    }
+    // Latitude/longitude: JSON null removes the key; a number sets it.
+    if let Some(v) = patch.location_latitude {
+        if v.is_null() {
+            toml_remove_key(&mut val, "location", "latitude");
+        } else if let Some(f) = v.as_f64() {
+            toml_set_f64(&mut val, "location", "latitude", f);
+        }
+    }
+    if let Some(v) = patch.location_longitude {
+        if v.is_null() {
+            toml_remove_key(&mut val, "location", "longitude");
+        } else if let Some(f) = v.as_f64() {
+            toml_set_f64(&mut val, "location", "longitude", f);
+        }
+    }
+    if let Some(v) = patch.backup_enabled {
+        toml_set_bool(&mut val, "backup", "enabled", v);
+    }
+    if let Some(v) = patch.backup_interval_hours {
+        toml_set_u64(&mut val, "backup", "interval_hours", v as u64);
+    }
+    if let Some(v) = patch.backup_keep_daily {
+        toml_set_u64(&mut val, "backup", "keep_daily", v as u64);
+    }
+    if let Some(v) = patch.backup_keep_weekly {
+        toml_set_u64(&mut val, "backup", "keep_weekly", v as u64);
+    }
+    if let Some(v) = patch.security_session_web_secs {
+        toml_set_u64(&mut val, "security", "session_lifetime_web_secs", v);
+    }
+    if let Some(v) = patch.security_session_mesh_secs {
+        toml_set_u64(&mut val, "security", "session_lifetime_mesh_secs", v);
+    }
+    if let Some(v) = patch.security_login_rate_per_min {
+        toml_set_u64(&mut val, "security", "login_rate_per_min", v as u64);
+    }
+    if let Some(v) = patch.security_command_rate_per_min {
+        toml_set_u64(&mut val, "security", "command_rate_per_min", v as u64);
+    }
+    if let Some(v) = patch.logging_level {
+        toml_set_str(&mut val, "logging", "level", v.to_ascii_uppercase());
+    }
+
+    let serialized = match toml::to_string(&val) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not serialize config: {e}"))),
+            )
+                .into_response()
+        }
+    };
+
+    if let Err(e) = std::fs::write(&path, &serialized) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("could not write config file: {e}"))),
+        )
+            .into_response();
+    }
+
+    // Audit log — best-effort.
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", user.username),
+            "config_change",
+            None,
+            None,
+        )
+        .await;
+
+    Json(serde_json::json!({
+        "ok": true,
+        "message": "Config saved. Restart the server to apply most changes."
+    }))
+    .into_response()
 }
 
 // ── HTTP log poll ─────────────────────────────────────────────────────────────
