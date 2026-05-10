@@ -26,6 +26,9 @@ features:
   - icon: 🪫
     title: Resilient & Offline
     details: Designed to run unattended for months on a Raspberry Pi. Single binary, single TOML config, single systemd unit — obvious to operate with no cloud dependency.
+  - icon: ⚡
+    title: Built in Rust
+    details: Zero garbage collector, no runtime, no interpreter. Supply Drop BBS starts in milliseconds, idles at near-zero CPU, and handles bursts without breaking a sweat — exactly what you want on a Pi running off a solar battery pack.
   - icon: 🔌
     title: Extensible Plugin API
     details: Add new transports, handlers, and behaviors via a clean Rust plugin API backed by Cargo features. No runtime loading overhead — unused transports compile out entirely.
