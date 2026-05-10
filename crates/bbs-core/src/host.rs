@@ -2410,9 +2410,6 @@ impl BbsHost {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
-        if level < PermissionLevel::Aide {
-            return Ok(Response::Error("Aide access required.".into()));
-        }
 
         let (status_filter, label) = match filter.as_deref() {
             None | Some("active") => (Some(UserStatus::Active), "active"),
@@ -2459,12 +2456,9 @@ impl BbsHost {
         session: SessionId,
         query: String,
     ) -> Result<Response, HostError> {
-        let (_, _, level, _) = match self.session_auth_user(session).await {
-            Ok(t) => t,
+        match self.session_auth_user(session).await {
+            Ok(_) => {}
             Err(r) => return Ok(r),
-        };
-        if level < PermissionLevel::Aide {
-            return Ok(Response::Error("Aide access required.".into()));
         }
         if query.is_empty() {
             return Ok(Response::Error("Usage: SEARCH <username>".into()));
@@ -2507,12 +2501,9 @@ impl BbsHost {
         session: SessionId,
         username: Username,
     ) -> Result<Response, HostError> {
-        let (_, _, level, _) = match self.session_auth_user(session).await {
-            Ok(t) => t,
+        match self.session_auth_user(session).await {
+            Ok(_) => {}
             Err(r) => return Ok(r),
-        };
-        if level < PermissionLevel::Aide {
-            return Ok(Response::Error("Aide access required.".into()));
         }
 
         let user = UserStore::get_by_username(&self.db, &username)
@@ -2854,7 +2845,7 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             "account" | "acct" if logged_in => HELP_ACCOUNT.to_owned(),
             "mail" if logged_in => HELP_MAIL.to_owned(),
             "aide" if is_aide => HELP_AIDE.to_owned(),
-            "users" if is_aide => HELP_USERS.to_owned(),
+            "users" if logged_in => HELP_USERS.to_owned(),
             "sysop" if is_sysop => HELP_SYSOP.to_owned(),
             cmd => help_for_command(cmd, level),
         },
@@ -2925,13 +2916,13 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".er" if is_aide => ".ER — edit current room\nEdit name, description, read-only flag, or min permission level.",
         ".eu" if is_aide => ".EU <user> — edit a user's profile or permissions\nAides cannot promote to Sysop.",
         "ban" if is_aide => "BAN <user> — ban a user account",
-        "users" if is_aide => {
+        "users" if logged_in => {
             "USERS — list active user accounts\n\
              USERS banned — list banned accounts\n\
              USERS all — list all accounts (sysop)"
         }
-        "search" if is_aide => "SEARCH <query> — find users by username (substring match)",
-        "whois" if is_aide => {
+        "search" if logged_in => "SEARCH <query> — find users by username (substring match)",
+        "whois" if logged_in => {
             "WHOIS <user> — show account details\n\
              Includes level, status, join date, last login, and active sessions."
         }
@@ -3006,13 +2997,11 @@ Account:\n\
  PASSWD  change your password\n\
  PROFILE edit your display name\n\
  Q      log out\n\
- W      who's online";
+ W      who's online\n\
+H: users acct";
 
 const HELP_AIDE: &str = "\
 Aide:\n\
- USERS   list user accounts\n\
- WHOIS <u>  user details\n\
- SEARCH <q>  search users\n\
  PENDING  pending users\n\
  V <u>   validate user\n\
  BAN <u>  ban a user\n\
@@ -3020,7 +3009,7 @@ Aide:\n\
 H: users aide";
 
 const HELP_USERS: &str = "\
-Users (Aide):\n\
+Users:\n\
  USERS          list active\n\
  USERS banned   list banned\n\
  SEARCH <q>     find by name\n\
