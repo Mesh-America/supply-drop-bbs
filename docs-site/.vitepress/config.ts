@@ -109,7 +109,7 @@ export default defineConfig({
 
     footer: {
       message: 'Released under the Apache 2.0 + Commons Clause License.',
-      copyright: 'Copyright © 2024-present Mesh America',
+      copyright: 'Copyright © 2026 Mesh America',
     },
 
     search: {
