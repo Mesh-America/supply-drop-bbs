@@ -436,7 +436,9 @@ if [[ "$run_setup" == true ]]; then
     echo "─── Setup ─────────────────────────────────────────────────────────────────"
     echo
     "$BIN_PATH" setup --config "$CONFIG_DIR/config.toml"
-    chown "root:$SERVICE_USER" "$CONFIG_DIR/config.toml"
+    # Service user owns the config so the web UI can write it.
+    # The directory stays root-owned so only root can add/remove files.
+    chown "$SERVICE_USER:$SERVICE_USER" "$CONFIG_DIR/config.toml"
     chmod 640 "$CONFIG_DIR/config.toml"
 fi
 
