@@ -290,6 +290,17 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_audit_log".into()))
     }
 
+    // ── Node location ────────────────────────────────────────────────────────────
+
+    /// Return the configured GPS coordinates for this BBS node, if any.
+    ///
+    /// The mesh transport calls this on `Connected` and sends `SetAdvertLatlon`
+    /// to the radio so the node's location appears in LoRa adverts.
+    /// Returns `None` when no location is configured (the radio default is used).
+    fn node_location(&self) -> Option<(f64, f64)> {
+        None
+    }
+
     // ── Mesh node credentials ────────────────────────────────────────────────────
     //
     // These methods implement the persistent node → user binding that lets mesh

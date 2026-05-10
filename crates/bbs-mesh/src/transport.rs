@@ -441,6 +441,15 @@ async fn event_loop(
                         // they don't corrupt in-progress workflows.
                         draining.store(true, Ordering::Relaxed);
                         let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
+                        // Push GPS coordinates to the radio if configured.
+                        if let Some((lat, lon)) = host.node_location() {
+                            let lat_1e6 = (lat * 1_000_000.0) as i32;
+                            let lon_1e6 = (lon * 1_000_000.0) as i32;
+                            info!(lat_1e6, lon_1e6, "mesh: setting radio location");
+                            let _ = cmd_tx
+                                .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
+                                .await;
+                        }
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
                         if will_retry {

@@ -66,6 +66,8 @@ pub struct Config {
     #[serde(default)]
     pub backup: BackupConfig,
     #[serde(default)]
+    pub location: LocationConfig,
+    #[serde(default)]
     pub plugins: PluginsConfig,
 }
 
@@ -153,6 +155,36 @@ fn default_welcome_msg() -> String {
 }
 fn default_timezone() -> String {
     "UTC".to_owned()
+}
+
+// ── [location] ───────────────────────────────────────────────────────────────
+
+/// GPS coordinates for this BBS node.
+///
+/// When set, the mesh transport sends `SetAdvertLatlon` to the radio on
+/// connect so the node's location is broadcast in LoRa adverts.
+/// Both fields must be present for the location to be applied; a partial
+/// entry (only lat or only lon) is silently ignored.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocationConfig {
+    /// Latitude in decimal degrees (e.g. `37.7749`).
+    #[serde(default)]
+    pub latitude: Option<f64>,
+
+    /// Longitude in decimal degrees (e.g. `-122.4194`).
+    #[serde(default)]
+    pub longitude: Option<f64>,
+}
+
+impl LocationConfig {
+    /// Return the coordinate pair if both fields are set, otherwise `None`.
+    pub fn as_coords(&self) -> Option<(f64, f64)> {
+        match (self.latitude, self.longitude) {
+            (Some(lat), Some(lon)) => Some((lat, lon)),
+            _ => None,
+        }
+    }
 }
 
 // ── [database] ────────────────────────────────────────────────────────────────

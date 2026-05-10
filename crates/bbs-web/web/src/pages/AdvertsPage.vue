@@ -39,10 +39,12 @@ async function sendAdvert() {
   sendStatus.value = null
   try {
     await api.post('/api/v1/adverts/send', { flood: flood.value })
+    const ts = new Date().toLocaleTimeString()
     sendStatus.value = {
       kind: 'ok',
-      message: `Advert sent (${flood.value ? 'flood' : 'direct'}).`,
+      message: `Advert sent (${flood.value ? 'flood' : 'direct'}) at ${ts}.`,
     }
+    await load()
   } catch (e: any) {
     let msg = e?.message ?? 'failed to send advert'
     if (e instanceof ApiError) {

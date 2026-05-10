@@ -282,7 +282,8 @@ async fn cmd_run(cli: &Cli) {
     };
 
     // ── 5. Host ───────────────────────────────────────────────────────────────
-    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
+    let host: Arc<dyn bbs_plugin_api::Host> =
+        Arc::new(BbsHost::with_location(db, cfg.location.as_coords()));
     info!("host initialised");
 
     // ── 6. Plugins ────────────────────────────────────────────────────────────

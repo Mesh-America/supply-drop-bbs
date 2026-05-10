@@ -35,6 +35,8 @@ struct Existing {
     web_backup_dir: Option<String>,
     region_idx: usize,
     hat_idx: usize,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
 }
 
 /// Load defaults from existing `config.toml` and `pymc-companion.yaml`.
@@ -108,6 +110,14 @@ fn load_existing(out_path: &Path) -> Existing {
     let yaml_path = companion_yaml_path(out_path);
     let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
 
+    let location = toml_val.get("location");
+    let latitude = location
+        .and_then(|l| l.get("latitude"))
+        .and_then(|v| v.as_float());
+    let longitude = location
+        .and_then(|l| l.get("longitude"))
+        .and_then(|v| v.as_float());
+
     Existing {
         bbs_name,
         data_dir,
@@ -119,6 +129,8 @@ fn load_existing(out_path: &Path) -> Existing {
         web_backup_dir,
         region_idx: match_region_preset(&yaml),
         hat_idx: match_hat_preset(&yaml),
+        latitude,
+        longitude,
     }
 }
 
@@ -287,6 +299,54 @@ pub fn run_wizard(config_out: Option<&Path>) {
         None
     };
 
+    // ── GPS location ──────────────────────────────────────────────────────────
+    section("GPS location (optional)");
+
+    println!("If set, the mesh transport sends your coordinates to the radio on");
+    println!("connect so your node appears on the map in adverts. Leave blank to skip.");
+    println!();
+
+    let set_gps = Confirm::with_theme(&theme)
+        .with_prompt("Set GPS coordinates?")
+        .default(ex.latitude.is_some())
+        .interact()
+        .unwrap_or_else(|_| cancelled());
+
+    let (gps_lat, gps_lon) = if set_gps {
+        let lat_default = ex.latitude.map(|v| format!("{v}")).unwrap_or_default();
+        let lat_str: String = Input::with_theme(&theme)
+            .with_prompt("Latitude  (decimal degrees, e.g. 37.7749)")
+            .default(lat_default)
+            .validate_with(|s: &String| -> Result<(), &str> {
+                match s.parse::<f64>() {
+                    Ok(v) if (-90.0..=90.0).contains(&v) => Ok(()),
+                    _ => Err("must be a number between -90 and 90"),
+                }
+            })
+            .interact_text()
+            .unwrap_or_else(|_| cancelled());
+
+        let lon_default = ex.longitude.map(|v| format!("{v}")).unwrap_or_default();
+        let lon_str: String = Input::with_theme(&theme)
+            .with_prompt("Longitude (decimal degrees, e.g. -122.4194)")
+            .default(lon_default)
+            .validate_with(|s: &String| -> Result<(), &str> {
+                match s.parse::<f64>() {
+                    Ok(v) if (-180.0..=180.0).contains(&v) => Ok(()),
+                    _ => Err("must be a number between -180 and 180"),
+                }
+            })
+            .interact_text()
+            .unwrap_or_else(|_| cancelled());
+
+        (
+            Some(lat_str.parse::<f64>().expect("validated")),
+            Some(lon_str.parse::<f64>().expect("validated")),
+        )
+    } else {
+        (None, None)
+    };
+
     // ── Pi HAT: region + model ────────────────────────────────────────────────
     let hat_params = if connection_type == "hat" {
         Some(configure_hat(
@@ -330,6 +390,8 @@ pub fn run_wizard(config_out: Option<&Path>) {
         web_enabled,
         web_bind: web_bind.as_deref(),
         web_backup_dir: web_backup_dir.as_deref(),
+        latitude: gps_lat,
+        longitude: gps_lon,
     });
 
     if let Some(parent) = out_path.parent() {
@@ -1042,6 +1104,8 @@ struct TomlParams<'a> {
     web_enabled: bool,
     web_bind: Option<&'a str>,
     web_backup_dir: Option<&'a str>,
+    latitude: Option<f64>,
+    longitude: Option<f64>,
 }
 
 fn build_toml(p: &TomlParams<'_>) -> String {
@@ -1065,6 +1129,13 @@ fn build_toml(p: &TomlParams<'_>) -> String {
     writeln!(s, "\n[bbs]").unwrap();
     writeln!(s, "name = {}", toml_str(p.bbs_name)).unwrap();
     writeln!(s, "data_dir = {}", toml_str(&p.data_dir.to_string_lossy())).unwrap();
+
+    // [location]
+    if let (Some(lat), Some(lon)) = (p.latitude, p.longitude) {
+        writeln!(s, "\n[location]").unwrap();
+        writeln!(s, "latitude  = {lat}").unwrap();
+        writeln!(s, "longitude = {lon}").unwrap();
+    }
 
     // [plugins.mesh]
     writeln!(s, "\n[plugins.mesh]").unwrap();

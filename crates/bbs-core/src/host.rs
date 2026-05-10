@@ -130,11 +130,18 @@ pub struct BbsHost {
     /// Per-username login failure counts (failures, last_attempt).
     /// Shared across all sessions so parallel sessions can't bypass rate limiting.
     login_failures: tokio::sync::Mutex<HashMap<String, (u32, Instant)>>,
+    /// Optional GPS coordinates from `[location]` config section.
+    location: Option<(f64, f64)>,
 }
 
 impl BbsHost {
     /// Create a new [`BbsHost`] backed by the given database.
     pub fn new(db: Database) -> Self {
+        Self::with_location(db, None)
+    }
+
+    /// Create a [`BbsHost`] with an optional GPS location.
+    pub fn with_location(db: Database, location: Option<(f64, f64)>) -> Self {
         let (events_tx, _) = broadcast::channel(256);
         Self {
             db,
@@ -143,6 +150,7 @@ impl BbsHost {
             next_id: AtomicU64::new(1),
             advert_bus: Arc::new(AdvertBus::new()),
             login_failures: tokio::sync::Mutex::new(HashMap::new()),
+            location,
         }
     }
 }
@@ -310,6 +318,10 @@ impl Host for BbsHost {
 
     fn advert_bus(&self) -> Arc<AdvertBus> {
         Arc::clone(&self.advert_bus)
+    }
+
+    fn node_location(&self) -> Option<(f64, f64)> {
+        self.location
     }
 
     // ── Admin / web-UI operations ─────────────────────────────────────────────
