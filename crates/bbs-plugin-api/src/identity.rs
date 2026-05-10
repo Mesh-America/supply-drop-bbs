@@ -88,7 +88,7 @@ impl Username {
     /// the original input as the error so the caller can render
     /// it in the user-facing error message.
     pub fn new(raw: impl Into<String>) -> Result<Self, InvalidUsername> {
-        let raw = raw.into();
+        let raw = raw.into().to_ascii_lowercase();
         Self::validate(&raw)?;
         Ok(Self(raw))
     }

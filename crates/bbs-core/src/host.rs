@@ -2977,7 +2977,7 @@ const HELP_QUICK_LOGGED_IN: &str = "\
  M  go to Mail\n\
  W  who's online\n\
  Q  log out\n\
-H show all";
+H all - show all";
 
 const HELP_OVERVIEW: &str = "\
 H M — Mail\n\
