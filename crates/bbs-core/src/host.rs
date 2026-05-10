@@ -2424,7 +2424,8 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             "reading" if logged_in => HELP_READING.to_owned(),
             "posting" if logged_in => HELP_POSTING.to_owned(),
             "navigation" | "nav" if logged_in => HELP_NAVIGATION.to_owned(),
-            "account" if logged_in => HELP_ACCOUNT.to_owned(),
+            "account" | "acct" if logged_in => HELP_ACCOUNT.to_owned(),
+            "mail" if logged_in => HELP_MAIL.to_owned(),
             "aide" if is_aide => HELP_AIDE.to_owned(),
             "sysop" if is_sysop => HELP_SYSOP.to_owned(),
             cmd => help_for_command(cmd, level),
@@ -2471,7 +2472,12 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "c" if logged_in => "C <name> — change room by name or number",
         "k" if logged_in => "K — list known rooms",
         "i" if logged_in => "I — ignore this room (toggle)\nIgnored rooms are skipped during navigation.",
-        "m" if logged_in => "M — go to Mail (private messages)",
+        "m" if logged_in => {
+            "M — go to Mail (private messages)\n\
+             In Mail: E to write, N to read new,\n\
+             F/R older/newer, S scan, D <#> delete.\n\
+             H mail for full mail help."
+        }
         "w" if logged_in => "W — who's online",
         "b" if logged_in => {
             "B <user> — block / unblock user\n\
@@ -2519,7 +2525,7 @@ const HELP_QUICK_LOGGED_IN: &str = "\
  M  go to Mail\n\
  W  who's online\n\
  Q  log out\n\
-H <topic>: read post nav acct";
+H: mail read post nav acct";
 
 const HELP_READING: &str = "\
 Reading:\n\
@@ -2541,6 +2547,15 @@ Navigation:\n\
  I    ignore this room\n\
  K    list known rooms\n\
  M    go to Mail";
+
+const HELP_MAIL: &str = "\
+Mail (private messages):\n\
+ M    go to Mail\n\
+ E    write (asks recipient)\n\
+ N    read new mail\n\
+ F/R  older / newer\n\
+ S    scan headers\n\
+ D <#> delete";
 
 const HELP_ACCOUNT: &str = "\
 Account:\n\
@@ -2602,6 +2617,7 @@ mod tests {
         let cases = [
             ("HELP_QUICK_ANON", HELP_QUICK_ANON),
             ("HELP_QUICK_LOGGED_IN", HELP_QUICK_LOGGED_IN),
+            ("HELP_MAIL", HELP_MAIL),
             ("HELP_READING", HELP_READING),
             ("HELP_POSTING", HELP_POSTING),
             ("HELP_NAVIGATION", HELP_NAVIGATION),
