@@ -139,7 +139,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         ".ff" => Some(Command::FastForward),
 
         // ── Message posting / deletion ───────────────────────────────────────
-        "e" => Some(Command::EnterMessage),
+        "e" => Some(Command::EnterMessage {
+            body: rest.filter(|s| !s.is_empty()).map(str::to_owned),
+        }),
 
         "d" => match rest.and_then(|s| s.parse::<i64>().ok()) {
             Some(id) => Some(Command::DeleteMessage { id }),

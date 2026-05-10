@@ -114,8 +114,19 @@ pub enum Command {
     FastForward,
 
     // ── Message posting / deletion ────────────────────────────────────
-    /// Begin composing a message for the current room (or Mail). (E)
-    EnterMessage,
+    /// Compose a message. (E)
+    ///
+    /// `body`: when `Some`, the message is posted immediately without a
+    /// prompt/reply round-trip — useful on low-reliability links like LoRa
+    /// where the prompt frame may be lost. `None` starts the two-step
+    /// workflow (prompt → body → post).
+    ///
+    /// For Mail DMs the format is `E @recipient message text`; for the
+    /// current room it is `E message text`.
+    EnterMessage {
+        /// Optional inline body (and, for Mail, optional `@recipient`).
+        body: Option<String>,
+    },
 
     /// Delete a message by its numeric ID. (D)
     DeleteMessage {

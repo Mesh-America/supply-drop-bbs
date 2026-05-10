@@ -232,7 +232,7 @@ impl Host for BbsHost {
             Command::FastForward => self.handle_fast_forward(session).await,
 
             // Message posting / deletion
-            Command::EnterMessage => self.handle_enter_message(session).await,
+            Command::EnterMessage { body } => self.handle_enter_message(session, body).await,
             Command::DeleteMessage { id } => self.handle_delete(session, id).await,
 
             // Moderation / account
@@ -1945,8 +1945,12 @@ impl BbsHost {
         Ok(Response::Text(lines.join("\n")))
     }
 
-    async fn handle_enter_message(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, _, level, room_id) = match self.session_auth_user(session).await {
+    async fn handle_enter_message(
+        &self,
+        session: SessionId,
+        inline_body: Option<String>,
+    ) -> Result<Response, HostError> {
+        let (sender, _, level, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1971,6 +1975,78 @@ impl BbsHost {
             return Ok(Response::Error(format!("'{}' is read-only.", room.name)));
         }
 
+        // ── Inline mode: body (and optional @recipient) supplied on the same line ──
+        if let Some(raw) = inline_body {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                // Treat bare "E " (with trailing space) same as bare "E".
+                // Fall through to the prompt flow below.
+            } else if room_id == MAIL_ROOM_ID {
+                // Mail inline: "E @recipient message" or "E recipient message"
+                let (first, rest) = raw
+                    .split_once(|c: char| c.is_whitespace())
+                    .map(|(a, b)| (a, Some(b)))
+                    .unwrap_or((raw, None));
+                let recipient_str = first.trim_start_matches('@');
+                match Username::new(recipient_str) {
+                    Ok(recipient) => {
+                        let exists = self
+                            .db
+                            .get_by_username(&recipient)
+                            .await
+                            .map_err(|e| HostError::Storage(format!("{e}")))?
+                            .is_some();
+                        if !exists {
+                            return Ok(Response::Error(format!(
+                                "User '{}' not found.",
+                                recipient.as_str()
+                            )));
+                        }
+                        let body = rest.unwrap_or("").trim();
+                        if body.is_empty() {
+                            return Ok(Response::Prompt {
+                                text: format!("Enter message for {}:", recipient.as_str()),
+                                hide_input: false,
+                            });
+                        }
+                        let now = Timestamp::now();
+                        let msg_id = self
+                            .db
+                            .post_direct(&sender, &recipient, body, now)
+                            .await
+                            .map_err(|e| HostError::Storage(format!("post_direct: {e}")))?;
+                        let _ = self.events_tx.send(DomainEvent::MessagePosted {
+                            sender,
+                            recipient: MessageRecipient::Direct(recipient),
+                            message_id: msg_id.as_i64() as u64,
+                        });
+                        return Ok(Response::Text("Message posted.".into()));
+                    }
+                    Err(_) => {
+                        return Ok(Response::Prompt {
+                            text: "Enter recipient username:".into(),
+                            hide_input: false,
+                        });
+                    }
+                }
+            } else {
+                // Room inline: "E message text" → post immediately.
+                let now = Timestamp::now();
+                let msg_id = self
+                    .db
+                    .post_to_room(room_id, &sender, raw, now)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))?;
+                let _ = self.events_tx.send(DomainEvent::MessagePosted {
+                    sender,
+                    recipient: MessageRecipient::Room(room_id.as_i64().to_string()),
+                    message_id: msg_id.as_i64() as u64,
+                });
+                return Ok(Response::Text("Message posted.".into()));
+            }
+        }
+
+        // ── Prompt flow: no inline body ──────────────────────────────────────
         if room_id == MAIL_ROOM_ID {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
@@ -2833,7 +2909,7 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::ReadReverse => "ReadReverse",
         Command::ScanMessages => "ScanMessages",
         Command::FastForward => "FastForward",
-        Command::EnterMessage => "EnterMessage",
+        Command::EnterMessage { .. } => "EnterMessage",
         Command::DeleteMessage { .. } => "DeleteMessage",
         Command::WhoIsOnline => "WhoIsOnline",
         Command::ListPending => "ListPending",
@@ -2915,7 +2991,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "r" if logged_in => "R — reverse-read (newest first)",
         "s" if logged_in => "S — scan message headers in this room",
         ".ff" if logged_in => ".FF — fast-forward past unread\nResets your last-read pointer to the latest message.",
-        "e" if logged_in => "E — enter a message in this room",
+        "e" if logged_in => "E — enter a message\nE <text> to post without a prompt\nIn Mail: E @user message",
         "d" if logged_in => "D <id> — delete a message\nAides and sysops can delete any message.",
         "g" if logged_in => "G — go to next room with unread messages",
         "c" if logged_in => "C <name> — change room by name or number",
@@ -3009,8 +3085,10 @@ Reading:\n\
 
 const HELP_POSTING: &str = "\
 Posting:\n\
- D    delete a message\n\
- E    enter a message";
+ D <#>  delete\n\
+ E      enter message (prompts)\n\
+ E msg  post now, no prompt\n\
+ E @user msg  send DM inline";
 
 const HELP_NAVIGATION: &str = "\
 Navigation:\n\
@@ -3023,10 +3101,11 @@ Navigation:\n\
 const HELP_MAIL: &str = "\
 Mail (private messages):\n\
  M    go to Mail\n\
- E    write (asks recipient)\n\
- N    read new mail\n\
- F/R  older / newer\n\
- S    scan headers\n\
+ E    write (prompts)\n\
+ E @user msg  send inline\n\
+ N    read new\n\
+ F/R  older/newer\n\
+ S    scan\n\
  D <#> delete";
 
 const HELP_ACCOUNT: &str = "\
@@ -3387,7 +3466,7 @@ mod tests {
 
         // Enter a message.
         let r = host
-            .process_command(sid, Command::EnterMessage)
+            .process_command(sid, Command::EnterMessage { body: None })
             .await
             .unwrap();
         assert!(matches!(r, Response::Prompt { .. }));
