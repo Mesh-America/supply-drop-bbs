@@ -437,11 +437,21 @@ async fn event_loop(
                             freq_khz = self_info.frequency_khz,
                             "mesh: radio bridge connected — draining stale queue"
                         );
+                        // Register the BBS node in the advert bus so it appears in
+                        // the web UI immediately (using whatever GPS the radio reports).
+                        host.advert_bus().upsert(
+                            self_info.pubkey,
+                            self_info.node_name.clone(),
+                            self_info.adv_type,
+                            self_info.latitude,
+                            self_info.longitude,
+                        );
                         // Drain any messages that queued while we were offline so
                         // they don't corrupt in-progress workflows.
                         draining.store(true, Ordering::Relaxed);
                         let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
-                        // Push GPS coordinates to the radio if configured.
+                        // Push GPS coordinates to the radio if configured, and refresh
+                        // the advert bus entry so the web UI shows the config GPS.
                         if let Some((lat, lon)) = host.node_location() {
                             let lat_1e6 = (lat * 1_000_000.0) as i32;
                             let lon_1e6 = (lon * 1_000_000.0) as i32;
@@ -449,6 +459,13 @@ async fn event_loop(
                             let _ = cmd_tx
                                 .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
                                 .await;
+                            host.advert_bus().upsert(
+                                self_info.pubkey,
+                                self_info.node_name.clone(),
+                                self_info.adv_type,
+                                lat_1e6,
+                                lon_1e6,
+                            );
                         }
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
