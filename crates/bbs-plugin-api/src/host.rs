@@ -149,6 +149,27 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_list_users".into()))
     }
 
+    /// Create a new user account directly, without going through the
+    /// interactive registration workflow.
+    ///
+    /// Intended for CLI bootstrap (e.g. creating the first sysop when there is
+    /// no existing account to log in with).
+    ///
+    /// `permission_level`: 0 = Unvalidated, 10 = User, 50 = Aide, 100 = Sysop.
+    /// The account is created with `status = Active`.
+    ///
+    /// Returns `HostError::PreconditionFailed` if the username is already taken
+    /// or is syntactically invalid.
+    async fn admin_create_user(
+        &self,
+        username: &str,
+        password: &str,
+        permission_level: u8,
+    ) -> Result<(), HostError> {
+        let _ = (username, password, permission_level);
+        Err(HostError::NotSupported("admin_create_user".into()))
+    }
+
     /// Update a user's status and/or permission level.
     ///
     /// Pass `None` for either field to leave it unchanged.

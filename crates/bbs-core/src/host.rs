@@ -451,6 +451,48 @@ impl Host for BbsHost {
         Ok(())
     }
 
+    async fn admin_create_user(
+        &self,
+        username: &str,
+        password: &str,
+        permission_level: u8,
+    ) -> Result<(), HostError> {
+        let uname = Username::new(username).map_err(|_| {
+            HostError::PreconditionFailed(format!("invalid username: {username:?}"))
+        })?;
+
+        let level = match permission_level {
+            0 => PermissionLevel::Unvalidated,
+            10 => PermissionLevel::User,
+            50 => PermissionLevel::Aide,
+            100 => PermissionLevel::Sysop,
+            other => {
+                return Err(HostError::PreconditionFailed(format!(
+                    "unknown permission_level {other}"
+                )))
+            }
+        };
+
+        let now = Timestamp::now();
+        let user_id = match UserStore::create(&self.db, &uname, None, level, now).await {
+            Ok(id) => id,
+            Err(crate::db::StoreError::Conflict(_)) => {
+                return Err(HostError::PreconditionFailed(format!(
+                    "username {username:?} is already taken"
+                )));
+            }
+            Err(e) => return Err(HostError::Storage(format!("create user: {e}"))),
+        };
+
+        self.db
+            .credentials()
+            .set_password(user_id, password, now)
+            .await
+            .map_err(|e| HostError::Storage(format!("set password: {e}")))?;
+
+        Ok(())
+    }
+
     async fn admin_list_rooms(&self) -> Result<Vec<AdminRoomSummary>, HostError> {
         self.db
             .admin_list_rooms()

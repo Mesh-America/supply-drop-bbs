@@ -95,6 +95,19 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum UserAction {
+    /// Create a new user account without going through the mesh registration workflow.
+    ///
+    /// Useful for bootstrapping the first sysop account when no BBS session is available.
+    /// Prompts for a password interactively (input is hidden).
+    Create {
+        /// BBS username to create.
+        username: String,
+        /// Grant Sysop permission (level 100) immediately.
+        ///
+        /// Without this flag the account is created as a regular User (level 10).
+        #[arg(long)]
+        sysop: bool,
+    },
     /// Promote a user to Sysop (permission level 100).
     Promote {
         /// BBS username to promote.
@@ -484,23 +497,54 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
 
     let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
 
-    let (username, new_level, label) = match action {
-        UserAction::Promote { username } => (username, 100u8, "sysop"),
-        UserAction::Demote { username } => (username, 10u8, "user"),
-    };
+    match action {
+        UserAction::Create { username, sysop } => {
+            let password = dialoguer::Password::new()
+                .with_prompt("Password")
+                .with_confirmation("Confirm password", "passwords do not match")
+                .interact()
+                .unwrap_or_else(|e| {
+                    eprintln!("error reading password: {e}");
+                    std::process::exit(1);
+                });
 
-    match host
-        .admin_update_user(&username, None, Some(new_level))
-        .await
-    {
-        Ok(()) => println!("{username} promoted to {label} (level {new_level})"),
-        Err(bbs_plugin_api::HostError::NotFound(_)) => {
-            eprintln!("error: user '{username}' not found");
-            std::process::exit(1);
+            let level = if sysop { 100u8 } else { 10u8 };
+            let label = if sysop { "sysop" } else { "user" };
+
+            match host.admin_create_user(&username, &password, level).await {
+                Ok(()) => println!("created {label} account: {username}"),
+                Err(bbs_plugin_api::HostError::PreconditionFailed(msg)) => {
+                    eprintln!("error: {msg}");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
+
+        action => {
+            let (username, new_level, label) = match action {
+                UserAction::Promote { username } => (username, 100u8, "sysop"),
+                UserAction::Demote { username } => (username, 10u8, "user"),
+                UserAction::Create { .. } => unreachable!(),
+            };
+
+            match host
+                .admin_update_user(&username, None, Some(new_level))
+                .await
+            {
+                Ok(()) => println!("{username} promoted to {label} (level {new_level})"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
