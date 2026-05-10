@@ -2851,13 +2851,14 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             }
         }
         Some(t) => match t.to_ascii_lowercase().as_str() {
-            "reading" if logged_in => HELP_READING.to_owned(),
-            "posting" if logged_in => HELP_POSTING.to_owned(),
-            "navigation" | "nav" if logged_in => HELP_NAVIGATION.to_owned(),
-            "account" | "acct" if logged_in => HELP_ACCOUNT.to_owned(),
-            "mail" if logged_in => HELP_MAIL.to_owned(),
-            "aide" if is_aide => HELP_AIDE.to_owned(),
+            "all" if logged_in => HELP_OVERVIEW.to_owned(),
+            "m" | "mail" if logged_in => HELP_MAIL.to_owned(),
+            "r" | "read" | "reading" if logged_in => HELP_READING.to_owned(),
+            "p" | "post" | "posting" if logged_in => HELP_POSTING.to_owned(),
             "u" | "users" if logged_in => HELP_USERS.to_owned(),
+            "n" | "nav" | "navigation" if logged_in => HELP_NAVIGATION.to_owned(),
+            "a" | "acct" | "account" if logged_in => HELP_ACCOUNT.to_owned(),
+            "aide" if is_aide => HELP_AIDE.to_owned(),
             "sysop" if is_sysop => HELP_SYSOP.to_owned(),
             cmd => help_for_command(cmd, level),
         },
@@ -2971,7 +2972,15 @@ const HELP_QUICK_LOGGED_IN: &str = "\
  M  go to Mail\n\
  W  who's online\n\
  Q  log out\n\
-H: mail read post nav acct";
+H show all";
+
+const HELP_OVERVIEW: &str = "\
+H M — Mail\n\
+H R — Reading\n\
+H P — Posting\n\
+H U — Users\n\
+H N — Navigation\n\
+H A — Account";
 
 const HELP_READING: &str = "\
 Reading:\n\
@@ -3010,7 +3019,7 @@ Account:\n\
  PROFILE edit your display name\n\
  Q      log out\n\
  W      who's online\n\
-H: u acct";
+H U — Users";
 
 const HELP_AIDE: &str = "\
 Aide:\n\
@@ -3018,17 +3027,17 @@ Aide:\n\
  V <u>   validate user\n\
  BAN <u>  ban a user\n\
  .ER     edit current room\n\
-H: u aide";
+H U — Users";
 
 const HELP_USERS: &str = "\
 Users:\n\
- U              list active\n\
- U banned       list banned\n\
- S <q>          find by name\n\
- WHOIS <user>   user details\n\
-Sysop only:\n\
- U all          list all\n\
- .DU <user>     delete user";
+ U         list active\n\
+ U banned  list banned\n\
+ U all     list all\n\
+ S <q>     search\n\
+ WHOIS <u> details\n\
+Sysop:\n\
+ .DU <u>   delete user";
 
 const HELP_SYSOP: &str = "\
 Sysop:\n\
@@ -3074,12 +3083,14 @@ mod tests {
         let cases = [
             ("HELP_QUICK_ANON", HELP_QUICK_ANON),
             ("HELP_QUICK_LOGGED_IN", HELP_QUICK_LOGGED_IN),
+            ("HELP_OVERVIEW", HELP_OVERVIEW),
             ("HELP_MAIL", HELP_MAIL),
             ("HELP_READING", HELP_READING),
             ("HELP_POSTING", HELP_POSTING),
             ("HELP_NAVIGATION", HELP_NAVIGATION),
             ("HELP_ACCOUNT", HELP_ACCOUNT),
             ("HELP_AIDE", HELP_AIDE),
+            ("HELP_USERS", HELP_USERS),
             ("HELP_SYSOP", HELP_SYSOP),
         ];
         for (name, s) in cases {
