@@ -91,6 +91,12 @@ enum Commands {
         #[command(subcommand)]
         action: UserAction,
     },
+
+    /// Manage rooms.
+    Room {
+        #[command(subcommand)]
+        action: RoomAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -121,6 +127,18 @@ enum UserAction {
 }
 
 #[derive(Subcommand)]
+enum RoomAction {
+    /// Create a new room and append it to the end of the room list.
+    Create {
+        /// Room name (must be unique; spaces are allowed).
+        name: String,
+        /// Optional one-line description shown in room listings.
+        #[arg(long)]
+        description: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     /// Validate the config file and exit (exit code 0 = valid).
     Check,
@@ -145,6 +163,7 @@ async fn main() {
         Some(Commands::Migrate) => cmd_migrate(&cli),
         Some(Commands::Backup) => cmd_backup(&cli),
         Some(Commands::User { action }) => cmd_user(config_path.as_deref(), action).await,
+        Some(Commands::Room { action }) => cmd_room(config_path.as_deref(), action).await,
     }
 }
 
@@ -538,6 +557,48 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
                 Ok(()) => println!("{username} promoted to {label} (level {new_level})"),
                 Err(bbs_plugin_api::HostError::NotFound(_)) => {
                     eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+async fn cmd_room(config_path: Option<&std::path::Path>, action: RoomAction) {
+    let cfg = match config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error loading config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let db_path = cfg
+        .database
+        .path
+        .as_ref()
+        .expect("database.path set by resolve()");
+
+    let db = match Database::open(&db_path.to_string_lossy()).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error opening database: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
+
+    match action {
+        RoomAction::Create { name, description } => {
+            match host.admin_create_room(&name, description.as_deref()).await {
+                Ok(room) => println!("created room '{}' (id {})", room.name, room.id),
+                Err(bbs_plugin_api::HostError::PreconditionFailed(msg)) => {
+                    eprintln!("error: {msg}");
                     std::process::exit(1);
                 }
                 Err(e) => {
