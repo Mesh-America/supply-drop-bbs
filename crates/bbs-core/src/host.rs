@@ -2845,7 +2845,7 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             "account" | "acct" if logged_in => HELP_ACCOUNT.to_owned(),
             "mail" if logged_in => HELP_MAIL.to_owned(),
             "aide" if is_aide => HELP_AIDE.to_owned(),
-            "users" if logged_in => HELP_USERS.to_owned(),
+            "u" | "users" if logged_in => HELP_USERS.to_owned(),
             "sysop" if is_sysop => HELP_SYSOP.to_owned(),
             cmd => help_for_command(cmd, level),
         },
@@ -2916,12 +2916,12 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".er" if is_aide => ".ER — edit current room\nEdit name, description, read-only flag, or min permission level.",
         ".eu" if is_aide => ".EU <user> — edit a user's profile or permissions\nAides cannot promote to Sysop.",
         "ban" if is_aide => "BAN <user> — ban a user account",
-        "users" if logged_in => {
-            "USERS — list active user accounts\n\
-             USERS banned — list banned accounts\n\
-             USERS all — list all accounts (sysop)"
+        "u" | "users" if logged_in => {
+            "U — list active user accounts\n\
+             U banned — list banned accounts\n\
+             U all — list all accounts (sysop)"
         }
-        "search" if logged_in => "SEARCH <query> — find users by username (substring match)",
+        "s" | "search" if logged_in => "S <query> — find users by username (substring match)",
         "whois" if logged_in => {
             "WHOIS <user> — show account details\n\
              Includes level, status, join date, last login, and active sessions."
@@ -2998,7 +2998,7 @@ Account:\n\
  PROFILE edit your display name\n\
  Q      log out\n\
  W      who's online\n\
-H: users acct";
+H: u acct";
 
 const HELP_AIDE: &str = "\
 Aide:\n\
@@ -3006,16 +3006,16 @@ Aide:\n\
  V <u>   validate user\n\
  BAN <u>  ban a user\n\
  .ER     edit current room\n\
-H: users aide";
+H: u aide";
 
 const HELP_USERS: &str = "\
 Users:\n\
- USERS          list active\n\
- USERS banned   list banned\n\
- SEARCH <q>     find by name\n\
+ U              list active\n\
+ U banned       list banned\n\
+ S <q>          find by name\n\
  WHOIS <user>   user details\n\
 Sysop only:\n\
- USERS all      list all\n\
+ U all          list all\n\
  .DU <user>     delete user";
 
 const HELP_SYSOP: &str = "\

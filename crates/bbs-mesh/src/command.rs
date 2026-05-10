@@ -129,7 +129,12 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "r" => Some(Command::ReadReverse),
 
-        "s" => Some(Command::ScanMessages),
+        "s" => match rest {
+            Some(q) if !q.is_empty() => Some(Command::SearchUsers {
+                query: q.to_owned(),
+            }),
+            _ => Some(Command::ScanMessages),
+        },
 
         ".ff" => Some(Command::FastForward),
 
@@ -191,18 +196,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
-        "users" => Some(Command::ListUsers {
+        "u" | "users" => Some(Command::ListUsers {
             filter: rest.map(str::to_owned),
         }),
-
-        "search" => match rest {
-            Some(q) if !q.is_empty() => Some(Command::SearchUsers {
-                query: q.to_owned(),
-            }),
-            _ => Some(Command::Help {
-                topic: Some("search".to_owned()),
-            }),
-        },
 
         "whois" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(username) => Some(Command::UserInfo { username }),
