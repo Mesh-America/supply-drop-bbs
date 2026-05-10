@@ -128,7 +128,7 @@ impl RoomStore for Database {
             r#"SELECT id AS "id!", name AS "name!", description, read_only AS "read_only!",
                       min_permission_level AS "min_permission_level!",
                       prev_neighbor, next_neighbor, created_at AS "created_at!"
-               FROM rooms WHERE name = ?"#,
+               FROM rooms WHERE name = ? COLLATE NOCASE"#,
             name
         )
         .fetch_optional(&self.read_pool)

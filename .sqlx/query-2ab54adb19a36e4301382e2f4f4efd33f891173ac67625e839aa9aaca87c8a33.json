@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id AS \"id!\", name AS \"name!\", description, read_only AS \"read_only!\",\n                      min_permission_level AS \"min_permission_level!\",\n                      prev_neighbor, next_neighbor, created_at AS \"created_at!\"\n               FROM rooms WHERE name = ?",
+  "query": "SELECT id AS \"id!\", name AS \"name!\", description, read_only AS \"read_only!\",\n                      min_permission_level AS \"min_permission_level!\",\n                      prev_neighbor, next_neighbor, created_at AS \"created_at!\"\n               FROM rooms WHERE name = ? COLLATE NOCASE",
   "describe": {
     "columns": [
       {
@@ -48,7 +48,7 @@
       "Right": 1
     },
     "nullable": [
-      true,
+      false,
       false,
       true,
       false,
@@ -58,5 +58,5 @@
       false
     ]
   },
-  "hash": "839185e73a8c3512d2adc48374229d636536311f3cdee22f4d77091ab3f6295b"
+  "hash": "2ab54adb19a36e4301382e2f4f4efd33f891173ac67625e839aa9aaca87c8a33"
 }
