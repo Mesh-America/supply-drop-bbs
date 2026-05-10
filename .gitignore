@@ -52,3 +52,8 @@ dist/
 *.profraw
 *.profdata
 /coverage/
+
+# VitePress docs site
+docs-site/node_modules/
+docs-site/.vitepress/dist/
+docs-site/.vitepress/cache/
