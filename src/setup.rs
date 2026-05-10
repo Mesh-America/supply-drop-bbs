@@ -1271,6 +1271,20 @@ fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: 
     }
     println!();
     println!("Setup complete!");
+    println!();
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("  Supply Drop BBS is an open source project by");
+    println!("  Mesh America — building resilient, community-");
+    println!("  owned mesh networks for everyone.");
+    println!();
+    println!("    https://meshamerica.com");
+    println!();
+    println!("  If this software is useful to you, please");
+    println!("  consider supporting our mission:");
+    println!();
+    println!("    https://meshamerica.com/pitch-in/");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!();
 }
 
 // ── UI helpers ────────────────────────────────────────────────────────────────
