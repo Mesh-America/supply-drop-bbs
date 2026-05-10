@@ -3059,4 +3059,104 @@ mod tests {
             .unwrap();
         assert!(matches!(r, Response::Error(_)));
     }
+
+    // ── Registration: sysop notification ─────────────────────────────────────
+
+    /// Full registration workflow for a username/password pair.
+    async fn do_register(host: &BbsHost, sid: SessionId, username: &str, password: &str) {
+        let uname = Username::new(username).unwrap();
+        host.process_command(sid, Command::Register { username: uname })
+            .await
+            .unwrap();
+        // display name (empty = skip)
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        // password
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: password.into(),
+            },
+        )
+        .await
+        .unwrap();
+        // confirm
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: password.into(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn registration_dms_sysop() {
+        let (host, _db) = make_host().await;
+
+        // First registrant — auto-promoted to sysop.
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "sysop", "s3cr3t!!").await;
+
+        let sysop_name = Username::new("sysop").unwrap();
+
+        // No DMs yet (first user, no notification sent).
+        let page = MessageStore::list_direct(&host.db, &sysop_name, None, 10)
+            .await
+            .unwrap();
+        assert!(
+            page.messages.is_empty(),
+            "first registrant should receive no notification DM"
+        );
+
+        // Second registrant — should trigger a DM to sysop.
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "newuser", "abc12345").await;
+
+        let page = MessageStore::list_direct(&host.db, &sysop_name, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.messages.len(),
+            1,
+            "sysop should receive exactly one notification DM"
+        );
+        let dm = &page.messages[0];
+        assert_eq!(dm.sender, Username::new("newuser").unwrap());
+        assert_eq!(dm.recipient.as_ref(), Some(&sysop_name));
+        assert!(
+            dm.content.contains("newuser"),
+            "DM should mention the new username"
+        );
+        assert!(
+            dm.content.to_lowercase().contains("verify")
+                || dm.content.to_lowercase().contains("v newuser"),
+            "DM should hint at the verify command"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_registrant_gets_no_sysop_dm() {
+        // Regression: the first user (who IS the sysop) must not receive a
+        // spurious notification about themselves.
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        do_register(&host, sid, "admin", "password1").await;
+
+        let admin_name = Username::new("admin").unwrap();
+        let page = MessageStore::list_direct(&host.db, &admin_name, None, 10)
+            .await
+            .unwrap();
+        assert!(
+            page.messages.is_empty(),
+            "first registrant should not get a DM about themselves"
+        );
+    }
 }
