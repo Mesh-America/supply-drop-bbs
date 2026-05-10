@@ -6,7 +6,7 @@ hero:
   text: A BBS for LoRa mesh networks, written in Rust
   tagline: Works with MeshCore and Meshtastic out of the box. Runs on a Pi. Add other transports (APRS, Telnet, IRC, whatever) by writing a plugin.
   image:
-    src: /supply-drop-icon-transparent.svg
+    src: /logo.png
     alt: Supply Drop BBS logo
   actions:
     - theme: brand

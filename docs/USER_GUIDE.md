@@ -385,11 +385,34 @@ For direct mail (when you're in the Mail room):
 
 ### Write a message to the current room
 
+**Inline (recommended on radio links):**
+
+```
+E Has anyone tried the new firmware?
+```
+
+The BBS echoes your draft and waits for confirmation:
+
+```
+Has anyone tried the new firmware?
+Type . to send
+```
+
+Send a lone `.` to post it:
+
+```
+.
+Message posted.
+```
+
+If the confirmation prompt is lost in transit, just send `.` again — the draft
+is preserved and will not be double-posted.
+
+**Prompt flow (alternative):**
+
 ```
 E
 ```
-
-You'll be prompted to type your message:
 
 ```
 Enter your message for General:
@@ -397,7 +420,9 @@ Enter your message for General:
 Message posted.
 ```
 
-Your message goes to every user who visits the room.
+The inline form is preferred on LoRa and other lossy links because the
+confirmation step makes the send idempotent: if "Message posted." never arrives,
+sending `.` safely retries without creating a duplicate.
 
 ### Delete a message
 
@@ -432,13 +457,33 @@ This switches your current room to your Mail inbox. All the reading commands
 
 ### Write a new mail
 
-Once you're in Mail, type:
+**Inline (recommended on radio links):**
+
+```
+E bob Hi Bob, did you get the antenna parts?
+```
+
+You can also prefix the username with `@`:
+
+```
+E @bob Hi Bob, did you get the antenna parts?
+```
+
+The BBS echoes the draft for confirmation:
+
+```
+To bob: Hi Bob, did you get the antenna parts?
+Type . to send
+```
+
+Send `.` to post. If the confirmation prompt is lost in transit, sending `.`
+again is safe — the draft is preserved and will not be double-posted.
+
+**Prompt flow (alternative):**
 
 ```
 E
 ```
-
-You'll be asked for the recipient:
 
 ```
 Enter recipient username:
@@ -780,7 +825,10 @@ account and you can re-register with the same username.
 
 | Command | Action |
 |---|---|
-| `E` | Write a message (or mail if in Mail room) |
+| `E` | Write a message (prompt flow) |
+| `E <text>` | Stage inline message — send `.` to confirm |
+| `E <user> <text>` | Stage inline mail — send `.` to confirm (when in Mail) |
+| `.` | Confirm and post a staged draft |
 | `D <id>` | Delete message #id |
 
 ### Logged in — account

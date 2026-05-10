@@ -432,7 +432,7 @@ pub enum Command {
     FastForward,
 
     // Message posting
-    EnterMessage,
+    EnterMessage { body: Option<String> },  // None = prompt flow; Some = inline (. to confirm)
     DeleteMessage { id: i64 },
 
     // Session control
@@ -462,7 +462,8 @@ they lack the required tier, the host returns an appropriate `Response::Error`.
 
 **Workflow replies** deserve special attention. When the host returns
 `Response::Prompt`, it is waiting for a free-form response (e.g., the user
-is mid-registration and the host just asked for a password). The transport
+is mid-registration and the host just asked for a password, or an inline
+`E <text>` draft is staged and waiting for `.` to confirm). The transport
 must track this per-session and, while a prompt is pending, treat the next
 incoming message as `Command::WorkflowReply { reply: raw_text }` rather than
 trying to parse it as a keyword command.
@@ -471,6 +472,13 @@ trying to parse it as a keyword command.
 `SessionState` struct. The mesh command parser (`parse_command`) receives this
 flag and produces `WorkflowReply` when it is set. You can copy this pattern
 or design your own.
+
+**The inline message confirmation pattern:** `EnterMessage { body: Some(text) }`
+causes the host to stage the message as a draft and return `Response::Prompt`
+echoing the draft with "Type . to send". The user's next message (`.` or
+anything else) arrives as `WorkflowReply`. Sending `.` posts the message;
+anything else re-displays the draft. This makes inline sends idempotent on
+lossy links — if "Message posted." is never received, retrying `.` is safe.
 
 ---
 
