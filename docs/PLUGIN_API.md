@@ -159,6 +159,14 @@ pub trait Host: Send + Sync {
     fn rooms(&self, perms: &PermissionCtx) -> &dyn RoomStore;
     fn messages(&self, perms: &PermissionCtx) -> &dyn MessageStore;
 
+    // ── Node identity ───────────────────────────────────────────────
+
+    /// GPS coordinates for this node, if configured. Transports use
+    /// this to broadcast position to the radio on connect. Returns
+    /// `None` when no coordinates are configured. The default
+    /// implementation returns `None`; plugins don't need to override.
+    fn node_location(&self) -> Option<(f64, f64)> { None }
+
     // ── Audit ───────────────────────────────────────────────────
 
     /// Append-only audit log. Plugins should call this for any

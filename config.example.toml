@@ -40,6 +40,19 @@
 # timezone = "UTC"
 
 
+# ─── GPS location ─────────────────────────────────────────────────
+#
+# When set, the mesh transport broadcasts your coordinates to the radio
+# immediately after each connection so the node appears on the MeshCore
+# map. Takes effect on the next mesh reconnect — no restart needed.
+# Both keys must be set together; remove (or omit the section) to stop
+# broadcasting. The setup wizard prompts for these and writes them here.
+
+# [location]
+# latitude  = 37.7749
+# longitude = -122.4194
+
+
 # ─── Database ─────────────────────────────────────────────────────
 
 [database]
@@ -222,3 +235,9 @@
 # strict policy that disallows inline scripts and external
 # resources except 'self'.
 # csp = "default-src 'self'; script-src 'self'; ..."
+
+# Path to the config file the web admin's Settings page reads and
+# writes. Set this to the same file the BBS is reading. The server
+# process must have write permission to this file; if it does not,
+# the Settings page shows instructions to fix the permission.
+# config_path = "/etc/supply-drop-bbs/config.toml"

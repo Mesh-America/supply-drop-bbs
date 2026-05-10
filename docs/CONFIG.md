@@ -89,13 +89,14 @@ The config is split into the following top-level sections:
 | Section                | Purpose                                           |
 |------------------------|---------------------------------------------------|
 | `[bbs]`                | System identity, data paths, room defaults        |
+| `[location]`           | GPS coordinates broadcast to the radio on connect |
 | `[database]`           | DB path, pool sizes, PRAGMA overrides             |
 | `[logging]`            | Level, file path, rotation, per-target overrides  |
 | `[security]`           | Argon2 parameters, session lifetimes, rate limits |
 | `[backup]`             | Schedule, retention, target directory             |
 | `[plugins.cli]`        | CLI transport: socket path, permissions           |
 | `[plugins.mesh]`       | Mesh transport: bridge address, retry policy      |
-| `[plugins.web]`        | Web admin: bind, CSRF, CSP                        |
+| `[plugins.web]`        | Web admin: bind, CSRF, CSP, config editor path    |
 | `[plugins.<other>]`    | Per-plugin sections for any other loaded plugins  |
 
 Sections referencing plugins not loaded at compile time are an
@@ -111,6 +112,31 @@ which plugin sections are valid.
 | `starting_room`| string | `"Lobby"`                | no       | Room a newly logged-in user lands in             |
 | `welcome_msg`  | string | `"Welcome to {name}."`   | no       | Banner shown on connect; supports `{name}` substitution |
 | `timezone`     | string | `"UTC"`                  | no       | Display timezone for sysop UI; storage is always UTC |
+
+## `[location]` - GPS coordinates
+
+When set, the mesh transport sends your node's coordinates to the radio
+immediately after each connection is established, so it appears on the
+MeshCore map in LoRa adverts. **Takes effect on the next mesh transport
+reconnect — no server restart needed.**
+
+| Key         | Type  | Default | Required | Description                          |
+|-------------|-------|---------|----------|--------------------------------------|
+| `latitude`  | float | (unset) | no       | WGS-84 latitude, degrees (-90…90)    |
+| `longitude` | float | (unset) | no       | WGS-84 longitude, degrees (-180…180) |
+
+Both keys must be set together; setting only one has no effect.
+Remove both (or omit the section) to stop broadcasting GPS coordinates.
+
+The setup wizard prompts for these during initial configuration and
+writes them here. They can also be edited live from the web admin's
+**Settings** page without restarting the server.
+
+```toml
+[location]
+latitude  = 37.7749
+longitude = -122.4194
+```
 
 ## `[database]` - persistence
 
@@ -248,6 +274,24 @@ your wiring differs from the standard layout):
 | `cookie_secure`         | bool    | `true`                 | no       | `Secure` flag on cookies. Set false only for local dev. |
 | `prometheus`            | bool    | `false`                | no       | Expose `/metrics`                          |
 | `csp`                   | string  | (built-in strict CSP)  | no       | Content-Security-Policy override           |
+| `config_path`           | path    | (none)                 | no       | Absolute path to the config file the web admin's **Settings** page reads and writes. Must be writable by the server process. When unset, the Settings page loads in read-only mode and explains the gap. |
+
+### Enabling the Settings page
+
+The **Settings** page (`/settings` in the web admin) lets sysops view and
+edit the config file through a form UI without touching the TOML directly.
+Point `config_path` at the same file the BBS is reading:
+
+```toml
+[plugins.web]
+config_path = "/etc/supply-drop-bbs/config.toml"
+```
+
+The server process must have write permission to that file. If it does not,
+the Settings page opens in read-only mode and shows the exact `chown`/`chmod`
+commands needed to fix the permission. Changes written through the UI require
+a restart to take effect (the GPS `[location]` section is the one exception —
+it applies on the next mesh reconnect).
 
 If `bind` is `0.0.0.0` and `external_origin` is unset, startup
 fails with an error: binding to all interfaces without specifying
