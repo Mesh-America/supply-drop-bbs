@@ -955,6 +955,8 @@ struct ConfigResponse {
     config_file: Option<String>,
     /// Whether the config file is writable by this process.
     writable: bool,
+    /// Server's system timezone (best-effort; TZ env → /etc/timezone → UTC).
+    server_timezone: String,
     bbs_name: Option<String>,
     bbs_starting_room: Option<String>,
     bbs_welcome_msg: Option<String>,
@@ -991,6 +993,21 @@ struct ConfigPatch {
     security_login_rate_per_min: Option<u32>,
     security_command_rate_per_min: Option<u32>,
     logging_level: Option<String>,
+}
+
+fn system_timezone() -> String {
+    if let Ok(tz) = std::env::var("TZ") {
+        if !tz.is_empty() {
+            return tz;
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string("/etc/timezone") {
+        let tz = content.trim().to_owned();
+        if !tz.is_empty() {
+            return tz;
+        }
+    }
+    "UTC".to_owned()
 }
 
 fn read_config_toml(path: &str) -> Result<toml::Value, String> {
@@ -1106,6 +1123,7 @@ async fn api_get_config(
     let resp = ConfigResponse {
         config_file: Some(path),
         writable,
+        server_timezone: system_timezone(),
         bbs_name: toml_str_field(&val, "bbs", "name"),
         bbs_starting_room: toml_str_field(&val, "bbs", "starting_room"),
         bbs_welcome_msg: toml_str_field(&val, "bbs", "welcome_msg"),
