@@ -83,8 +83,11 @@ breaking the other.
 curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
 ```
 
-The script builds from source, installs, and walks you through configuration.
-**Expect 5–15 minutes on a Raspberry Pi** for the Rust build.
+The script downloads a pre-built binary for your architecture, installs it,
+and walks you through configuration. **Install typically takes under a minute**
+on supported hardware (Raspberry Pi aarch64/armv7, x86-64 Linux). If no
+pre-built binary is available for your architecture, the script falls back to
+building from source (5–15 minutes on a Pi).
 
 Before running, have ready:
 
@@ -94,16 +97,22 @@ Before running, have ready:
 
 ### What the installer does
 
-1. Installs system packages (`build-essential`, `git`, `nodejs`, `npm`, Rust)
-2. Clones the repository to `/opt/supply-drop-bbs`
-3. Builds the binary (`cargo build --release`)
-4. Creates the `supply-drop` system user
+1. Installs minimal system packages (`curl`, `git`, `figlet`)
+2. Clones (or updates) the repository to `/opt/supply-drop-bbs` — always
+   needed for service files and pymc-companion scripts
+3. **Tries to download a pre-built binary** from the latest GitHub release for
+   your architecture, and verifies its SHA256 checksum before installing
+4. **If no pre-built binary is available** (unusual architecture, no network
+   access, or checksum failure), installs build packages (`build-essential`,
+   `pkg-config`, `libssl-dev`, `nodejs`, `npm`, Rust) and compiles from source
 5. Installs the binary to `/usr/local/bin/supply-drop-bbs`
-6. Installs the `supply-drop-bbs.service` systemd unit
-7. Runs the **setup wizard** (see below)
-8. **Pi HAT only:** installs `pymc_core` in a Python venv, writes
-   `pymc-companion.yaml`, and enables `pymc-companion.service`
-9. Enables and starts both services
+6. Creates the `supply-drop` system user
+7. Creates config (`/etc/supply-drop-bbs`) and data (`/var/lib/supply-drop-bbs`) directories
+8. Installs the `supply-drop-bbs.service` systemd unit
+9. Runs the **setup wizard** (see below)
+10. **Pi HAT only:** installs `pymc_core` in a Python venv, writes
+    `pymc-companion.yaml`, and enables `pymc-companion.service`
+11. Enables and starts both services
 
 ### What the setup wizard asks
 
@@ -186,7 +195,7 @@ sudo systemctl restart pymc-companion
 
 ### Building from source (manual)
 
-Required: Rust 1.76+ (`rustup install stable`).
+Required: Rust 1.88+ (`rustup install 1.88`).
 
 ```sh
 git clone https://github.com/Mesh-America/supply-drop-bbs
@@ -195,6 +204,10 @@ cargo build --release
 sudo install -m 0755 target/release/supply-drop-bbs /usr/local/bin/
 supply-drop-bbs setup
 ```
+
+Use `--profile release-min` instead of `--release` to produce a smaller
+binary with the same settings used in the official releases (`opt-level = "z"`,
+`lto = "thin"`, debug symbols stripped).
 
 ## Uninstall
 
@@ -299,21 +312,59 @@ automatically if `pymc-companion` restarts.
 
 ## Update
 
+### One-line update (recommended)
+
+Re-run the installer. It downloads the latest pre-built binary, updates
+service files, and leaves your config and data completely untouched:
+
 ```sh
-# Re-run the installer - it pulls the latest source and rebuilds.
 curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
   | sudo bash
 ```
 
-The installer detects an existing installation and updates in-place without
-touching your config or data. If you answer N when asked to reconfigure, the
-existing `config.toml` is left unchanged.
+When asked **"Reconfigure now?"**, answer **N** to keep your existing
+`/etc/supply-drop-bbs/config.toml` unchanged. The service restarts
+automatically at the end.
 
-For a manual binary-only update:
+**Typical update time: under a minute** on supported architectures.
+
+### Manual binary-only update
+
+If you prefer to update only the binary without running the full installer,
+download the pre-built binary for your architecture directly:
+
+```sh
+# Detect your architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+    armv7l)  TARGET="armv7-unknown-linux-gnueabihf" ;;
+    x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
+esac
+
+# Find the latest release tag
+TAG=$(curl -sSf https://api.github.com/repos/Mesh-America/supply-drop-bbs/releases/latest \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+
+# Download and install
+curl -fsSL \
+    "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/supply-drop-bbs-${TAG}-${TARGET}" \
+    -o /tmp/supply-drop-bbs-new
+sudo systemctl stop supply-drop-bbs
+sudo install -m 755 /tmp/supply-drop-bbs-new /usr/local/bin/supply-drop-bbs
+sudo systemctl start supply-drop-bbs
+supply-drop-bbs --version
+```
+
+### Manual source build update
+
+Use this path only if no pre-built binary is available for your architecture:
 
 ```sh
 sudo systemctl stop supply-drop-bbs
-cd /opt/supply-drop-bbs && sudo git pull && sudo cargo build --release
+cd /opt/supply-drop-bbs
+sudo git pull
+sudo cargo build --release
 sudo install -m 0755 target/release/supply-drop-bbs /usr/local/bin/
 sudo systemctl start supply-drop-bbs
 ```

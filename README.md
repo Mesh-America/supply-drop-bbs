@@ -73,7 +73,7 @@ attached to each [GitHub Release](https://github.com/Mesh-America/supply-drop-bb
 For a one-command Pi setup:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
 ```
 
 See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for full installation and
