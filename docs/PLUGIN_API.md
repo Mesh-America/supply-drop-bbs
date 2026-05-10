@@ -159,13 +159,20 @@ pub trait Host: Send + Sync {
     fn rooms(&self, perms: &PermissionCtx) -> &dyn RoomStore;
     fn messages(&self, perms: &PermissionCtx) -> &dyn MessageStore;
 
-    // ── Node identity ───────────────────────────────────────────────
+    // ── Node location ───────────────────────────────────────────────
 
-    /// GPS coordinates for this node, if configured. Transports use
-    /// this to broadcast position to the radio on connect. Returns
-    /// `None` when no coordinates are configured. The default
-    /// implementation returns `None`; plugins don't need to override.
-    fn node_location(&self) -> Option<(f64, f64)> { None }
+    /// GPS coordinates for this node, if configured. Returns `None`
+    /// when no coordinates are configured. Transports call this on
+    /// every successful connect to push the position to their
+    /// underlying hardware or network layer.
+    fn node_location(&self) -> Option<(f64, f64)>;
+
+    /// Update the in-memory GPS location without a restart.
+    /// Called by the web admin plugin after a sysop saves new
+    /// coordinates via the web UI. Transport plugins should NOT call
+    /// this — it is only for the admin layer. The updated value is
+    /// returned by the next call to `node_location()`.
+    fn set_node_location(&self, location: Option<(f64, f64)>);
 
     // ── Audit ───────────────────────────────────────────────────
 
@@ -187,6 +194,56 @@ The `Host` is the entirety of the BBS-core API surface for plugins.
 Direct DB access, raw session-token manipulation, and bypassing the
 permission system are **not** exposed; if a plugin needs something
 that isn't on `Host`, that's a signal to extend `Host`.
+
+## Node location (GPS)
+
+The operator may configure a GPS position for the node under
+`[location]` in `config.toml`:
+
+```toml
+[location]
+latitude  = 46.478
+longitude = -122.798
+```
+
+The host reads this at startup and keeps it in memory. The web admin
+plugin updates it live (via `set_node_location`) whenever a sysop
+saves new coordinates — no restart required.
+
+### How transport plugins consume this
+
+Call `host.node_location()` each time your transport successfully
+connects to its underlying layer (radio bridge, network socket, etc.).
+It returns `Option<(f64, f64)>` in `(latitude, longitude)` order:
+
+- `None` → no location configured; leave the hardware default as-is.
+- `Some((lat, lon))` → send the appropriate position frame to your
+  hardware or network layer.
+
+The call is synchronous and cheap (reads a `RwLock`). The mesh
+transport does this in its `ClientEvent::Connected` handler:
+
+```rust
+// On every successful radio-bridge connect:
+if let Some((lat, lon)) = host.node_location() {
+    let lat_1e6 = (lat * 1_000_000.0) as i32;
+    let lon_1e6 = (lon * 1_000_000.0) as i32;
+    cmd_tx.send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 }).await?;
+}
+```
+
+Calling on each reconnect (rather than caching at `init`) is
+intentional: a sysop can update the coordinates via the web UI while
+the service is running, and the change takes effect the next time
+the transport reconnects.
+
+### What transport plugins must NOT do
+
+- Do **not** call `set_node_location`. That method is reserved for
+  the admin layer. Transports are consumers of the location, not
+  producers.
+- Do **not** cache `node_location()` at `init` time. Always read it
+  fresh on each connect so live updates from the web UI are picked up.
 
 ## Configuration
 
