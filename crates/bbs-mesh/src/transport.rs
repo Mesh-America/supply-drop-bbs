@@ -39,9 +39,15 @@ use bbs_plugin_api::{
 };
 use meshcore_companion::{
     client::{ClientConfig, ClientEvent, CompanionClient, SerialConfig},
-    constants::TXT_TYPE_PLAIN,
+    constants::{MAX_FRAME_SIZE, TXT_TYPE_PLAIN},
     frame::OutboundFrame,
 };
+
+/// Maximum bytes of plain text that fit in one `SendTxtMsg` companion frame.
+///
+/// Wire layout: `[prefix:1][len:2][CMD:1][txt_type:1][attempt:1][reserved:4][prefix:6][text:N]`
+/// = 16 bytes of overhead.  Total frame must not exceed `MAX_FRAME_SIZE`.
+const MAX_REPLY_BYTES: usize = MAX_FRAME_SIZE - 16;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
@@ -723,6 +729,26 @@ async fn dispatch_message(
     // ── Send the response back to the node ────────────────────────────────────
     let Some(reply_text) = format_response(&response) else {
         return;
+    };
+
+    // Guard against oversized frames: truncate to the maximum that fits in one
+    // companion frame.  Truncation is a last resort — fixed strings should be
+    // kept under MAX_REPLY_BYTES at the source.  We truncate on a byte
+    // boundary that preserves valid UTF-8 by walking back from the limit.
+    let reply_text = if reply_text.len() > MAX_REPLY_BYTES {
+        warn!(
+            ?session,
+            original_len = reply_text.len(),
+            max_len = MAX_REPLY_BYTES,
+            "mesh: reply too long for one frame — truncating"
+        );
+        let mut end = MAX_REPLY_BYTES;
+        while !reply_text.is_char_boundary(end) {
+            end -= 1;
+        }
+        reply_text[..end].to_owned()
+    } else {
+        reply_text
     };
 
     info!(

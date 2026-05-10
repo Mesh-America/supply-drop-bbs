@@ -2509,17 +2509,17 @@ LOGIN <user>     log in to your account\n\
 Q  quit\n\
 H  help";
 
-// 173 bytes — must stay ≤ 176 (MeshCore plain-text payload limit).
+// 156 bytes — must stay ≤ MAX_REPLY_BYTES (MAX_FRAME_SIZE(172) - 16 bytes overhead).
 const HELP_QUICK_LOGGED_IN: &str = "\
  K  list rooms\n\
  C  change room\n\
- N  read new messages\n\
- E  enter a message\n\
- G  next unread room\n\
+ N  new messages\n\
+ E  enter message\n\
+ G  next unread\n\
  M  go to Mail\n\
  W  who's online\n\
  Q  log out\n\
-H <topic>: reading posting nav acct";
+H <topic>: read post nav acct";
 
 const HELP_READING: &str = "\
 Reading:\n\
@@ -2591,11 +2591,14 @@ mod tests {
     use bbs_plugin_api::{Command, Username};
     use tempfile::NamedTempFile;
 
-    /// MeshCore silently drops plain-text payloads over 176 bytes.
-    /// Every canned help string must stay under that limit.
+    /// Every canned help string must fit in one companion frame.
+    ///
+    /// `SendTxtMsg` wire layout adds 16 bytes of overhead on top of the text.
+    /// With `MAX_FRAME_SIZE = 172` the maximum text is 156 bytes.
     #[test]
     fn help_strings_fit_mesh_payload() {
-        const MESH_MAX: usize = 176;
+        // MAX_FRAME_SIZE(172) - 16 bytes overhead = 156 bytes max text.
+        const MESH_MAX: usize = 156;
         let cases = [
             ("HELP_QUICK_ANON", HELP_QUICK_ANON),
             ("HELP_QUICK_LOGGED_IN", HELP_QUICK_LOGGED_IN),
