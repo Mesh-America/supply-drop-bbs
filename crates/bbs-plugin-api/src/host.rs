@@ -301,6 +301,11 @@ pub trait Host: Send + Sync {
         None
     }
 
+    /// Update the in-memory GPS location without a restart.
+    /// Called by the web admin after saving a `[location]` config change.
+    /// The mesh transport reads this on the next reconnect.
+    fn set_node_location(&self, _location: Option<(f64, f64)>) {}
+
     // ── Mesh node credentials ────────────────────────────────────────────────────
     //
     // These methods implement the persistent node → user binding that lets mesh

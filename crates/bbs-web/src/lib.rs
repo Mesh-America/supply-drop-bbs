@@ -1251,6 +1251,7 @@ async fn api_patch_config(
         toml_set_str(&mut val, "bbs", "timezone", v);
     }
     // Latitude/longitude: JSON null removes the key; a number sets it.
+    let location_touched = patch.location_latitude.is_some() || patch.location_longitude.is_some();
     if let Some(v) = patch.location_latitude {
         if v.is_null() {
             toml_remove_key(&mut val, "location", "latitude");
@@ -1310,6 +1311,19 @@ async fn api_patch_config(
             Json(json_error(&format!("could not write config file: {e}"))),
         )
             .into_response();
+    }
+
+    // Update in-memory GPS location so the mesh transport picks it up on next
+    // reconnect without a restart.
+    if location_touched {
+        let new_location = match (
+            toml_f64_field(&val, "location", "latitude"),
+            toml_f64_field(&val, "location", "longitude"),
+        ) {
+            (Some(lat), Some(lon)) => Some((lat, lon)),
+            _ => None,
+        };
+        state.host.set_node_location(new_location);
     }
 
     // Audit log — best-effort.

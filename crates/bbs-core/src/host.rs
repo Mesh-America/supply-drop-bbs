@@ -131,7 +131,8 @@ pub struct BbsHost {
     /// Shared across all sessions so parallel sessions can't bypass rate limiting.
     login_failures: tokio::sync::Mutex<HashMap<String, (u32, Instant)>>,
     /// Optional GPS coordinates from `[location]` config section.
-    location: Option<(f64, f64)>,
+    /// Wrapped in a RwLock so the web admin can update it without a restart.
+    location: std::sync::RwLock<Option<(f64, f64)>>,
 }
 
 impl BbsHost {
@@ -150,7 +151,7 @@ impl BbsHost {
             next_id: AtomicU64::new(1),
             advert_bus: Arc::new(AdvertBus::new()),
             login_failures: tokio::sync::Mutex::new(HashMap::new()),
-            location,
+            location: std::sync::RwLock::new(location),
         }
     }
 }
@@ -321,7 +322,11 @@ impl Host for BbsHost {
     }
 
     fn node_location(&self) -> Option<(f64, f64)> {
-        self.location
+        *self.location.read().unwrap()
+    }
+
+    fn set_node_location(&self, location: Option<(f64, f64)>) {
+        *self.location.write().unwrap() = location;
     }
 
     // ── Admin / web-UI operations ─────────────────────────────────────────────

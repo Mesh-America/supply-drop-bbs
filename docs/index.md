@@ -3,11 +3,11 @@ layout: home
 
 hero:
   name: Supply Drop BBS
-  text: A resilient BBS that meets users where they are
-  tagline: First-class support for MeshCore and Meshtastic LoRa networks — plus any transport you can write a plugin for. One node, every channel, running unattended for months.
+  text: A BBS for LoRa mesh networks, written in Rust
+  tagline: Works with MeshCore and Meshtastic out of the box. Runs on a Pi. Add other transports (APRS, Telnet, IRC, whatever) by writing a plugin.
   image:
     src: /supply-drop-icon-transparent.svg
-    alt: Supply Drop BBS logo — pixel-art parachute dropping a supply crate
+    alt: Supply Drop BBS logo
   actions:
     - theme: brand
       text: Get Started
@@ -18,18 +18,18 @@ hero:
 
 features:
   - icon: 📻
-    title: MeshCore & Meshtastic
-    details: Native bridges for MeshCore LoRa and Meshtastic networks. Supports RAK WisBlock, Heltec, and other companion devices over serial or USB.
+    title: MeshCore and Meshtastic
+    details: Ships with bridges for MeshCore and Meshtastic LoRa networks. Tested on RAK WisBlock and Heltec hardware over serial and USB.
   - icon: 🔀
-    title: Multi-Transport by Design
-    details: Run MeshCore radio, a Unix socket CLI, the HTTP web admin, and any community transport — APRS, Telnet, IRC, Matrix — all simultaneously on one node. Sessions share the same message store and user database across every channel.
-  - icon: 🪫
-    title: Resilient & Offline
-    details: Designed to run unattended for months on a Raspberry Pi. Single binary, single TOML config, single systemd unit — obvious to operate with no cloud dependency.
+    title: Run multiple transports at once
+    details: MeshCore radio, the CLI socket, the web admin, and any custom transport all run in the same process and share one user database and message store. APRS, Telnet, IRC, Matrix are all possible.
+  - icon: 🥧
+    title: Simple to run
+    details: One binary, one TOML config file, one systemd unit. Intended to sit on a Pi and be ignored for months at a time.
   - icon: ⚡
     title: Built in Rust
-    details: Zero garbage collector, no runtime, no interpreter. Supply Drop BBS starts in milliseconds, idles at near-zero CPU, and handles bursts without breaking a sweat — exactly what you want on a Pi running off a solar battery pack.
+    details: Fast startup, low memory, no GC pauses. Useful when you're running on a solar-charged Pi 3.
   - icon: 🔌
-    title: Extensible Plugin API
-    details: Add new transports, handlers, and behaviors via a clean Rust plugin API backed by Cargo features. No runtime loading overhead — unused transports compile out entirely.
+    title: Plugin API
+    details: New transports and behaviors are Rust crates gated behind Cargo features. If you don't compile it in, it isn't there.
 ---
