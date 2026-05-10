@@ -421,6 +421,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/reports", get(api_reports))
         .route("/settings", get(api_settings))
         .route("/config", get(api_get_config).patch(api_patch_config))
+        .route("/restart", post(api_restart))
         .route("/logs", get(api_logs))
         .route("/sse/logs", get(api_sse_logs))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
@@ -433,7 +434,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             auth_middleware,
         ));
 
-    let public_api = Router::new().route("/auth/login", post(api_login));
+    let public_api = Router::new()
+        .route("/auth/login", post(api_login))
+        .route("/health", get(api_health));
 
     Router::new()
         .nest("/api/v1", protected_api)
@@ -993,6 +996,53 @@ struct ConfigPatch {
     security_login_rate_per_min: Option<u32>,
     security_command_rate_per_min: Option<u32>,
     logging_level: Option<String>,
+}
+
+async fn api_health() -> Response {
+    Json(serde_json::json!({ "status": "ok" })).into_response()
+}
+
+async fn api_restart(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    if std::env::var("INVOCATION_ID").is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "not running under systemd — restart manually: sudo systemctl restart supply-drop-bbs",
+            )),
+        )
+            .into_response();
+    }
+
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", user.username),
+            "service_restart",
+            None,
+            None,
+        )
+        .await;
+
+    // Spawn restart after a short delay so the 202 response can leave first.
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let _ = std::process::Command::new("sudo")
+            .args(["systemctl", "restart", "supply-drop-bbs"])
+            .spawn();
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "message": "restart initiated" })),
+    )
+        .into_response()
 }
 
 fn system_timezone() -> String {

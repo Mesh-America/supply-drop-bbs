@@ -50,9 +50,12 @@ const configFile = ref<string | null>(null)
 const writable = ref(false)
 const loading = ref(false)
 const saving = ref(false)
+const restarting = ref(false)
+const restartOk = ref(false)
 const loadError = ref<string | null>(null)
 const saveOk = ref<string | null>(null)
 const saveError = ref<string | null>(null)
+const restartError = ref<string | null>(null)
 const validationErrors = ref<Record<string, string>>({})
 
 const rooms = ref<string[]>([])
@@ -207,6 +210,40 @@ async function save() {
   } finally {
     saving.value = false
   }
+}
+
+async function restartService() {
+  restarting.value = true
+  restartOk.value = false
+  restartError.value = null
+  try {
+    await api.post('/api/v1/restart')
+  } catch (e: any) {
+    // A network error here means the process died before responding —
+    // that's fine, the restart happened. Any other error is a real failure.
+    if (!(e instanceof TypeError)) {
+      restarting.value = false
+      restartError.value = e?.message ?? 'restart request failed'
+      return
+    }
+  }
+  // Poll /api/v1/health until the server comes back (up to 60 s).
+  for (let i = 0; i < 30; i++) {
+    await new Promise(r => setTimeout(r, 2000))
+    try {
+      const r = await fetch('/api/v1/health')
+      if (r.ok) {
+        restartOk.value = true
+        restarting.value = false
+        setTimeout(() => window.location.reload(), 1500)
+        return
+      }
+    } catch {
+      // still coming back up — keep polling
+    }
+  }
+  restarting.value = false
+  restartError.value = 'Service did not come back within 60 s. Check: journalctl -u supply-drop-bbs -f'
 }
 
 onMounted(() => {
@@ -400,6 +437,23 @@ chmod g+w {{ configFile }}</pre>
         </button>
         <span v-if="!writable" class="hint">config file is not writable</span>
       </div>
+
+      <!-- Service restart -->
+      <section class="card">
+        <h2>Service</h2>
+        <p class="hint">
+          Restart the systemd service to apply config changes. The web UI will
+          reconnect automatically when the service comes back up (~5 s).
+        </p>
+        <div v-if="restartOk" class="notice ok-notice">Service restarted. Reloading…</div>
+        <div v-if="restartError" class="notice error-notice">{{ restartError }}</div>
+        <div class="actions">
+          <button type="button" class="secondary" :disabled="restarting" @click="restartService">
+            {{ restarting ? 'restarting…' : 'restart service' }}
+          </button>
+          <span v-if="restarting" class="hint">waiting for service to come back…</span>
+        </div>
+      </section>
 
     </form>
   </div>
