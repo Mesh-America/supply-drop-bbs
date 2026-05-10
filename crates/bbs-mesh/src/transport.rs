@@ -625,10 +625,22 @@ async fn dispatch_message(
         .expect("state mutex poisoned")
         .is_awaiting_reply(&sender_prefix);
 
+    // ── Dedup radio retransmissions of all inbound messages ──────────────────
+    // The radio layer retransmits packets; process only the first copy within
+    // the dedup window. This covers both regular commands and workflow replies.
+    if state
+        .lock()
+        .expect("state mutex poisoned")
+        .dedup_message(&sender_prefix, text)
+    {
+        debug!("mesh: dropping retransmitted message (dedup)");
+        return;
+    }
+
     // ── Dedup mesh retransmissions of workflow replies ────────────────────────
-    // The mesh protocol retransmits packets; a retransmitted password can arrive
-    // after login completes (awaiting_reply=false). Drop it silently if it
-    // matches the most recently processed WorkflowReply within the dedup window.
+    // A retransmitted password can arrive after login completes
+    // (awaiting_reply=false). Drop it silently if it matches the most recently
+    // processed WorkflowReply within the dedup window.
     if !awaiting_reply
         && state
             .lock()

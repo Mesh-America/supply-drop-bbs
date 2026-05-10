@@ -34,6 +34,10 @@ use bbs_plugin_api::SessionId;
 /// as a workflow reply and then immediately sent "h" for help.
 const WORKFLOW_REPLY_DEDUP_SECS: u64 = 10;
 
+/// How long any inbound message is remembered for deduplication.
+/// Covers radio retransmissions of regular commands (non-workflow).
+const MESSAGE_DEDUP_SECS: u64 = 10;
+
 /// Per-node state tracked inside [`SessionState`].
 #[derive(Debug)]
 pub struct SessionEntry {
@@ -51,6 +55,10 @@ pub struct SessionEntry {
     /// processed. Used to silently drop mesh retransmissions of workflow
     /// input (passwords etc.) that arrive after the workflow completes.
     pub last_workflow_reply: Option<(String, Instant)>,
+
+    /// The last inbound message text and the time it was processed.
+    /// Used to silently drop radio retransmissions of regular commands.
+    pub last_message: Option<(String, Instant)>,
 }
 
 /// Bi-directional map between MeshCore pubkey prefixes and BBS session IDs.
@@ -90,6 +98,7 @@ impl SessionState {
                 session_id: new_id,
                 awaiting_reply: false,
                 last_workflow_reply: None,
+                last_message: None,
             },
         );
         self.by_session.insert(new_id, prefix);
@@ -145,6 +154,23 @@ impl SessionState {
                 return reply == text
                     && instant.elapsed() < Duration::from_secs(WORKFLOW_REPLY_DEDUP_SECS);
             }
+        }
+        false
+    }
+
+    /// Return `true` if `text` matches the last processed message for `prefix`
+    /// within the deduplication window.  If it does not match, record `text`
+    /// as the new last message and return `false`.
+    ///
+    /// Used to silently drop radio retransmissions of regular commands.
+    pub fn dedup_message(&mut self, prefix: &[u8; 6], text: &str) -> bool {
+        if let Some(entry) = self.by_prefix.get_mut(prefix) {
+            if let Some((last, instant)) = &entry.last_message {
+                if last == text && instant.elapsed() < Duration::from_secs(MESSAGE_DEDUP_SECS) {
+                    return true;
+                }
+            }
+            entry.last_message = Some((text.to_owned(), Instant::now()));
         }
         false
     }
