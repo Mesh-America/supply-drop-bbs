@@ -1747,11 +1747,17 @@ impl BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        let page = self
-            .db
-            .list_in_room(room_id, after, MESH_PAGE)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let page = if room_id == MAIL_ROOM_ID {
+            self.db
+                .list_direct(&username, after, MESH_PAGE)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+        } else {
+            self.db
+                .list_in_room(room_id, after, MESH_PAGE)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+        };
 
         let blocked = self
             .db
@@ -1806,11 +1812,17 @@ impl BbsHost {
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
         let after_id = after.map(crate::ids::MessageId::new);
-        let page = self
-            .db
-            .list_in_room(room_id, after_id, MESH_PAGE)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let page = if room_id == MAIL_ROOM_ID {
+            self.db
+                .list_direct(&username, after_id, MESH_PAGE)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+        } else {
+            self.db
+                .list_in_room(room_id, after_id, MESH_PAGE)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+        };
 
         let blocked = self
             .db
