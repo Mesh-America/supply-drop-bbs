@@ -88,7 +88,9 @@ impl Username {
     /// the original input as the error so the caller can render
     /// it in the user-facing error message.
     pub fn new(raw: impl Into<String>) -> Result<Self, InvalidUsername> {
-        let raw = raw.into().to_ascii_lowercase();
+        // Strip a leading '@' so mesh users can type "@alice" and get "alice".
+        let raw = raw.into();
+        let raw = raw.strip_prefix('@').unwrap_or(&raw).to_ascii_lowercase();
         Self::validate(&raw)?;
         Ok(Self(raw))
     }
@@ -107,7 +109,7 @@ impl Username {
             return Err(InvalidUsername::NonAscii);
         }
         for c in raw.chars() {
-            if c.is_control() || c.is_whitespace() {
+            if c.is_control() || c.is_whitespace() || c == '@' {
                 return Err(InvalidUsername::DisallowedCharacter(c));
             }
         }
