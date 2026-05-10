@@ -17,8 +17,11 @@ or any other channel by writing a new transport crate.
 5. [Command parsing and dispatch](#5-command-parsing-and-dispatch)
 6. [Rendering responses](#6-rendering-responses)
 7. [Receiving domain events and notifications](#7-receiving-domain-events-and-notifications)
+7a. [Advisory events and state reconciliation](#7a-advisory-events-and-state-reconciliation)
+7b. [Notification retry semantics](#7b-notification-retry-semantics)
 8. [Payload size constraints](#8-payload-size-constraints)
 9. [Persistent node identity (auto-login)](#9-persistent-node-identity-auto-login)
+9a. [Session lifetime and restart behavior](#9a-session-lifetime-and-restart-behavior)
 10. [Registering a transport in the host binary](#10-registering-a-transport-in-the-host-binary)
 11. [Configuration](#11-configuration)
 12. [Error handling](#12-error-handling)
@@ -617,6 +620,172 @@ retry or drop based on the outcome you return.
 
 ---
 
+## 7a. Advisory Events and State Reconciliation
+
+Domain events are advisory, not authoritative.
+
+The event bus exists to provide low-latency notifications and cache
+invalidation signals to transports. It is not intended to be a durable
+replication stream or guaranteed-delivery synchronization mechanism.
+
+Internally, the event bus uses a bounded broadcast channel. Under load, slow
+subscribers may lag behind and lose events.
+
+**What this means in practice:**
+
+- Events may be dropped if a subscriber falls behind.
+- Events are not replayed.
+- Events may arrive late or out of order.
+- Missing events are not considered a host error condition.
+
+A lagged subscriber should treat its local state as potentially stale and
+reconcile directly against the host. For example:
+
+- rebuild online-user lists
+- refresh unread counts
+- re-query room membership
+- re-check session existence
+
+Do not assume that observing every event is required for correctness.
+
+**Canonical handling pattern:**
+
+```rust
+loop {
+    match events.recv().await {
+        Ok(event) => {
+            handle_event(&host, &sessions, event).await;
+        }
+        Err(broadcast::error::RecvError::Lagged(n)) => {
+            warn!("event bus lagged, dropped {n} events");
+            // Reconcile local cached state from the host.
+            reconcile_session_map(&host, &sessions).await;
+        }
+        Err(broadcast::error::RecvError::Closed) => {
+            break;
+        }
+    }
+}
+```
+
+If your transport maintains any in-memory representation of host state, treat
+it as a cache only. Examples include:
+
+- online-user lists
+- room membership caches
+- unread counters
+- active-node tracking
+
+The event bus invalidates these caches, but it is not authoritative state
+synchronization. If reconciliation is required, query the host directly rather
+than waiting for future events.
+
+For durable delivery guarantees, audit trails, or replayable history, use
+explicit host APIs or persistence mechanisms rather than the domain event
+stream.
+
+---
+
+## 7b. Notification Retry Semantics
+
+The transport owns all retry behavior. The host does not retry notifications
+after `notify()` returns.
+
+When the host calls:
+
+```rust
+transport.notify(session_id, notification).await
+```
+
+the returned `NotifyOutcome` tells the host how routing should proceed.
+
+| Outcome | Meaning |
+|---|---|
+| `Delivered` | Notification was sent or durably accepted by the transport |
+| `Queued` | Transport accepted responsibility for later delivery |
+| `Dropped` | Notification could not be delivered due to transient conditions |
+| `PermanentFailure` | Session is no longer valid and should no longer be routed |
+
+If a transport returns `Queued`, the host assumes the transport will handle
+all retry behavior internally. The host does not:
+
+- retry notifications
+- implement backoff
+- maintain a global delivery queue
+- track delivery acknowledgement
+
+This avoids duplicate-delivery ambiguity and keeps delivery policy
+transport-specific.
+
+**Recommended transport pattern:**
+
+```rust
+async fn notify(
+    &self,
+    session: SessionId,
+    payload: Notification,
+) -> NotifyOutcome {
+    let tx = {
+        self.sessions
+            .lock()
+            .unwrap()
+            .get(&session)
+            .map(|entry| entry.tx.clone())
+    };
+
+    let Some(tx) = tx else {
+        return NotifyOutcome::Dropped;
+    };
+
+    match tx.try_send(render(payload)) {
+        Ok(()) => {
+            NotifyOutcome::Queued
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            NotifyOutcome::Dropped
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            NotifyOutcome::PermanentFailure(
+                "session closed".into()
+            )
+        }
+    }
+}
+```
+
+Do not block inside `notify()` and do not implement retry loops directly
+inside the method. The host may call `notify()` from shared routing paths —
+blocking or long-running retry loops inside `notify()` can stall delivery to
+unrelated sessions. Instead, transports should enqueue work quickly, return
+immediately, and handle retry from background tasks or internal queues.
+
+**`Dropped` vs `PermanentFailure`**
+
+Use `Dropped` for transient conditions:
+
+- node temporarily offline
+- queue full
+- intermittent radio loss
+- temporary transport backpressure
+
+Use `PermanentFailure` only when the session is definitively invalid:
+
+- socket closed permanently
+- session removed from transport state
+- connection teardown completed
+
+The host may stop routing notifications to a session after `PermanentFailure`.
+
+**Radio Transport Note**
+
+Radio transports often cannot synchronously confirm over-the-air delivery.
+Returning `Queued` after successfully enqueueing a frame for transmission is
+correct even if the remote node has not yet acknowledged receipt. Mesh-layer
+acknowledgement behavior belongs to the radio protocol itself, not to
+`NotifyOutcome`.
+
+---
+
 ## 8. Payload size constraints
 
 Radio transports have hard payload size limits imposed by the physical layer.
@@ -743,6 +912,91 @@ host.mesh_node_bind(session, node_prefix).await?;
 // On explicit logout (Response::LoggedOut):
 host.mesh_node_unbind(node_prefix).await?;
 ```
+
+---
+
+## 9a. Session Lifetime and Restart Behavior
+
+Sessions are ephemeral runtime objects and do not survive process restarts.
+
+A `SessionId` is valid only for the lifetime of the running host process.
+Transports must not:
+
+- persist `SessionId` values
+- assume session identifiers are stable across restarts
+- attempt to restore old sessions after a restart
+
+When the host process exits or crashes:
+
+- all sessions are lost
+- all in-progress workflows are lost
+- all pending prompts are lost
+- all transport-owned session mappings become invalid
+
+After restart, reconnecting users or nodes receive newly created sessions.
+
+### Persistent Identity vs Ephemeral Session
+
+Persistent node identity and session identity are separate concepts.
+
+Persistent identity is typically backed by durable credential storage, such as:
+
+- node public-key bindings
+- login credentials
+- transport identity mappings
+
+Session state itself is not persisted. For example:
+
+```rust
+host.create_session("meshtastic").await
+```
+
+creates a brand new runtime session. A later identity restore step may
+authenticate that session against stored credentials, but it does not reuse
+the previous `SessionId`.
+
+### Workflow Continuation
+
+Workflow continuation across reconnects is not currently supported. If a
+transport disconnects during registration, login, prompts, or multi-step
+workflows, the reconnecting user typically begins a fresh session and restarts
+the workflow. Transports should design UX flows accordingly:
+
+- keep prompts concise
+- avoid unnecessarily large transient state
+- tolerate interrupted interaction
+
+### Session Cleanup
+
+Transports should always call `host.end_session(session_id).await` when a
+connection or transport context terminates. This includes:
+
+- disconnect paths
+- transport shutdown
+- task cancellation
+- error handling paths
+
+**Recommended pattern:**
+
+```rust
+async fn handle_connection(
+    conn: Connection,
+    session: SessionId,
+    host: Arc<dyn Host>,
+) {
+    let result = run_session_loop(&conn, session, &host).await;
+
+    // Always clean up the session, even on error.
+    let _ = host.end_session(session).await;
+
+    if let Err(err) = result {
+        warn!("session {:?} ended with error: {}", session, err);
+    }
+}
+```
+
+Transports should not assume abandoned sessions are automatically cleaned up
+immediately.
 
 ---
 
