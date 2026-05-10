@@ -191,6 +191,26 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
+        "users" => Some(Command::ListUsers {
+            filter: rest.map(str::to_owned),
+        }),
+
+        "search" => match rest {
+            Some(q) if !q.is_empty() => Some(Command::SearchUsers {
+                query: q.to_owned(),
+            }),
+            _ => Some(Command::Help {
+                topic: Some("search".to_owned()),
+            }),
+        },
+
+        "whois" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::UserInfo { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
         "profile" => Some(Command::EditProfile),
 
         "passwd" => Some(Command::ChangePassword),
@@ -218,6 +238,13 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         ".eu" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(username) => Some(Command::EditUser { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
+        ".du" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::DeleteUser { username }),
             None => Some(Command::Unknown {
                 raw: text.to_owned(),
             }),

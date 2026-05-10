@@ -198,6 +198,32 @@ pub enum Command {
         /// The username of the account to edit.
         username: Username,
     },
+
+    /// List user accounts (Aide+). (USERS)
+    ///
+    /// Optional filter: "active" (default), "banned", or "all" (Sysop+).
+    ListUsers {
+        /// Status filter string from the user. None = active only.
+        filter: Option<String>,
+    },
+
+    /// Search user accounts by username substring (Aide+). (SEARCH)
+    SearchUsers {
+        /// Substring to match against usernames (case-insensitive).
+        query: String,
+    },
+
+    /// Show details for a specific user account (Aide+). (WHOIS)
+    UserInfo {
+        /// The username to look up.
+        username: Username,
+    },
+
+    /// Soft-delete a user account (Sysop+). (.DU)
+    DeleteUser {
+        /// The username of the account to delete.
+        username: Username,
+    },
 }
 
 /// A protocol-neutral response from the BBS to a session.

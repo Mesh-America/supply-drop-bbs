@@ -249,6 +249,10 @@ impl Host for BbsHost {
             Command::EditUser { .. } => Ok(Response::Text(
                 "User editing is not yet implemented.".into(),
             )),
+            Command::ListUsers { filter } => self.handle_list_users(session, filter).await,
+            Command::SearchUsers { query } => self.handle_search_users(session, query).await,
+            Command::UserInfo { username } => self.handle_user_info(session, username).await,
+            Command::DeleteUser { username } => self.handle_delete_user(session, username).await,
 
             Command::Unknown { .. } => {
                 Ok(Response::Text("Unknown command. Type H for help.".into()))
@@ -2397,6 +2401,243 @@ impl BbsHost {
         )))
     }
 
+    async fn handle_list_users(
+        &self,
+        session: SessionId,
+        filter: Option<String>,
+    ) -> Result<Response, HostError> {
+        let (_, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Aide {
+            return Ok(Response::Error("Aide access required.".into()));
+        }
+
+        let (status_filter, label) = match filter.as_deref() {
+            None | Some("active") => (Some(UserStatus::Active), "active"),
+            Some("banned") => (Some(UserStatus::Banned), "banned"),
+            Some("deleted") if level >= PermissionLevel::Sysop => {
+                (Some(UserStatus::Deleted), "deleted")
+            }
+            Some("all") if level >= PermissionLevel::Sysop => (None, "all"),
+            Some("deleted") | Some("all") => {
+                return Ok(Response::Error(
+                    "Sysop access required for that filter.".into(),
+                ))
+            }
+            Some(other) => {
+                return Ok(Response::Error(format!(
+                    "Unknown filter '{other}'. Use: active, banned, all (sysop)."
+                )))
+            }
+        };
+
+        let users = UserStore::list(&self.db, status_filter, 50, 0)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        if users.is_empty() {
+            return Ok(Response::Text(format!("No {label} users found.")));
+        }
+
+        let mut lines = vec![format!("Users ({label}, {}):", users.len())];
+        for u in &users {
+            let lvl = match u.permission_level {
+                PermissionLevel::Sysop => "sysop",
+                PermissionLevel::Aide => "aide",
+                PermissionLevel::User => "user",
+                PermissionLevel::Unvalidated => "unval",
+            };
+            lines.push(format!(" {} [{}]", u.username.as_str(), lvl));
+        }
+        Ok(Response::Text(lines.join("\n")))
+    }
+
+    async fn handle_search_users(
+        &self,
+        session: SessionId,
+        query: String,
+    ) -> Result<Response, HostError> {
+        let (_, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Aide {
+            return Ok(Response::Error("Aide access required.".into()));
+        }
+        if query.is_empty() {
+            return Ok(Response::Error("Usage: SEARCH <username>".into()));
+        }
+
+        let all = UserStore::list(&self.db, None, 500, 0)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let q = query.to_lowercase();
+        let matches: Vec<_> = all
+            .iter()
+            .filter(|u| u.username.as_str().to_lowercase().contains(&q))
+            .collect();
+
+        if matches.is_empty() {
+            return Ok(Response::Text(format!("No users matching '{query}'.")));
+        }
+
+        let mut lines = vec![format!("Search '{query}' ({}):", matches.len())];
+        for u in matches {
+            let lvl = match u.permission_level {
+                PermissionLevel::Sysop => "sysop",
+                PermissionLevel::Aide => "aide",
+                PermissionLevel::User => "user",
+                PermissionLevel::Unvalidated => "unval",
+            };
+            let status = match u.status {
+                UserStatus::Active => "",
+                UserStatus::Banned => " [banned]",
+                UserStatus::Deleted => " [deleted]",
+            };
+            lines.push(format!(" {} [{}]{}", u.username.as_str(), lvl, status));
+        }
+        Ok(Response::Text(lines.join("\n")))
+    }
+
+    async fn handle_user_info(
+        &self,
+        session: SessionId,
+        username: Username,
+    ) -> Result<Response, HostError> {
+        let (_, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Aide {
+            return Ok(Response::Error("Aide access required.".into()));
+        }
+
+        let user = UserStore::get_by_username(&self.db, &username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let user = match user {
+            None => return Ok(Response::Error("User not found.".into())),
+            Some(u) => u,
+        };
+
+        let session_count = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .values()
+                .filter(|r| r.username.as_ref() == Some(&username))
+                .count()
+        };
+
+        let lvl = match user.permission_level {
+            PermissionLevel::Sysop => "sysop",
+            PermissionLevel::Aide => "aide",
+            PermissionLevel::User => "user",
+            PermissionLevel::Unvalidated => "unvalidated",
+        };
+        let status = match user.status {
+            UserStatus::Active => "active",
+            UserStatus::Banned => "banned",
+            UserStatus::Deleted => "deleted",
+        };
+
+        let mut lines = vec![
+            format!("User: {}", user.username.as_str()),
+            format!("Level: {lvl}  Status: {status}"),
+        ];
+        if let Some(ref dn) = user.display_name {
+            lines.push(format!("Name: {dn}"));
+        }
+        lines.push(format!("Joined: {}", user.created_at));
+        if let Some(last) = user.last_login_at {
+            lines.push(format!("Last login: {last}"));
+        }
+        if session_count > 0 {
+            lines.push(format!(
+                "Online ({} session{})",
+                session_count,
+                if session_count == 1 { "" } else { "s" }
+            ));
+        }
+        Ok(Response::Text(lines.join("\n")))
+    }
+
+    async fn handle_delete_user(
+        &self,
+        session: SessionId,
+        username: Username,
+    ) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Sysop {
+            return Ok(Response::Error("Sysop access required.".into()));
+        }
+
+        let user = UserStore::get_by_username(&self.db, &username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let user = match user {
+            None => return Ok(Response::Error("User not found.".into())),
+            Some(u) => u,
+        };
+
+        if user.status == UserStatus::Deleted {
+            return Ok(Response::Error(format!(
+                "'{}' is already deleted.",
+                username.as_str()
+            )));
+        }
+        if user.permission_level >= level {
+            return Ok(Response::Error(format!(
+                "Cannot delete '{}' — equal or higher permission tier.",
+                username.as_str()
+            )));
+        }
+
+        UserStore::update(
+            &self.db,
+            user.id,
+            None,
+            Some(UserStatus::Deleted),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        {
+            let mut sessions = self.sessions.write().await;
+            let to_end: Vec<SessionId> = sessions
+                .iter()
+                .filter(|(_, r)| r.username.as_ref() == Some(&username))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in to_end {
+                sessions.remove(&id);
+            }
+        }
+
+        if let Err(e) = self
+            .db
+            .audit_write(actor.as_str(), "delete_user", Some(username.as_str()), None)
+            .await
+        {
+            tracing::warn!("audit write failed: {e}");
+        }
+
+        warn!(%actor, %username, "user deleted");
+        Ok(Response::Text(format!(
+            "'{}' has been deleted.",
+            username.as_str()
+        )))
+    }
+
     async fn handle_edit_profile(&self, session: SessionId) -> Result<Response, HostError> {
         match self.session_auth_user(session).await {
             Ok(_) => {}
@@ -2613,6 +2854,7 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             "account" | "acct" if logged_in => HELP_ACCOUNT.to_owned(),
             "mail" if logged_in => HELP_MAIL.to_owned(),
             "aide" if is_aide => HELP_AIDE.to_owned(),
+            "users" if is_aide => HELP_USERS.to_owned(),
             "sysop" if is_sysop => HELP_SYSOP.to_owned(),
             cmd => help_for_command(cmd, level),
         },
@@ -2683,11 +2925,22 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".er" if is_aide => ".ER — edit current room\nEdit name, description, read-only flag, or min permission level.",
         ".eu" if is_aide => ".EU <user> — edit a user's profile or permissions\nAides cannot promote to Sysop.",
         "ban" if is_aide => "BAN <user> — ban a user account",
+        "users" if is_aide => {
+            "USERS — list active user accounts\n\
+             USERS banned — list banned accounts\n\
+             USERS all — list all accounts (sysop)"
+        }
+        "search" if is_aide => "SEARCH <query> — find users by username (substring match)",
+        "whois" if is_aide => {
+            "WHOIS <user> — show account details\n\
+             Includes level, status, join date, last login, and active sessions."
+        }
 
         // ── Sysop+ only ──────────────────────────────────────────────────
         "unban" if is_sysop => "UNBAN <user> — lift a ban",
         ".c" if is_sysop => ".C — create a new room\nEnters the room creation workflow.",
         ".dr" if is_sysop => ".DR <name> — delete a room",
+        ".du" if is_sysop => ".DU <user> — soft-delete a user account\nSets status to deleted and ends active sessions.",
 
         other => {
             return format!(
@@ -2757,17 +3010,31 @@ Account:\n\
 
 const HELP_AIDE: &str = "\
 Aide:\n\
- .ER     edit current room\n\
- .EU     edit a user\n\
- BAN     ban a user\n\
+ USERS   list user accounts\n\
+ WHOIS <u>  user details\n\
+ SEARCH <q>  search users\n\
  PENDING  pending users\n\
- V       validate pending users";
+ V <u>   validate user\n\
+ BAN <u>  ban a user\n\
+ .ER     edit current room\n\
+H: users aide";
+
+const HELP_USERS: &str = "\
+Users (Aide):\n\
+ USERS          list active\n\
+ USERS banned   list banned\n\
+ SEARCH <q>     find by name\n\
+ WHOIS <user>   user details\n\
+Sysop only:\n\
+ USERS all      list all\n\
+ .DU <user>     delete user";
 
 const HELP_SYSOP: &str = "\
 Sysop:\n\
- .C    create a new room\n\
- .DR   delete a room\n\
- UNBAN  lift a ban";
+ .C <name>   create room\n\
+ .DR <name>  delete room\n\
+ .DU <user>  delete user\n\
+ UNBAN <u>   lift a ban";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
