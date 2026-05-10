@@ -6,7 +6,7 @@ const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
 export default defineConfig({
   title: 'Supply Drop BBS',
-  description: 'Open-source BBS for MeshCore LoRa radio networks',
+  description: 'Open-source BBS for MeshCore, Meshtastic, and any transport you can write a plugin for.',
   base: '/supply-drop-bbs/',
   srcDir: '../docs',
 
