@@ -1035,6 +1035,35 @@ impl BbsHost {
                     info!(%session, %username, "first registration — promoted to Sysop");
                 } else {
                     info!(%session, %username, "registration complete — awaiting validation");
+
+                    // DM every active sysop so they know there's a new
+                    // user waiting to be validated (or banned).
+                    let sysops: Vec<crate::user::User> = UserStore::list(&self.db, None, 200, 0)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|u| {
+                            u.permission_level == PermissionLevel::Sysop
+                                && u.status == crate::user::UserStatus::Active
+                        })
+                        .collect();
+
+                    if !sysops.is_empty() {
+                        let dm_ts = Timestamp::now();
+                        let dm_body = format!(
+                            "New user registered: {username}\nV {username} to verify, B {username} to ban."
+                        );
+                        for sysop in sysops {
+                            let _ = MessageStore::post_direct(
+                                &self.db,
+                                &username,
+                                &sysop.username,
+                                &dm_body,
+                                dm_ts,
+                            )
+                            .await;
+                        }
+                    }
                 }
                 Ok(Response::LoggedIn { user: username })
             }

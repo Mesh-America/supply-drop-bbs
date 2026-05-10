@@ -114,6 +114,22 @@ enum UserAction {
         #[arg(long)]
         sysop: bool,
     },
+    /// List user accounts.
+    ///
+    /// By default lists all accounts. Use --pending to show only those
+    /// waiting for sysop validation (permission level 0).
+    List {
+        /// Show only unvalidated accounts (permission level 0).
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Verify (validate) a user account, promoting it from Unvalidated to User.
+    ///
+    /// Equivalent to the in-session `V <username>` sysop command.
+    Verify {
+        /// BBS username to verify.
+        username: String,
+    },
     /// Promote a user to Sysop (permission level 100).
     Promote {
         /// BBS username to promote.
@@ -517,6 +533,72 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
     let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
 
     match action {
+        UserAction::List { pending } => match host.admin_list_users(None, 500, 0).await {
+            Ok(users) => {
+                let users: Vec<_> = if pending {
+                    users
+                        .into_iter()
+                        .filter(|u| u.permission_level == 0)
+                        .collect()
+                } else {
+                    users
+                };
+                if users.is_empty() {
+                    println!(
+                        "{}",
+                        if pending {
+                            "No pending users."
+                        } else {
+                            "No users."
+                        }
+                    );
+                } else {
+                    println!(
+                        "{:<20} {:<12} {:<12} {:<10}",
+                        "username", "level", "status", "created"
+                    );
+                    println!("{}", "-".repeat(56));
+                    for u in &users {
+                        let level = match u.permission_level {
+                            0 => "unvalidated",
+                            10 => "user",
+                            50 => "aide",
+                            100 => "sysop",
+                            n => {
+                                println!("  {:<20} level={n}", u.username);
+                                continue;
+                            }
+                        };
+                        println!(
+                            "{:<20} {:<12} {:<12} {:<10}",
+                            u.username,
+                            level,
+                            u.status,
+                            u.created_at.get(..10).unwrap_or(&u.created_at),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
+
+        UserAction::Verify { username } => {
+            match host.admin_update_user(&username, None, Some(10)).await {
+                Ok(()) => println!("verified: {username} (promoted to User)"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         UserAction::Create { username, sysop } => {
             let password = dialoguer::Password::new()
                 .with_prompt("Password")
@@ -547,7 +629,9 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
             let (username, new_level, label) = match action {
                 UserAction::Promote { username } => (username, 100u8, "sysop"),
                 UserAction::Demote { username } => (username, 10u8, "user"),
-                UserAction::Create { .. } => unreachable!(),
+                UserAction::Create { .. } | UserAction::List { .. } | UserAction::Verify { .. } => {
+                    unreachable!()
+                }
             };
 
             match host

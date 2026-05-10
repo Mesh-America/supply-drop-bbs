@@ -103,6 +103,156 @@ UI are all active at the same time.
 are compiled in and started at startup (see ADR-0004). The planned path to
 runtime-loadable plugins is WASM, but that is post-1.0.
 
+### 2.1 Wiring two transports together: step-by-step
+
+Suppose you are adding a Meshtastic transport (`bbs-meshtastic`) alongside the
+existing MeshCore transport (`bbs-mesh`). Here is exactly what you change.
+
+#### Step 1 — `Cargo.toml` (workspace root)
+
+Add the new crate and a feature flag. **Each transport gets its own flag** so
+operators can choose what to compile in.
+
+```toml
+# Cargo.toml (workspace members)
+[workspace]
+members = [
+    "crates/bbs-core",
+    "crates/bbs-plugin-api",
+    "crates/bbs-mesh",       # existing MeshCore transport
+    "crates/bbs-meshtastic", # new transport
+    "crates/bbs-cli",
+    "crates/bbs-web",
+    "src",                   # the host binary
+]
+
+# Supply-drop-bbs binary Cargo.toml (src/Cargo.toml or Cargo.toml)
+[features]
+default = ["transport-mesh", "transport-meshtastic", "transport-cli", "admin-web"]
+transport-mesh       = ["dep:bbs-mesh"]
+transport-meshtastic = ["dep:bbs-meshtastic"]   # NEW
+transport-cli        = ["dep:bbs-cli"]
+admin-web            = ["dep:bbs-web"]
+
+[dependencies]
+bbs-mesh        = { path = "crates/bbs-mesh",        optional = true }
+bbs-meshtastic  = { path = "crates/bbs-meshtastic",  optional = true }  # NEW
+bbs-cli         = { path = "crates/bbs-cli",         optional = true }
+bbs-web         = { path = "crates/bbs-web",         optional = true }
+```
+
+#### Step 2 — `src/main.rs`: declare the handle
+
+Each transport gets an `Option<T>` handle in `cmd_run` so it can be stopped
+cleanly on shutdown. Follow the exact same pattern as the existing transports:
+
+```rust
+// In cmd_run(), section 6 (plugins):
+
+#[cfg(feature = "transport-meshtastic")]
+let meshtastic_transport =
+    init_meshtastic_plugin(&cfg.plugins.meshtastic, Arc::clone(&host)).await;
+
+// ... (shutdown section, reverse order) ...
+
+#[cfg(feature = "transport-meshtastic")]
+if let Some(t) = meshtastic_transport {
+    if let Err(e) = t.stop().await {
+        error!("meshtastic transport stop error: {e}");
+    }
+}
+```
+
+Add the corresponding `init_meshtastic_plugin` helper:
+
+```rust
+#[cfg(feature = "transport-meshtastic")]
+async fn init_meshtastic_plugin(
+    cfg: &bbs_meshtastic::MeshtasticConfig,
+    host: Arc<dyn bbs_plugin_api::Host>,
+) -> Option<bbs_meshtastic::MeshtasticTransport> {
+    use bbs_plugin_api::Plugin;
+
+    if !cfg.enabled {
+        info!("meshtastic: disabled in config — skipping");
+        return None;
+    }
+
+    let transport = match bbs_meshtastic::MeshtasticTransport::init(cfg.clone(), host).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("meshtastic transport init failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = transport.start().await {
+        error!("meshtastic transport start failed: {e}");
+        std::process::exit(1);
+    }
+
+    Some(transport)
+}
+```
+
+#### Step 3 — `src/config.rs`: add the config section
+
+```rust
+#[cfg(feature = "transport-meshtastic")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshtasticPluginConfig {
+    pub enabled: bool,
+    // TCP host of the Meshtastic companion daemon:
+    pub host: String,
+    pub port: u16,
+}
+
+// In the top-level Config struct:
+#[cfg(feature = "transport-meshtastic")]
+pub meshtastic: MeshtasticPluginConfig,
+```
+
+#### Step 4 — `config.toml` (operator config)
+
+```toml
+[plugins.meshtastic]
+enabled = true
+host    = "127.0.0.1"
+port    = 4404
+```
+
+### 2.2 What happens at runtime with two radio transports
+
+Once both transports are running, the following all work correctly without any
+extra plumbing:
+
+| Scenario | What happens |
+|---|---|
+| Alice on MeshCore DMs Bob on Meshtastic | `post_direct` writes to DB; Bob's Meshtastic session receives a `Notification::NewDirectMessage` pushed by the host's notify loop |
+| Sysop bans a user from web admin | `DomainEvent::SessionEnded` fires; **both** the MeshCore transport and the Meshtastic transport receive it; each transport ends any session belonging to that user |
+| Sysop posts to a room from CLI | `DomainEvent::MessagePosted` fires; subscribers on all transports see it and can push in-session notifications to users who are in that room |
+| User connects on both MeshCore and Meshtastic simultaneously | Both sessions coexist. The same `Username` appears twice in `W` (who's online). Read-state (last-read pointer) is shared — reading on one transport advances the pointer for the other |
+
+### 2.3 Payload size is per-transport, not global
+
+Each transport enforces its own `MAX_REPLY_BYTES` constant. The host returns
+the same `Response` enum value to all transports; it is each transport's
+responsibility to truncate or paginate before sending.
+
+```
+Transport        Max text per frame   Notes
+──────────────   ──────────────────   ─────────────────────────────────────
+MeshCore radio   156 bytes            MAX_FRAME_SIZE(172) − 16 B overhead
+Meshtastic       ~220 bytes           MTU varies by modem preset
+APRS             ~64 bytes            AX.25 payload minus header
+CLI / TCP        unlimited            full UTF-8, no truncation needed
+Web admin API    unlimited            JSON over HTTP
+```
+
+A long room listing that fits on CLI will be silently truncated on APRS.
+Design your `Response` rendering to be shortest-first: lead with the most
+important information so truncation loses only the least important tail.
+
 ---
 
 ## 3. The plugin traits
