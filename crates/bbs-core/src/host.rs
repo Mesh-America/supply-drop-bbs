@@ -69,6 +69,20 @@ enum Workflow {
     },
     /// Editing the user's own display name (PROFILE command).
     EditProfile,
+    /// Changing the user's password (PASSWD command).
+    ChangePassword {
+        stage: ChangePwdStage,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum ChangePwdStage {
+    /// Waiting for the user to enter their current password.
+    VerifyOld { attempts: u32 },
+    /// Current password verified; waiting for the new password.
+    EnterNew,
+    /// New password entered; waiting for confirmation.
+    ConfirmNew { new_password: String },
 }
 
 #[derive(Clone, Debug)]
@@ -226,6 +240,7 @@ impl Host for BbsHost {
 
             // Profile / room management
             Command::EditProfile => self.handle_edit_profile(session).await,
+            Command::ChangePassword => self.handle_change_password(session).await,
             Command::CreateRoom { name } => self.handle_create_room(session, &name).await,
             Command::DeleteRoom { name } => self.handle_delete_room(session, &name).await,
             Command::EditRoom => Ok(Response::Text(
@@ -1334,6 +1349,118 @@ impl BbsHost {
                 }
                 Ok(Response::Text("Display name updated.".into()))
             }
+
+            // ── Password change ──────────────────────────────────────────────
+            Workflow::ChangePassword {
+                stage: ChangePwdStage::VerifyOld { attempts },
+            } => {
+                let (_, user_id, _, _) = match self.session_auth(session).await {
+                    Ok(t) => t,
+                    Err(r) => return Ok(r),
+                };
+                let now = Timestamp::now();
+                let ok = self
+                    .db
+                    .credentials()
+                    .verify_password(user_id, &reply, now)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("verify_password: {e}")))?;
+
+                if ok {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::ChangePassword {
+                            stage: ChangePwdStage::EnterNew,
+                        };
+                    }
+                    Ok(Response::Prompt {
+                        text: "New password (min 8 characters):".into(),
+                        hide_input: true,
+                    })
+                } else {
+                    let new_attempts = attempts + 1;
+                    if new_attempts >= 3 {
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::None;
+                        }
+                        Ok(Response::Error(
+                            "Too many failed attempts. Password not changed.".into(),
+                        ))
+                    } else {
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::ChangePassword {
+                                stage: ChangePwdStage::VerifyOld {
+                                    attempts: new_attempts,
+                                },
+                            };
+                        }
+                        Ok(Response::Prompt {
+                            text: "Incorrect password. Current password:".into(),
+                            hide_input: true,
+                        })
+                    }
+                }
+            }
+
+            Workflow::ChangePassword {
+                stage: ChangePwdStage::EnterNew,
+            } => {
+                if reply.chars().count() < 8 {
+                    return Ok(Response::Prompt {
+                        text: "Too short (min 8 characters). New password:".into(),
+                        hide_input: true,
+                    });
+                }
+                let mut sessions = self.sessions.write().await;
+                if let Some(r) = sessions.get_mut(&session) {
+                    r.workflow = Workflow::ChangePassword {
+                        stage: ChangePwdStage::ConfirmNew {
+                            new_password: reply,
+                        },
+                    };
+                }
+                Ok(Response::Prompt {
+                    text: "Confirm new password:".into(),
+                    hide_input: true,
+                })
+            }
+
+            Workflow::ChangePassword {
+                stage: ChangePwdStage::ConfirmNew { new_password },
+            } => {
+                if reply != new_password {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::ChangePassword {
+                            stage: ChangePwdStage::EnterNew,
+                        };
+                    }
+                    return Ok(Response::Prompt {
+                        text: "Passwords don't match. New password:".into(),
+                        hide_input: true,
+                    });
+                }
+                let (_, user_id, _, _) = match self.session_auth(session).await {
+                    Ok(t) => t,
+                    Err(r) => return Ok(r),
+                };
+                let now = Timestamp::now();
+                self.db
+                    .credentials()
+                    .set_password(user_id, &new_password, now)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("set_password: {e}")))?;
+                {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                    }
+                }
+                info!(%session, "user changed password");
+                Ok(Response::Text("Password changed successfully.".into()))
+            }
         }
     }
 }
@@ -1396,7 +1523,7 @@ impl BbsHost {
 
         Err(Response::Text(
             "Your account is pending validation by an aide.\n\
-             Type 'whoami', 'help', 'pending', or 'logout'."
+             Type H for help, WHOAMI to see your status, or Q to log out."
                 .into(),
         ))
     }
@@ -2297,6 +2424,35 @@ impl BbsHost {
         })
     }
 
+    async fn handle_change_password(&self, session: SessionId) -> Result<Response, HostError> {
+        match self.session_auth_user(session).await {
+            Ok(_) => {}
+            Err(r) => return Ok(r),
+        }
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(r) = sessions.get(&session) {
+                if !matches!(r.workflow, Workflow::None) {
+                    return Ok(Response::Error(
+                        "A workflow is already in progress. Type 'cancel' first.".into(),
+                    ));
+                }
+            }
+        }
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::ChangePassword {
+                    stage: ChangePwdStage::VerifyOld { attempts: 0 },
+                };
+            }
+        }
+        Ok(Response::Prompt {
+            text: "Current password:".into(),
+            hide_input: true,
+        })
+    }
+
     async fn handle_create_room(
         &self,
         session: SessionId,
@@ -2425,6 +2581,7 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::BanUser { .. } => "BanUser",
         Command::UnbanUser { .. } => "UnbanUser",
         Command::EditProfile => "EditProfile",
+        Command::ChangePassword => "ChangePassword",
         Command::EditRoom => "EditRoom",
         Command::EditUser { .. } => "EditUser",
         Command::CreateRoom { .. } => "CreateRoom",
@@ -2514,6 +2671,10 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
              Hides their messages from you."
         }
         "profile" if logged_in => "PROFILE — edit your display name",
+        "passwd" if logged_in => {
+            "PASSWD — change your password\n\
+             You'll be asked for your current password, then the new one twice."
+        }
         "stop" if logged_in => "STOP — stop pending messages",
 
         // ── Aide+ only ───────────────────────────────────────────────────
@@ -2588,12 +2749,11 @@ Mail (private messages):\n\
 
 const HELP_ACCOUNT: &str = "\
 Account:\n\
- B    block / unblock user\n\
- H    help (also: ?)\n\
- PROFILE  edit display name\n\
- Q    log out\n\
- W    who's online\n\
-'cancel' to bail out of any prompt.";
+ B      block / unblock a user\n\
+ PASSWD  change your password\n\
+ PROFILE edit your display name\n\
+ Q      log out\n\
+ W      who's online";
 
 const HELP_AIDE: &str = "\
 Aide:\n\
@@ -3139,6 +3299,220 @@ mod tests {
             dm.content.to_lowercase().contains("verify")
                 || dm.content.to_lowercase().contains("v newuser"),
             "DM should hint at the verify command"
+        );
+    }
+
+    // ── Password change ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn passwd_change_full_flow() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        do_register(&host, sid, "alice", "oldpass1").await;
+
+        // Start PASSWD workflow.
+        let r = host
+            .process_command(sid, Command::ChangePassword)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                r,
+                Response::Prompt {
+                    hide_input: true,
+                    ..
+                }
+            ),
+            "should prompt for current password"
+        );
+
+        // Provide current password.
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "oldpass1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                r,
+                Response::Prompt {
+                    hide_input: true,
+                    ..
+                }
+            ),
+            "should prompt for new password"
+        );
+
+        // Provide new password.
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "newpass99".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                r,
+                Response::Prompt {
+                    hide_input: true,
+                    ..
+                }
+            ),
+            "should prompt for confirmation"
+        );
+
+        // Confirm new password.
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "newpass99".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(r, Response::Text("Password changed successfully.".into()));
+
+        // Verify new password works — log out, log back in with new password.
+        host.process_command(sid, Command::Logout).await.unwrap();
+        let sid2 = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        host.process_command(sid2, Command::Login { username: uname })
+            .await
+            .unwrap();
+        let r = host
+            .process_command(
+                sid2,
+                Command::WorkflowReply {
+                    reply: "newpass99".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::LoggedIn { .. }),
+            "new password should log in"
+        );
+    }
+
+    #[tokio::test]
+    async fn passwd_wrong_current_password_is_retried() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        do_register(&host, sid, "bob", "correct8").await;
+
+        host.process_command(sid, Command::ChangePassword)
+            .await
+            .unwrap();
+
+        // Wrong password — twice.
+        let r1 = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "wrongpwd".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r1, Response::Prompt { .. }),
+            "first wrong attempt should re-prompt"
+        );
+
+        let r2 = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "wrongpwd".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r2, Response::Prompt { .. }),
+            "second wrong attempt should re-prompt"
+        );
+
+        // Third wrong attempt — workflow should be aborted with an error.
+        let r3 = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "wrongpwd".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r3, Response::Error(_)),
+            "third wrong attempt should abort"
+        );
+
+        // Workflow is cleared — new commands should work normally.
+        let r = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            !matches!(r, Response::Error(_)),
+            "session should be usable after aborted PASSWD"
+        );
+    }
+
+    #[tokio::test]
+    async fn passwd_confirm_mismatch_retries_new_password() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        do_register(&host, sid, "carol", "startpwd").await;
+
+        host.process_command(sid, Command::ChangePassword)
+            .await
+            .unwrap();
+
+        // Correct current password.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: "startpwd".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // New password.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: "mynewpwd1".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Mismatched confirmation → should go back to EnterNew prompt.
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "differentp".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                r,
+                Response::Prompt {
+                    hide_input: true,
+                    ..
+                }
+            ),
+            "mismatch should re-prompt for new password"
         );
     }
 

@@ -170,6 +170,13 @@ pub enum Command {
     /// Begin editing the caller's own display name. (PROFILE)
     EditProfile,
 
+    /// Begin the change-password workflow. (PASSWD)
+    ///
+    /// The workflow asks for the current password (to verify identity),
+    /// then the new password twice.  Requires the session to be logged in
+    /// at User level or above.
+    ChangePassword,
+
     // ── Room / user management ────────────────────────────────────────
     /// Create a new room with the given name (Sysop+). (.C)
     CreateRoom {

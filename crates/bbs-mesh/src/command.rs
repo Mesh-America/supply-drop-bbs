@@ -193,6 +193,8 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "profile" => Some(Command::EditProfile),
 
+        "passwd" => Some(Command::ChangePassword),
+
         // ── Room management ──────────────────────────────────────────────────
         ".c" => match rest {
             Some(name) if !name.is_empty() => Some(Command::CreateRoom {
