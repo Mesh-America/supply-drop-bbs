@@ -9,6 +9,10 @@ curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/i
 Downloads a pre-built binary, runs a setup wizard, and configures a systemd service. Takes under a minute on a Pi 4. Jump to the [full installation section](#installation) for details.
 :::
 
+::: info This guide covers MeshCore
+The installation and configuration steps here are written for MeshCore LoRa hardware (USB companion devices and Pi HATs). Supply Drop BBS supports additional transports — Meshtastic, APRS, Telnet, and others — and dedicated guides for those will be added as they mature.
+:::
+
 ## Audience
 
 Sysops running a Supply Drop BBS deployment:
