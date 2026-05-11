@@ -140,6 +140,17 @@ pub struct MeshConfig {
     /// disable persistent node credentials entirely.
     #[serde(default = "default_node_credential_ttl_days")]
     pub node_credential_ttl_days: u32,
+
+    /// Reset a node's stored path immediately after sending it a message,
+    /// so that the next outbound message (e.g. a mail notification) is
+    /// delivered via flood rather than a potentially-stale direct path.
+    ///
+    /// Flood mode rebroadcasts hop-by-hop across the mesh and reaches the
+    /// destination regardless of whether the BBS's stored route is still
+    /// valid.  Disabling this restores the previous direct-path-only
+    /// behaviour.  Defaults to `true`.
+    #[serde(default = "default_flood_after_send")]
+    pub flood_after_send: bool,
 }
 
 impl MeshConfig {
@@ -167,6 +178,7 @@ impl Default for MeshConfig {
             reconnect_delay_initial_ms: default_reconnect_initial_ms(),
             reconnect_delay_max_ms: default_reconnect_max_ms(),
             node_credential_ttl_days: default_node_credential_ttl_days(),
+            flood_after_send: default_flood_after_send(),
         }
     }
 }
@@ -199,4 +211,8 @@ fn default_reconnect_max_ms() -> u64 {
 
 fn default_node_credential_ttl_days() -> u32 {
     14
+}
+
+fn default_flood_after_send() -> bool {
+    true
 }

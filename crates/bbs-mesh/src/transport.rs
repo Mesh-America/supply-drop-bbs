@@ -98,6 +98,11 @@ pub struct MeshTransport {
     /// Set to `true` while draining stale queued messages on (re)connect.
     /// Cleared when the bridge signals `NoMoreMessages`.
     draining: Arc<AtomicBool>,
+    /// When `true`, queue a `ResetPath` immediately after every outbound
+    /// `SendTxtMsg` so the next send to that node floods rather than using
+    /// a potentially-stale direct path.  Can be disabled in config to
+    /// restore pre-v0.2.4 direct-path-only behaviour.
+    flood_after_send: bool,
 }
 
 #[async_trait]
@@ -169,6 +174,7 @@ impl Plugin for MeshTransport {
             welcome_message: config.welcome_message,
             node_credential_ttl_days: config.node_credential_ttl_days,
             draining: Arc::new(AtomicBool::new(false)),
+            flood_after_send: config.flood_after_send,
         })
     }
 
@@ -191,6 +197,7 @@ impl Plugin for MeshTransport {
         let prefix = self.command_prefix;
         let welcome = self.welcome_message.clone();
         let ttl_days = self.node_credential_ttl_days;
+        let flood_after_send = self.flood_after_send;
 
         // Watch for advert-send requests from the web UI.
         let mut advert_send_rx = host.advert_bus().subscribe_send();
@@ -248,6 +255,7 @@ impl Plugin for MeshTransport {
                                     &notif_host,
                                     &notif_cmd_tx,
                                     &notif_state,
+                                    flood_after_send,
                                 )
                                 .await;
                             }
@@ -273,6 +281,7 @@ impl Plugin for MeshTransport {
             welcome,
             ttl_days,
             draining,
+            flood_after_send,
         ));
 
         info!("mesh transport started");
@@ -332,6 +341,17 @@ impl TransportEngine for MeshTransport {
             .await
             .map_err(|_| TransportError::ConnectionLost("companion client closed".into()))?;
 
+        if self.flood_after_send {
+            let full_pubkey = self
+                .state
+                .lock()
+                .expect("state mutex poisoned")
+                .get_full_pubkey(&pubkey_prefix);
+            if let Some(pubkey) = full_pubkey {
+                let _ = self.cmd_tx.send(OutboundFrame::ResetPath { pubkey }).await;
+            }
+        }
+
         Ok(NotifyOutcome::Queued)
     }
 }
@@ -347,6 +367,7 @@ async fn push_domain_notification(
     host: &Arc<dyn Host>,
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
+    flood_after_send: bool,
 ) {
     let sessions: Vec<SessionId> = state
         .lock()
@@ -382,6 +403,15 @@ async fn push_domain_notification(
                                 .to_owned(),
                         })
                         .await;
+                    if flood_after_send {
+                        let pubkey = state
+                            .lock()
+                            .expect("state mutex poisoned")
+                            .get_full_pubkey(&prefix);
+                        if let Some(pubkey) = pubkey {
+                            let _ = cmd_tx.send(OutboundFrame::ResetPath { pubkey }).await;
+                        }
+                    }
                 }
             }
         }
@@ -411,6 +441,15 @@ async fn push_domain_notification(
                             ),
                         })
                         .await;
+                    if flood_after_send {
+                        let pubkey = state
+                            .lock()
+                            .expect("state mutex poisoned")
+                            .get_full_pubkey(&prefix);
+                        if let Some(pubkey) = pubkey {
+                            let _ = cmd_tx.send(OutboundFrame::ResetPath { pubkey }).await;
+                        }
+                    }
                 }
             }
         }
@@ -432,6 +471,7 @@ async fn event_loop(
     welcome_message: String,
     node_credential_ttl_days: u32,
     draining: Arc<AtomicBool>,
+    flood_after_send: bool,
 ) {
     loop {
         tokio::select! {
@@ -491,7 +531,7 @@ async fn event_loop(
                         }
                     }
                     Some(ClientEvent::Frame(frame)) => {
-                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining).await;
+                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining, flood_after_send).await;
                     }
                 }
             }
@@ -514,6 +554,7 @@ async fn handle_frame(
     welcome_message: &str,
     node_credential_ttl_days: u32,
     draining: &Arc<AtomicBool>,
+    flood_after_send: bool,
 ) {
     use meshcore_companion::frame::InboundFrame;
 
@@ -563,6 +604,7 @@ async fn handle_frame(
                 command_prefix,
                 welcome_message,
                 node_credential_ttl_days,
+                flood_after_send,
             )
             .await;
         }
@@ -603,6 +645,12 @@ async fn handle_frame(
                 gps_lat,
                 gps_lon,
             );
+            // Record the full pubkey so we can send ResetPath after delivers.
+            let prefix: [u8; 6] = contact.pubkey[..6].try_into().expect("pubkey is 32 bytes");
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_full_pubkey(&prefix, contact.pubkey);
             debug!(name = %contact.name, "mesh: full advert (new contact) received");
         }
 
@@ -624,6 +672,7 @@ async fn dispatch_message(
     command_prefix: Option<char>,
     welcome_message: &str,
     node_credential_ttl_days: u32,
+    flood_after_send: bool,
 ) {
     // ── Get or create a session for this node ─────────────────────────────────
     let (session, is_new) = get_or_create_session(sender_prefix, host, state).await;
@@ -653,7 +702,8 @@ async fn dispatch_message(
             welcome_message.to_owned()
         };
 
-        if !greeting.is_empty()
+        let greeting_empty = greeting.is_empty();
+        let welcome_sent = !greeting_empty
             && cmd_tx
                 .send(OutboundFrame::SendTxtMsg {
                     txt_type: TXT_TYPE_PLAIN,
@@ -662,12 +712,21 @@ async fn dispatch_message(
                     text: greeting,
                 })
                 .await
-                .is_err()
-        {
+                .is_ok();
+        if !welcome_sent && !greeting_empty {
             warn!(
                 ?session,
                 "mesh: could not enqueue welcome — cmd channel closed"
             );
+        }
+        if welcome_sent && flood_after_send {
+            let pubkey = state
+                .lock()
+                .expect("state mutex poisoned")
+                .get_full_pubkey(&sender_prefix);
+            if let Some(pubkey) = pubkey {
+                let _ = cmd_tx.send(OutboundFrame::ResetPath { pubkey }).await;
+            }
         }
     }
 
@@ -821,7 +880,7 @@ async fn dispatch_message(
         "mesh: sending reply to node"
     );
 
-    if cmd_tx
+    let reply_sent = cmd_tx
         .send(OutboundFrame::SendTxtMsg {
             txt_type: TXT_TYPE_PLAIN,
             attempt: 0,
@@ -829,12 +888,21 @@ async fn dispatch_message(
             text: reply_text,
         })
         .await
-        .is_err()
-    {
+        .is_ok();
+    if !reply_sent {
         warn!(
             ?session,
             "mesh: could not enqueue reply — cmd channel closed"
         );
+    }
+    if reply_sent && flood_after_send {
+        let pubkey = state
+            .lock()
+            .expect("state mutex poisoned")
+            .get_full_pubkey(&sender_prefix);
+        if let Some(pubkey) = pubkey {
+            let _ = cmd_tx.send(OutboundFrame::ResetPath { pubkey }).await;
+        }
     }
 }
 

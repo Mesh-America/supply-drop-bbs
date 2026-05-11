@@ -59,6 +59,12 @@ pub struct SessionEntry {
     /// The last inbound message text and the time it was processed.
     /// Used to silently drop radio retransmissions of regular commands.
     pub last_message: Option<(String, Instant)>,
+
+    /// Full 32-byte public key for this node, populated the first time a
+    /// `NewAdvert` frame arrives from this node.  `None` until that happens.
+    /// Used to send `ResetPath` after delivering a message so the next
+    /// outbound message floods rather than using a potentially-stale path.
+    pub full_pubkey: Option<[u8; 32]>,
 }
 
 /// Bi-directional map between MeshCore pubkey prefixes and BBS session IDs.
@@ -104,6 +110,7 @@ impl SessionState {
                 awaiting_reply: false,
                 last_workflow_reply: None,
                 last_message: None,
+                full_pubkey: None,
             },
         );
         self.by_session.insert(new_id, prefix);
@@ -161,6 +168,19 @@ impl SessionState {
             }
         }
         false
+    }
+
+    /// Store the full 32-byte public key for `prefix`.  No-op if the prefix
+    /// has no session yet (the key will be recorded when a session is created).
+    pub fn set_full_pubkey(&mut self, prefix: &[u8; 6], pubkey: [u8; 32]) {
+        if let Some(entry) = self.by_prefix.get_mut(prefix) {
+            entry.full_pubkey = Some(pubkey);
+        }
+    }
+
+    /// Return the full 32-byte public key for `prefix`, if known.
+    pub fn get_full_pubkey(&self, prefix: &[u8; 6]) -> Option<[u8; 32]> {
+        self.by_prefix.get(prefix)?.full_pubkey
     }
 
     /// Return `true` if `text` matches the last processed message for `prefix`
