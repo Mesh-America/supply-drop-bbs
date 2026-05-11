@@ -513,6 +513,11 @@ pub struct PluginsConfig {
     #[cfg(feature = "admin-web")]
     #[serde(default)]
     pub web: bbs_web::WebConfig,
+
+    /// Externally-spawned transport plugins (`[[plugins.process]]` blocks).
+    #[cfg(feature = "transport-process")]
+    #[serde(default)]
+    pub process: Vec<bbs_plugin_api::ProcessPluginConfig>,
 }
 
 // ── File resolution ───────────────────────────────────────────────────────────
@@ -528,6 +533,13 @@ pub struct PluginsConfig {
 ///
 /// Returns `(path, was_explicit)`. `was_explicit = true` means the
 /// caller specified the path; a missing explicit path is a hard error.
+/// Return the config file path that would be used by `load()`.
+///
+/// Returns `None` when no config file can be located.
+pub fn resolve_config_path(explicit_path: Option<&std::path::Path>) -> Option<PathBuf> {
+    resolve_file(explicit_path).0
+}
+
 fn resolve_file(explicit_path: Option<&std::path::Path>) -> (Option<PathBuf>, bool) {
     if let Some(p) = explicit_path {
         return (Some(p.to_owned()), true);

@@ -63,7 +63,9 @@ export default defineConfig({
         items: [
           { text: 'Architecture', link: '/ARCHITECTURE' },
           { text: 'Protocol Notes', link: '/PROTOCOL' },
-          { text: 'Transport Plugins', link: '/TRANSPORT_PLUGINS' },
+          { text: 'Transport Plugins (Native)', link: '/TRANSPORT_PLUGINS' },
+          { text: 'Process Transports (Developer)', link: '/PROCESS_TRANSPORTS' },
+          { text: 'Process Transports (Operator)', link: '/PROCESS_TRANSPORTS_OPS' },
         ],
       },
       {

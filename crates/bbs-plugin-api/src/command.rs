@@ -26,6 +26,18 @@
 use crate::identity::Username;
 use serde::{Deserialize, Serialize};
 
+// ── Parsing helpers (private) ─────────────────────────────────────────────────
+
+fn split_first_word(s: &str) -> (&str, Option<&str>) {
+    match s.find(|c: char| c.is_ascii_whitespace()) {
+        None => (s, None),
+        Some(i) => {
+            let rest = s[i..].trim_start();
+            (&s[..i], if rest.is_empty() { None } else { Some(rest) })
+        }
+    }
+}
+
 /// A protocol-neutral command from a session to the BBS.
 ///
 /// Transports parse their wire format into one of these variants
@@ -277,6 +289,104 @@ pub enum Response {
     /// element as an independent frame. Transports without size constraints
     /// (e.g. CLI) may join the parts with newlines.
     MultiText(Vec<String>),
+}
+
+// ── Command::parse ────────────────────────────────────────────────────────────
+
+impl Command {
+    /// Parse a raw text line from a transport connection into a [`Command`].
+    ///
+    /// When `awaiting_reply` is `true` (the previous [`Response`] was a
+    /// [`Response::Prompt`]), the entire line becomes a [`Command::WorkflowReply`]
+    /// regardless of content — this lets the host handle password entry, message
+    /// bodies, and other free-form workflow steps without each transport
+    /// re-implementing that state machine.
+    ///
+    /// This is the canonical parser shared by all transports that forward raw
+    /// text lines (CLI, process plugins).  Transports with their own wire
+    /// syntax (e.g. MeshCore frames) do their own mapping.
+    pub fn parse(line: &str, awaiting_reply: bool) -> Self {
+        let text = line.trim();
+
+        if awaiting_reply {
+            return Command::WorkflowReply {
+                reply: text.to_owned(),
+            };
+        }
+
+        if text.is_empty() {
+            return Command::Unknown { raw: String::new() };
+        }
+
+        let (word, rest) = split_first_word(text);
+        let keyword = word.to_ascii_lowercase();
+
+        match keyword.as_str() {
+            "h" | "help" | "?" => Command::Help {
+                topic: rest.map(str::to_owned),
+            },
+            "register" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(u) => Command::Register { username: u },
+                None => Command::Help {
+                    topic: Some("register".to_owned()),
+                },
+            },
+            "login" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(u) => Command::Login { username: u },
+                None => Command::Help {
+                    topic: Some("login".to_owned()),
+                },
+            },
+            "logout" | "q" => Command::Logout,
+            _ => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        }
+    }
+}
+
+// ── Response helpers ──────────────────────────────────────────────────────────
+
+impl Response {
+    /// Render this response to a user-visible text string.
+    ///
+    /// Returns `None` for variants that carry no displayable content.
+    /// Transports should treat `None` as "send nothing to the user."
+    pub fn render(&self) -> Option<String> {
+        match self {
+            Response::Text(t) => Some(t.clone()),
+            Response::Prompt { text, .. } => Some(text.clone()),
+            Response::LoggedIn { user } => Some(format!(
+                "Welcome, {}. Type 'H' for commands.",
+                user.as_str()
+            )),
+            Response::LoggedOut => Some("Goodbye. Your session has ended.".to_owned()),
+            Response::Error(e) => Some(format!("Error: {e}")),
+            Response::MultiText(parts) => Some(parts.join("\n")),
+        }
+    }
+
+    /// Whether the next input from the user should be treated as a
+    /// [`Command::WorkflowReply`] rather than a parsed command.
+    ///
+    /// Transports must track this flag per-session and pass it to
+    /// [`Command::parse`] on the next input.
+    pub fn sets_awaiting_reply(&self) -> bool {
+        matches!(self, Response::Prompt { .. })
+    }
+
+    /// Whether the user's next input should be visually hidden
+    /// (e.g. password entry). Only meaningful when
+    /// [`sets_awaiting_reply`](Self::sets_awaiting_reply) is also `true`.
+    pub fn hides_next_input(&self) -> bool {
+        matches!(
+            self,
+            Response::Prompt {
+                hide_input: true,
+                ..
+            }
+        )
+    }
 }
 
 #[cfg(test)]

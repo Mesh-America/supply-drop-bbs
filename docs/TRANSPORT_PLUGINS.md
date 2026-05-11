@@ -1,10 +1,21 @@
 # Transport Plugin Development Guide
 
+> **Which guide do you need?**
+>
+> - **Contributing a native transport to Supply Drop's source** (Rust crate,
+>   shipped in the binary, PRs welcome) — you are in the right place.
+>
+> - **Connecting your own device or protocol to your BBS without recompiling**
+>   — write an external executable in any language and use the
+>   [Process Transport (Developer Guide)](./PROCESS_TRANSPORTS.md). For
+>   installation and operations, see the
+>   [Process Transport (Operator Guide)](./PROCESS_TRANSPORTS_OPS.md).
+
 This document is the authoritative guide for building transport plugins for
-Supply Drop BBS. A transport plugin is how users connect to the BBS — the
-MeshCore radio bridge, the Unix domain socket CLI, and the HTTP web admin
-are all transports. You can add Meshtastic, APRS, Telnet, IRC bridge, Matrix,
-or any other channel by writing a new transport crate.
+Supply Drop BBS as native Rust crates. A transport plugin is how users connect
+to the BBS — the MeshCore radio bridge, the Unix domain socket CLI, and the
+HTTP web admin are all transports. You can add Meshtastic, APRS, Telnet, IRC
+bridge, Matrix, or any other channel by writing a new transport crate.
 
 ---
 

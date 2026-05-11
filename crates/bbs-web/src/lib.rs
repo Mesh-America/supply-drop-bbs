@@ -34,6 +34,12 @@
 //! │  │  GET  /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups/:filename    (auth)       │    │
 //! │  │  DELETE /api/v1/backups/:filename  (auth)       │    │
+//! │  │  GET  /api/v1/plugins              (auth)       │    │
+//! │  │  POST /api/v1/plugins              (auth)       │    │
+//! │  │  DELETE /api/v1/plugins/:name      (auth)       │    │
+//! │  │  PATCH /api/v1/plugins/:name       (auth)       │    │
+//! │  │  POST /api/v1/plugins/:name/restart (auth)      │    │
+//! │  │  GET  /api/v1/plugins/:name/logs   (auth)       │    │
 //! │  │  GET  /*               → rust-embed SPA         │    │
 //! │  └─────────────────────────────────────────────────┘    │
 //! └─────────────────────────────────────────────────────────┘
@@ -69,6 +75,7 @@ use bbs_plugin_api::error::{HostError, PluginError};
 use bbs_plugin_api::event::{DomainEvent, MessageRecipient};
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::plugin::Plugin;
+use bbs_plugin_api::registry::{PluginRegistryApi, ProcessPluginConfig, RegistryError};
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -230,6 +237,7 @@ struct AppState {
     started_at: Instant,
     log_tx: broadcast::Sender<String>,
     log_buf: std::sync::Arc<Mutex<LogBuffer>>,
+    plugin_registry: std::sync::Mutex<Option<Arc<dyn PluginRegistryApi>>>,
 }
 
 impl AppState {
@@ -242,6 +250,7 @@ impl AppState {
             started_at: Instant::now(),
             log_tx,
             log_buf: std::sync::Arc::new(Mutex::new(LogBuffer::new())),
+            plugin_registry: std::sync::Mutex::new(None),
         }
     }
 
@@ -400,6 +409,20 @@ impl Plugin for WebPlugin {
     }
 }
 
+impl WebPlugin {
+    /// Inject the process plugin registry so the web API can manage plugins.
+    ///
+    /// Must be called before `start()`.  Safe to call with `None` to disable
+    /// plugin management endpoints (they return 501 in that case).
+    pub fn set_plugin_registry(&self, registry: Arc<dyn PluginRegistryApi>) {
+        *self
+            .state
+            .plugin_registry
+            .lock()
+            .expect("plugin_registry poisoned") = Some(registry);
+    }
+}
+
 // ── Router ────────────────────────────────────────────────────────────────────
 
 fn build_router(state: Arc<AppState>) -> Router {
@@ -431,6 +454,13 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/backups/:filename",
             get(api_download_backup).delete(api_delete_backup),
         )
+        .route("/plugins", get(api_list_plugins).post(api_add_plugin))
+        .route(
+            "/plugins/:name",
+            delete(api_remove_plugin).patch(api_update_plugin),
+        )
+        .route("/plugins/:name/restart", post(api_restart_plugin))
+        .route("/plugins/:name/logs", get(api_plugin_logs))
         .route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             auth_middleware,
@@ -1775,4 +1805,231 @@ fn server_error(internal_msg: &str) -> Response {
         Json(json_error("internal server error")),
     )
         .into_response()
+}
+
+// ── Plugin registry helpers ───────────────────────────────────────────────────
+
+fn registry_unavailable() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json_error("process plugin registry not available")),
+    )
+        .into_response()
+}
+
+fn registry_err(e: RegistryError) -> Response {
+    let status = match &e {
+        RegistryError::NotFound(_) => StatusCode::NOT_FOUND,
+        RegistryError::AlreadyExists(_) => StatusCode::CONFLICT,
+        RegistryError::NotRunning(_) => StatusCode::CONFLICT,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, Json(json_error(&e.to_string()))).into_response()
+}
+
+// ── Plugin handlers ───────────────────────────────────────────────────────────
+
+async fn api_list_plugins(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let registry = { state.plugin_registry.lock().expect("poisoned").clone() };
+    let Some(registry) = registry else {
+        return registry_unavailable();
+    };
+    Json(registry.list_plugins().await).into_response()
+}
+
+#[derive(Deserialize)]
+struct AddPluginBody {
+    name: String,
+    command: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default = "default_true")]
+    restart_on_crash: bool,
+    #[serde(default = "default_restart_delay")]
+    restart_delay_secs: u64,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_restart_delay() -> u64 {
+    5
+}
+
+async fn api_add_plugin(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(body): Json<AddPluginBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let registry = { state.plugin_registry.lock().expect("poisoned").clone() };
+    let Some(registry) = registry else {
+        return registry_unavailable();
+    };
+    let cfg = ProcessPluginConfig {
+        name: body.name,
+        command: body.command,
+        args: body.args,
+        enabled: body.enabled,
+        restart_on_crash: body.restart_on_crash,
+        restart_delay_secs: body.restart_delay_secs,
+    };
+    match registry.add_plugin(cfg).await {
+        Ok(()) => {
+            let _ = state
+                .host
+                .admin_write_audit(
+                    &format!("web:{}", user.username),
+                    "add_plugin",
+                    Some(
+                        &registry
+                            .list_plugins()
+                            .await
+                            .last()
+                            .map(|p| p.name.clone())
+                            .unwrap_or_default(),
+                    ),
+                    None,
+                )
+                .await;
+            (StatusCode::CREATED, Json(serde_json::json!({ "ok": true }))).into_response()
+        }
+        Err(e) => registry_err(e),
+    }
+}
+
+async fn api_remove_plugin(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(name): Path<String>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let registry = { state.plugin_registry.lock().expect("poisoned").clone() };
+    let Some(registry) = registry else {
+        return registry_unavailable();
+    };
+    match registry.remove_plugin(&name).await {
+        Ok(()) => {
+            let _ = state
+                .host
+                .admin_write_audit(
+                    &format!("web:{}", user.username),
+                    "remove_plugin",
+                    Some(&name),
+                    None,
+                )
+                .await;
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(e) => registry_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct UpdatePluginBody {
+    enabled: Option<bool>,
+}
+
+async fn api_update_plugin(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(name): Path<String>,
+    Json(body): Json<UpdatePluginBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let registry = { state.plugin_registry.lock().expect("poisoned").clone() };
+    let Some(registry) = registry else {
+        return registry_unavailable();
+    };
+    if let Some(enabled) = body.enabled {
+        if let Err(e) = registry.set_enabled(&name, enabled).await {
+            return registry_err(e);
+        }
+        let _ = state
+            .host
+            .admin_write_audit(
+                &format!("web:{}", user.username),
+                if enabled {
+                    "enable_plugin"
+                } else {
+                    "disable_plugin"
+                },
+                Some(&name),
+                None,
+            )
+            .await;
+    }
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+async fn api_restart_plugin(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(name): Path<String>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let registry = { state.plugin_registry.lock().expect("poisoned").clone() };
+    let Some(registry) = registry else {
+        return registry_unavailable();
+    };
+    match registry.restart_plugin(&name).await {
+        Ok(()) => {
+            let _ = state
+                .host
+                .admin_write_audit(
+                    &format!("web:{}", user.username),
+                    "restart_plugin",
+                    Some(&name),
+                    None,
+                )
+                .await;
+            Json(serde_json::json!({ "ok": true })).into_response()
+        }
+        Err(e) => registry_err(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct PluginLogsQuery {
+    #[serde(default = "default_log_lines")]
+    lines: usize,
+}
+
+fn default_log_lines() -> usize {
+    50
+}
+
+async fn api_plugin_logs(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(name): Path<String>,
+    Query(q): Query<PluginLogsQuery>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let registry = { state.plugin_registry.lock().expect("poisoned").clone() };
+    let Some(registry) = registry else {
+        return registry_unavailable();
+    };
+    match registry.get_logs(&name, q.lines.min(500)).await {
+        Ok(lines) => Json(serde_json::json!({ "lines": lines })).into_response(),
+        Err(e) => registry_err(e),
+    }
 }

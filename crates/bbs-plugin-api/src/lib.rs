@@ -17,6 +17,7 @@
 //! - [`command`]     — `Command`, `Response` (still placeholders;
 //!   these grow with feature work)
 //! - [`error`]       — `PluginError`, `HostError`, `TransportError`
+//! - [`registry`]    — `PluginRegistryApi`, `ProcessPluginConfig`, `PluginStatus`
 //! - [`testing`]     — fake `Host` for plugin unit tests
 //!
 //! ## Status
@@ -36,6 +37,7 @@ pub mod host;
 pub mod identity;
 pub mod permissions;
 pub mod plugin;
+pub mod registry;
 pub mod testing;
 pub mod transport;
 
@@ -60,4 +62,7 @@ pub use host::Host;
 pub use identity::{SessionId, Username};
 pub use permissions::{PermissionCtx, PermissionLevel};
 pub use plugin::Plugin;
+pub use registry::{
+    PluginRegistryApi, PluginState, PluginStatus, ProcessPluginConfig, RegistryError,
+};
 pub use transport::TransportEngine;

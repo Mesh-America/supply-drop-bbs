@@ -97,6 +97,16 @@ enum Commands {
         #[command(subcommand)]
         action: RoomAction,
     },
+
+    /// Manage externally-spawned transport plugins.
+    ///
+    /// These commands modify config.toml directly. Changes take effect on the
+    /// next BBS restart (or use the web UI for live runtime management).
+    #[cfg(feature = "transport-process")]
+    Plugin {
+        #[command(subcommand)]
+        action: PluginAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -154,6 +164,53 @@ enum RoomAction {
     },
 }
 
+#[cfg(feature = "transport-process")]
+#[derive(Subcommand)]
+enum PluginAction {
+    /// List all configured process transport plugins.
+    List,
+
+    /// Add a new process transport plugin to config.toml.
+    ///
+    /// Restart the BBS (or use the web UI) to start the plugin immediately.
+    Add {
+        /// Unique plugin name.
+        name: String,
+        /// Path to the plugin executable.
+        command: String,
+        /// Arguments for the executable (space-separated if multiple).
+        #[arg(long, num_args = 0..)]
+        args: Vec<String>,
+        /// Disable the plugin after adding (default: enabled).
+        #[arg(long)]
+        disabled: bool,
+        /// Do not restart the plugin on crash (default: restart).
+        #[arg(long)]
+        no_restart: bool,
+        /// Seconds to wait between crash restarts.
+        #[arg(long, default_value = "5")]
+        restart_delay: u64,
+    },
+
+    /// Remove a process transport plugin from config.toml.
+    Remove {
+        /// Plugin name to remove.
+        name: String,
+    },
+
+    /// Enable a disabled plugin in config.toml.
+    Enable {
+        /// Plugin name to enable.
+        name: String,
+    },
+
+    /// Disable a running plugin in config.toml.
+    Disable {
+        /// Plugin name to disable.
+        name: String,
+    },
+}
+
 #[derive(Subcommand)]
 enum ConfigAction {
     /// Validate the config file and exit (exit code 0 = valid).
@@ -180,6 +237,8 @@ async fn main() {
         Some(Commands::Backup) => cmd_backup(&cli),
         Some(Commands::User { action }) => cmd_user(config_path.as_deref(), action).await,
         Some(Commands::Room { action }) => cmd_room(config_path.as_deref(), action).await,
+        #[cfg(feature = "transport-process")]
+        Some(Commands::Plugin { action }) => cmd_plugin(config_path.as_deref(), action),
     }
 }
 
@@ -334,6 +393,26 @@ async fn cmd_run(cli: &Cli) {
     #[cfg(feature = "transport-mesh")]
     let mesh_transport = init_mesh_plugin(&cfg.plugins.mesh, Arc::clone(&host)).await;
 
+    // Process transport plugins — start manager, then hand registry to web.
+    #[cfg(feature = "transport-process")]
+    let process_registry = {
+        use bbs_process_transport::ProcessPluginManager;
+        let config_path = cli
+            .config
+            .as_deref()
+            .and_then(|p| p.canonicalize().ok())
+            .or_else(|| {
+                [
+                    std::path::PathBuf::from("config.toml"),
+                    std::path::PathBuf::from("/etc/supply-drop-bbs/config.toml"),
+                ]
+                .iter()
+                .find(|p| p.exists())
+                .and_then(|p| p.canonicalize().ok())
+            });
+        ProcessPluginManager::new(cfg.plugins.process.clone(), Arc::clone(&host), config_path).await
+    };
+
     #[cfg(feature = "admin-web")]
     let web_plugin = {
         // Resolve the config file to an absolute path so the web plugin can
@@ -355,7 +434,14 @@ async fn cmd_run(cli: &Cli) {
             .and_then(|p| p.canonicalize().ok())
             .map(|abs| abs.to_string_lossy().into_owned())
         };
-        init_web_plugin(&cfg.plugins.web, Arc::clone(&host), cfg_abs).await
+        let wp = init_web_plugin(&cfg.plugins.web, Arc::clone(&host), cfg_abs).await;
+        #[cfg(feature = "transport-process")]
+        if let Some(ref plugin) = wp {
+            let registry =
+                Arc::clone(&process_registry) as Arc<dyn bbs_plugin_api::PluginRegistryApi>;
+            plugin.set_plugin_registry(registry);
+        }
+        wp
     };
 
     // ── 9. Wait for shutdown signal ───────────────────────────────────────────
@@ -528,6 +614,174 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                 std::process::exit(1);
             }
         },
+    }
+}
+
+/// Manage process transport plugins by editing config.toml directly.
+///
+/// Changes take effect on the next BBS restart. Use the web admin UI
+/// for live runtime management (start/stop/restart without restarting).
+#[cfg(feature = "transport-process")]
+fn cmd_plugin(config_path: Option<&std::path::Path>, action: PluginAction) {
+    use bbs_plugin_api::ProcessPluginConfig;
+
+    let path = match config::resolve_config_path(config_path) {
+        Some(p) => p,
+        None => {
+            eprintln!("error: no config file found");
+            std::process::exit(1);
+        }
+    };
+
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error reading config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let mut doc: toml_edit::DocumentMut = match raw.parse() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error parsing config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Read current plugins list.
+    let mut plugins: Vec<ProcessPluginConfig> = {
+        let cfg = config::load(config_path).unwrap_or_default();
+        #[cfg(feature = "transport-process")]
+        {
+            cfg.plugins.process
+        }
+        #[cfg(not(feature = "transport-process"))]
+        {
+            vec![]
+        }
+    };
+
+    match action {
+        PluginAction::List => {
+            if plugins.is_empty() {
+                println!("No process plugins configured.");
+                return;
+            }
+            println!("{:<20} {:<12} COMMAND", "NAME", "ENABLED");
+            for p in &plugins {
+                let args = if p.args.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", p.args.join(" "))
+                };
+                println!(
+                    "{:<20} {:<12} {}{}",
+                    p.name,
+                    if p.enabled { "yes" } else { "no" },
+                    p.command,
+                    args
+                );
+            }
+        }
+
+        PluginAction::Add {
+            name,
+            command,
+            args,
+            disabled,
+            no_restart,
+            restart_delay,
+        } => {
+            if plugins.iter().any(|p| p.name == name) {
+                eprintln!("error: plugin '{name}' already exists");
+                std::process::exit(1);
+            }
+            plugins.push(ProcessPluginConfig {
+                name: name.clone(),
+                command,
+                args,
+                enabled: !disabled,
+                restart_on_crash: !no_restart,
+                restart_delay_secs: restart_delay,
+            });
+            write_plugins(&mut doc, &plugins, &path);
+            println!("Added plugin '{name}'. Restart the BBS to start it (or use the web UI).");
+        }
+
+        PluginAction::Remove { name } => {
+            let before = plugins.len();
+            plugins.retain(|p| p.name != name);
+            if plugins.len() == before {
+                eprintln!("error: plugin '{name}' not found");
+                std::process::exit(1);
+            }
+            write_plugins(&mut doc, &plugins, &path);
+            println!("Removed plugin '{name}'.");
+        }
+
+        PluginAction::Enable { name } => {
+            let p = plugins.iter_mut().find(|p| p.name == name);
+            match p {
+                Some(p) => {
+                    p.enabled = true;
+                    write_plugins(&mut doc, &plugins, &path);
+                    println!("Enabled '{name}'.");
+                }
+                None => {
+                    eprintln!("error: plugin '{name}' not found");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        PluginAction::Disable { name } => {
+            let p = plugins.iter_mut().find(|p| p.name == name);
+            match p {
+                Some(p) => {
+                    p.enabled = false;
+                    write_plugins(&mut doc, &plugins, &path);
+                    println!("Disabled '{name}'.");
+                }
+                None => {
+                    eprintln!("error: plugin '{name}' not found");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "transport-process")]
+fn write_plugins(
+    doc: &mut toml_edit::DocumentMut,
+    plugins: &[bbs_plugin_api::ProcessPluginConfig],
+    path: &std::path::Path,
+) {
+    let mut aot = toml_edit::ArrayOfTables::new();
+    for p in plugins {
+        let mut tbl = toml_edit::Table::new();
+        tbl.insert("name", toml_edit::value(&p.name));
+        tbl.insert("command", toml_edit::value(&p.command));
+        if !p.args.is_empty() {
+            let mut arr = toml_edit::Array::default();
+            for a in &p.args {
+                arr.push(a.as_str());
+            }
+            tbl.insert("args", toml_edit::value(arr));
+        }
+        tbl.insert("enabled", toml_edit::value(p.enabled));
+        tbl.insert("restart_on_crash", toml_edit::value(p.restart_on_crash));
+        tbl.insert(
+            "restart_delay_secs",
+            toml_edit::value(p.restart_delay_secs as i64),
+        );
+        aot.push(tbl);
+    }
+    doc["plugins"]["process"] = toml_edit::Item::ArrayOfTables(aot);
+    if let Err(e) = std::fs::write(path, doc.to_string()) {
+        eprintln!("error writing config: {e}");
+        std::process::exit(1);
     }
 }
 

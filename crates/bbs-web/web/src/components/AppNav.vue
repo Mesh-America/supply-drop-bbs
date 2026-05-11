@@ -79,6 +79,7 @@ const groups: NavGroup[] = [
     items: [
       { to: '/reports', label: 'reports' },
       { to: '/backups', label: 'backups' },
+      { to: '/plugins', label: 'plugins' },
       { to: '/logs', label: 'logs' },
       { to: '/audit', label: 'audit' },
       { to: '/settings', label: 'settings' },

@@ -275,7 +275,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
 h1 { margin: 0; }
 p { margin: 0; }
 
-.search-bar { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
+.page-header .search-bar { display: flex; flex-direction: row; gap: 0.4rem; align-items: center; flex-wrap: wrap; }
 .search-input { min-width: 130px; }
 
 .search-results { flex: 1; overflow-y: auto; border: 1px solid var(--border); border-radius: 4px; }

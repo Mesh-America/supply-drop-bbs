@@ -301,6 +301,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbs-process-transport"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "bbs-plugin-api",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tokio",
+ "toml_edit",
+ "tracing",
+]
+
+[[package]]
 name = "bbs-web"
 version = "0.3.0"
 dependencies = [
@@ -2431,6 +2445,7 @@ dependencies = [
  "bbs-core",
  "bbs-mesh",
  "bbs-plugin-api",
+ "bbs-process-transport",
  "bbs-web",
  "clap",
  "dialoguer",
@@ -2442,6 +2457,7 @@ dependencies = [
  "tokio",
  "tokio-serial",
  "toml",
+ "toml_edit",
  "tracing",
  "tracing-subscriber",
 ]
