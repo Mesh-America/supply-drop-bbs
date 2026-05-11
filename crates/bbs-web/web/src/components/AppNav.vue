@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '../stores/auth'
+import { useStatsStore } from '../stores/stats'
 import { useRouter } from 'vue-router'
 import { useTheme } from '../composables/useTheme'
 import type { Mode, ColorTheme } from '../composables/useTheme'
@@ -10,6 +11,7 @@ const open = ref(false)
 const menuOpen = ref(false)
 const menuRef = ref<HTMLElement>()
 const auth = useAuthStore()
+const stats = useStatsStore()
 const router = useRouter()
 const { mode, color, modeLabel } = useTheme()
 
@@ -27,8 +29,14 @@ function handleClickOutside(e: MouseEvent) {
   }
 }
 
-onMounted(() => document.addEventListener('click', handleClickOutside))
-onUnmounted(() => document.removeEventListener('click', handleClickOutside))
+onMounted(() => {
+  document.addEventListener('click', handleClickOutside)
+  stats.startPolling()
+})
+onUnmounted(() => {
+  document.removeEventListener('click', handleClickOutside)
+  stats.stopPolling()
+})
 
 const colors: { value: ColorTheme; label: string }[] = [
   { value: 'blue',   label: 'Blue' },
@@ -42,7 +50,10 @@ const modes: { value: Mode; label: string }[] = [
   { value: 'system', label: modeLabel.system },
 ]
 
-const groups = [
+interface NavItem { to: string; label: string; badge?: boolean }
+interface NavGroup { title: string; items: NavItem[] }
+
+const groups: NavGroup[] = [
   {
     title: 'overview',
     items: [{ to: '/', label: 'dashboard' }],
@@ -58,7 +69,7 @@ const groups = [
   {
     title: 'admin',
     items: [
-      { to: '/users', label: 'users' },
+      { to: '/users', label: 'users', badge: true },
       { to: '/rooms', label: 'rooms' },
       { to: '/messages', label: 'messages' },
     ],
@@ -132,7 +143,14 @@ const groups = [
         <div class="group-title">{{ g.title }}</div>
         <ul>
           <li v-for="item in g.items" :key="item.to">
-            <router-link :to="item.to" @click="close">{{ item.label }}</router-link>
+            <router-link :to="item.to" @click="close">
+              {{ item.label }}
+              <span
+                v-if="item.badge && stats.pendingUsers > 0"
+                class="nav-badge"
+                :title="`${stats.pendingUsers} pending verification`"
+              >{{ stats.pendingUsers }}</span>
+            </router-link>
           </li>
         </ul>
       </div>
@@ -289,6 +307,19 @@ const groups = [
   border-left-color: var(--accent);
   background: var(--accent-bg);
 }
+.nav-badge {
+  display: inline-block;
+  margin-left: 0.4rem;
+  font-size: 0.65em;
+  font-weight: 700;
+  background: var(--warn, #b45309);
+  color: #fff;
+  border-radius: 999px;
+  padding: 0.1em 0.5em;
+  vertical-align: middle;
+  line-height: 1.4;
+}
+
 .sidebar-footer {
   font-size: 0.75em;
   text-align: center;

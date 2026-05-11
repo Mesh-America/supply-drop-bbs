@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted } from 'vue'
 import { api } from '../api/client'
+import { useToast } from '../composables/useToast'
+import { useAuthStore } from '../stores/auth'
 
 interface Session {
   session_id: number
@@ -12,6 +14,9 @@ interface Session {
 const sessions = ref<Session[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
+const killing = ref<number | null>(null)
+const toast = useToast()
+const auth = useAuthStore()
 
 function levelLabel(l: number): string {
   if (l >= 100) return 'sysop'
@@ -32,6 +37,20 @@ async function load() {
   }
 }
 
+async function killSession(s: Session) {
+  if (!confirm(`Terminate session ${s.session_id}${s.username ? ` (${s.username})` : ''}?`)) return
+  killing.value = s.session_id
+  try {
+    await api.del(`/api/v1/sessions/${s.session_id}`)
+    toast.ok(`Session ${s.session_id} terminated`)
+    await load()
+  } catch (e: any) {
+    toast.error(e?.message ?? 'failed to kill session')
+  } finally {
+    killing.value = null
+  }
+}
+
 let timer: ReturnType<typeof setInterval> | null = null
 onMounted(() => { load(); timer = setInterval(load, 10_000) })
 onUnmounted(() => { if (timer !== null) clearInterval(timer) })
@@ -47,7 +66,7 @@ onUnmounted(() => { if (timer !== null) clearInterval(timer) })
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>
-    <p v-if="!loading && sessions.length === 0 && !error" class="muted">No active sessions.</p>
+    <p v-if="!loading && sessions.length === 0 && !error" class="muted empty">No active sessions.</p>
 
     <table v-if="sessions.length > 0">
       <thead>
@@ -56,14 +75,28 @@ onUnmounted(() => { if (timer !== null) clearInterval(timer) })
           <th>transport</th>
           <th>username</th>
           <th>level</th>
+          <th v-if="auth.isSysop"></th>
         </tr>
       </thead>
       <tbody>
         <tr v-for="s in sessions" :key="s.session_id">
           <td><code>{{ s.session_id }}</code></td>
           <td>{{ s.transport }}</td>
-          <td>{{ s.username ?? '—' }}</td>
+          <td>
+            <router-link
+              v-if="s.username"
+              :to="{ path: '/users', query: { search: s.username } }"
+            >{{ s.username }}</router-link>
+            <span v-else class="muted">—</span>
+          </td>
           <td>{{ levelLabel(s.permission_level) }}</td>
+          <td v-if="auth.isSysop">
+            <button
+              class="small-btn danger"
+              :disabled="killing === s.session_id"
+              @click="killSession(s)"
+            >kill</button>
+          </td>
         </tr>
       </tbody>
     </table>
@@ -76,4 +109,6 @@ onUnmounted(() => { if (timer !== null) clearInterval(timer) })
 .page-header div { display: flex; flex-direction: column; gap: 0.2rem; }
 h1 { margin: 0; }
 p { margin: 0; }
+.empty { padding-top: 0.5rem; }
+.small-btn { padding: 0.2rem 0.5rem; font-size: 0.8em; }
 </style>

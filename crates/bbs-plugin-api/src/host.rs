@@ -290,6 +290,47 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_audit_log".into()))
     }
 
+    /// Forcibly terminate a live session by its numeric ID.
+    ///
+    /// Returns `true` when a session was found and removed, `false` when no
+    /// matching session existed (already gone).
+    async fn admin_kill_session(&self, session_id: u64) -> Result<bool, HostError> {
+        let _ = session_id;
+        Err(HostError::NotSupported("admin_kill_session".into()))
+    }
+
+    /// Update mutable fields of a room.
+    ///
+    /// All parameters are optional; `None` = leave unchanged.
+    /// `description = Some(None)` clears the description to NULL.
+    ///
+    /// Returns the updated `AdminRoomSummary` on success.
+    async fn admin_update_room(
+        &self,
+        room_id: i64,
+        description: Option<Option<String>>,
+        read_only: Option<bool>,
+        min_permission_level: Option<u8>,
+    ) -> Result<AdminRoomSummary, HostError> {
+        let _ = (room_id, description, read_only, min_permission_level);
+        Err(HostError::NotSupported("admin_update_room".into()))
+    }
+
+    /// Search room messages (excludes private Mail DMs).
+    ///
+    /// `sender`: filter by exact username; `None` = all senders.
+    /// `query`: substring match against message content; `None` = no text filter.
+    /// `limit`: maximum rows to return (capped server-side at 200).
+    async fn admin_search_messages(
+        &self,
+        sender: Option<&str>,
+        query: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AdminMessageRecord>, HostError> {
+        let _ = (sender, query, limit);
+        Err(HostError::NotSupported("admin_search_messages".into()))
+    }
+
     // ── Node location ────────────────────────────────────────────────────────────
 
     /// Return the configured GPS coordinates for this BBS node, if any.

@@ -9,8 +9,8 @@
 
 use super::{error::StoreError, Database};
 use bbs_plugin_api::{
-    AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity, AdminReports, AdminRoomSummary,
-    AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminWeeklySignups,
+    AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity, AdminMessageRecord, AdminReports,
+    AdminRoomSummary, AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminWeeklySignups,
 };
 use sqlx::Row;
 use std::path::Path;
@@ -259,6 +259,71 @@ impl Database {
             msgs_last_7d,
             msgs_last_30d,
         })
+    }
+
+    /// Message count for a single room (used by admin_update_room to populate the
+    /// returned `AdminRoomSummary`).
+    pub(crate) async fn room_message_count(&self, room_id: i64) -> Result<i64, StoreError> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM room_messages WHERE room_id = ?")
+            .bind(room_id)
+            .fetch_one(&self.read_pool)
+            .await?;
+        Ok(count)
+    }
+
+    /// Search non-DM room messages by optional sender and/or content substring.
+    ///
+    /// Only messages linked via `room_messages` are searched — private Mail DMs
+    /// (stored in `messages` but not in `room_messages`) are never returned.
+    pub(crate) async fn admin_search_messages(
+        &self,
+        sender: Option<&str>,
+        query: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AdminMessageRecord>, StoreError> {
+        // Build the WHERE clauses dynamically.  We always have the room_messages
+        // join which already excludes DMs.  Additional filters are opt-in.
+        let mut sql = String::from(
+            "SELECT m.id, m.sender, m.recipient, m.content, m.timestamp \
+             FROM messages m \
+             INNER JOIN room_messages rm ON rm.message_id = m.id \
+             WHERE 1=1",
+        );
+        if sender.is_some() {
+            sql.push_str(" AND m.sender = ?");
+        }
+        if query.is_some() {
+            sql.push_str(" AND m.content LIKE ? ESCAPE '\\'");
+        }
+        sql.push_str(" ORDER BY m.id DESC LIMIT ?");
+
+        let mut q = sqlx::query(&sql);
+        if let Some(s) = sender {
+            q = q.bind(s);
+        }
+        if let Some(text) = query {
+            // Escape LIKE metacharacters so user input is treated as a literal.
+            let escaped = text
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            q = q.bind(format!("%{escaped}%"));
+        }
+        q = q.bind(limit as i64);
+
+        let rows = q.fetch_all(&self.read_pool).await?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(AdminMessageRecord {
+                    id: r.try_get("id")?,
+                    sender: r.try_get("sender")?,
+                    recipient: r.try_get("recipient")?,
+                    content: r.try_get("content")?,
+                    timestamp: r.try_get("timestamp")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Db)
     }
 
     /// Run `VACUUM INTO dest_path` to create a backup copy of the database.

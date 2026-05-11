@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted } from 'vue'
+import { useRoute } from 'vue-router'
 import { api } from '../api/client'
 
 interface AuditEntry {
@@ -11,10 +12,13 @@ interface AuditEntry {
   created_at: string
 }
 
+const route = useRoute()
+
 const entries = ref<AuditEntry[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
 const actionFilter = ref('')
+const actorFilter = ref((route.query.actor as string) ?? '')
 const limit = ref(100)
 const offset = ref(0)
 const hasMore = ref(false)
@@ -27,7 +31,9 @@ const ACTION_OPTIONS = [
   { value: 'set_permission', label: 'set_permission' },
   { value: 'delete_message', label: 'delete_message' },
   { value: 'create_room', label: 'create_room' },
+  { value: 'edit_room', label: 'edit_room' },
   { value: 'delete_room', label: 'delete_room' },
+  { value: 'kill_session', label: 'kill_session' },
 ]
 
 function actionClass(action: string): string {
@@ -37,18 +43,29 @@ function actionClass(action: string): string {
     case 'validate':       return 'badge-validate'
     case 'set_permission': return 'badge-perm'
     case 'delete_message': return 'badge-delete'
-    case 'create_room':    return 'badge-create'
     case 'delete_room':    return 'badge-delete'
+    case 'kill_session':   return 'badge-delete'
+    case 'create_room':    return 'badge-create'
+    case 'edit_room':      return 'badge-create'
     default:               return 'badge-default'
   }
 }
 
 function formatTs(iso: string): string {
-  try {
-    return new Date(iso).toLocaleString()
-  } catch {
-    return iso
-  }
+  try { return new Date(iso).toLocaleString() } catch { return iso }
+}
+
+// Strip the "web:" prefix from actor for user links
+function actorUsername(actor: string): string | null {
+  if (actor === 'system') return null
+  return actor.startsWith('web:') ? actor.slice(4) : actor
+}
+
+// A target is a username reference when it doesn't start with # (message id) or contain =
+function targetUsername(target: string | null): string | null {
+  if (!target) return null
+  if (target.startsWith('#') || target.includes('=') || target.includes('id=')) return null
+  return target
 }
 
 async function load(reset = true) {
@@ -62,8 +79,14 @@ async function load(reset = true) {
     })
     if (actionFilter.value) params.set('action', actionFilter.value)
     const rows = await api.get<AuditEntry[]>(`/api/v1/audit-log?${params}`)
+    let filtered = rows
+    // Client-side actor filter (server doesn't support it yet)
+    if (actorFilter.value.trim()) {
+      const q = actorFilter.value.trim().toLowerCase()
+      filtered = filtered.filter(e => e.actor.toLowerCase().includes(q))
+    }
     hasMore.value = rows.length > limit.value
-    entries.value = rows.slice(0, limit.value)
+    entries.value = filtered.slice(0, limit.value)
   } catch (e: any) {
     error.value = e?.message ?? 'failed to load audit log'
   } finally {
@@ -71,15 +94,8 @@ async function load(reset = true) {
   }
 }
 
-function prev() {
-  offset.value = Math.max(0, offset.value - limit.value)
-  load(false)
-}
-
-function next() {
-  offset.value += limit.value
-  load(false)
-}
+function prev() { offset.value = Math.max(0, offset.value - limit.value); load(false) }
+function next() { offset.value += limit.value; load(false) }
 
 onMounted(() => load())
 </script>
@@ -92,6 +108,12 @@ onMounted(() => load())
         <p class="muted">Durable record of privileged actions</p>
       </div>
       <div class="controls">
+        <input
+          v-model="actorFilter"
+          placeholder="filter by actor…"
+          class="actor-input"
+          @input="load()"
+        />
         <select v-model="actionFilter" @change="load()">
           <option v-for="o in ACTION_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
         </select>
@@ -117,11 +139,25 @@ onMounted(() => load())
           <tr v-for="e in entries" :key="e.id">
             <td class="col-id muted">{{ e.id }}</td>
             <td class="col-ts mono">{{ formatTs(e.created_at) }}</td>
-            <td class="col-actor mono">{{ e.actor }}</td>
+            <td class="col-actor mono">
+              <router-link
+                v-if="actorUsername(e.actor)"
+                :to="{ path: '/users', query: { search: actorUsername(e.actor)! } }"
+                class="link"
+              >{{ e.actor }}</router-link>
+              <span v-else>{{ e.actor }}</span>
+            </td>
             <td class="col-action">
               <span class="badge" :class="actionClass(e.action)">{{ e.action }}</span>
             </td>
-            <td class="col-target mono">{{ e.target ?? '' }}</td>
+            <td class="col-target mono">
+              <router-link
+                v-if="targetUsername(e.target)"
+                :to="{ path: '/users', query: { search: targetUsername(e.target)! } }"
+                class="link"
+              >{{ e.target }}</router-link>
+              <span v-else>{{ e.target ?? '' }}</span>
+            </td>
             <td class="col-detail muted">{{ e.detail ?? '' }}</td>
           </tr>
         </tbody>
@@ -150,6 +186,7 @@ h1 { margin: 0 0 0.15rem; }
 p { margin: 0; }
 
 .controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.actor-input { min-width: 140px; }
 
 .table-wrap { overflow-x: auto; }
 
@@ -166,15 +203,11 @@ tr:nth-child(even) td { background: var(--row-alt); }
 .col-detail { }
 
 .mono { font-family: monospace; font-size: 0.95em; }
+.link { color: var(--accent); }
 
 .badge {
-  display: inline-block;
-  padding: 0.15em 0.5em;
-  border-radius: 3px;
-  font-size: 0.82em;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+  display: inline-block; padding: 0.15em 0.5em; border-radius: 3px;
+  font-size: 0.82em; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
 }
 .badge-ban      { background: #fee2e2; color: #b91c1c; }
 .badge-unban    { background: #dcfce7; color: #15803d; }
@@ -184,7 +217,6 @@ tr:nth-child(even) td { background: var(--row-alt); }
 .badge-create   { background: #dcfce7; color: #15803d; }
 .badge-default  { background: var(--row-alt); color: var(--muted); }
 
-/* dark-mode badge adjustments */
 :global(.dark) .badge-ban      { background: #450a0a; color: #fca5a5; }
 :global(.dark) .badge-unban    { background: #052e16; color: #86efac; }
 :global(.dark) .badge-validate { background: #1e3a5f; color: #93c5fd; }
@@ -194,11 +226,6 @@ tr:nth-child(even) td { background: var(--row-alt); }
 
 .empty-state { padding: 2rem 0.5rem; text-align: center; }
 
-.pagination {
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  padding-top: 0.25rem;
-}
+.pagination { display: flex; align-items: center; gap: 0.75rem; padding-top: 0.25rem; }
 .page-info { font-size: 0.85em; }
 </style>

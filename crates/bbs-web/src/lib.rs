@@ -410,11 +410,13 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/adverts", get(api_adverts))
         .route("/adverts/send", post(api_adverts_send))
         .route("/sessions", get(api_list_sessions))
+        .route("/sessions/:id", delete(api_kill_session))
         .route("/users", get(api_list_users))
         .route("/users/:username", patch(api_update_user))
         .route("/rooms", get(api_list_rooms).post(api_create_room))
-        .route("/rooms/:id", delete(api_delete_room))
+        .route("/rooms/:id", patch(api_update_room).delete(api_delete_room))
         .route("/rooms/:id/messages", get(api_list_messages))
+        .route("/messages/search", get(api_search_messages))
         .route("/messages/:id", delete(api_delete_message))
         .route("/audit-log", get(api_audit_log))
         .route("/stats", get(api_stats))
@@ -666,6 +668,35 @@ async fn api_list_sessions(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+async fn api_kill_session(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(id): Path<u64>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop required to kill sessions")),
+        )
+            .into_response();
+    }
+    match state.host.admin_kill_session(id).await {
+        Ok(true) => {
+            let actor_str = format!("web:{}", caller.username);
+            if let Err(e) = state
+                .host
+                .admin_write_audit(&actor_str, "kill_session", Some(&format!("{id}")), None)
+                .await
+            {
+                warn!("audit write failed: {e}");
+            }
+            Json(serde_json::json!({"ok": true})).into_response()
+        }
+        Ok(false) => (StatusCode::NOT_FOUND, Json(json_error("session not found"))).into_response(),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
 // ── Users ─────────────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -827,6 +858,65 @@ async fn api_create_room(
     }
 }
 
+#[derive(Deserialize)]
+struct UpdateRoomBody {
+    description: Option<serde_json::Value>, // null = clear, string = set, absent = leave
+    read_only: Option<bool>,
+    min_permission_level: Option<u8>,
+}
+
+async fn api_update_room(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateRoomBody>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop required to edit rooms")),
+        )
+            .into_response();
+    }
+
+    // Convert JSON Value for description: absent key → None (leave), null → Some(None) (clear),
+    // string → Some(Some(s)) (set).
+    let description: Option<Option<String>> = match body.description {
+        None => None,
+        Some(serde_json::Value::Null) => Some(None),
+        Some(serde_json::Value::String(s)) => Some(Some(s)),
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("description must be a string or null")),
+            )
+                .into_response()
+        }
+    };
+
+    match state
+        .host
+        .admin_update_room(id, description, body.read_only, body.min_permission_level)
+        .await
+    {
+        Ok(room) => {
+            let actor_str = format!("web:{}", caller.username);
+            if let Err(e) = state
+                .host
+                .admin_write_audit(&actor_str, "edit_room", Some(&room.name), None)
+                .await
+            {
+                warn!("audit write failed: {e}");
+            }
+            Json(room).into_response()
+        }
+        Err(HostError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, Json(json_error("room not found"))).into_response()
+        }
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
 async fn api_delete_room(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<CurrentUser>,
@@ -874,9 +964,39 @@ async fn api_list_messages(
     Path(room_id): Path<i64>,
     Query(q): Query<ListMessagesQuery>,
 ) -> Response {
+    // Room 2 is the Mail room — DMs are private and must never be exposed here.
+    if room_id == 2 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("mail room messages are private")),
+        )
+            .into_response();
+    }
     match state
         .host
         .admin_list_messages(room_id, q.limit, q.after_id)
+        .await
+    {
+        Ok(m) => Json(m).into_response(),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchMessagesQuery {
+    sender: Option<String>,
+    q: Option<String>,
+    #[serde(default = "default_page_size")]
+    limit: u32,
+}
+
+async fn api_search_messages(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SearchMessagesQuery>,
+) -> Response {
+    match state
+        .host
+        .admin_search_messages(params.sender.as_deref(), params.q.as_deref(), params.limit)
         .await
     {
         Ok(m) => Json(m).into_response(),

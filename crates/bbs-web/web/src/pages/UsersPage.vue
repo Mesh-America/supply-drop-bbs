@@ -1,6 +1,10 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '../api/client'
+import { useToast } from '../composables/useToast'
+import { useStatsStore } from '../stores/stats'
+import { useAuthStore } from '../stores/auth'
 
 interface UserInfo {
   id: number
@@ -12,27 +16,38 @@ interface UserInfo {
   last_login_at: string | null
 }
 
-// 'pending' is a client-side filter (permission_level === 0); all other
-// values are passed to the server as ?status=<n>.
 const ALL_USERS = ref<UserInfo[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
-const filterMode = ref<string>('') // '' | 'pending' | '0' | '1'
-const actionError = ref<string | null>(null)
-const actionOk = ref<string | null>(null)
+const filterMode = ref<string>('')
 const acting = ref(false)
+const bulkValidating = ref(false)
+const toast = useToast()
+const stats = useStatsStore()
+const auth = useAuthStore()
+const route = useRoute()
+const router = useRouter()
+
+// Search driven from query param (cross-linked from SessionsPage)
+const searchText = ref((route.query.search as string) ?? '')
+watch(() => route.query.search, v => { searchText.value = (v as string) ?? '' })
 
 const users = computed<UserInfo[]>(() => {
-  if (filterMode.value === 'pending') {
-    return ALL_USERS.value.filter(u => u.permission_level === 0 && u.status !== 'banned')
-  }
-  if (filterMode.value === '0') return ALL_USERS.value.filter(u => u.status === 'active')
-  if (filterMode.value === '1') return ALL_USERS.value.filter(u => u.status === 'banned')
-  return ALL_USERS.value
+  let list = ALL_USERS.value
+  if (filterMode.value === 'pending') list = list.filter(u => u.permission_level === 0 && u.status !== 'banned')
+  else if (filterMode.value === '0') list = list.filter(u => u.status === 'active')
+  else if (filterMode.value === '1') list = list.filter(u => u.status === 'banned')
+  const q = searchText.value.trim().toLowerCase()
+  if (q) list = list.filter(u => u.username.toLowerCase().includes(q) || (u.display_name ?? '').toLowerCase().includes(q))
+  return list
 })
 
 const pendingCount = computed(() =>
   ALL_USERS.value.filter(u => u.permission_level === 0 && u.status !== 'banned').length
+)
+
+const pendingUsers = computed(() =>
+  ALL_USERS.value.filter(u => u.permission_level === 0 && u.status !== 'banned')
 )
 
 function levelLabel(l: number): string {
@@ -46,8 +61,6 @@ async function load() {
   loading.value = true
   error.value = null
   try {
-    // Always fetch all users; filtering is done client-side so the
-    // pending count stays accurate regardless of the active filter.
     ALL_USERS.value = await api.get<UserInfo[]>('/api/v1/users')
   } catch (e: any) {
     error.value = e?.message ?? 'failed to load users'
@@ -59,25 +72,56 @@ async function load() {
 async function doAction(username: string, body: object, okMsg: string) {
   if (acting.value) return
   acting.value = true
-  actionError.value = null
-  actionOk.value = null
   try {
     await api.patch(`/api/v1/users/${encodeURIComponent(username)}`, body)
-    actionOk.value = okMsg
+    toast.ok(okMsg)
     await load()
+    stats.refresh()
   } catch (e: any) {
-    actionError.value = e?.message ?? 'action failed'
+    toast.error(e?.message ?? 'action failed')
   } finally {
     acting.value = false
   }
 }
 
-const validate = (u: string) => doAction(u, { status: 0, permission_level: 10 }, `${u} verified`)
-const ban      = (u: string) => doAction(u, { status: 1 }, `${u} banned`)
-const unban    = (u: string) => doAction(u, { status: 0 }, `${u} unbanned`)
+const validate   = (u: string) => doAction(u, { status: 0, permission_level: 10 }, `${u} verified`)
+const ban        = (u: string) => doAction(u, { status: 1 }, `${u} banned`)
+const unban      = (u: string) => doAction(u, { status: 0 }, `${u} unbanned`)
+
+async function setLevel(u: UserInfo, level: number) {
+  if (level === u.permission_level) return
+  await doAction(u.username, { permission_level: level }, `${u.username} set to ${levelLabel(level)}`)
+}
+
+async function bulkValidateAll() {
+  if (!pendingUsers.value.length) return
+  if (!confirm(`Validate all ${pendingUsers.value.length} pending users?`)) return
+  bulkValidating.value = true
+  let ok = 0, fail = 0
+  for (const u of pendingUsers.value) {
+    try {
+      await api.patch(`/api/v1/users/${encodeURIComponent(u.username)}`, { status: 0, permission_level: 10 })
+      ok++
+    } catch { fail++ }
+  }
+  bulkValidating.value = false
+  if (fail === 0) toast.ok(`${ok} user${ok !== 1 ? 's' : ''} verified`)
+  else toast.error(`${ok} verified, ${fail} failed`)
+  await load()
+  stats.refresh()
+}
+
+// ── Detail drawer ─────────────────────────────────────────────────────────────
+const drawerUser = ref<UserInfo | null>(null)
+function openDrawer(u: UserInfo) { drawerUser.value = u }
+function closeDrawer() { drawerUser.value = null }
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
-onMounted(() => { load(); pollTimer = setInterval(load, 30_000) })
+onMounted(() => {
+  if (route.query.filter) filterMode.value = route.query.filter as string
+  load()
+  pollTimer = setInterval(load, 30_000)
+})
 onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
 </script>
 
@@ -94,18 +138,28 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
         <p class="muted">Manage BBS user accounts</p>
       </div>
       <div class="controls">
+        <input
+          v-model="searchText"
+          placeholder="search username…"
+          class="search-input"
+          @input="() => router.replace({ query: { ...route.query, search: searchText || undefined } })"
+        />
         <select v-model="filterMode">
           <option value="">all</option>
           <option value="pending">pending verification</option>
           <option value="0">active</option>
           <option value="1">banned</option>
         </select>
+        <button
+          v-if="pendingCount > 0 && auth.isAide"
+          class="secondary"
+          :disabled="bulkValidating"
+          @click="bulkValidateAll"
+        >verify all ({{ pendingCount }})</button>
       </div>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>
-    <p v-if="actionError" class="error">{{ actionError }}</p>
-    <p v-if="actionOk" class="ok">{{ actionOk }}</p>
     <p v-if="!loading && users.length === 0 && !error" class="muted">
       {{ filterMode === 'pending' ? 'No users awaiting verification.' : 'No users found.' }}
     </p>
@@ -117,19 +171,40 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
           <th>display name</th>
           <th>status</th>
           <th>level</th>
-          <th>created</th>
+          <th>joined</th>
+          <th>last login</th>
           <th>actions</th>
         </tr>
       </thead>
       <tbody>
-        <tr v-for="u in users" :key="u.id" :class="u.permission_level === 0 && u.status !== 'banned' ? 'row-pending' : ''">
-          <td><strong>{{ u.username }}</strong></td>
+        <tr
+          v-for="u in users"
+          :key="u.id"
+          :class="u.permission_level === 0 && u.status !== 'banned' ? 'row-pending' : ''"
+        >
+          <td>
+            <button class="link-btn" @click="openDrawer(u)"><strong>{{ u.username }}</strong></button>
+          </td>
           <td>{{ u.display_name ?? '—' }}</td>
           <td :class="u.status === 'banned' ? 'error' : ''">{{ u.status }}</td>
           <td :class="u.permission_level === 0 ? 'warn' : ''">
-            {{ levelLabel(u.permission_level) }}
+            <!-- Sysops get an inline dropdown; Aides see plain text (can't promote to sysop) -->
+            <select
+              v-if="auth.isSysop"
+              :value="u.permission_level"
+              :disabled="acting"
+              class="level-select"
+              @change="(e) => setLevel(u, Number((e.target as HTMLSelectElement).value))"
+            >
+              <option :value="0">unvalidated</option>
+              <option :value="10">user</option>
+              <option :value="50">aide</option>
+              <option :value="100">sysop</option>
+            </select>
+            <span v-else>{{ levelLabel(u.permission_level) }}</span>
           </td>
           <td class="muted small">{{ u.created_at.slice(0, 10) }}</td>
+          <td class="muted small">{{ u.last_login_at ? u.last_login_at.slice(0, 10) : '—' }}</td>
           <td class="actions">
             <button
               v-if="u.status !== 'banned' && u.permission_level === 0"
@@ -153,6 +228,59 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
         </tr>
       </tbody>
     </table>
+
+    <!-- Detail drawer -->
+    <Teleport to="body">
+      <div v-if="drawerUser" class="drawer-backdrop" @click.self="closeDrawer">
+        <aside class="drawer">
+          <div class="drawer-header">
+            <h2>{{ drawerUser.username }}</h2>
+            <button class="secondary small-btn" @click="closeDrawer">✕</button>
+          </div>
+          <dl class="detail-list">
+            <dt>display name</dt>
+            <dd>{{ drawerUser.display_name ?? '—' }}</dd>
+            <dt>status</dt>
+            <dd :class="drawerUser.status === 'banned' ? 'error' : ''">{{ drawerUser.status }}</dd>
+            <dt>permission level</dt>
+            <dd>{{ levelLabel(drawerUser.permission_level) }} ({{ drawerUser.permission_level }})</dd>
+            <dt>joined</dt>
+            <dd>{{ new Date(drawerUser.created_at).toLocaleString() }}</dd>
+            <dt>last login</dt>
+            <dd>{{ drawerUser.last_login_at ? new Date(drawerUser.last_login_at).toLocaleString() : 'never' }}</dd>
+          </dl>
+          <div class="drawer-links">
+            <router-link
+              :to="{ path: '/messages', query: { sender: drawerUser.username } }"
+              @click="closeDrawer"
+            >view messages →</router-link>
+            <router-link
+              :to="{ path: '/audit', query: { actor: drawerUser.username } }"
+              @click="closeDrawer"
+            >audit history →</router-link>
+          </div>
+          <div class="drawer-actions">
+            <button
+              v-if="drawerUser.status !== 'banned' && drawerUser.permission_level === 0"
+              :disabled="acting"
+              @click="validate(drawerUser.username); closeDrawer()"
+            >verify</button>
+            <button
+              v-if="drawerUser.status !== 'banned'"
+              class="danger"
+              :disabled="acting"
+              @click="ban(drawerUser.username); closeDrawer()"
+            >ban</button>
+            <button
+              v-if="drawerUser.status === 'banned'"
+              class="secondary"
+              :disabled="acting"
+              @click="unban(drawerUser.username); closeDrawer()"
+            >unban</button>
+          </div>
+        </aside>
+      </div>
+    </Teleport>
   </div>
 </template>
 
@@ -162,22 +290,45 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
 .page-header div { display: flex; flex-direction: column; gap: 0.2rem; }
 h1 { margin: 0; display: flex; align-items: center; gap: 0.6rem; }
 p { margin: 0; }
-.controls { display: flex; align-items: center; gap: 0.5rem; }
+.controls { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.search-input { min-width: 160px; }
 .small { font-size: 0.85em; }
 .small-btn { padding: 0.2rem 0.5rem; font-size: 0.8em; margin-right: 0.3rem; }
 .actions { white-space: nowrap; }
-.ok { color: #2a8a2a; }
 .warn { color: var(--warn, #b45309); font-weight: 600; }
 .pending-badge {
-  display: inline-block;
-  font-size: 0.55em;
-  font-weight: 600;
-  background: var(--warn, #b45309);
-  color: #fff;
-  border-radius: 999px;
-  padding: 0.15em 0.65em;
-  vertical-align: middle;
-  letter-spacing: 0.02em;
+  display: inline-block; font-size: 0.55em; font-weight: 600;
+  background: var(--warn, #b45309); color: #fff; border-radius: 999px;
+  padding: 0.15em 0.65em; vertical-align: middle; letter-spacing: 0.02em;
 }
 tr.row-pending { background: var(--accent-bg); }
+
+.link-btn {
+  background: transparent; border: none; padding: 0; cursor: pointer;
+  color: var(--accent); font: inherit; text-decoration: underline;
+}
+
+.level-select {
+  font-size: 0.82em; padding: 0.1rem 0.2rem;
+  background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+  border-radius: 3px;
+}
+
+/* Drawer */
+.drawer-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,0.4); z-index: 200;
+}
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: 320px; max-width: 90vw;
+  background: var(--bg); border-left: 1px solid var(--border);
+  padding: 1.2rem 1.4rem; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 1rem;
+}
+.drawer-header { display: flex; align-items: center; justify-content: space-between; }
+.drawer-header h2 { margin: 0; }
+.detail-list { display: grid; grid-template-columns: auto 1fr; gap: 0.3rem 1rem; font-size: 0.9em; margin: 0; }
+dt { color: var(--muted); font-size: 0.82em; text-transform: uppercase; letter-spacing: 0.04em; align-self: center; }
+dd { margin: 0; }
+.drawer-links { display: flex; flex-direction: column; gap: 0.4rem; font-size: 0.9em; }
+.drawer-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; padding-top: 0.5rem; border-top: 1px solid var(--border); }
 </style>

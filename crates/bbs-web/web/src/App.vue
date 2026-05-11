@@ -3,6 +3,7 @@ import { onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useAuthStore } from './stores/auth'
 import AppNav from './components/AppNav.vue'
+import ToastStack from './components/ToastStack.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -30,6 +31,7 @@ onMounted(async () => {
         <router-view />
       </div>
     </main>
+    <ToastStack />
   </div>
 </template>
 

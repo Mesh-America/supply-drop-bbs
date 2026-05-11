@@ -734,6 +734,85 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    async fn admin_kill_session(&self, session_id: u64) -> Result<bool, HostError> {
+        let target = SessionId::__internal_new(session_id);
+        let found = self.sessions.write().await.remove(&target).is_some();
+        if found {
+            let _ = self.events_tx.send(DomainEvent::SessionEnded {
+                session: target,
+                reason: "admin_kill".into(),
+            });
+            info!(%target, "session forcibly ended by admin");
+        }
+        Ok(found)
+    }
+
+    async fn admin_update_room(
+        &self,
+        room_id: i64,
+        description: Option<Option<String>>,
+        read_only: Option<bool>,
+        min_permission_level: Option<u8>,
+    ) -> Result<bbs_plugin_api::AdminRoomSummary, HostError> {
+        use crate::ids::RoomId;
+        let rid = RoomId::new(room_id);
+
+        let new_level = match min_permission_level {
+            None => None,
+            Some(0) => Some(PermissionLevel::Unvalidated),
+            Some(10) => Some(PermissionLevel::User),
+            Some(50) => Some(PermissionLevel::Aide),
+            Some(100) => Some(PermissionLevel::Sysop),
+            Some(other) => {
+                return Err(HostError::PreconditionFailed(format!(
+                    "unknown min_permission_level {other}"
+                )))
+            }
+        };
+
+        // description: None = leave alone; Some(None) = clear; Some(Some(s)) = set
+        let desc_update: Option<Option<&str>> = description.as_ref().map(|inner| inner.as_deref());
+
+        RoomStore::update(&self.db, rid, desc_update, read_only, new_level)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let room = RoomStore::get_by_id(&self.db, rid)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+            .ok_or_else(|| HostError::NotFound(format!("room {room_id}")))?;
+
+        let count = self
+            .db
+            .room_message_count(room_id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        Ok(bbs_plugin_api::AdminRoomSummary {
+            id: room.id.as_i64(),
+            name: room.name,
+            description: room.description,
+            read_only: room.read_only,
+            min_permission_level: room.min_permission_level as u8,
+            message_count: count,
+            created_at: room.created_at.to_rfc3339(),
+            deletable: room_id > 5,
+        })
+    }
+
+    async fn admin_search_messages(
+        &self,
+        sender: Option<&str>,
+        query: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<bbs_plugin_api::AdminMessageRecord>, HostError> {
+        let capped = limit.min(200);
+        self.db
+            .admin_search_messages(sender, query, capped)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
     async fn mesh_node_restore(
         &self,
         session: SessionId,
