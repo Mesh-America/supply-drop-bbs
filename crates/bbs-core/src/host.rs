@@ -3601,9 +3601,7 @@ Users:\n\
  U banned  list banned\n\
  U all     list all\n\
  S <q>     search\n\
- WHOIS <u> details\n\
-Sysop:\n\
- .DU <u>   delete user";
+ WHOIS <u> details";
 
 const HELP_SYSOP: &str = "\
 Sysop:\n\

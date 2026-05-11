@@ -785,6 +785,13 @@ async fn api_create_room(
     Extension(caller): Extension<CurrentUser>,
     Json(body): Json<CreateRoomBody>,
 ) -> Response {
+    if caller.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop required to create rooms")),
+        )
+            .into_response();
+    }
     let name = body.name.trim();
     if name.is_empty() || name.len() > 64 {
         return (
@@ -825,6 +832,13 @@ async fn api_delete_room(
     Extension(caller): Extension<CurrentUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    if caller.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop required to delete rooms")),
+        )
+            .into_response();
+    }
     match state.host.admin_delete_room(id).await {
         Ok(true) => {
             let actor_str = format!("web:{}", caller.username);
