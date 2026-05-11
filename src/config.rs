@@ -536,6 +536,7 @@ pub struct PluginsConfig {
 /// Return the config file path that would be used by `load()`.
 ///
 /// Returns `None` when no config file can be located.
+#[cfg(feature = "transport-process")]
 pub fn resolve_config_path(explicit_path: Option<&std::path::Path>) -> Option<PathBuf> {
     resolve_file(explicit_path).0
 }
