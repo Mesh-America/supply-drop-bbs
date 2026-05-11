@@ -139,6 +139,7 @@ const columns = [
       :columns="columns"
       :rows="rows"
       :row-key="(r) => `${r.ts}-${r.pubkey}`"
+      :page-size="50"
       empty="No adverts heard yet (is mesh transport enabled and connected?)."
     >
       <template #[`cell:ts`]="{ row }">{{ fmtLocal(row.ts) }}</template>
