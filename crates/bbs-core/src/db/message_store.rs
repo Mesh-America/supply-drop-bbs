@@ -132,6 +132,18 @@ pub trait MessageStore: Send + Sync {
     /// Count unread messages in a room for a user.
     async fn unread_count(&self, user_id: UserId, room_id: RoomId) -> Result<u64, StoreError>;
 
+    /// Count unread direct messages involving `username`.
+    ///
+    /// Uses the same read-pointer stored in `user_room_state` under `room_id`
+    /// (the Mail room). Call this instead of [`unread_count`](Self::unread_count)
+    /// for the Mail room, where DMs live in `messages` (not `room_messages`).
+    async fn unread_direct_count(
+        &self,
+        username: &Username,
+        user_id: UserId,
+        room_id: RoomId,
+    ) -> Result<u64, StoreError>;
+
     /// Return the user's last-read message ID in a room, or `None`
     /// if they have never visited it.
     async fn get_last_read(
@@ -368,6 +380,36 @@ impl MessageStore for Database {
             "#,
             uid,
             rid
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+
+        Ok(count as u64)
+    }
+
+    async fn unread_direct_count(
+        &self,
+        username: &Username,
+        user_id: UserId,
+        room_id: RoomId,
+    ) -> Result<u64, StoreError> {
+        let uname = username.as_str();
+        let uid = user_id.as_i64();
+        let rid = room_id.as_i64();
+
+        let count: i64 = sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) FROM messages m
+            LEFT JOIN user_room_state urs ON urs.user_id = ? AND urs.room_id = ?
+            WHERE (m.sender = ? OR m.recipient = ?)
+              AND m.recipient IS NOT NULL
+              AND (urs.last_read_message_id IS NULL
+                   OR m.id > urs.last_read_message_id)
+            "#,
+            uid,
+            rid,
+            uname,
+            uname
         )
         .fetch_one(&self.read_pool)
         .await?;

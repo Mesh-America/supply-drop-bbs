@@ -270,6 +270,13 @@ pub enum Response {
     /// An error response. The text is suitable for showing the
     /// user; structured details are not exposed at this level.
     Error(String),
+
+    /// Multiple text frames to be delivered as separate messages.
+    ///
+    /// Transports with per-message size limits (e.g. LoRa radio) send each
+    /// element as an independent frame. Transports without size constraints
+    /// (e.g. CLI) may join the parts with newlines.
+    MultiText(Vec<String>),
 }
 
 #[cfg(test)]
@@ -314,6 +321,7 @@ mod tests {
             },
             Response::LoggedOut,
             Response::Error("nope".to_owned()),
+            Response::MultiText(vec!["part 1".to_owned(), "part 2".to_owned()]),
         ];
         for r in responses {
             let json = serde_json::to_string(&r).unwrap();

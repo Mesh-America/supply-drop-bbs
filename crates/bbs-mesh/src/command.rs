@@ -294,6 +294,10 @@ pub fn format_response(response: &Response) -> Option<String> {
 
         Response::Error(e) => Some(format!("Error: {e}")),
 
+        // MultiText: join parts for callers that expect a single string.
+        // The mesh transport handles MultiText specially in dispatch_message.
+        Response::MultiText(parts) => Some(parts.join("\n")),
+
         // Non-exhaustive catch-all — future variants we don't render yet.
         _ => None,
     }

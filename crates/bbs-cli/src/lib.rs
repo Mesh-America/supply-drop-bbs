@@ -573,6 +573,7 @@ fn format_response(response: &Response) -> Option<String> {
         )),
         Response::LoggedOut => Some("Goodbye. Your session has ended.".to_owned()),
         Response::Error(e) => Some(format!("Error: {e}")),
+        Response::MultiText(parts) => Some(parts.join("\n")),
         _ => None,
     }
 }

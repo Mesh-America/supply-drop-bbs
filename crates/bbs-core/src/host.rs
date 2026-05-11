@@ -1626,7 +1626,7 @@ impl BbsHost {
     }
 
     async fn handle_list_rooms(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, level, current_room) = match self.session_auth_user(session).await {
+        let (username, user_id, level, current_room) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1639,11 +1639,14 @@ impl BbsHost {
 
         let mut lines = Vec::new();
         for room in &rooms {
-            let unread = self
-                .db
-                .unread_count(user_id, room.id)
-                .await
-                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let unread = if room.id == MAIL_ROOM_ID {
+                self.db
+                    .unread_direct_count(&username, user_id, room.id)
+                    .await
+            } else {
+                self.db.unread_count(user_id, room.id).await
+            }
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
             let marker = if unread > 0 { "*" } else { " " };
             let here = if room.id == current_room {
                 " [here]"
@@ -1665,7 +1668,7 @@ impl BbsHost {
     }
 
     async fn handle_go_next_unread(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, level, current_room) = match self.session_auth_user(session).await {
+        let (username, user_id, level, current_room) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1688,11 +1691,14 @@ impl BbsHost {
             if room.id == current_room {
                 continue;
             }
-            let unread = self
-                .db
-                .unread_count(user_id, room.id)
-                .await
-                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let unread = if room.id == MAIL_ROOM_ID {
+                self.db
+                    .unread_direct_count(&username, user_id, room.id)
+                    .await
+            } else {
+                self.db.unread_count(user_id, room.id).await
+            }
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
             if unread > 0 {
                 self.set_current_room(session, room.id).await;
                 return self.handle_read_new(session).await;
@@ -1711,7 +1717,7 @@ impl BbsHost {
             return Ok(Response::Text("Usage: C <room name or number>".into()));
         }
 
-        let (_, user_id, level, _) = match self.session_auth_user(session).await {
+        let (username, user_id, level, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1741,11 +1747,14 @@ impl BbsHost {
         }
 
         self.set_current_room(session, room.id).await;
-        let unread = self
-            .db
-            .unread_count(user_id, room.id)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let unread = if room.id == MAIL_ROOM_ID {
+            self.db
+                .unread_direct_count(&username, user_id, room.id)
+                .await
+        } else {
+            self.db.unread_count(user_id, room.id).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         let msg = if unread > 0 {
             format!("Now in: {} ({unread} new). Type N to read.", room.name)
@@ -1760,7 +1769,7 @@ impl BbsHost {
         session: SessionId,
         room_id: RoomId,
     ) -> Result<Response, HostError> {
-        let (_, user_id, level, _) = match self.session_auth_user(session).await {
+        let (username, user_id, level, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1778,11 +1787,14 @@ impl BbsHost {
         }
 
         self.set_current_room(session, room.id).await;
-        let unread = self
-            .db
-            .unread_count(user_id, room.id)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let unread = if room.id == MAIL_ROOM_ID {
+            self.db
+                .unread_direct_count(&username, user_id, room.id)
+                .await
+        } else {
+            self.db.unread_count(user_id, room.id).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         let msg = if unread > 0 {
             format!("Now in: {} ({unread} new). Type N to read.", room.name)
@@ -1856,17 +1868,17 @@ impl BbsHost {
             return Ok(Response::Text(format!("No new messages in {}.", room.name)));
         }
 
-        let mut lines = vec![format!("[{} — new messages]", room.name)];
+        let mut parts = vec![format!("[{} — new messages]", room.name)];
         for msg in &visible {
-            lines.push(format_message(msg));
+            parts.push(format_message(msg));
         }
         if let Some(cursor) = page.next_cursor {
-            lines.push(format!(
+            parts.push(format!(
                 "(more — type N again or F {} to continue)",
                 cursor.as_i64()
             ));
         }
-        Ok(Response::Text(lines.join("\n")))
+        Ok(Response::MultiText(parts))
     }
 
     async fn handle_read_forward(

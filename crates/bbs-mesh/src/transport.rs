@@ -849,59 +849,76 @@ async fn dispatch_message(
         .expect("state mutex poisoned")
         .set_awaiting_reply(&sender_prefix, is_prompt);
 
-    // ── Send the response back to the node ────────────────────────────────────
-    let Some(reply_text) = format_response(&response) else {
-        return;
-    };
-
-    // Guard against oversized frames: truncate to the maximum that fits in one
-    // companion frame.  Truncation is a last resort — fixed strings should be
-    // kept under MAX_REPLY_BYTES at the source.  We truncate on a byte
-    // boundary that preserves valid UTF-8 by walking back from the limit.
-    let reply_text = if reply_text.len() > MAX_REPLY_BYTES {
-        warn!(
-            ?session,
-            original_len = reply_text.len(),
-            max_len = MAX_REPLY_BYTES,
-            "mesh: reply too long for one frame — truncating"
-        );
-        let mut end = MAX_REPLY_BYTES;
-        while !reply_text.is_char_boundary(end) {
-            end -= 1;
-        }
-        reply_text[..end].to_owned()
+    // ── Collect frames to send back ───────────────────────────────────────────
+    // MultiText delivers each element as a separate radio frame.
+    // All other variants produce a single frame via format_response.
+    let frames: Vec<String> = if let Response::MultiText(parts) = &response {
+        parts.clone()
     } else {
-        reply_text
+        match format_response(&response) {
+            Some(t) => vec![t],
+            None => return,
+        }
     };
 
-    info!(
-        ?session,
-        len = reply_text.len(),
-        "mesh: sending reply to node"
-    );
+    let frame_count = frames.len();
+    for (i, reply_text) in frames.into_iter().enumerate() {
+        let is_last = i + 1 == frame_count;
 
-    let reply_sent = cmd_tx
-        .send(OutboundFrame::SendTxtMsg {
-            txt_type: TXT_TYPE_PLAIN,
-            attempt: 0,
-            pubkey_prefix: sender_prefix,
-            text: reply_text,
-        })
-        .await
-        .is_ok();
-    if !reply_sent {
-        warn!(
+        // Guard against oversized frames: truncate to the maximum that fits in
+        // one companion frame.  Truncation is a last resort — source strings
+        // should stay under MAX_REPLY_BYTES.  Walk back from the limit to
+        // preserve valid UTF-8.
+        let reply_text = if reply_text.len() > MAX_REPLY_BYTES {
+            warn!(
+                ?session,
+                original_len = reply_text.len(),
+                max_len = MAX_REPLY_BYTES,
+                "mesh: reply too long for one frame — truncating"
+            );
+            let mut end = MAX_REPLY_BYTES;
+            while !reply_text.is_char_boundary(end) {
+                end -= 1;
+            }
+            reply_text[..end].to_owned()
+        } else {
+            reply_text
+        };
+
+        info!(
             ?session,
-            "mesh: could not enqueue reply — cmd channel closed"
+            len = reply_text.len(),
+            frame = i + 1,
+            total = frame_count,
+            "mesh: sending reply to node"
         );
-    }
-    if reply_sent && flood_after_send {
-        let pubkey = state
-            .lock()
-            .expect("state mutex poisoned")
-            .get_full_pubkey(&sender_prefix);
-        if let Some(pubkey) = pubkey {
-            let _ = cmd_tx.send(OutboundFrame::ResetPath { pubkey }).await;
+
+        let reply_sent = cmd_tx
+            .send(OutboundFrame::SendTxtMsg {
+                txt_type: TXT_TYPE_PLAIN,
+                attempt: 0,
+                pubkey_prefix: sender_prefix,
+                text: reply_text,
+            })
+            .await
+            .is_ok();
+        if !reply_sent {
+            warn!(
+                ?session,
+                "mesh: could not enqueue reply — cmd channel closed"
+            );
+            break;
+        }
+        // Reset path only after the last frame so intermediate frames travel
+        // the same (possibly direct) route as the first.
+        if is_last && flood_after_send {
+            let pubkey = state
+                .lock()
+                .expect("state mutex poisoned")
+                .get_full_pubkey(&sender_prefix);
+            if let Some(pubkey) = pubkey {
+                let _ = cmd_tx.send(OutboundFrame::ResetPath { pubkey }).await;
+            }
         }
     }
 }
