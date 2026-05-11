@@ -11,7 +11,7 @@ hero:
   actions:
     - theme: brand
       text: Get Started
-      link: /OPERATIONS
+      link: /INTRO
     - theme: alt
       text: View on GitHub
       link: https://github.com/Mesh-America/supply-drop-bbs

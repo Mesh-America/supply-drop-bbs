@@ -19,7 +19,7 @@ export default defineConfig({
 
     nav: [
       { text: 'Home', link: '/' },
-      { text: 'Docs', link: '/USER_GUIDE' },
+      { text: 'Docs', link: '/INTRO' },
       {
         text: 'GitHub',
         link: 'https://github.com/Mesh-America/supply-drop-bbs',
@@ -31,6 +31,7 @@ export default defineConfig({
       {
         text: 'Getting Started',
         items: [
+          { text: 'Introduction', link: '/INTRO' },
           { text: 'User Guide', link: '/USER_GUIDE' },
           { text: 'Installation & Operations', link: '/OPERATIONS' },
           { text: 'CLI Reference', link: '/CLI' },
