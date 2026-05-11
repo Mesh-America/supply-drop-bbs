@@ -1695,10 +1695,7 @@ impl BbsHost {
                 .map_err(|e| HostError::Storage(format!("{e}")))?;
             if unread > 0 {
                 self.set_current_room(session, room.id).await;
-                return Ok(Response::Text(format!(
-                    "Now in: {} ({unread} new)",
-                    room.name
-                )));
+                return self.handle_read_new(session).await;
             }
         }
 
