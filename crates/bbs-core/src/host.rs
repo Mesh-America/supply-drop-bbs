@@ -73,6 +73,8 @@ enum Workflow {
     ChangePassword {
         stage: ChangePwdStage,
     },
+    /// Browsing messages one-at-a-time with F/R navigation.
+    Reading,
 }
 
 #[derive(Clone, Debug)]
@@ -1563,6 +1565,27 @@ impl BbsHost {
                 info!(%session, "user changed password");
                 Ok(Response::Text("Password changed successfully.".into()))
             }
+
+            // ── Message reading ──────────────────────────────────────────────
+            Workflow::Reading => {
+                match reply.trim().to_uppercase().as_str() {
+                    "F" => self.handle_read_forward(session, None).await,
+                    "R" => self.handle_read_reverse(session).await,
+                    _ => {
+                        // Any other input exits reading mode.
+                        {
+                            let mut sessions = self.sessions.write().await;
+                            if let Some(r) = sessions.get_mut(&session) {
+                                r.workflow = Workflow::None;
+                                r.current_message_id = None;
+                            }
+                        }
+                        Ok(Response::Text(
+                            "Exited reading mode. Type H for help.".into(),
+                        ))
+                    }
+                }
+            }
         }
     }
 }
@@ -1814,6 +1837,7 @@ impl BbsHost {
         if let Some(r) = sessions.get_mut(&session) {
             if r.current_room != room_id {
                 r.current_message_id = None;
+                r.workflow = Workflow::None;
             }
             r.current_room = room_id;
         }
@@ -1905,12 +1929,40 @@ impl BbsHost {
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
         // Explicit cursor from "F <id>" overrides session state.
-        let cursor = after.map(MessageId::new).or_else(|| {
-            self.sessions
-                .try_read()
-                .ok()
-                .and_then(|s| s.get(&session).and_then(|r| r.current_message_id))
-        });
+        let (cursor, already_reading) = {
+            let sessions = self.sessions.read().await;
+            let r = sessions.get(&session);
+            let cursor = after
+                .map(MessageId::new)
+                .or_else(|| r.and_then(|r| r.current_message_id));
+            let already_reading = r.is_some_and(|r| matches!(r.workflow, Workflow::Reading));
+            (cursor, already_reading)
+        };
+
+        // First F with no cursor and not yet in reading mode → show intro.
+        if cursor.is_none() && !already_reading {
+            let count = if room_id == MAIL_ROOM_ID {
+                self.db.count_direct(&username).await
+            } else {
+                self.db.count_in_room(room_id).await
+            }
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+            {
+                let mut sessions = self.sessions.write().await;
+                if let Some(r) = sessions.get_mut(&session) {
+                    r.workflow = Workflow::Reading;
+                }
+            }
+
+            return Ok(Response::Prompt {
+                text: format!(
+                    "[{} — Reading]\n{} message(s)\nF - Forward  R - Backward  X - Exit",
+                    room.name, count
+                ),
+                hide_input: false,
+            });
+        }
 
         let msg = if room_id == MAIL_ROOM_ID {
             self.db.next_direct(&username, cursor).await
@@ -1921,10 +1973,10 @@ impl BbsHost {
 
         let msg = match msg {
             None => {
-                return Ok(Response::Text(format!(
-                    "No more messages in {}.",
-                    room.name
-                )))
+                return Ok(Response::Prompt {
+                    text: format!("No more messages in {}.\nR - Backward  X - Exit", room.name),
+                    hide_input: false,
+                })
             }
             Some(m) => m,
         };
@@ -1935,6 +1987,7 @@ impl BbsHost {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
                 r.current_message_id = Some(msg.id);
+                r.workflow = Workflow::Reading;
             }
         }
 
@@ -1955,9 +2008,10 @@ impl BbsHost {
         .map_err(|e| HostError::Storage(format!("{e}")))?
         .is_some();
 
-        Ok(Response::Text(build_message_with_nav(
-            &msg, has_prev, has_next,
-        )))
+        Ok(Response::Prompt {
+            text: build_message_with_nav(&msg, has_prev, has_next),
+            hide_input: false,
+        })
     }
 
     async fn handle_read_reverse(&self, session: SessionId) -> Result<Response, HostError> {
@@ -1972,11 +2026,38 @@ impl BbsHost {
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
         // R with no position → jump to last message; otherwise go one back.
-        let cursor = self
-            .sessions
-            .try_read()
-            .ok()
-            .and_then(|s| s.get(&session).and_then(|r| r.current_message_id));
+        let (cursor, already_reading) = {
+            let sessions = self.sessions.read().await;
+            let r = sessions.get(&session);
+            let cursor = r.and_then(|r| r.current_message_id);
+            let already_reading = r.is_some_and(|r| matches!(r.workflow, Workflow::Reading));
+            (cursor, already_reading)
+        };
+
+        // First R with no cursor and not yet in reading mode → show intro.
+        if cursor.is_none() && !already_reading {
+            let count = if room_id == MAIL_ROOM_ID {
+                self.db.count_direct(&username).await
+            } else {
+                self.db.count_in_room(room_id).await
+            }
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+            {
+                let mut sessions = self.sessions.write().await;
+                if let Some(r) = sessions.get_mut(&session) {
+                    r.workflow = Workflow::Reading;
+                }
+            }
+
+            return Ok(Response::Prompt {
+                text: format!(
+                    "[{} — Reading]\n{} message(s)\nF - Forward  R - Backward  X - Exit",
+                    room.name, count
+                ),
+                hide_input: false,
+            });
+        }
 
         let msg = if room_id == MAIL_ROOM_ID {
             self.db.prev_direct(&username, cursor).await
@@ -1987,10 +2068,13 @@ impl BbsHost {
 
         let msg = match msg {
             None => {
-                return Ok(Response::Text(format!(
-                    "No previous messages in {}.",
-                    room.name
-                )))
+                return Ok(Response::Prompt {
+                    text: format!(
+                        "No previous messages in {}.\nF - Forward  X - Exit",
+                        room.name
+                    ),
+                    hide_input: false,
+                })
             }
             Some(m) => m,
         };
@@ -2001,6 +2085,7 @@ impl BbsHost {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
                 r.current_message_id = Some(msg.id);
+                r.workflow = Workflow::Reading;
             }
         }
 
@@ -2021,9 +2106,10 @@ impl BbsHost {
         .map_err(|e| HostError::Storage(format!("{e}")))?
         .is_some();
 
-        Ok(Response::Text(build_message_with_nav(
-            &msg, has_prev, has_next,
-        )))
+        Ok(Response::Prompt {
+            text: build_message_with_nav(&msg, has_prev, has_next),
+            hide_input: false,
+        })
     }
 
     async fn handle_scan(&self, session: SessionId) -> Result<Response, HostError> {

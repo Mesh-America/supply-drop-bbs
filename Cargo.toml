@@ -55,7 +55,7 @@ resolver = "2"
 members  = ["crates/*"]
 
 [workspace.package]
-version      = "0.2.7"
+version      = "0.2.8"
 edition      = "2021"
 authors      = ["Mesh-America"]
 repository   = "https://github.com/Mesh-America/supply-drop-bbs"
