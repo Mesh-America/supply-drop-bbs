@@ -74,6 +74,11 @@ pub struct SessionEntry {
 /// The lock is never held across an `.await` point.
 #[derive(Debug, Default)]
 pub struct SessionState {
+    /// The BBS node's own 32-byte public key, set on the first `Connected`
+    /// event.  Used to detect when the radio echoes our own advert back so
+    /// the `NewAdvert` handler can substitute the configured GPS rather than
+    /// the radio's hardware GPS reading (which is 0,0 when no GPS lock).
+    pub self_pubkey: Option<[u8; 32]>,
     /// Pubkey prefix (6 bytes) → session entry.
     pub by_prefix: HashMap<[u8; 6], SessionEntry>,
     /// Session ID → pubkey prefix (6 bytes).

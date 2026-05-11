@@ -460,6 +460,10 @@ async fn event_loop(
                         // they don't corrupt in-progress workflows.
                         draining.store(true, Ordering::Relaxed);
                         let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
+                        // Record our own pubkey so the NewAdvert handler can
+                        // detect self-advert echoes and preserve configured GPS.
+                        state.lock().expect("state mutex poisoned").self_pubkey =
+                            Some(self_info.pubkey);
                         // Push GPS coordinates to the radio if configured, and refresh
                         // the advert bus entry so the web UI shows the config GPS.
                         if let Some((lat, lon)) = host.node_location() {
@@ -580,12 +584,24 @@ async fn handle_frame(
             debug!(prefix = ?&pubkey[..6], "mesh: short advert received");
         }
         InboundFrame::NewAdvert(contact) => {
+            // When the radio echoes our own advert back, its GPS fields reflect
+            // the radio's hardware GPS (0,0 if no lock) — not the configured
+            // location we pushed via SetAdvertLatlon.  Substitute the configured
+            // GPS so the web UI stays accurate regardless of hardware GPS state.
+            let self_pubkey = state.lock().expect("state mutex poisoned").self_pubkey;
+            let (gps_lat, gps_lon) = if self_pubkey == Some(contact.pubkey) {
+                host.node_location()
+                    .map(|(lat, lon)| ((lat * 1_000_000.0) as i32, (lon * 1_000_000.0) as i32))
+                    .unwrap_or((contact.gps_lat, contact.gps_lon))
+            } else {
+                (contact.gps_lat, contact.gps_lon)
+            };
             host.advert_bus().upsert(
                 contact.pubkey,
                 contact.name.clone(),
                 contact.adv_type,
-                contact.gps_lat,
-                contact.gps_lon,
+                gps_lat,
+                gps_lon,
             );
             debug!(name = %contact.name, "mesh: full advert (new contact) received");
         }
