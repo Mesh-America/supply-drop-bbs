@@ -316,16 +316,19 @@ chmod g+w {{ configFile }}</pre>
 
         <div class="field" :class="{ 'has-error': validationErrors.bbs_timezone }">
           <label>Timezone</label>
+          <select v-if="timezones.length" v-model="form.bbs_timezone">
+            <option
+              v-if="form.bbs_timezone && !timezones.includes(form.bbs_timezone)"
+              :value="form.bbs_timezone"
+            >{{ form.bbs_timezone }}</option>
+            <option v-for="tz in timezones" :key="tz" :value="tz">{{ tz }}</option>
+          </select>
           <input
+            v-else
             v-model="form.bbs_timezone"
             type="text"
-            list="tz-datalist"
             placeholder="e.g. America/New_York"
-            autocomplete="off"
           />
-          <datalist id="tz-datalist">
-            <option v-for="tz in timezones" :key="tz" :value="tz" />
-          </datalist>
           <p v-if="validationErrors.bbs_timezone" class="field-error">{{ validationErrors.bbs_timezone }}</p>
           <p v-else class="hint">IANA timezone name. Used for display timestamps.</p>
         </div>
