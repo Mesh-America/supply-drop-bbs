@@ -17,6 +17,11 @@ to the BBS — the MeshCore radio bridge, the Unix domain socket CLI, and the
 HTTP web admin are all transports. You can add Meshtastic, APRS, Telnet, IRC
 bridge, Matrix, or any other channel by writing a new transport crate.
 
+> **Start here:** `crates/bbs-hello-transport` is a fully-compilable reference
+> transport (~200 lines) that demonstrates every integration point covered in
+> this guide. Read it alongside this document, or fork it as your starting
+> point. Run its tests with `cargo test -p bbs-hello-transport`.
+
 ---
 
 ## Table of contents

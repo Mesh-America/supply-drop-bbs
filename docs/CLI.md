@@ -159,7 +159,17 @@ supply-drop-bbs migrate [OPTIONS]
 
 Apply any pending database migrations and exit. The `run` subcommand always migrates on startup, so this is only needed if you want to migrate without starting the BBS (e.g. as a pre-flight step in a deployment script).
 
-> **Note:** not yet implemented. The command exits with an error in the current release.
+```
+exit 0   migrations applied (or already up to date)
+exit 1   database could not be opened or a migration failed
+```
+
+Example deployment sequence:
+
+```sh
+supply-drop-bbs migrate --config /etc/supply-drop-bbs/config.toml
+supply-drop-bbs run    --config /etc/supply-drop-bbs/config.toml
+```
 
 ---
 
@@ -169,9 +179,15 @@ Apply any pending database migrations and exit. The `run` subcommand always migr
 supply-drop-bbs backup [OPTIONS]
 ```
 
-Trigger an immediate database backup (`VACUUM INTO`) and exit. The backup lands in `<data_dir>/backups/` with a timestamp filename. The running BBS service does not need to be stopped - `VACUUM INTO` is non-blocking.
+Trigger an immediate database backup (`VACUUM INTO`) and exit. The backup lands in `<data_dir>/backups/` (or the configured `[backup] directory`) with a timestamp filename. The running BBS service does not need to be stopped — `VACUUM INTO` is non-blocking and consistent.
 
-> **Note:** not yet implemented. The command exits with an error in the current release. Use the **Trigger backup** button in the web admin UI in the meantime.
+On success, prints the filename, size in bytes, and destination directory:
+
+```
+Backup created: backup_20260511_142301.db
+  size:     2097152 bytes
+  location: /var/lib/supply-drop-bbs/backups
+```
 
 ---
 

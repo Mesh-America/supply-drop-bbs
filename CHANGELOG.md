@@ -8,6 +8,18 @@ minor bumps may carry breaking changes).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`migrate` command** — was a stub that exited 1; now opens the database and
+  runs all pending sqlx migrations, exits 0 on success. Deployment scripts can
+  sequence `migrate && run` for clean schema upgrades without starting the BBS.
+- **`backup` command** — was a stub that exited 1; now triggers an immediate
+  `VACUUM INTO` backup, creates the backup directory if absent, and prints the
+  filename, size, and destination path.
+- **Process plugin crash restart** — `restart_on_crash = true` in
+  `[[plugins.process]]` now actually respawns the process after the configured
+  `restart_delay_secs`. Previously the crash was logged but no restart occurred.
+
 ### Features
 
 - **GPS location broadcast** - new `[location]` config section; when

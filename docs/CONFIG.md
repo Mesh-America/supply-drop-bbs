@@ -297,6 +297,40 @@ If `bind` is `0.0.0.0` and `external_origin` is unset, startup
 fails with an error: binding to all interfaces without specifying
 the public origin makes CSRF protection unsafe.
 
+## `[[plugins.process]]` - externally-spawned transport plugins (only if `transport-process` feature enabled)
+
+Process transport plugins are external executables that speak the Supply Drop
+IPC protocol over stdin/stdout. Each plugin is a separate entry in an array
+table. Manage them with `supply-drop-bbs plugin add/remove/enable/disable` or
+directly in the web admin UI.
+
+```toml
+[[plugins.process]]
+name              = "my-telnet"           # unique stable identifier
+command           = "/usr/local/bin/my-telnet-plugin"
+args              = ["--port", "23"]      # optional
+enabled           = true
+restart_on_crash  = true                  # respawn automatically on non-zero exit
+restart_delay_secs = 5                    # seconds to wait before respawn
+
+[[plugins.process]]
+name    = "my-aprs"
+command = "/opt/aprs-bridge/aprs-bridge"
+enabled = false                           # start disabled; enable via web UI
+```
+
+| Key                  | Type     | Default | Required | Description |
+|----------------------|----------|---------|----------|-------------|
+| `name`               | string   | —       | **yes**  | Unique stable identifier. Used in logs, web UI, and CLI output. Lowercase ASCII with hyphens. |
+| `command`            | string   | —       | **yes**  | Path to the plugin executable. |
+| `args`               | string[] | `[]`    | no       | Arguments passed verbatim to the executable. |
+| `enabled`            | bool     | `true`  | no       | Whether to start this plugin on BBS startup. |
+| `restart_on_crash`   | bool     | `true`  | no       | Respawn the process when it exits with a non-zero code. |
+| `restart_delay_secs` | integer  | `5`     | no       | Seconds to wait before respawning after a crash. |
+
+See [PROCESS_TRANSPORTS_OPS.md](PROCESS_TRANSPORTS_OPS.md) for plugin
+installation, the IPC protocol, and troubleshooting.
+
 ## Validation rules
 
 Validation runs at startup, before any service starts. Failures
