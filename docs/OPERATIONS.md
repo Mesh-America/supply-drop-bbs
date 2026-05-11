@@ -2,6 +2,13 @@
 
 How to install, configure, update, back up, and remove Supply Drop BBS.
 
+::: tip Quick start
+```sh
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
+```
+Downloads a pre-built binary, runs a setup wizard, and configures a systemd service. Takes under a minute on a Pi 4. Jump to the [full installation section](#installation) for details.
+:::
+
 ## Audience
 
 Sysops running a Supply Drop BBS deployment:
