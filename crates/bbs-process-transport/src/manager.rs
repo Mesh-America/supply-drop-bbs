@@ -6,6 +6,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bbs_plugin_api::registry::{
@@ -13,7 +14,7 @@ use bbs_plugin_api::registry::{
 };
 use bbs_plugin_api::{Host, Plugin};
 use tokio::process::Command as TokioCommand;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
 use crate::transport::ProcessTransport;
@@ -40,7 +41,10 @@ struct ManagedPlugin {
 /// `WebPlugin::set_plugin_registry()`.  The CLI `plugin` subcommand
 /// accesses it directly through the returned `Arc`.
 pub struct ProcessPluginManager {
-    plugins: Mutex<HashMap<String, ManagedPlugin>>,
+    /// Wrapped in `Arc` so crash-restart tasks can hold a reference without
+    /// requiring `Arc<ProcessPluginManager>` (which would be self-referential
+    /// given that `new()` returns `Arc<Self>`).
+    plugins: Arc<Mutex<HashMap<String, ManagedPlugin>>>,
     host: Arc<dyn Host>,
     /// Path to `config.toml` for persisting add/remove/enable changes.
     config_path: Option<PathBuf>,
@@ -56,7 +60,7 @@ impl ProcessPluginManager {
         config_path: Option<PathBuf>,
     ) -> Arc<Self> {
         let mgr = Arc::new(Self {
-            plugins: Mutex::new(HashMap::new()),
+            plugins: Arc::new(Mutex::new(HashMap::new())),
             host,
             config_path,
         });
@@ -115,7 +119,8 @@ impl ProcessPluginManager {
         let command = config.command.clone();
         let args = config.args.clone();
 
-        // Validate that the executable exists and is runnable.
+        // Validate that the executable path is non-empty (basic sanity check
+        // before the real spawn happens inside ProcessTransport::start).
         let mut cmd = TokioCommand::new(&command);
         cmd.args(&args)
             .stdin(std::process::Stdio::piped())
@@ -123,21 +128,29 @@ impl ProcessPluginManager {
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
 
-        // We spawn through ProcessTransport::start() which does the real spawn.
-        // Here we just construct and start.
-        let transport = ProcessTransport::new(config, Arc::clone(&self.host));
+        let transport = ProcessTransport::new(config.clone(), Arc::clone(&self.host));
+
+        // Wire up crash-restart BEFORE start() so there is no window where
+        // a very-fast crash could go unnoticed.
+        if config.restart_on_crash {
+            if let Some(crash_rx) = transport.take_crash_receiver() {
+                tokio::spawn(crash_restart_loop(
+                    name.clone(),
+                    crash_rx,
+                    config.restart_delay_secs,
+                    Arc::clone(&self.plugins),
+                    Arc::clone(&self.host),
+                ));
+            }
+        }
 
         transport
             .start()
             .await
             .map_err(|e| RegistryError::SpawnFailed(name.clone(), e.to_string()))?;
 
-        // Attach a stderr tapper if available.  The actual stderr capture is
-        // done inside ProcessTransport::start(); here we provide a hook for the
-        // manager's own log ring buffer by spawning a separate stderr reader.
-        // Note: since ProcessTransport already consumed stderr, we rely on its
-        // internal tracing output for now.
-        // TODO: expose log_buffer into ProcessTransport for direct capture.
+        // Log capture: ProcessTransport already captures stderr via tracing.
+        // A direct ring-buffer tap is a future improvement.
         let _ = log_buffer;
 
         info!(plugin = %name, "started");
@@ -359,5 +372,69 @@ impl PluginRegistryApi for ProcessPluginManager {
             .rev()
             .collect();
         Ok(lines)
+    }
+}
+
+// ── Crash restart loop ────────────────────────────────────────────────────────
+
+/// Spawned once per plugin that has `restart_on_crash = true`.
+///
+/// Receives a crash signal from `ProcessTransport`'s watcher task, waits the
+/// configured delay, respawns the process, and updates the manager's state.
+/// When the new process is running its own crash channel replaces `rx` so the
+/// loop continues watching the new child.  The loop exits when:
+///
+/// - The sender is dropped (plugin was removed or disabled)
+/// - A respawn attempt fails (state is set to `Crashed`)
+async fn crash_restart_loop(
+    name: String,
+    mut rx: mpsc::Receiver<()>,
+    delay_secs: u64,
+    plugins: Arc<Mutex<HashMap<String, ManagedPlugin>>>,
+    host: Arc<dyn Host>,
+) {
+    while rx.recv().await.is_some() {
+        warn!(plugin = %name, delay_secs, "crashed — restarting");
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+        let (config, _log_buffer) = {
+            let map = plugins.lock().await;
+            let Some(m) = map.get(&name) else { return };
+            (m.config.clone(), Arc::clone(&m.log_buffer))
+        };
+
+        let new_transport = ProcessTransport::new(config, Arc::clone(&host));
+        // Take the crash receiver for the new process before it starts.
+        let new_rx = new_transport.take_crash_receiver();
+
+        match new_transport.start().await {
+            Ok(()) => {
+                {
+                    let mut map = plugins.lock().await;
+                    if let Some(m) = map.get_mut(&name) {
+                        m.transport = Some(new_transport);
+                        m.state = PluginState::Running;
+                        m.restart_count += 1;
+                    }
+                }
+                info!(plugin = %name, "restarted after crash");
+                // Switch to watching the new process.
+                match new_rx {
+                    Some(new_rx) => rx = new_rx,
+                    None => break, // restart_on_crash was false on new config — stop looping
+                }
+            }
+            Err(e) => {
+                warn!(plugin = %name, error = %e, "restart failed");
+                let mut map = plugins.lock().await;
+                if let Some(m) = map.get_mut(&name) {
+                    m.transport = None;
+                    m.state = PluginState::Crashed {
+                        reason: e.to_string(),
+                    };
+                }
+                break;
+            }
+        }
     }
 }

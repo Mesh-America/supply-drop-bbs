@@ -62,6 +62,11 @@ pub struct ProcessTransport {
     /// 0 = unlimited; set from the plugin's `ready` message.
     payload_limit: Arc<AtomicUsize>,
     shutdown_tx: watch::Sender<bool>,
+    /// Fires `()` when the child exits with a non-zero code (crash).
+    /// Only populated when `config.restart_on_crash` is true.
+    crash_tx: Option<mpsc::Sender<()>>,
+    /// Taken once by the manager to wire up the auto-restart loop.
+    crash_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
 }
 
 impl ProcessTransport {
@@ -69,6 +74,12 @@ impl ProcessTransport {
         // Leak the name string once to get a &'static str.
         // This is a deliberate one-time allocation per plugin name.
         let transport_name: &'static str = Box::leak(config.name.clone().into_boxed_str());
+        let (crash_tx, crash_rx) = if config.restart_on_crash {
+            let (tx, rx) = mpsc::channel(4);
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         Self {
             transport_name,
             config,
@@ -77,7 +88,17 @@ impl ProcessTransport {
             sessions: Arc::new(Mutex::new(SessionMap::new())),
             payload_limit: Arc::new(AtomicUsize::new(0)),
             shutdown_tx: watch::channel(false).0,
+            crash_tx,
+            crash_rx: std::sync::Mutex::new(crash_rx),
         }
+    }
+
+    /// Take the crash receiver so the manager can drive the auto-restart loop.
+    ///
+    /// Returns `None` when `restart_on_crash` is false or when already taken.
+    /// Must be called before [`Plugin::start`].
+    pub(crate) fn take_crash_receiver(&self) -> Option<mpsc::Receiver<()>> {
+        self.crash_rx.lock().expect("crash_rx poisoned").take()
     }
 
     /// Spawn the child and return it along with the stdin sender channel.
@@ -228,21 +249,22 @@ impl Plugin for ProcessTransport {
             }
         });
 
-        // Process watcher task — handles crash/restart.
+        // Process watcher task — detects crashes and notifies the manager.
         let plugin_name3 = self.config.name.clone();
         let restart = self.config.restart_on_crash;
-        let restart_delay = self.config.restart_delay_secs;
+        let crash_tx = self.crash_tx.clone();
         tokio::spawn(async move {
             match child.wait().await {
                 Ok(status) => {
                     if restart && !status.success() {
                         warn!(
                             plugin = %plugin_name3,
-                            "process exited with {status} — restarting in {restart_delay}s"
+                            "process exited with {status} — notifying manager for restart"
                         );
-                        tokio::time::sleep(tokio::time::Duration::from_secs(restart_delay)).await;
-                        // TODO: re-spawn (requires access to config + parent state).
-                        // For now, log the crash. Full restart is managed by ProcessPluginManager.
+                        // Signal the crash-restart loop in ProcessPluginManager.
+                        if let Some(tx) = crash_tx {
+                            let _ = tx.send(()).await;
+                        }
                     } else {
                         info!(plugin = %plugin_name3, "process exited with {status}");
                     }

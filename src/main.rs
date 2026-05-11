@@ -233,8 +233,8 @@ async fn main() {
         None | Some(Commands::Run) => cmd_run(&cli).await,
         Some(Commands::Setup) => cmd_setup(config_path.as_deref()),
         Some(Commands::Config { action }) => cmd_config(config_path.as_deref(), action),
-        Some(Commands::Migrate) => cmd_migrate(&cli),
-        Some(Commands::Backup) => cmd_backup(&cli),
+        Some(Commands::Migrate) => cmd_migrate(&cli).await,
+        Some(Commands::Backup) => cmd_backup(&cli).await,
         Some(Commands::User { action }) => cmd_user(config_path.as_deref(), action).await,
         Some(Commands::Room { action }) => cmd_room(config_path.as_deref(), action).await,
         #[cfg(feature = "transport-process")]
@@ -785,16 +785,87 @@ fn write_plugins(
     }
 }
 
-fn cmd_migrate(_cli: &Cli) {
-    // TODO: open database, run sqlx::migrate!().
-    eprintln!("error: migrate not yet implemented.");
-    std::process::exit(1);
+/// Apply any pending database migrations and exit.
+///
+/// `Database::open` runs migrations automatically, so this command is
+/// equivalent to opening the database and immediately closing it.  It exists
+/// as an explicit step for deployment scripts that want a clear "migrations
+/// done" signal before starting the BBS process.
+async fn cmd_migrate(cli: &Cli) {
+    let cfg = match config::load(cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error loading config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let db_path = cfg
+        .database
+        .path
+        .as_ref()
+        .expect("database.path set by resolve()");
+
+    println!("Applying migrations to: {}", db_path.display());
+
+    match Database::open(&db_path.to_string_lossy()).await {
+        Ok(_db) => println!("Migrations applied successfully."),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
-fn cmd_backup(_cli: &Cli) {
-    // TODO: open database, trigger VACUUM INTO backup.
-    eprintln!("error: backup not yet implemented.");
-    std::process::exit(1);
+/// Trigger an immediate database backup and report the result.
+async fn cmd_backup(cli: &Cli) {
+    let cfg = match config::load(cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error loading config: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let db_path = cfg
+        .database
+        .path
+        .as_ref()
+        .expect("database.path set by resolve()");
+
+    let backup_dir = cfg
+        .backup
+        .directory
+        .as_ref()
+        .expect("backup.directory set by resolve()");
+
+    let db = match Database::open(&db_path.to_string_lossy()).await {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error opening database: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
+
+    if let Err(e) = tokio::fs::create_dir_all(backup_dir).await {
+        eprintln!("error creating backup directory: {e}");
+        std::process::exit(1);
+    }
+
+    let dir_str = backup_dir.to_string_lossy();
+    match host.admin_trigger_backup(&dir_str).await {
+        Ok(rec) => {
+            println!("Backup created: {}", rec.filename);
+            println!("  size:     {} bytes", rec.size_bytes);
+            println!("  location: {}", backup_dir.display());
+        }
+        Err(e) => {
+            eprintln!("error creating backup: {e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
