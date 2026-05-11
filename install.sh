@@ -298,7 +298,7 @@ for a in d.get('assets', []):
         if curl -sSfL --max-time 15 "$sums_url" -o "$tmp_sums" 2>/dev/null; then
             info "Verifying checksum..."
             local expected actual
-            expected=$(grep -F "$binary_name" "$tmp_sums" | awk '{print $1}')
+            expected=$(awk -v n="$binary_name" '$2 == n || $2 == "*"n {print $1}' "$tmp_sums")
             actual=$(sha256sum "$tmp_bin" | awk '{print $1}')
             rm -f "$tmp_sums"
 
