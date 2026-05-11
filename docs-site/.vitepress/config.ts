@@ -32,7 +32,7 @@ export default defineConfig({
         text: 'Getting Started',
         items: [
           { text: 'User Guide', link: '/USER_GUIDE' },
-          { text: 'Operations', link: '/OPERATIONS' },
+          { text: 'Installation & Operations', link: '/OPERATIONS' },
           { text: 'CLI Reference', link: '/CLI' },
         ],
       },

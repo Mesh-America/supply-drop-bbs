@@ -33,3 +33,19 @@ features:
     title: Plugin API
     details: New transports and behaviors are Rust crates gated behind Cargo features. If you don't compile it in, it isn't there.
 ---
+
+## Quick start
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
+```
+
+The script downloads a pre-built binary for your architecture, runs a setup wizard, and configures a systemd service. Takes under a minute on a Pi 4. Older hardware or unusual architectures fall back to building from source (5–15 minutes).
+
+Before you run it, have these on hand:
+
+- Radio type: USB companion device or Pi HAT
+- HAT model (if using a HAT)
+- Your region/frequency
+
+[Full installation guide](/OPERATIONS) · [Configuration reference](/CONFIG)
