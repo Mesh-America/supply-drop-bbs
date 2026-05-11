@@ -44,7 +44,6 @@ onUnmounted(() => { if (timer !== null) clearInterval(timer) })
         <h1>sessions</h1>
         <p class="muted">Active BBS connections across all transports</p>
       </div>
-      <button class="secondary" @click="load" :disabled="loading">refresh</button>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>

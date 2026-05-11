@@ -50,6 +50,35 @@ const configFile = ref<string | null>(null)
 const writable = ref(false)
 const loading = ref(false)
 const saving = ref(false)
+
+// Snapshot taken after each successful load/save; used for dirty detection.
+const savedForm = ref<string>('')
+const isDirty = computed(() => savedForm.value !== '' && JSON.stringify(form.value) !== savedForm.value)
+
+const isFormValid = computed<boolean>(() => {
+  const f = form.value
+  if (!f.bbs_name.trim()) return false
+  if (!f.bbs_starting_room.trim()) return false
+  if (!f.bbs_timezone.trim()) return false
+  if (timezones.value.length && !timezones.value.includes(f.bbs_timezone)) return false
+  if (f.location_enabled) {
+    const lat = parseFloat(f.location_latitude)
+    const lon = parseFloat(f.location_longitude)
+    if (isNaN(lat) || lat < -90 || lat > 90) return false
+    if (isNaN(lon) || lon < -180 || lon > 180) return false
+  }
+  const { backup_interval_hours, backup_keep_daily, backup_keep_weekly,
+          security_session_web_hours, security_session_mesh_days,
+          security_login_rate_per_min, security_command_rate_per_min } = f
+  if (!Number.isInteger(backup_interval_hours) || backup_interval_hours < 1 || backup_interval_hours > 168) return false
+  if (!Number.isInteger(backup_keep_daily) || backup_keep_daily < 0 || backup_keep_daily > 365) return false
+  if (!Number.isInteger(backup_keep_weekly) || backup_keep_weekly < 0 || backup_keep_weekly > 52) return false
+  if (!Number.isInteger(security_session_web_hours) || security_session_web_hours < 1 || security_session_web_hours > 8760) return false
+  if (!Number.isInteger(security_session_mesh_days) || security_session_mesh_days < 1 || security_session_mesh_days > 365) return false
+  if (!Number.isInteger(security_login_rate_per_min) || security_login_rate_per_min < 1 || security_login_rate_per_min > 100) return false
+  if (!Number.isInteger(security_command_rate_per_min) || security_command_rate_per_min < 1 || security_command_rate_per_min > 600) return false
+  return true
+})
 const restarting = ref(false)
 const restartOk = ref(false)
 const loadError = ref<string | null>(null)
@@ -103,6 +132,7 @@ async function load() {
   try {
     const c = await api.get<ConfigData>('/api/v1/config')
     populateForm(c)
+    savedForm.value = JSON.stringify(form.value)
   } catch (e: any) {
     if (e instanceof ApiError && e.status === 404) {
       loadError.value = 'Config file path not set. Add config_path to [plugins.web] in your config.toml.'
@@ -205,6 +235,7 @@ async function save() {
 
     const res = await api.patch<{ message: string }>('/api/v1/config', patch)
     saveOk.value = res.message
+    savedForm.value = JSON.stringify(form.value)
   } catch (e: any) {
     saveError.value = e?.message ?? 'failed to save config'
   } finally {
@@ -435,10 +466,11 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <div class="actions">
-        <button type="submit" :disabled="saving || !writable">
+        <button type="submit" :disabled="saving || !writable || !isDirty || !isFormValid">
           {{ saving ? 'saving…' : 'save settings' }}
         </button>
         <span v-if="!writable" class="hint">config file is not writable</span>
+        <span v-else-if="!isDirty" class="hint">no unsaved changes</span>
       </div>
 
       <!-- Service restart -->

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { api } from '../api/client'
 
@@ -16,6 +16,8 @@ interface Message {
   timestamp: string
 }
 
+const PAGE_SIZE = 50
+
 const route = useRoute()
 
 const rooms = ref<Room[]>([])
@@ -27,14 +29,20 @@ const loadingMsgs = ref(false)
 const error = ref<string | null>(null)
 const actionError = ref<string | null>(null)
 const actionOk = ref<string | null>(null)
-const afterId = ref<number | null>(null)
+
+// Cursor-stack pagination: each entry is the `after_id` used to fetch that page.
+// pages[0] = null (fetch from beginning), pages[N] = last ID of page N-1.
+const pages = ref<(number | null)[]>([null])
+const pageIdx = ref(0)
+const hasNextPage = ref(false)
+
+const hasPrevPage = computed(() => pageIdx.value > 0)
+const currentCursor = computed(() => pages.value[pageIdx.value])
 
 async function loadRooms() {
   loadingRooms.value = true
   try {
     rooms.value = await api.get<Room[]>('/api/v1/rooms')
-    // If no room is pre-selected, default to the first one.
-    // If one was pre-selected from query params, just load its messages.
     if (!selectedRoomId.value && rooms.value.length > 0) {
       selectRoom(rooms.value[0])
     } else if (selectedRoomId.value) {
@@ -51,30 +59,43 @@ function selectRoom(room: Room) {
   selectedRoomId.value = room.id
   selectedRoomName.value = room.name
   messages.value = []
-  afterId.value = null
+  pages.value = [null]
+  pageIdx.value = 0
+  hasNextPage.value = false
   loadMessages()
 }
 
-async function loadMessages(more = false) {
+async function loadMessages() {
   if (!selectedRoomId.value) return
   loadingMsgs.value = true
   error.value = null
   try {
-    const qs = more && afterId.value ? `?after_id=${afterId.value}` : ''
+    const cursor = currentCursor.value
+    const qs = cursor !== null
+      ? `?limit=${PAGE_SIZE}&after_id=${cursor}`
+      : `?limit=${PAGE_SIZE}`
     const page = await api.get<Message[]>(`/api/v1/rooms/${selectedRoomId.value}/messages${qs}`)
-    if (more) {
-      messages.value.push(...page)
-    } else {
-      messages.value = page
-    }
-    if (page.length > 0) {
-      afterId.value = page[page.length - 1].id
-    }
+    messages.value = page
+    hasNextPage.value = page.length === PAGE_SIZE
   } catch (e: any) {
     error.value = e?.message ?? 'failed to load messages'
   } finally {
     loadingMsgs.value = false
   }
+}
+
+function goNext() {
+  if (!hasNextPage.value || messages.value.length === 0) return
+  const nextCursor = messages.value[messages.value.length - 1].id
+  pages.value = [...pages.value.slice(0, pageIdx.value + 1), nextCursor]
+  pageIdx.value++
+  loadMessages()
+}
+
+function goPrev() {
+  if (pageIdx.value === 0) return
+  pageIdx.value--
+  loadMessages()
 }
 
 async function deleteMessage(id: number) {
@@ -90,10 +111,9 @@ async function deleteMessage(id: number) {
   }
 }
 
+let pollTimer: ReturnType<typeof setInterval> | null = null
+
 onMounted(async () => {
-  // Support ?room=ID&name=NAME query params from rooms page links.
-  // loadRooms() calls selectRoom() which calls loadMessages(), so we only
-  // pre-set the ID here to avoid a duplicate fetch.
   const roomParam = route.query.room
   const nameParam = route.query.name
   if (roomParam) {
@@ -101,7 +121,10 @@ onMounted(async () => {
     selectedRoomName.value = String(nameParam ?? '')
   }
   await loadRooms()
+  pollTimer = setInterval(() => { if (selectedRoomId.value) loadMessages() }, 15_000)
 })
+
+onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
 </script>
 
 <template>
@@ -133,7 +156,6 @@ onMounted(async () => {
       <section class="msg-panel">
         <div class="msg-header" v-if="selectedRoomId">
           <strong>#{{ selectedRoomName }}</strong>
-          <button class="secondary small-btn" @click="loadMessages()">refresh</button>
         </div>
         <p v-if="!selectedRoomId" class="muted">Select a room to browse messages.</p>
 
@@ -158,12 +180,12 @@ onMounted(async () => {
           </tbody>
         </table>
         <p v-if="selectedRoomId && !loadingMsgs && messages.length === 0" class="muted">No messages in this room.</p>
-        <button
-          v-if="messages.length > 0"
-          class="secondary load-more"
-          @click="loadMessages(true)"
-          :disabled="loadingMsgs"
-        >load more</button>
+
+        <div v-if="hasPrevPage || hasNextPage" class="pagination">
+          <button class="secondary small-btn" @click="goPrev" :disabled="!hasPrevPage || loadingMsgs">← prev</button>
+          <span class="muted small">page {{ pageIdx + 1 }}</span>
+          <button class="secondary small-btn" @click="goNext" :disabled="!hasNextPage || loadingMsgs">next →</button>
+        </div>
       </section>
     </div>
   </div>
@@ -203,6 +225,15 @@ p { margin: 0; }
 .small { font-size: 0.85em; }
 .small-btn { padding: 0.2rem 0.5rem; font-size: 0.8em; }
 .content-cell { max-width: 500px; word-break: break-word; white-space: pre-wrap; }
-.load-more { margin: 0.5rem auto; display: block; }
+
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 0.8rem;
+  border-top: 1px solid var(--border);
+  margin-top: auto;
+}
+
 .ok { color: #2a8a2a; }
 </style>

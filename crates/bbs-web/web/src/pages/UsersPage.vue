@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { api } from '../api/client'
 
 interface UserInfo {
@@ -76,7 +76,9 @@ const validate = (u: string) => doAction(u, { status: 0, permission_level: 10 },
 const ban      = (u: string) => doAction(u, { status: 1 }, `${u} banned`)
 const unban    = (u: string) => doAction(u, { status: 0 }, `${u} unbanned`)
 
-onMounted(load)
+let pollTimer: ReturnType<typeof setInterval> | null = null
+onMounted(() => { load(); pollTimer = setInterval(load, 30_000) })
+onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
 </script>
 
 <template>
@@ -98,7 +100,6 @@ onMounted(load)
           <option value="0">active</option>
           <option value="1">banned</option>
         </select>
-        <button class="secondary" @click="load" :disabled="loading">refresh</button>
       </div>
     </header>
 

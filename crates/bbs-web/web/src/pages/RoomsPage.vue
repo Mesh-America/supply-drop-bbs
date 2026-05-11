@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onUnmounted } from 'vue'
 import { api } from '../api/client'
 
 interface Room {
@@ -69,7 +69,9 @@ async function remove(room: Room) {
   }
 }
 
-onMounted(load)
+let pollTimer: ReturnType<typeof setInterval> | null = null
+onMounted(() => { load(); pollTimer = setInterval(load, 30_000) })
+onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
 </script>
 
 <template>
@@ -79,7 +81,6 @@ onMounted(load)
         <h1>rooms</h1>
         <p class="muted">Message rooms and their settings</p>
       </div>
-      <button class="secondary" @click="load" :disabled="loading">refresh</button>
     </header>
 
     <section class="create-form">
