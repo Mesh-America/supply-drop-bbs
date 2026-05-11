@@ -195,6 +195,7 @@ impl Plugin for MeshTransport {
         // Watch for advert-send requests from the web UI.
         let mut advert_send_rx = host.advert_bus().subscribe_send();
         let advert_cmd_tx = self.cmd_tx.clone();
+        let advert_host = Arc::clone(&host);
         let mut advert_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             loop {
@@ -202,6 +203,15 @@ impl Plugin for MeshTransport {
                     result = advert_send_rx.recv() => {
                         match result {
                             Ok(flood) => {
+                                // Refresh the radio's stored location before broadcasting
+                                // so manual sends include GPS just like the on-connect push.
+                                if let Some((lat, lon)) = advert_host.node_location() {
+                                    let lat_1e6 = (lat * 1_000_000.0) as i32;
+                                    let lon_1e6 = (lon * 1_000_000.0) as i32;
+                                    let _ = advert_cmd_tx
+                                        .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
+                                        .await;
+                                }
                                 if advert_cmd_tx
                                     .send(OutboundFrame::SendSelfAdvert { flood })
                                     .await
