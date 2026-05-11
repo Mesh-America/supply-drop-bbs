@@ -1931,14 +1931,25 @@ impl BbsHost {
             return Ok(Response::Text(format!("No messages in {}.", room.name)));
         }
 
-        let mut lines = vec![format!("[{} — forward read]", room.name)];
+        let total = if room_id == MAIL_ROOM_ID {
+            self.db.count_direct(&username).await
+        } else {
+            self.db.count_in_room(room_id).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let word = if total == 1 { "message" } else { "messages" };
+        let mut parts = vec![format!(
+            "[{} — Forward Read]\nThere are {total} {word} in this room.\nType F to read forward, R for most recent.",
+            room.name
+        )];
         for msg in &visible {
-            lines.push(format_message(msg));
+            parts.push(format_message(msg));
         }
         if let Some(cursor) = page.next_cursor {
-            lines.push(format!("(more — type F {} to continue)", cursor.as_i64()));
+            parts.push(format!("(more — type F {} to continue)", cursor.as_i64()));
         }
-        Ok(Response::Text(lines.join("\n")))
+        Ok(Response::MultiText(parts))
     }
 
     async fn handle_read_reverse(&self, session: SessionId) -> Result<Response, HostError> {
@@ -1972,11 +1983,21 @@ impl BbsHost {
             return Ok(Response::Text(format!("No messages in {}.", room.name)));
         }
 
-        let mut lines = vec![format!("[{} — newest first]", room.name)];
+        let total = self
+            .db
+            .count_in_room(room_id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let word = if total == 1 { "message" } else { "messages" };
+        let mut parts = vec![format!(
+            "[{} — Most Recent]\nThere are {total} {word} in this room.\nType F to read from start, R to refresh.",
+            room.name
+        )];
         for msg in &visible {
-            lines.push(format_message(msg));
+            parts.push(format_message(msg));
         }
-        Ok(Response::Text(lines.join("\n")))
+        Ok(Response::MultiText(parts))
     }
 
     async fn handle_scan(&self, session: SessionId) -> Result<Response, HostError> {

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) FROM messages\n               WHERE (sender = ? OR recipient = ?) AND recipient IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "COUNT(*)",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f28af5b33c18a73c7c9baeec38b61a7def0144223c403bf4215cf520df3c9191"
+}

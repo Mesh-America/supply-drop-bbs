@@ -158,6 +158,12 @@ pub trait MessageStore: Send + Sync {
         room_id: RoomId,
         limit: u32,
     ) -> Result<Vec<Message>, StoreError>;
+
+    /// Count all messages in a room (via the `room_messages` join table).
+    async fn count_in_room(&self, room_id: RoomId) -> Result<u64, StoreError>;
+
+    /// Count all direct messages involving `username` (as sender or recipient).
+    async fn count_direct(&self, username: &Username) -> Result<u64, StoreError>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────
@@ -464,5 +470,27 @@ impl MessageStore for Database {
         rows.into_iter()
             .map(|r| map_message_row(r.id, r.sender, r.recipient, r.content, r.timestamp))
             .collect()
+    }
+
+    async fn count_in_room(&self, room_id: RoomId) -> Result<u64, StoreError> {
+        let rid = room_id.as_i64();
+        let count: i64 =
+            sqlx::query_scalar!("SELECT COUNT(*) FROM room_messages WHERE room_id = ?", rid)
+                .fetch_one(&self.read_pool)
+                .await?;
+        Ok(count as u64)
+    }
+
+    async fn count_direct(&self, username: &Username) -> Result<u64, StoreError> {
+        let uname = username.as_str();
+        let count: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) FROM messages
+               WHERE (sender = ? OR recipient = ?) AND recipient IS NOT NULL"#,
+            uname,
+            uname
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(count as u64)
     }
 }
