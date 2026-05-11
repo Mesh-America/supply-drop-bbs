@@ -74,7 +74,20 @@ enum Workflow {
         stage: ChangePwdStage,
     },
     /// Browsing messages one-at-a-time with F/R navigation.
+    /// E replies to the current message; any other input exits.
     Reading,
+    /// Choosing a room from the numbered list produced by K.
+    /// Stores the ordered room IDs so the user can type a number to jump in.
+    Rooms {
+        room_ids: Vec<RoomId>,
+    },
+    /// Stepping through unvalidated accounts one-at-a-time (LP queue).
+    /// `pending` is the list of usernames still to review; `index` is the
+    /// next one to show. Aide+ only.
+    ReviewPending {
+        pending: Vec<Username>,
+        index: usize,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1571,6 +1584,7 @@ impl BbsHost {
                 match reply.trim().to_uppercase().as_str() {
                     "F" => self.handle_read_forward(session, None).await,
                     "R" => self.handle_read_reverse(session).await,
+                    "E" => self.handle_reply_from_reading(session).await,
                     _ => {
                         // Any other input exits reading mode.
                         {
@@ -1583,6 +1597,100 @@ impl BbsHost {
                         Ok(Response::Text(
                             "Exited reading mode. Type H for help.".into(),
                         ))
+                    }
+                }
+            }
+
+            // ── Room selection ────────────────────────────────────────────────
+            Workflow::Rooms { room_ids } => {
+                let trimmed = reply.trim();
+                // X or empty → cancel
+                if trimmed.eq_ignore_ascii_case("x") || trimmed.is_empty() {
+                    {
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::None;
+                        }
+                    }
+                    return Ok(Response::Text("Cancelled.".into()));
+                }
+                // Numeric index into the list shown by K
+                if let Ok(n) = trimmed.parse::<usize>() {
+                    if n >= 1 && n <= room_ids.len() {
+                        let target_id = room_ids[n - 1];
+                        {
+                            let mut sessions = self.sessions.write().await;
+                            if let Some(r) = sessions.get_mut(&session) {
+                                r.workflow = Workflow::None;
+                            }
+                        }
+                        self.set_current_room(session, target_id).await;
+                        return self.handle_change_to_room(session, target_id).await;
+                    }
+                }
+                // Fall back: treat as room name via the normal change-room path
+                {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                    }
+                }
+                self.handle_change_room(session, trimmed).await
+            }
+
+            // ── Pending-user review queue ─────────────────────────────────────
+            Workflow::ReviewPending { pending, index } => {
+                if index >= pending.len() {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                    }
+                    return Ok(Response::Text("No more pending accounts.".into()));
+                }
+
+                let username = pending[index].clone();
+                let next_index = index + 1;
+
+                match reply.trim().to_uppercase().as_str() {
+                    "V" => {
+                        // Validate (promote to User tier)
+                        let result = self.handle_validate_user(session, username.clone()).await;
+                        // Advance or finish
+                        self.advance_review_pending(session, pending, next_index)
+                            .await?;
+                        result
+                    }
+                    "B" => {
+                        // Ban
+                        let result = self.handle_ban_user(session, username.clone()).await;
+                        self.advance_review_pending(session, pending, next_index)
+                            .await?;
+                        result
+                    }
+                    "S" | "X" => {
+                        // Skip or exit queue
+                        let done =
+                            next_index >= pending.len() || reply.trim().to_uppercase() == "X";
+                        if done {
+                            let mut sessions = self.sessions.write().await;
+                            if let Some(r) = sessions.get_mut(&session) {
+                                r.workflow = Workflow::None;
+                            }
+                            Ok(Response::Text("Exited review queue.".into()))
+                        } else {
+                            self.advance_review_pending(session, pending, next_index)
+                                .await
+                        }
+                    }
+                    _ => {
+                        // Re-show current entry
+                        Ok(Response::Prompt {
+                            text: format!(
+                                "{} — V Validate  S Skip  B Ban  X Exit",
+                                username.as_str()
+                            ),
+                            hide_input: false,
+                        })
                     }
                 }
             }
@@ -1692,7 +1800,30 @@ impl BbsHost {
         if lines.is_empty() {
             return Ok(Response::Text("No accessible rooms.".into()));
         }
-        Ok(Response::Text(format!("Rooms:\n{}", lines.join("\n"))))
+
+        // Prefix each line with its 1-based index so the user can type a
+        // number to jump in (handled by Workflow::Rooms).
+        let numbered: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| format!("{}. {}", i + 1, l))
+            .collect();
+
+        let room_ids: Vec<RoomId> = rooms.iter().map(|r| r.id).collect();
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::Rooms { room_ids };
+            }
+        }
+
+        Ok(Response::Prompt {
+            text: format!(
+                "Rooms:\n{}\nEnter # to join, X to cancel",
+                numbered.join("\n")
+            ),
+            hide_input: false,
+        })
     }
 
     async fn handle_go_next_unread(&self, session: SessionId) -> Result<Response, HostError> {
@@ -1830,6 +1961,110 @@ impl BbsHost {
             format!("Now in: {} (no new messages).", room.name)
         };
         Ok(Response::Text(msg))
+    }
+
+    /// Start a reply compose from reading mode.
+    ///
+    /// Looks up the current message, switches to `Workflow::Compose` with the
+    /// sender pre-populated as recipient (Mail room) or no recipient (room
+    /// post), and returns a body prompt so the user can type their reply
+    /// without leaving the reading context manually.
+    async fn handle_reply_from_reading(&self, session: SessionId) -> Result<Response, HostError> {
+        let (_, _, level, room_id) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+
+        let room = RoomStore::get_by_id(&self.db, room_id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+            .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
+
+        if room.read_only && level < PermissionLevel::Aide {
+            return Ok(Response::Error(format!("'{}' is read-only.", room.name)));
+        }
+
+        let msg_id = {
+            let sessions = self.sessions.read().await;
+            sessions.get(&session).and_then(|r| r.current_message_id)
+        };
+
+        let recipient: Option<Username> = if let Some(mid) = msg_id {
+            let msg = MessageStore::get_by_id(&self.db, mid)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            // In Mail room, reply goes to the sender of the current message.
+            // In a regular room, there is no specific recipient.
+            if room_id == MAIL_ROOM_ID {
+                msg.map(|m| m.sender)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let prompt = match &recipient {
+            Some(r) => format!("Reply to {}:", r.as_str()),
+            None => format!("Post to {}:", room.name),
+        };
+
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::Compose {
+                    room_id,
+                    stage: ComposeStage::AwaitingBody { recipient },
+                };
+            }
+        }
+
+        Ok(Response::Prompt {
+            text: prompt,
+            hide_input: false,
+        })
+    }
+
+    /// Advance the `ReviewPending` queue to `next_index`, showing the next
+    /// account or finishing the workflow when the list is exhausted.
+    async fn advance_review_pending(
+        &self,
+        session: SessionId,
+        pending: Vec<Username>,
+        next_index: usize,
+    ) -> Result<Response, HostError> {
+        if next_index >= pending.len() {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::None;
+            }
+            return Ok(Response::Text(
+                "Review complete — no more pending accounts.".into(),
+            ));
+        }
+
+        let next_user = &pending[next_index];
+        let prompt = format!(
+            "#{} of {}: {}  — V Validate  S Skip  B Ban  X Exit",
+            next_index + 1,
+            pending.len(),
+            next_user.as_str()
+        );
+
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::ReviewPending {
+                    pending,
+                    index: next_index,
+                };
+            }
+        }
+
+        Ok(Response::Prompt {
+            text: prompt,
+            hide_input: false,
+        })
     }
 
     async fn set_current_room(&self, session: SessionId, room_id: RoomId) {
@@ -2444,16 +2679,24 @@ impl BbsHost {
             return Ok(Response::Text("No accounts pending validation.".into()));
         }
 
-        let mut lines = vec![format!("Pending validation ({}):", pending.len())];
-        for u in &pending {
-            lines.push(format!(
-                "  {} (joined {})",
-                u.username.as_str(),
-                u.created_at
-            ));
+        let usernames: Vec<Username> = pending.iter().map(|u| u.username.clone()).collect();
+        let first_name = usernames[0].as_str().to_owned();
+        let total = usernames.len();
+
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::ReviewPending {
+                    pending: usernames,
+                    index: 0,
+                };
+            }
         }
-        lines.push("Use V <username> to validate, B <username> to ban.".into());
-        Ok(Response::Text(lines.join("\n")))
+
+        Ok(Response::Prompt {
+            text: format!("#1 of {total}: {first_name}  — V Validate  S Skip  B Ban  X Exit"),
+            hide_input: false,
+        })
     }
 
     async fn handle_validate_user(
@@ -3379,11 +3622,8 @@ fn build_message_with_nav(msg: &Message, has_prev: bool, has_next: bool) -> Stri
     if has_next {
         nav.push("F - Next");
     }
-    if nav.is_empty() {
-        format_message(msg)
-    } else {
-        format!("{}\n{}", format_message(msg), nav.join("  "))
-    }
+    nav.push("E - Reply");
+    format!("{}\n{}", format_message(msg), nav.join("  "))
 }
 
 fn format_message(msg: &Message) -> String {
@@ -3656,9 +3896,10 @@ mod tests {
         // Validate bob so he can use room commands.
         force_validate(&host, &uname).await;
 
+        // K now returns Prompt (Workflow::Rooms) so the user can pick by number.
         let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
-        let Response::Text(text) = resp else {
-            panic!("expected Text")
+        let Response::Prompt { text, .. } = resp else {
+            panic!("expected Prompt from ListRooms")
         };
         assert!(text.contains("Lobby"));
     }
