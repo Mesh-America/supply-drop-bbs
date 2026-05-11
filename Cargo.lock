@@ -301,6 +301,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbs-meshtastic"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "bbs-plugin-api",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bbs-plugin-api"
 version = "0.3.0"
 dependencies = [
@@ -2455,6 +2466,7 @@ dependencies = [
  "bbs-cli",
  "bbs-core",
  "bbs-mesh",
+ "bbs-meshtastic",
  "bbs-plugin-api",
  "bbs-process-transport",
  "bbs-web",

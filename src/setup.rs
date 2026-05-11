@@ -2,12 +2,18 @@
 //!
 //! Guides the operator through:
 //!
-//! 1. Choosing a radio connection type (USB serial / TCP / Pi HAT)
-//! 2. Configuring the connection (port selection or address entry)
+//! 1. Choosing which radio protocols to enable (MeshCore, Meshtastic, or both)
+//! 2. Configuring each enabled protocol (connection type, serial port / address)
 //! 3. Setting BBS identity (name, data directory)
 //! 4. Writing a `config.toml`
-//! 5. For Pi HAT: prompting region + HAT model and writing `pymc-companion.yaml`
+//! 5. For MeshCore Pi HAT: writing `pymc-companion.yaml`
 //! 6. Printing platform-specific next steps (group membership, systemd)
+//!
+//! Which protocol sections appear is determined by compiled-in cargo features:
+//! - `transport-mesh`        → MeshCore section present
+//! - `transport-meshtastic`  → Meshtastic section present
+//! - If both are compiled in, the wizard asks the operator to select which to
+//!   enable.  If only one is compiled in, that protocol is always offered.
 //!
 //! Entry point: [`run_wizard`].
 
@@ -21,29 +27,32 @@ use std::{
 
 // ── Existing-config loader ────────────────────────────────────────────────────
 
-/// Values read from any already-existing config files.
-/// All fields fall back to the same hard-coded defaults the wizard previously
-/// used when no config existed.
 struct Existing {
     bbs_name: String,
     data_dir: String,
-    connection_type: String, // "serial" | "hat" | "tcp"
-    serial_port: Option<String>,
-    baud_rate: u32,
+    // MeshCore
+    mesh_enabled: bool,
+    mesh_connection_type: String,
+    mesh_serial_port: Option<String>,
+    mesh_baud_rate: u32,
+    // Meshtastic
+    meshtastic_enabled: bool,
+    meshtastic_connection_type: String,
+    meshtastic_serial_port: Option<String>,
+    meshtastic_baud_rate: u32,
+    // Web
     web_enabled: bool,
     web_bind: String,
     web_backup_dir: Option<String>,
+    // pymc-companion
     region_idx: usize,
     hat_idx: usize,
+    // GPS
     latitude: Option<f64>,
     longitude: Option<f64>,
 }
 
-/// Load defaults from existing `config.toml` and `pymc-companion.yaml`.
-/// Missing files or parse errors are silently ignored; compiled-in defaults
-/// are used for anything that can't be read.
 fn load_existing(out_path: &Path) -> Existing {
-    // ── config.toml ───────────────────────────────────────────────────────────
     let toml_raw = fs::read_to_string(out_path).unwrap_or_default();
     let toml_val: toml::Value = toml_raw
         .parse()
@@ -51,7 +60,9 @@ fn load_existing(out_path: &Path) -> Existing {
 
     let bbs = toml_val.get("bbs");
     let mesh = toml_val.get("plugins").and_then(|p| p.get("mesh"));
+    let meshtastic = toml_val.get("plugins").and_then(|p| p.get("meshtastic"));
     let web = toml_val.get("plugins").and_then(|p| p.get("web"));
+    let location = toml_val.get("location");
 
     let bbs_name = bbs
         .and_then(|b| b.get("name"))
@@ -73,44 +84,62 @@ fn load_existing(out_path: &Path) -> Existing {
             }
         });
 
-    let connection_type = mesh
+    // MeshCore existing values
+    let mesh_enabled = mesh
+        .and_then(|m| m.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let mesh_connection_type = mesh
         .and_then(|m| m.get("connection_type"))
         .and_then(|v| v.as_str())
         .unwrap_or("serial")
         .to_owned();
-
-    let serial_port = mesh
+    let mesh_serial_port = mesh
         .and_then(|m| m.get("serial_port"))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
-
-    let baud_rate = mesh
+    let mesh_baud_rate = mesh
         .and_then(|m| m.get("baud_rate"))
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
         .unwrap_or(115_200);
 
+    // Meshtastic existing values
+    let meshtastic_enabled = meshtastic
+        .and_then(|m| m.get("enabled"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let meshtastic_connection_type = meshtastic
+        .and_then(|m| m.get("connection_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("serial")
+        .to_owned();
+    let meshtastic_serial_port = meshtastic
+        .and_then(|m| m.get("serial_port"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let meshtastic_baud_rate = meshtastic
+        .and_then(|m| m.get("baud_rate"))
+        .and_then(|v| v.as_integer())
+        .map(|v| v as u32)
+        .unwrap_or(115_200);
+
+    // Web
     let web_enabled = web
         .and_then(|w| w.get("enabled"))
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-
     let web_bind = web
         .and_then(|w| w.get("bind"))
         .and_then(|v| v.as_str())
         .unwrap_or("0.0.0.0:8080")
         .to_owned();
-
     let web_backup_dir = web
         .and_then(|w| w.get("backup_dir"))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    // ── pymc-companion.yaml ───────────────────────────────────────────────────
-    let yaml_path = companion_yaml_path(out_path);
-    let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
-
-    let location = toml_val.get("location");
+    // GPS
     let latitude = location
         .and_then(|l| l.get("latitude"))
         .and_then(|v| v.as_float());
@@ -118,12 +147,21 @@ fn load_existing(out_path: &Path) -> Existing {
         .and_then(|l| l.get("longitude"))
         .and_then(|v| v.as_float());
 
+    // pymc-companion
+    let yaml_path = companion_yaml_path(out_path);
+    let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
+
     Existing {
         bbs_name,
         data_dir,
-        connection_type,
-        serial_port,
-        baud_rate,
+        mesh_enabled,
+        mesh_connection_type,
+        mesh_serial_port,
+        mesh_baud_rate,
+        meshtastic_enabled,
+        meshtastic_connection_type,
+        meshtastic_serial_port,
+        meshtastic_baud_rate,
         web_enabled,
         web_bind,
         web_backup_dir,
@@ -134,7 +172,6 @@ fn load_existing(out_path: &Path) -> Existing {
     }
 }
 
-/// Extract a scalar value from a flat YAML file by key name.
 fn yaml_value(yaml: &str, key: &str) -> Option<String> {
     for line in yaml.lines() {
         let line = line.trim();
@@ -150,8 +187,6 @@ fn yaml_value(yaml: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Find the index in `REGION_PRESETS` whose frequency + bandwidth +
-/// spreading_factor matches the YAML.  Falls back to USA/Canada (14).
 fn match_region_preset(yaml: &str) -> usize {
     let freq = yaml_value(yaml, "frequency").and_then(|s| s.parse::<u64>().ok());
     let bw = yaml_value(yaml, "bandwidth").and_then(|s| s.parse::<u32>().ok());
@@ -166,8 +201,6 @@ fn match_region_preset(yaml: &str) -> usize {
     14 // USA/Canada
 }
 
-/// Find the index in `HAT_PRESETS` whose key GPIO pins match the YAML.
-/// Falls back to 0 (ZebraHat).
 fn match_hat_preset(yaml: &str) -> usize {
     let get_i32 = |key: &str| yaml_value(yaml, key).and_then(|s| s.parse::<i32>().ok());
     let bus = get_i32("bus_id");
@@ -194,47 +227,180 @@ fn match_hat_preset(yaml: &str) -> usize {
     0
 }
 
-use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
+use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
-/// Run the interactive setup wizard.
-///
-/// `config_out` is where to write the resulting `config.toml`.  If `None` the
-/// wizard writes to `./config.toml` in the current working directory (the most
-/// common case for new installs).
 pub fn run_wizard(config_out: Option<&Path>) {
     print_banner();
 
     let theme = ColorfulTheme::default();
 
-    // Determine output path early so we can read the existing config from it.
     let out_path = config_out
         .map(|p| p.to_owned())
         .unwrap_or_else(|| PathBuf::from("config.toml"));
 
     let ex = load_existing(&out_path);
 
-    // ── Radio connection ──────────────────────────────────────────────────────
-    section("Radio connection");
+    // ── Protocol selection ────────────────────────────────────────────────────
+    //
+    // Which protocols appear here is determined by compiled-in features:
+    //   transport-mesh        → MeshCore offered
+    //   transport-meshtastic  → Meshtastic offered
+    //
+    // If only one protocol is compiled in the selection step is skipped and
+    // the wizard goes straight to configuring that protocol.
 
-    let conn_items = &[
-        "USB / serial  (Heltec V3, T-Beam, RAK4631 — plug in via USB)",
-        "Pi HAT        (ZebraHat, Waveshare, PiMesh, FemtoFox — SPI on GPIO)",
-    ];
+    #[allow(unused_mut)]
+    let mut use_mesh = cfg!(feature = "transport-mesh") && ex.mesh_enabled;
+    #[allow(unused_mut)]
+    let mut use_meshtastic = cfg!(feature = "transport-meshtastic") && ex.meshtastic_enabled;
 
-    let conn_default = if ex.connection_type == "hat" { 1 } else { 0 };
-    let conn_choice = prompt_select(
-        &theme,
-        "How does your radio connect?",
-        conn_items,
-        conn_default,
-    );
+    let mesh_available = cfg!(feature = "transport-mesh");
+    let meshtastic_available = cfg!(feature = "transport-meshtastic");
 
-    let (connection_type, serial_port, baud_rate) = match conn_choice {
-        0 => configure_serial(&theme, ex.serial_port.as_deref(), ex.baud_rate),
-        _ => ("hat", None, None),
-    };
+    if mesh_available && meshtastic_available {
+        // Both compiled in — ask the operator which to enable.
+        section("Radio protocols");
+
+        println!("This BBS supports multiple radio protocols simultaneously.");
+        println!("Select which protocols to enable (space to toggle, enter to confirm):");
+        println!();
+
+        let mut items = vec![];
+        if mesh_available {
+            items.push("MeshCore  (ZebraHat, Heltec V3, T-Beam, RAK — MeshCore firmware)");
+        }
+        if meshtastic_available {
+            items.push("Meshtastic (any Meshtastic-firmware radio — USB or meshtasticd TCP)");
+        }
+
+        let defaults: Vec<bool> = vec![
+            mesh_available && ex.mesh_enabled,
+            meshtastic_available && ex.meshtastic_enabled,
+        ];
+
+        let selections = MultiSelect::with_theme(&theme)
+            .with_prompt("Enable protocols")
+            .items(&items)
+            .defaults(&defaults)
+            .interact()
+            .unwrap_or_else(|_| cancelled());
+
+        use_mesh = mesh_available && selections.contains(&0);
+        use_meshtastic = meshtastic_available && selections.contains(&1);
+
+        if !use_mesh && !use_meshtastic {
+            println!();
+            println!("  No protocols selected — the BBS will start with no radio transports.");
+            println!("  You can still use the CLI transport (Unix socket) and web admin.");
+        }
+    } else if mesh_available {
+        // Only MeshCore compiled in — always offer it.
+        use_mesh = true;
+        use_meshtastic = false;
+    } else if meshtastic_available {
+        // Only Meshtastic compiled in — always offer it.
+        use_mesh = false;
+        use_meshtastic = true;
+    }
+
+    // ── MeshCore connection ───────────────────────────────────────────────────
+
+    let mesh_conn_type;
+    let mesh_serial_port;
+    let mesh_baud_rate;
+    let mut hat_params: Option<HatParams> = None;
+
+    if use_mesh {
+        section("MeshCore radio connection");
+
+        let conn_items = &[
+            "USB / serial  (Heltec V3, T-Beam, RAK4631 — plug in via USB)",
+            "Pi HAT        (ZebraHat, Waveshare, PiMesh, FemtoFox — SPI on GPIO)",
+        ];
+        let conn_default = if ex.mesh_connection_type == "hat" {
+            1
+        } else {
+            0
+        };
+        let conn_choice = prompt_select(
+            &theme,
+            "How does your MeshCore radio connect?",
+            conn_items,
+            conn_default,
+        );
+
+        let (ct, sp, br) = match conn_choice {
+            0 => configure_serial(&theme, ex.mesh_serial_port.as_deref(), ex.mesh_baud_rate),
+            _ => ("hat", None, None),
+        };
+
+        mesh_conn_type = ct;
+        mesh_serial_port = sp;
+        mesh_baud_rate = br;
+    } else {
+        mesh_conn_type = "serial";
+        mesh_serial_port = None;
+        mesh_baud_rate = None;
+    }
+
+    // ── Meshtastic connection ─────────────────────────────────────────────────
+
+    let meshtastic_conn_type;
+    let meshtastic_serial_port;
+    let meshtastic_baud_rate;
+    let meshtastic_addr: Option<String>;
+
+    if use_meshtastic {
+        section("Meshtastic radio connection");
+
+        let conn_items = &[
+            "USB / serial  (any Meshtastic-firmware radio — plug in via USB)",
+            "TCP           (connect to a running meshtasticd, default port 4403)",
+        ];
+        let conn_default = if ex.meshtastic_connection_type == "tcp" {
+            1
+        } else {
+            0
+        };
+        let conn_choice = prompt_select(
+            &theme,
+            "How does your Meshtastic radio connect?",
+            conn_items,
+            conn_default,
+        );
+
+        match conn_choice {
+            0 => {
+                let (ct, sp, br) = configure_serial(
+                    &theme,
+                    ex.meshtastic_serial_port.as_deref(),
+                    ex.meshtastic_baud_rate,
+                );
+                meshtastic_conn_type = ct;
+                meshtastic_serial_port = sp;
+                meshtastic_baud_rate = br;
+                meshtastic_addr = None;
+            }
+            _ => {
+                let addr: String = Input::with_theme(&theme)
+                    .with_prompt("meshtasticd address")
+                    .default("127.0.0.1:4403".to_owned())
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+                meshtastic_conn_type = "tcp";
+                meshtastic_serial_port = None;
+                meshtastic_baud_rate = None;
+                meshtastic_addr = Some(addr);
+            }
+        }
+    } else {
+        meshtastic_conn_type = "serial";
+        meshtastic_serial_port = None;
+        meshtastic_baud_rate = None;
+        meshtastic_addr = None;
+    }
 
     // ── BBS identity ──────────────────────────────────────────────────────────
     section("BBS identity");
@@ -302,8 +468,8 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // ── GPS location ──────────────────────────────────────────────────────────
     section("GPS location (optional)");
 
-    println!("If set, the mesh transport sends your coordinates to the radio on");
-    println!("connect so your node appears on the map in adverts. Leave blank to skip.");
+    println!("If set, radio transports broadcast your coordinates on connect so");
+    println!("your node appears on mesh maps. Leave blank to skip.");
     println!();
 
     let set_gps = Confirm::with_theme(&theme)
@@ -347,18 +513,16 @@ pub fn run_wizard(config_out: Option<&Path>) {
         (None, None)
     };
 
-    // ── Pi HAT: region + model ────────────────────────────────────────────────
-    let hat_params = if connection_type == "hat" {
-        Some(configure_hat(
+    // ── MeshCore Pi HAT: region + model ──────────────────────────────────────
+    if use_mesh && mesh_conn_type == "hat" {
+        hat_params = Some(configure_hat(
             &theme,
             &bbs_name,
             &data_dir,
             ex.region_idx,
             ex.hat_idx,
-        ))
-    } else {
-        None
-    };
+        ));
+    }
 
     // ── Confirm & write ───────────────────────────────────────────────────────
     section("Write config");
@@ -384,9 +548,15 @@ pub fn run_wizard(config_out: Option<&Path>) {
     let toml = build_toml(&TomlParams {
         bbs_name: &bbs_name,
         data_dir: &data_dir,
-        connection_type,
-        serial_port: serial_port.as_deref(),
-        baud_rate,
+        use_mesh,
+        mesh_connection_type: mesh_conn_type,
+        mesh_serial_port: mesh_serial_port.as_deref(),
+        mesh_baud_rate,
+        use_meshtastic,
+        meshtastic_connection_type: meshtastic_conn_type,
+        meshtastic_serial_port: meshtastic_serial_port.as_deref(),
+        meshtastic_baud_rate,
+        meshtastic_addr: meshtastic_addr.as_deref(),
         web_enabled,
         web_bind: web_bind.as_deref(),
         web_backup_dir: web_backup_dir.as_deref(),
@@ -413,13 +583,11 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     println!("\nConfig written to {}.", out_path.display());
 
-    // Create backup directory and set ownership so the service user can write to it.
     if let Some(ref dir) = web_backup_dir {
         if !dir.is_empty() {
             match fs::create_dir_all(dir) {
                 Ok(()) => {
                     println!("Backup directory created: {dir}");
-                    // On Linux, chown to the service user so it can write backup files.
                     #[cfg(target_os = "linux")]
                     {
                         let status = std::process::Command::new("chown")
@@ -446,7 +614,6 @@ pub fn run_wizard(config_out: Option<&Path>) {
         }
     }
 
-    // Write pymc-companion.yaml if HAT was chosen.
     if let Some(ref hat) = hat_params {
         let yaml_path = companion_yaml_path(&out_path);
         let yaml = build_companion_yaml(hat);
@@ -459,7 +626,14 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     // ── Next steps ────────────────────────────────────────────────────────────
     section("Next steps");
-    print_next_steps(connection_type, serial_port.as_deref(), web_bind.as_deref());
+    print_next_steps(
+        use_mesh,
+        mesh_conn_type,
+        mesh_serial_port.as_deref(),
+        use_meshtastic,
+        meshtastic_conn_type,
+        web_bind.as_deref(),
+    );
 }
 
 // ── Connection type configuration ─────────────────────────────────────────────
@@ -493,7 +667,6 @@ fn configure_serial(
             .collect();
         items.push("Enter path manually…".into());
 
-        // Pre-select the existing port if it appears in the detected list.
         let port_default = existing_port
             .and_then(|ep| ports.iter().position(|p| p.name == ep))
             .unwrap_or(0);
@@ -1003,7 +1176,7 @@ fn configure_hat(
     existing_region: usize,
     existing_hat: usize,
 ) -> HatParams {
-    section("Pi HAT — region");
+    section("MeshCore Pi HAT — region");
 
     let region_names: Vec<String> = REGION_PRESETS
         .iter()
@@ -1018,7 +1191,7 @@ fn configure_hat(
 
     let region_choice = prompt_select(theme, "Select your region", &region_names, existing_region);
 
-    section("Pi HAT — model");
+    section("MeshCore Pi HAT — model");
 
     let hat_names: Vec<&str> = HAT_PRESETS.iter().map(|h| h.name).collect();
     let hat_choice = prompt_select(theme, "Select your Pi HAT", &hat_names, existing_hat);
@@ -1098,12 +1271,22 @@ fn build_companion_yaml(p: &HatParams) -> String {
 struct TomlParams<'a> {
     bbs_name: &'a str,
     data_dir: &'a Path,
-    connection_type: &'a str,
-    serial_port: Option<&'a str>,
-    baud_rate: Option<u32>,
+    // MeshCore
+    use_mesh: bool,
+    mesh_connection_type: &'a str,
+    mesh_serial_port: Option<&'a str>,
+    mesh_baud_rate: Option<u32>,
+    // Meshtastic
+    use_meshtastic: bool,
+    meshtastic_connection_type: &'a str,
+    meshtastic_serial_port: Option<&'a str>,
+    meshtastic_baud_rate: Option<u32>,
+    meshtastic_addr: Option<&'a str>,
+    // Web
     web_enabled: bool,
     web_bind: Option<&'a str>,
     web_backup_dir: Option<&'a str>,
+    // GPS
     latitude: Option<f64>,
     longitude: Option<f64>,
 }
@@ -1139,21 +1322,69 @@ fn build_toml(p: &TomlParams<'_>) -> String {
 
     // [plugins.mesh]
     writeln!(s, "\n[plugins.mesh]").unwrap();
-    writeln!(s, "connection_type = {}", toml_str(p.connection_type)).unwrap();
-
-    match p.connection_type {
-        "serial" => {
-            if let Some(port) = p.serial_port {
-                writeln!(s, "serial_port = {}", toml_str(port)).unwrap();
-            }
-            if let Some(baud) = p.baud_rate {
-                if baud != 115_200 {
-                    writeln!(s, "baud_rate = {baud}").unwrap();
+    writeln!(s, "enabled = {}", p.use_mesh).unwrap();
+    if p.use_mesh {
+        writeln!(s, "connection_type = {}", toml_str(p.mesh_connection_type)).unwrap();
+        match p.mesh_connection_type {
+            "serial" => {
+                if let Some(port) = p.mesh_serial_port {
+                    writeln!(s, "serial_port = {}", toml_str(port)).unwrap();
+                }
+                if let Some(baud) = p.mesh_baud_rate {
+                    if baud != 115_200 {
+                        writeln!(s, "baud_rate = {baud}").unwrap();
+                    }
                 }
             }
+            "hat" | "tcp" => {}
+            _ => {}
         }
-        "hat" => {}
-        _ => {}
+    }
+
+    // [plugins.meshtastic] — only written when the feature is compiled in
+    #[cfg(feature = "transport-meshtastic")]
+    {
+        writeln!(s, "\n[plugins.meshtastic]").unwrap();
+        writeln!(s, "enabled = {}", p.use_meshtastic).unwrap();
+        if p.use_meshtastic {
+            writeln!(
+                s,
+                "connection_type = {}",
+                toml_str(p.meshtastic_connection_type)
+            )
+            .unwrap();
+            match p.meshtastic_connection_type {
+                "serial" => {
+                    if let Some(port) = p.meshtastic_serial_port {
+                        writeln!(s, "serial_port = {}", toml_str(port)).unwrap();
+                    }
+                    if let Some(baud) = p.meshtastic_baud_rate {
+                        if baud != 115_200 {
+                            writeln!(s, "baud_rate = {baud}").unwrap();
+                        }
+                    }
+                }
+                "tcp" => {
+                    if let Some(addr) = p.meshtastic_addr {
+                        if addr != "127.0.0.1:4403" {
+                            writeln!(s, "addr = {}", toml_str(addr)).unwrap();
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Suppress unused-variable warnings when feature is off.
+    #[cfg(not(feature = "transport-meshtastic"))]
+    {
+        let _ = (
+            p.use_meshtastic,
+            p.meshtastic_connection_type,
+            p.meshtastic_serial_port,
+            p.meshtastic_baud_rate,
+            p.meshtastic_addr,
+        );
     }
 
     // [plugins.web]
@@ -1224,19 +1455,32 @@ fn list_serial_ports() -> Vec<PortInfo> {
 
 // ── Next steps ────────────────────────────────────────────────────────────────
 
-fn print_next_steps(connection_type: &str, serial_port: Option<&str>, web_bind: Option<&str>) {
-    if connection_type == "serial" && cfg!(target_os = "linux") {
-        println!("To allow Supply Drop BBS to access the serial port, your user must");
+fn print_next_steps(
+    use_mesh: bool,
+    mesh_conn_type: &str,
+    mesh_serial_port: Option<&str>,
+    use_meshtastic: bool,
+    meshtastic_conn_type: &str,
+    web_bind: Option<&str>,
+) {
+    let needs_dialout = cfg!(target_os = "linux")
+        && ((use_mesh && mesh_conn_type == "serial")
+            || (use_meshtastic && meshtastic_conn_type == "serial"));
+
+    if needs_dialout {
+        println!("To allow Supply Drop BBS to access serial ports, your user must");
         println!("be in the 'dialout' group:");
         println!();
         println!("  sudo usermod -aG dialout $USER");
         println!("  # then log out and back in, or run:");
         println!("  newgrp dialout");
         println!();
-        if let Some(port) = serial_port {
-            println!("You can verify access with:");
-            println!("  ls -l {port}");
-            println!();
+        if use_mesh && mesh_conn_type == "serial" {
+            if let Some(port) = mesh_serial_port {
+                println!("Verify MeshCore port access with:");
+                println!("  ls -l {port}");
+                println!();
+            }
         }
     }
 

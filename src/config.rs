@@ -510,6 +510,10 @@ pub struct PluginsConfig {
     #[serde(default)]
     pub mesh: bbs_mesh::MeshConfig,
 
+    #[cfg(feature = "transport-meshtastic")]
+    #[serde(default)]
+    pub meshtastic: bbs_meshtastic::MeshtasticConfig,
+
     #[cfg(feature = "admin-web")]
     #[serde(default)]
     pub web: bbs_web::WebConfig,

@@ -66,6 +66,11 @@ pub enum ConnectionType {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshConfig {
+    /// Set to `false` to disable the MeshCore transport at runtime without
+    /// removing the config section.  Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
     /// How to reach the radio.
     #[serde(default)]
     pub connection_type: ConnectionType,
@@ -168,6 +173,7 @@ impl MeshConfig {
 impl Default for MeshConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             connection_type: ConnectionType::default(),
             addr: default_addr(),
             serial_port: None,
@@ -214,5 +220,9 @@ fn default_node_credential_ttl_days() -> u32 {
 }
 
 fn default_flood_after_send() -> bool {
+    true
+}
+
+fn default_true() -> bool {
     true
 }

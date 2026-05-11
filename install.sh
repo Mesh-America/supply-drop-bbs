@@ -55,7 +55,7 @@ if [[ "${1:-}" == "--uninstall" ]]; then
 
     [[ $EUID -eq 0 ]] || die "Please run with sudo:  sudo bash install.sh --uninstall"
 
-    warn "This will remove Supply Drop BBS and pymc-companion from this system."
+    warn "This will remove Supply Drop BBS and pymc-companion (MeshCore HAT bridge) from this system."
     echo
     read -r -p "  Continue? [y/N] " _confirm
     [[ "$_confirm" =~ ^[Yy] ]] || { echo "  Aborted."; exit 0; }
@@ -442,23 +442,84 @@ if [[ "$run_setup" == true ]]; then
     chmod 640 "$CONFIG_DIR/config.toml"
 fi
 
-# ── pymc-companion (Pi HAT radio bridge) ──────────────────────────────────────
+# ── Protocol-specific radio setup ────────────────────────────────────────────
+#
+# Each protocol is independent.  MeshCore Pi HAT needs pymc-companion;
+# all other connection types (serial, tcp) and Meshtastic need nothing extra.
+#
+# We read the config that the setup wizard just wrote to determine what the
+# operator enabled.  A section is "enabled" if its `enabled` key is absent
+# (defaults to true for mesh) or explicitly set to `true`.
+
+_mesh_enabled=false
+_mesh_conn_type=""
+_meshtastic_enabled=false
+
+# Parse [plugins.mesh] — enabled defaults to true if key is absent.
+if python3 - "$CONFIG_DIR/config.toml" <<'PYEOF'
+import sys, re
+
+path = sys.argv[1]
+text = open(path).read()
+
+# Find [plugins.mesh] section.
+m = re.search(r'^\[plugins\.mesh\](.*?)(?=^\[|\Z)', text, re.M | re.S)
+if not m:
+    sys.exit(0)   # section absent → not configured
+
+section = m.group(1)
+
+enabled_m = re.search(r'^enabled\s*=\s*(true|false)', section, re.M)
+enabled = enabled_m.group(1) if enabled_m else 'true'
+if enabled != 'true':
+    sys.exit(0)
+
+conn_m = re.search(r'^connection_type\s*=\s*"(\w+)"', section, re.M)
+conn = conn_m.group(1) if conn_m else 'tcp'
+
+print(conn)
+PYEOF
+then
+    _mesh_conn_type=$(python3 - "$CONFIG_DIR/config.toml" <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+text = open(path).read()
+m = re.search(r'^\[plugins\.mesh\](.*?)(?=^\[|\Z)', text, re.M | re.S)
+if not m: sys.exit(0)
+section = m.group(1)
+conn_m = re.search(r'^connection_type\s*=\s*"(\w+)"', section, re.M)
+print(conn_m.group(1) if conn_m else 'tcp')
+PYEOF
+)
+    _mesh_enabled=true
+fi
+
+# Parse [plugins.meshtastic] — enabled defaults to false if key is absent.
+if python3 - "$CONFIG_DIR/config.toml" <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+text = open(path).read()
+m = re.search(r'^\[plugins\.meshtastic\](.*?)(?=^\[|\Z)', text, re.M | re.S)
+if not m: sys.exit(1)
+section = m.group(1)
+enabled_m = re.search(r'^enabled\s*=\s*(true|false)', section, re.M)
+enabled = enabled_m.group(1) if enabled_m else 'false'
+sys.exit(0 if enabled == 'true' else 1)
+PYEOF
+then
+    _meshtastic_enabled=true
+fi
+
+# ── MeshCore Pi HAT: pymc-companion ──────────────────────────────────────────
 
 PYMC_DIR="/opt/pymc-companion"
 PYMC_UNIT="/etc/systemd/system/pymc-companion.service"
 PYMC_CONFIG="$CONFIG_DIR/pymc-companion.yaml"
 
-# Read the connection_type the setup wizard wrote.
-_conn_type=$(grep '^connection_type' "$CONFIG_DIR/config.toml" \
-    | sed 's/connection_type = "\(.*\)"/\1/' | tr -d '[:space:]')
-
-if [[ "$_conn_type" == "hat" ]]; then
+if [[ "$_mesh_enabled" == true && "$_mesh_conn_type" == "hat" ]]; then
     echo
-    echo "─── Pi HAT radio bridge ────────────────────────────────────────────────────"
+    echo "─── MeshCore Pi HAT radio bridge ───────────────────────────────────────────"
     echo
-
-    # Region and HAT model were selected interactively by the Rust wizard,
-    # which already wrote pymc-companion.yaml to $PYMC_CONFIG.
 
     # Detect if gpiod backend is needed (written by the wizard into the YAML).
     _gpiod=false
@@ -486,7 +547,7 @@ if [[ "$_conn_type" == "hat" ]]; then
     fi
 
     # ── System dependencies ───────────────────────────────────────────────────
-    info "Installing HAT system dependencies..."
+    info "Installing MeshCore HAT system dependencies..."
     _syspkgs="python3-venv python3-dev liblgpio-dev"
     [[ "$_gpiod" == true ]] && _syspkgs="$_syspkgs libgpiod-dev"
     # shellcheck disable=SC2086
@@ -512,7 +573,6 @@ if [[ "$_conn_type" == "hat" ]]; then
         "$SRC_DIR/contrib/pymc-companion/pymc-companion.py" \
         "$PYMC_DIR/pymc-companion.py"
 
-    # pymc-companion.yaml was written by the setup wizard above.
     chown "root:$SERVICE_USER" "$PYMC_CONFIG"
     chmod 640 "$PYMC_CONFIG"
     success "pymc-companion.yaml configured"
@@ -528,14 +588,28 @@ if [[ "$_conn_type" == "hat" ]]; then
     success "pymc-companion service enabled and started"
 
 else
-    # Not a HAT — remove pymc-companion if it was previously installed.
+    # MeshCore HAT not in use — remove pymc-companion if it was previously installed.
     if systemctl is-enabled --quiet pymc-companion 2>/dev/null; then
-        info "Removing pymc-companion (not needed for '$_conn_type' connection)..."
+        info "Removing pymc-companion (MeshCore HAT not configured)..."
         systemctl disable --now pymc-companion 2>/dev/null || true
         rm -f "$PYMC_UNIT"
         systemctl daemon-reload
         success "pymc-companion removed"
     fi
+fi
+
+# ── Meshtastic: informational only ───────────────────────────────────────────
+# Meshtastic talks directly to the radio via USB serial or to meshtasticd
+# via TCP — no companion service is needed.
+
+if [[ "$_meshtastic_enabled" == true ]]; then
+    echo
+    echo "─── Meshtastic ─────────────────────────────────────────────────────────────"
+    echo
+    info "Meshtastic transport enabled."
+    warn "Note: the Meshtastic codec is not yet implemented."
+    warn "Set 'enabled = false' in [plugins.meshtastic] until the codec ships."
+    echo
 fi
 
 # ── Enable and start ──────────────────────────────────────────────────────────

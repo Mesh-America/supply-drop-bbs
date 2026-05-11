@@ -393,6 +393,10 @@ async fn cmd_run(cli: &Cli) {
     #[cfg(feature = "transport-mesh")]
     let mesh_transport = init_mesh_plugin(&cfg.plugins.mesh, Arc::clone(&host)).await;
 
+    #[cfg(feature = "transport-meshtastic")]
+    let meshtastic_transport =
+        init_meshtastic_plugin(&cfg.plugins.meshtastic, Arc::clone(&host)).await;
+
     // Process transport plugins — start manager, then hand registry to web.
     #[cfg(feature = "transport-process")]
     let process_registry = {
@@ -461,6 +465,14 @@ async fn cmd_run(cli: &Cli) {
         }
     }
 
+    #[cfg(feature = "transport-meshtastic")]
+    if let Some(ref t) = meshtastic_transport {
+        use bbs_plugin_api::Plugin;
+        if let Err(e) = t.stop().await {
+            warn!("meshtastic transport stop error: {e}");
+        }
+    }
+
     #[cfg(feature = "transport-mesh")]
     if let Some(ref t) = mesh_transport {
         use bbs_plugin_api::Plugin;
@@ -492,6 +504,11 @@ async fn init_mesh_plugin(
 ) -> Option<bbs_mesh::MeshTransport> {
     use bbs_plugin_api::Plugin;
 
+    if !mesh_cfg.enabled {
+        info!("mesh transport (MeshCore): disabled in config — skipping");
+        return None;
+    }
+
     let transport = match bbs_mesh::MeshTransport::init(mesh_cfg.clone(), host).await {
         Ok(t) => t,
         Err(e) => {
@@ -502,6 +519,38 @@ async fn init_mesh_plugin(
 
     if let Err(e) = transport.start().await {
         error!("mesh transport start failed: {e}");
+        std::process::exit(1);
+    }
+
+    Some(transport)
+}
+
+/// Initialise and start the Meshtastic transport plugin.
+///
+/// Returns `None` when the plugin is disabled in config or fails to
+/// initialise (error is logged and the process exits).
+#[cfg(feature = "transport-meshtastic")]
+async fn init_meshtastic_plugin(
+    cfg: &bbs_meshtastic::MeshtasticConfig,
+    host: Arc<dyn bbs_plugin_api::Host>,
+) -> Option<bbs_meshtastic::MeshtasticTransport> {
+    use bbs_plugin_api::Plugin;
+
+    if !cfg.enabled {
+        info!("meshtastic transport: disabled in config — skipping");
+        return None;
+    }
+
+    let transport = match bbs_meshtastic::MeshtasticTransport::init(cfg.clone(), host).await {
+        Ok(t) => t,
+        Err(e) => {
+            error!("meshtastic transport init failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = transport.start().await {
+        error!("meshtastic transport start failed: {e}");
         std::process::exit(1);
     }
 

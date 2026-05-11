@@ -122,6 +122,15 @@ UI are all active at the same time.
 are compiled in and started at startup (see ADR-0004). The planned path to
 runtime-loadable plugins is WASM, but that is post-1.0.
 
+**One instance per protocol is enforced by the config structure.** Each
+built-in protocol has a single named TOML section (`[plugins.mesh]`,
+`[plugins.meshtastic]`) — not an array — so the parser itself prevents
+two MeshCore transports from being configured. If you need a second radio
+of a different protocol, that is exactly the multi-transport case above. If
+you need a protocol that has no built-in transport yet, use the
+[Process Transport](./PROCESS_TRANSPORTS.md) to run an external executable
+via `[[plugins.process]]`.
+
 ### 2.1 Wiring two transports together: step-by-step
 
 Suppose you are adding a Meshtastic transport (`bbs-meshtastic`) alongside the

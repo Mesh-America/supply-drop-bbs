@@ -20,17 +20,19 @@ path = "src/main.rs"
 # rationale. Operators wanting an unusual combination build from
 # source with `cargo build --release --features <list>`.
 [features]
-default          = ["transport-cli", "transport-mesh", "admin-web", "transport-process"]
-transport-cli    = ["dep:bbs-cli"]
-transport-mesh   = ["dep:bbs-mesh"]
-admin-web        = ["dep:bbs-web"]
-transport-process = ["dep:bbs-process-transport"]
+default               = ["transport-cli", "transport-mesh", "admin-web", "transport-process"]
+transport-cli         = ["dep:bbs-cli"]
+transport-mesh        = ["dep:bbs-mesh"]
+transport-meshtastic  = ["dep:bbs-meshtastic"]
+admin-web             = ["dep:bbs-web"]
+transport-process     = ["dep:bbs-process-transport"]
 
 [dependencies]
 bbs-core.workspace        = true
 bbs-plugin-api.workspace  = true
 bbs-cli              = { workspace = true, optional = true }
 bbs-mesh             = { workspace = true, optional = true }
+bbs-meshtastic       = { workspace = true, optional = true }
 bbs-web              = { workspace = true, optional = true }
 bbs-process-transport = { workspace = true, optional = true }
 clap.workspace            = true
@@ -72,6 +74,7 @@ bbs-core              = { path = "crates/bbs-core",              version = "0.3.
 bbs-plugin-api        = { path = "crates/bbs-plugin-api",        version = "0.3.0" }
 bbs-cli               = { path = "crates/bbs-cli",               version = "0.3.0" }
 bbs-mesh              = { path = "crates/bbs-mesh",              version = "0.3.0" }
+bbs-meshtastic        = { path = "crates/bbs-meshtastic",        version = "0.3.0" }
 bbs-web               = { path = "crates/bbs-web",              version = "0.3.0" }
 bbs-process-transport = { path = "crates/bbs-process-transport", version = "0.3.0" }
 meshcore-companion    = { path = "crates/meshcore-companion",    version = "0.3.0" }

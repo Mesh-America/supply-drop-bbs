@@ -264,6 +264,52 @@ your wiring differs from the standard layout):
 | `waveshare`   | 21 | 18    | 20   | 16  | TXEN=13, RXEN=12             |
 | `uconsole`    | -1 | 25    | 24   | 26  | bus_id=1, hardware CS        |
 
+## `[plugins.meshtastic]` - Meshtastic transport (only if `transport-meshtastic` feature enabled)
+
+> **Status:** codec not yet implemented. The config section, feature flag, setup
+> wizard, and installer are wired up and ready. Set `enabled = false` (the
+> default) until the Meshtastic codec ships.
+
+Meshtastic is a separate radio protocol from MeshCore. Both can run simultaneously
+on the same BBS — each talks to its own radio device. Meshtastic radios connect
+either via USB serial or TCP to a running `meshtasticd` instance.
+
+### Connection type
+
+| Key                | Type   | Default    | Required | Description                                         |
+|--------------------|--------|------------|----------|-----------------------------------------------------|
+| `enabled`          | bool   | `false`    | no       | Whether to start the Meshtastic transport           |
+| `connection_type`  | enum   | `"serial"` | no       | How to reach the radio: `"serial"` or `"tcp"`      |
+| `command_prefix`   | string | `""`       | no       | Optional single-character prefix for BBS commands   |
+
+### Serial mode (`connection_type = "serial"`)
+
+Direct USB connection to a Meshtastic radio (Heltec V3, T-Beam, RAK4631, etc.).
+No daemon required.
+
+| Key           | Type    | Default          | Required | Description           |
+|---------------|---------|------------------|----------|-----------------------|
+| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path    |
+| `baud_rate`   | integer | `115200`         | no       | Serial baud rate      |
+
+### TCP mode (`connection_type = "tcp"`)
+
+Connects to a running `meshtasticd` instance or any Meshtastic node that exposes
+a TCP stream. Default port for `meshtasticd` is `4403`.
+
+| Key    | Type   | Default            | Required | Description                 |
+|--------|--------|--------------------|----------|-----------------------------|
+| `addr` | string | `"127.0.0.1:4403"` | no       | Address of the meshtasticd listener |
+
+### Example
+
+```toml
+[plugins.meshtastic]
+enabled         = true
+connection_type = "serial"
+serial_port     = "/dev/ttyUSB0"
+```
+
 ## `[plugins.web]` - admin web (only if `admin-web` feature enabled)
 
 | Key                     | Type    | Default                | Required | Description                                |
