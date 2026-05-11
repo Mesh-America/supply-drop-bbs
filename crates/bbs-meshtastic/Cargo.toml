@@ -1,6 +1,6 @@
 [package]
 name             = "bbs-meshtastic"
-description      = "Meshtastic transport plugin for Supply Drop BBS (protocol stub — codec not yet implemented)"
+description      = "Meshtastic transport plugin for Supply Drop BBS"
 version.workspace    = true
 edition.workspace    = true
 authors.workspace    = true
@@ -12,8 +12,10 @@ publish          = false
 [dependencies]
 bbs-plugin-api = { workspace = true }
 async-trait    = { workspace = true }
+prost          = { workspace = true }
 serde          = { workspace = true }
-tokio          = { workspace = true }
+tokio          = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+tokio-serial   = { workspace = true }
 tracing        = { workspace = true }
 
 [lints]

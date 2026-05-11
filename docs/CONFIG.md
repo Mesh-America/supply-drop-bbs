@@ -266,10 +266,6 @@ your wiring differs from the standard layout):
 
 ## `[plugins.meshtastic]` - Meshtastic transport (only if `transport-meshtastic` feature enabled)
 
-> **Status:** codec not yet implemented. The config section, feature flag, setup
-> wizard, and installer are wired up and ready. Set `enabled = false` (the
-> default) until the Meshtastic codec ships.
-
 Meshtastic is a separate radio protocol from MeshCore. Both can run simultaneously
 on the same BBS — each talks to its own radio device. Meshtastic radios connect
 either via USB serial or TCP to a running `meshtasticd` instance.
@@ -280,7 +276,14 @@ either via USB serial or TCP to a running `meshtasticd` instance.
 |--------------------|--------|------------|----------|-----------------------------------------------------|
 | `enabled`          | bool   | `false`    | no       | Whether to start the Meshtastic transport           |
 | `connection_type`  | enum   | `"serial"` | no       | How to reach the radio: `"serial"` or `"tcp"`      |
-| `command_prefix`   | string | `""`       | no       | Optional single-character prefix for BBS commands   |
+| `command_prefix`   | string | (unset)    | no       | Optional single-character prefix for BBS commands   |
+| `welcome_message`  | string | see default | no      | Greeting sent to a node on first contact            |
+| `max_payload_bytes`| integer| `220`      | no       | Maximum UTF-8 bytes per outbound text packet        |
+| `node_credential_ttl_days` | integer | `14` | no | Days a node auto-login credential remains valid (`0` disables) |
+| `hop_limit`        | integer| `3`        | no       | Hop limit for outbound replies and notifications    |
+| `want_ack`         | bool   | `true`     | no       | Request Meshtastic radio-layer acknowledgements     |
+| `reconnect_delay_initial_ms` | integer | `1000` | no | Initial reconnect delay after disconnect           |
+| `reconnect_delay_max_ms`     | integer | `60000`| no | Maximum reconnect delay after repeated failures    |
 
 ### Serial mode (`connection_type = "serial"`)
 

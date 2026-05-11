@@ -14,11 +14,12 @@ minor bumps may carry breaking changes).
   independent, co-equal transports. A single BBS instance can run MeshCore
   only, Meshtastic only, or both simultaneously.
 - **`transport-meshtastic` feature flag** — new `bbs-meshtastic` crate wires
-  the Meshtastic config, setup wizard, and installer; the radio codec (protobuf
-  over serial/TCP) is a stub pending implementation.
+  the Meshtastic config, setup wizard, installer, and protobuf-over-serial/TCP
+  radio codec.
 - **`[plugins.meshtastic]` config section** — `connection_type` (`serial` or
-  `tcp`), `serial_port`, `baud_rate`, `addr`, `command_prefix`, and `enabled`
-  fields. Defaults to `enabled = false` so existing installs are unaffected.
+  `tcp`), `serial_port`, `baud_rate`, `addr`, `command_prefix`, payload,
+  reconnect, and delivery fields. Defaults to `enabled = false` so existing
+  installs are unaffected.
 - **`enabled` flag on `[plugins.mesh]`** — MeshCore transport can now be
   disabled without removing the config section. Defaults to `true` for
   backward compatibility.

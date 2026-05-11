@@ -246,7 +246,7 @@ checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
 name = "bbs-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bbs-plugin-api",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "async-trait",
@@ -277,7 +277,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-hello-transport"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bbs-plugin-api",
@@ -288,7 +288,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-mesh"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bbs-core",
@@ -302,18 +302,20 @@ dependencies = [
 
 [[package]]
 name = "bbs-meshtastic"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bbs-plugin-api",
+ "prost",
  "serde",
  "tokio",
+ "tokio-serial",
  "tracing",
 ]
 
 [[package]]
 name = "bbs-plugin-api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "serde",
@@ -324,7 +326,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-process-transport"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bbs-plugin-api",
@@ -338,7 +340,7 @@ dependencies = [
 
 [[package]]
 name = "bbs-web"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1272,6 +1274,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1408,7 +1419,7 @@ checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
 name = "meshcore-companion"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "proptest",
  "thiserror 1.0.69",
@@ -1777,6 +1788,29 @@ dependencies = [
  "rusty-fork",
  "tempfile",
  "unarray",
+]
+
+[[package]]
+name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "syn",
 ]
 
 [[package]]
@@ -2461,7 +2495,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "supply-drop-bbs"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bbs-cli",
  "bbs-core",

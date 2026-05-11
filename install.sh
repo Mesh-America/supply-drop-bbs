@@ -607,8 +607,7 @@ if [[ "$_meshtastic_enabled" == true ]]; then
     echo "─── Meshtastic ─────────────────────────────────────────────────────────────"
     echo
     info "Meshtastic transport enabled."
-    warn "Note: the Meshtastic codec is not yet implemented."
-    warn "Set 'enabled = false' in [plugins.meshtastic] until the codec ships."
+    info "No companion service is required. USB serial talks directly to the radio; TCP connects to meshtasticd."
     echo
 fi
 
