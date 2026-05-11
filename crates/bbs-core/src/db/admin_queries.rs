@@ -9,8 +9,8 @@
 
 use super::{error::StoreError, Database};
 use bbs_plugin_api::{
-    AdminBackupRecord, AdminDailyVolume, AdminReports, AdminRoomSummary, AdminStaleRoom,
-    AdminStats, AdminTopRoom, AdminTopSender,
+    AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity, AdminReports, AdminRoomSummary,
+    AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminWeeklySignups,
 };
 use sqlx::Row;
 use std::path::Path;
@@ -190,11 +190,74 @@ impl Database {
             .collect::<Result<Vec<_>, sqlx::Error>>()
             .map_err(StoreError::Db)?;
 
+        // Hourly activity distribution across all time.
+        let hourly_rows = sqlx::query(
+            "SELECT CAST(strftime('%H', timestamp) AS INTEGER) AS hour, COUNT(*) AS cnt \
+             FROM messages GROUP BY hour ORDER BY hour ASC",
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        let hourly_activity = hourly_rows
+            .into_iter()
+            .map(|r| {
+                Ok(AdminHourlyActivity {
+                    hour: r.try_get::<i64, _>("hour")? as u8,
+                    count: r.try_get("cnt")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Db)?;
+
+        // New user signups per week for the last 8 weeks.
+        let signups_rows = sqlx::query(
+            "SELECT strftime('%Y-W%W', created_at) AS week, COUNT(*) AS cnt \
+             FROM users WHERE created_at >= datetime('now', '-56 days') \
+             GROUP BY week ORDER BY week ASC",
+        )
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        let new_users_by_week = signups_rows
+            .into_iter()
+            .map(|r| {
+                Ok(AdminWeeklySignups {
+                    week: r.try_get("week")?,
+                    count: r.try_get("cnt")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Db)?;
+
+        // Recent message window counts.
+        let msgs_last_24h: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE timestamp >= datetime('now', '-1 day')",
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+
+        let msgs_last_7d: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE timestamp >= datetime('now', '-7 days')",
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+
+        let msgs_last_30d: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE timestamp >= datetime('now', '-30 days')",
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+
         Ok(AdminReports {
             top_senders,
             top_rooms,
             daily_volume,
             stale_rooms,
+            hourly_activity,
+            new_users_by_week,
+            msgs_last_24h,
+            msgs_last_7d,
+            msgs_last_30d,
         })
     }
 

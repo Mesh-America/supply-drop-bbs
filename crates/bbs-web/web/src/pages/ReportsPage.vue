@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { api } from '../api/client'
 
 interface Stats {
@@ -33,11 +33,26 @@ interface StaleRoom {
   last_message_at: string | null
 }
 
+interface HourlyActivity {
+  hour: number
+  count: number
+}
+
+interface WeeklySignups {
+  week: string
+  count: number
+}
+
 interface Reports {
   top_senders: TopSender[]
   top_rooms: TopRoom[]
   daily_volume: DailyVolume[]
   stale_rooms: StaleRoom[]
+  hourly_activity: HourlyActivity[]
+  new_users_by_week: WeeklySignups[]
+  msgs_last_24h: number
+  msgs_last_7d: number
+  msgs_last_30d: number
 }
 
 const stats = ref<Stats | null>(null)
@@ -62,7 +77,7 @@ async function load() {
   }
 }
 
-// SVG chart geometry
+// ── Daily volume SVG line chart ──────────────────────────────────────────────
 const CHART_W = 600
 const CHART_H = 140
 const PAD = { top: 12, right: 12, bottom: 26, left: 36 }
@@ -100,7 +115,6 @@ const areaPoints = computed(() => {
 const yTicks = computed(() => {
   const data = reports.value?.daily_volume ?? []
   if (data.length === 0) {
-    // Show placeholder ticks so grid is visible even with no data
     return [0, 5, 10].map((v, i) => ({
       y: PAD.top + plotH - (i / 2) * plotH,
       label: String(v),
@@ -140,6 +154,106 @@ const weekTrend = computed(() => {
   return Math.round(((recent - prior) / prior) * 100)
 })
 
+// ── Hourly activity SVG bar chart ────────────────────────────────────────────
+const HR_W = 600
+const HR_H = 100
+const HR_PAD = { top: 10, right: 12, bottom: 20, left: 36 }
+const hrPlotW = HR_W - HR_PAD.left - HR_PAD.right
+const hrPlotH = HR_H - HR_PAD.top - HR_PAD.bottom
+
+const hourlyBars = computed(() => {
+  const data = reports.value?.hourly_activity ?? []
+  if (data.length === 0) return []
+  const maxVal = Math.max(...data.map(d => d.count), 1)
+  const barW = hrPlotW / 24
+  const gap = 2
+  return data.map(d => ({
+    x: HR_PAD.left + d.hour * barW + gap / 2,
+    y: HR_PAD.top + hrPlotH - Math.max((d.count / maxVal) * hrPlotH, 1),
+    w: barW - gap,
+    h: Math.max((d.count / maxVal) * hrPlotH, 1),
+    hour: d.hour,
+    count: d.count,
+  }))
+})
+
+const hrYTicks = computed(() => {
+  const data = reports.value?.hourly_activity ?? []
+  const max = data.length ? Math.max(...data.map(d => d.count), 1) : 10
+  return [0, max].map(v => ({
+    y: HR_PAD.top + hrPlotH - (v / max) * hrPlotH,
+    label: String(v),
+  }))
+})
+
+function hourLabel(h: number): string {
+  if (h === 0) return '12a'
+  if (h === 12) return '12p'
+  return h < 12 ? `${h}a` : `${h - 12}p`
+}
+
+const hrXLabels = computed(() =>
+  [0, 6, 12, 18, 23].map(h => ({
+    x: HR_PAD.left + h * (hrPlotW / 24) + (hrPlotW / 24) / 2,
+    label: hourLabel(h),
+  }))
+)
+
+const peakHour = computed(() => {
+  const data = reports.value?.hourly_activity ?? []
+  if (data.length === 0) return null
+  return data.reduce((best, d) => (d.count > best.count ? d : best), data[0])
+})
+
+// ── Weekly signups SVG line chart ─────────────────────────────────────────────
+const WK_W = 600
+const WK_H = 100
+const WK_PAD = { top: 10, right: 12, bottom: 20, left: 36 }
+const wkPlotW = WK_W - WK_PAD.left - WK_PAD.right
+const wkPlotH = WK_H - WK_PAD.top - WK_PAD.bottom
+
+const weeklyPoints = computed(() => {
+  const data = reports.value?.new_users_by_week ?? []
+  if (data.length === 0) return []
+  const maxVal = Math.max(...data.map(d => d.count), 1)
+  const n = data.length
+  return data.map((d, i) => ({
+    x: WK_PAD.left + (n > 1 ? (i / (n - 1)) * wkPlotW : wkPlotW / 2),
+    y: WK_PAD.top + wkPlotH - (d.count / maxVal) * wkPlotH,
+    week: d.week,
+    count: d.count,
+  }))
+})
+
+const wkLinePoints = computed(() =>
+  weeklyPoints.value.map(p => `${p.x},${p.y}`).join(' ')
+)
+
+const wkAreaPoints = computed(() => {
+  const pts = weeklyPoints.value
+  if (pts.length === 0) return ''
+  const bottom = WK_PAD.top + wkPlotH
+  return [
+    `${pts[0].x},${bottom}`,
+    ...pts.map(p => `${p.x},${p.y}`),
+    `${pts[pts.length - 1].x},${bottom}`,
+  ].join(' ')
+})
+
+const wkYTicks = computed(() => {
+  const data = reports.value?.new_users_by_week ?? []
+  const max = data.length ? Math.max(...data.map(d => d.count), 1) : 5
+  return [0, max].map(v => ({
+    y: WK_PAD.top + wkPlotH - (v / max) * wkPlotH,
+    label: String(v),
+  }))
+})
+
+const totalNewUsers = computed(() =>
+  (reports.value?.new_users_by_week ?? []).reduce((s, w) => s + w.count, 0)
+)
+
+// ── Shared helpers ───────────────────────────────────────────────────────────
 function maxCount(items: { message_count: number }[]) {
   return Math.max(...items.map(i => i.message_count), 1)
 }
@@ -147,7 +261,6 @@ function maxCount(items: { message_count: number }[]) {
 function pct(n: number, max: number) {
   if (max === 0) return 3
   const p = Math.round((n / max) * 100)
-  // Always show at least a sliver so bar structure is visible
   return p === 0 ? 3 : p
 }
 
@@ -156,7 +269,9 @@ function fmtDate(iso: string | null) {
   return iso.slice(0, 10)
 }
 
-onMounted(load)
+let pollTimer: ReturnType<typeof setInterval> | null = null
+onMounted(() => { load(); pollTimer = setInterval(load, 60_000) })
+onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
 </script>
 
 <template>
@@ -166,11 +281,10 @@ onMounted(load)
         <h1>reports</h1>
         <p class="muted">Aggregate BBS analytics</p>
       </div>
-      <button class="secondary" @click="load" :disabled="loading">refresh</button>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>
-    <p v-if="loading" class="muted">Loading…</p>
+    <p v-if="loading && !stats" class="muted">Loading…</p>
 
     <!-- System stat cards -->
     <section v-if="stats" class="stat-grid">
@@ -189,6 +303,18 @@ onMounted(load)
       <div class="stat-card">
         <div class="stat-label">total messages</div>
         <div class="stat-value">{{ stats.total_messages }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">msgs (24 h)</div>
+        <div class="stat-value">{{ reports?.msgs_last_24h ?? '—' }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">msgs (7 d)</div>
+        <div class="stat-value">{{ reports?.msgs_last_7d ?? '—' }}</div>
+      </div>
+      <div class="stat-card">
+        <div class="stat-label">msgs (30 d)</div>
+        <div class="stat-value">{{ reports?.msgs_last_30d ?? '—' }}</div>
       </div>
       <div class="stat-card">
         <div class="stat-label">rooms</div>
@@ -222,7 +348,6 @@ onMounted(load)
           role="img"
           aria-label="Daily message volume"
         >
-          <!-- Y grid lines + labels (always shown) -->
           <g v-for="tick in yTicks" :key="tick.label">
             <line
               :x1="PAD.left" :y1="tick.y"
@@ -233,15 +358,11 @@ onMounted(load)
               {{ tick.label }}
             </text>
           </g>
-
-          <!-- X axis baseline -->
           <line
             :x1="PAD.left" :y1="PAD.top + plotH"
             :x2="CHART_W - PAD.right" :y2="PAD.top + plotH"
             class="grid-line"
           />
-
-          <!-- No-data state -->
           <template v-if="(reports.daily_volume?.length ?? 0) === 0">
             <line
               :x1="PAD.left" :y1="PAD.top + plotH"
@@ -254,10 +375,7 @@ onMounted(load)
               class="no-data-label"
             >no messages yet</text>
           </template>
-
-          <!-- Data state -->
           <template v-else>
-            <!-- X axis labels -->
             <text
               v-for="xl in xLabels"
               :key="xl.label"
@@ -265,14 +383,8 @@ onMounted(load)
               text-anchor="middle"
               class="axis-label"
             >{{ xl.label }}</text>
-
-            <!-- Area fill -->
             <polygon :points="areaPoints" class="area-fill" />
-
-            <!-- Line -->
             <polyline :points="linePoints" class="data-line" />
-
-            <!-- Dots with native hover tooltips -->
             <circle
               v-for="p in dailyPoints"
               :key="p.day"
@@ -282,6 +394,65 @@ onMounted(load)
             >
               <title>{{ p.day }}: {{ p.count }} messages</title>
             </circle>
+          </template>
+        </svg>
+      </section>
+
+      <!-- Hourly activity SVG bar chart -->
+      <section class="panel panel-wide">
+        <div class="panel-header-row">
+          <h2 class="panel-title">hourly activity <span class="panel-sub">(all time, UTC)</span></h2>
+          <div class="panel-callouts">
+            <span v-if="peakHour" class="callout">
+              peak: <strong>{{ hourLabel(peakHour.hour) }}</strong> ({{ peakHour.count }})
+            </span>
+          </div>
+        </div>
+
+        <svg
+          :viewBox="`0 0 ${HR_W} ${HR_H}`"
+          class="line-chart"
+          role="img"
+          aria-label="Hourly message activity"
+        >
+          <g v-for="tick in hrYTicks" :key="tick.label">
+            <line
+              :x1="HR_PAD.left" :y1="tick.y"
+              :x2="HR_W - HR_PAD.right" :y2="tick.y"
+              class="grid-line"
+            />
+            <text :x="HR_PAD.left - 5" :y="tick.y + 3.5" text-anchor="end" class="axis-label">
+              {{ tick.label }}
+            </text>
+          </g>
+          <line
+            :x1="HR_PAD.left" :y1="HR_PAD.top + hrPlotH"
+            :x2="HR_W - HR_PAD.right" :y2="HR_PAD.top + hrPlotH"
+            class="grid-line"
+          />
+
+          <template v-if="hourlyBars.length === 0">
+            <text
+              :x="HR_W / 2" :y="HR_PAD.top + hrPlotH / 2 + 4"
+              text-anchor="middle" class="no-data-label"
+            >no messages yet</text>
+          </template>
+          <template v-else>
+            <rect
+              v-for="b in hourlyBars"
+              :key="b.hour"
+              :x="b.x" :y="b.y"
+              :width="b.w" :height="b.h"
+              class="hour-bar"
+            >
+              <title>{{ hourLabel(b.hour) }} ({{ b.hour }}:00–{{ b.hour }}:59): {{ b.count }} messages</title>
+            </rect>
+            <text
+              v-for="xl in hrXLabels"
+              :key="xl.label"
+              :x="xl.x" :y="HR_H - 3"
+              text-anchor="middle" class="axis-label"
+            >{{ xl.label }}</text>
           </template>
         </svg>
       </section>
@@ -314,6 +485,60 @@ onMounted(load)
         </div>
       </section>
 
+      <!-- New user growth -->
+      <section class="panel">
+        <div class="panel-header-row">
+          <h2 class="panel-title">new users <span class="panel-sub">(last 8 weeks)</span></h2>
+          <div class="panel-callouts">
+            <span v-if="totalNewUsers > 0" class="callout">
+              total: <strong>{{ totalNewUsers }}</strong>
+            </span>
+          </div>
+        </div>
+
+        <svg
+          :viewBox="`0 0 ${WK_W} ${WK_H}`"
+          class="line-chart"
+          role="img"
+          aria-label="Weekly new user registrations"
+        >
+          <g v-for="tick in wkYTicks" :key="tick.label">
+            <line
+              :x1="WK_PAD.left" :y1="tick.y"
+              :x2="WK_W - WK_PAD.right" :y2="tick.y"
+              class="grid-line"
+            />
+            <text :x="WK_PAD.left - 5" :y="tick.y + 3.5" text-anchor="end" class="axis-label">
+              {{ tick.label }}
+            </text>
+          </g>
+          <line
+            :x1="WK_PAD.left" :y1="WK_PAD.top + wkPlotH"
+            :x2="WK_W - WK_PAD.right" :y2="WK_PAD.top + wkPlotH"
+            class="grid-line"
+          />
+          <template v-if="weeklyPoints.length === 0">
+            <text
+              :x="WK_W / 2" :y="WK_PAD.top + wkPlotH / 2 + 4"
+              text-anchor="middle" class="no-data-label"
+            >no signups in last 8 weeks</text>
+          </template>
+          <template v-else>
+            <polygon :points="wkAreaPoints" class="area-fill area-fill-green" />
+            <polyline :points="wkLinePoints" class="data-line data-line-green" />
+            <circle
+              v-for="p in weeklyPoints"
+              :key="p.week"
+              :cx="p.x" :cy="p.y"
+              r="3.5"
+              class="data-dot data-dot-green"
+            >
+              <title>{{ p.week }}: {{ p.count }} new users</title>
+            </circle>
+          </template>
+        </svg>
+      </section>
+
       <!-- Stale rooms -->
       <section class="panel">
         <h2 class="panel-title">stale rooms <span class="panel-sub">(30+ days inactive)</span></h2>
@@ -341,7 +566,7 @@ h1 { margin: 0; }
 p { margin: 0; }
 
 /* Stat cards */
-.stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 0.9rem; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); gap: 0.9rem; }
 .stat-card {
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -390,19 +615,19 @@ p { margin: 0; }
 .callout.neg { color: var(--error); }
 .empty { font-size: 0.88em; }
 
-/* SVG line chart */
-.line-chart {
-  display: block;
-  width: 100%;
-  height: auto;
-}
+/* SVG charts */
+.line-chart { display: block; width: 100%; height: auto; }
 .grid-line { stroke: var(--border); stroke-width: 1; }
 .area-fill { fill: var(--accent); opacity: 0.13; }
+.area-fill-green { fill: #2a8a2a; opacity: 0.13; }
 .data-line { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.data-line-green { stroke: #2a8a2a; }
 .no-data-line { opacity: 0.25; stroke-dasharray: 4 4; }
 .data-dot { fill: var(--accent); cursor: default; }
+.data-dot-green { fill: #2a8a2a; }
 .axis-label { fill: var(--muted); font-size: 10px; font-family: inherit; }
 .no-data-label { fill: var(--muted); font-size: 11px; font-family: inherit; font-style: italic; }
+.hour-bar { fill: var(--accent); opacity: 0.8; cursor: default; }
 
 /* Horizontal bar chart */
 .bar-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.85em; }

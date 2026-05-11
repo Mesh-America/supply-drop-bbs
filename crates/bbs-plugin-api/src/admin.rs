@@ -133,6 +133,24 @@ pub struct AdminStaleRoom {
     pub last_message_at: Option<String>,
 }
 
+/// Message count for a single hour of the day (0–23, UTC).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminHourlyActivity {
+    /// Hour of day in UTC (0–23).
+    pub hour: u8,
+    /// Total messages sent during this hour, across all time.
+    pub count: i64,
+}
+
+/// New user registrations for a single calendar week.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminWeeklySignups {
+    /// Week identifier in `"YYYY-Www"` format (`strftime('%Y-W%W')`).
+    pub week: String,
+    /// Number of new user accounts created during this week.
+    pub count: i64,
+}
+
 /// Bundled analytics returned by [`crate::host::Host::admin_reports`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminReports {
@@ -144,6 +162,16 @@ pub struct AdminReports {
     pub daily_volume: Vec<AdminDailyVolume>,
     /// Rooms with no messages in the last 30 days (or ever), oldest-first.
     pub stale_rooms: Vec<AdminStaleRoom>,
+    /// Message count per hour of day (0–23 UTC), all-time.
+    pub hourly_activity: Vec<AdminHourlyActivity>,
+    /// New user registrations per week for the last 8 weeks (ascending).
+    pub new_users_by_week: Vec<AdminWeeklySignups>,
+    /// Messages posted in the last 24 hours.
+    pub msgs_last_24h: i64,
+    /// Messages posted in the last 7 days.
+    pub msgs_last_7d: i64,
+    /// Messages posted in the last 30 days.
+    pub msgs_last_30d: i64,
 }
 
 /// A database backup file record.
