@@ -1,0 +1,21 @@
+[package]
+name            = "bbs-hello-transport"
+description     = "Reference implementation: minimal TCP transport plugin for Supply Drop BBS"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+repository.workspace  = true
+rust-version.workspace = true
+license-file    = "../../LICENSE"
+publish         = false   # reference crate — not published to crates.io
+
+[dependencies]
+bbs-plugin-api.workspace = true
+async-trait.workspace    = true
+serde.workspace          = true
+# net + io-util are not in the workspace-level tokio feature set, so add them here.
+tokio = { workspace = true, features = ["net", "io-util"] }
+tracing.workspace        = true
+
+[lints]
+workspace = true

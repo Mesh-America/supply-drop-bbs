@@ -276,6 +276,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "bbs-hello-transport"
+version = "0.3.0"
+dependencies = [
+ "async-trait",
+ "bbs-plugin-api",
+ "serde",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "bbs-mesh"
 version = "0.3.0"
 dependencies = [

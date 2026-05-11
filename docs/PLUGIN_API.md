@@ -363,11 +363,24 @@ don't block other plugins.
 
 ## Worked example: a minimal plugin
 
-**TBD** - a complete reference plugin (`crates/bbs-example-hello/`)
-that prints a log line every time a message is posted, with a
-configurable log level. About 50 lines of Rust. Published when the
-implementation lands so this section can be filled in with real
-code that compiles.
+`crates/bbs-hello-transport` is a fully-compilable reference transport
+that demonstrates every integration point in under 200 lines of Rust.
+Read `src/lib.rs` top-to-bottom; each section is annotated with the
+pattern it illustrates.
+
+| Pattern | Location |
+|---------|----------|
+| Serde config with `#[serde(default)]` | `HelloConfig` |
+| `Plugin::init` / `start` / `stop` lifecycle | `HelloTransport` impl |
+| Background accept loop with `watch` shutdown | `HelloTransport::start` |
+| `host.create_session` → `host.process_command` → `host.end_session` | `handle_connection` |
+| `awaiting_reply` state machine | `handle_connection` |
+| `TransportEngine::notify` delivering push text | `HelloTransport` impl |
+| `MockHost` in tests (port `0` for free-port allocation) | inline `tests` module |
+
+The crate compiles as-is and its tests run with `cargo test -p bbs-hello-transport`.
+To build a real transport, fork the crate, rename the structs, and replace
+the TCP listener with your protocol's I/O layer.
 
 ## Errors
 
@@ -391,13 +404,58 @@ always better.
 Plugin authors should:
 
 - Unit-test pure logic with `cargo test`
-- Integration-test against a real `Host` implementation provided
-  by `bbs-plugin-api::testing` (TBD: this helper is part of the
-  initial `bbs-plugin-api` work)
+- Integration-test against `MockHost` from `bbs-plugin-api::testing`
 - Use `proptest` for state-machine and parser code
-- Document any test that requires external infrastructure
-  (real radio, real broker) and gate it behind a cargo feature
-  so CI doesn't run it by default
+- Gate tests that need real hardware (radio, broker) behind a Cargo
+  feature so CI skips them by default
+
+### Using MockHost
+
+`bbs_plugin_api::testing::MockHost` is a fully in-memory `Host`.  It
+records every command dispatched to it and lets you script responses:
+
+```rust
+use std::sync::Arc;
+use bbs_plugin_api::{Command, Host, Response, testing::MockHost};
+
+#[tokio::test]
+async fn plugin_responds_to_help() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+
+    let sid = (Arc::clone(&host) as Arc<dyn Host>)
+        .create_session("test-transport")
+        .await
+        .unwrap();
+
+    let response = (Arc::clone(&host) as Arc<dyn Host>)
+        .process_command(sid, Command::Help { topic: None })
+        .await
+        .unwrap();
+
+    assert!(matches!(response, Response::Text(_)));
+
+    let cmds = host.commands_received();
+    assert_eq!(cmds.len(), 1);
+    assert!(matches!(cmds[0].1, Command::Help { topic: None }));
+}
+```
+
+Key `MockHost` methods:
+
+| Method | Purpose |
+|--------|---------|
+| `MockHost::new()` | Fresh mock with no sessions |
+| `set_default_response(r)` | Return `r` for any unmatched command |
+| `set_response_for(pred, r)` | Return `r` when `pred(cmd)` is true (first match wins) |
+| `commands_received()` | `Vec<(SessionId, Command)>` — all dispatched commands in order |
+| `emit_event(e)` | Inject a `DomainEvent` into the broadcast channel |
+
+For complete working examples see:
+
+- `crates/bbs-hello-transport/src/lib.rs` — basic `init`/`start`/`stop` test
+- `crates/bbs-process-transport/tests/process.rs` — full session lifecycle,
+  `awaiting_reply` state machine, `notify()` delivery
 
 The project's overall test strategy is in
 [ARCHITECTURE.md §11](ARCHITECTURE.md#11-testing).
