@@ -4,11 +4,28 @@ import path from 'path'
 
 const __dirname = fileURLToPath(new URL('.', import.meta.url))
 
+// Replicates @mdit-vue/shared slugify but without the _ prefix on digit-starting slugs,
+// so "## 6. Getting help" generates id="6-getting-help" instead of "_6-getting-help".
+function slugify(str: string): string {
+  return str
+    .toLowerCase()
+    .trim()
+    .replace(/[\s]+/g, '-')
+    .replace(/[^\w-]/g, '')
+    .replace(/^-+|-+$/g, '')
+}
+
 export default defineConfig({
   title: 'Supply Drop BBS',
   description: 'Open-source BBS for MeshCore, Meshtastic, and any transport you can write a plugin for.',
   base: '/supply-drop-bbs/',
   srcDir: '../docs',
+
+  markdown: {
+    anchor: {
+      slugify,
+    },
+  },
 
   // Links to repo-root files (LICENSE, config.example.toml, CONTRIBUTING, SECURITY)
   // and the adr/index stub are valid on GitHub but outside VitePress srcDir.
