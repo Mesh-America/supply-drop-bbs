@@ -286,7 +286,42 @@ async fn cmd_run(cli: &Cli) {
         Arc::new(BbsHost::with_location(db, cfg.location.as_coords()));
     info!("host initialised");
 
-    // ── 6. Plugins ────────────────────────────────────────────────────────────
+    // ── 6. Backup task ───────────────────────────────────────────────────────
+    if cfg.backup.enabled {
+        if let Some(backup_dir) = cfg.backup.directory.clone() {
+            let keep_daily = cfg.backup.keep_daily;
+            let keep_weekly = cfg.backup.keep_weekly;
+            let interval_hours = cfg.backup.interval_hours;
+            let host_backup = Arc::clone(&host);
+            info!(
+                dir = %backup_dir.display(),
+                interval_hours,
+                "starting automatic backup task"
+            );
+            tokio::spawn(async move {
+                let period = tokio::time::Duration::from_secs(u64::from(interval_hours) * 3600);
+                let mut ticker = tokio::time::interval(period);
+                ticker.tick().await; // skip immediate first tick
+                loop {
+                    ticker.tick().await;
+                    if let Err(e) = tokio::fs::create_dir_all(&backup_dir).await {
+                        warn!("backup: could not create backup dir: {e}");
+                        continue;
+                    }
+                    let dir_str = backup_dir.to_string_lossy();
+                    match host_backup.admin_trigger_backup(&dir_str).await {
+                        Ok(rec) => {
+                            info!(filename = %rec.filename, "automatic backup completed");
+                            prune_backups(&host_backup, &dir_str, keep_daily, keep_weekly).await;
+                        }
+                        Err(e) => warn!("automatic backup failed: {e}"),
+                    }
+                }
+            });
+        }
+    }
+
+    // ── 8. Plugins ────────────────────────────────────────────────────────────
     //
     // Each plugin is init'd then start'd.  Errors at init abort startup;
     // errors at start are fatal.  Plugins are stopped in reverse order on
@@ -323,7 +358,7 @@ async fn cmd_run(cli: &Cli) {
         init_web_plugin(&cfg.plugins.web, Arc::clone(&host), cfg_abs).await
     };
 
-    // ── 7. Wait for shutdown signal ───────────────────────────────────────────
+    // ── 9. Wait for shutdown signal ───────────────────────────────────────────
     info!("supply-drop-bbs ready — press Ctrl-C to stop");
 
     match tokio::signal::ctrl_c().await {
@@ -331,7 +366,7 @@ async fn cmd_run(cli: &Cli) {
         Err(e) => error!("error waiting for Ctrl-C: {e}"),
     }
 
-    // ── 8. Stop plugins (reverse order) ──────────────────────────────────────
+    // ── 10. Stop plugins (reverse order) ─────────────────────────────────────
     #[cfg(feature = "admin-web")]
     if let Some(ref t) = web_plugin {
         use bbs_plugin_api::Plugin;
@@ -693,6 +728,72 @@ async fn cmd_room(config_path: Option<&std::path::Path>, action: RoomAction) {
             }
         }
     }
+}
+
+// ── Backup helpers ────────────────────────────────────────────────────────────
+
+/// Delete backups that fall outside the daily/weekly retention window.
+///
+/// Sorted newest-first, we keep the first occurrence of each unique calendar
+/// date up to `keep_daily` dates, and the first occurrence of each unique ISO
+/// week up to `keep_weekly` weeks.  Everything else is deleted.
+async fn prune_backups(
+    host: &Arc<dyn bbs_plugin_api::Host>,
+    backup_dir: &str,
+    keep_daily: u32,
+    keep_weekly: u32,
+) {
+    let mut backups = match host.admin_list_backups(backup_dir).await {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("backup pruning: list failed: {e}");
+            return;
+        }
+    };
+
+    // Newest first.
+    backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let mut daily_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut weekly_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for rec in &backups {
+        let date_key = rec.created_at.get(..10).unwrap_or("").to_owned();
+        let week_key = iso_week_key(&rec.created_at);
+
+        let new_day = !date_key.is_empty()
+            && daily_seen.len() < keep_daily as usize
+            && daily_seen.insert(date_key);
+        let new_week = !week_key.is_empty()
+            && weekly_seen.len() < keep_weekly as usize
+            && weekly_seen.insert(week_key);
+
+        if new_day || new_week {
+            keep.insert(rec.filename.clone());
+        }
+    }
+
+    for rec in &backups {
+        if !keep.contains(&rec.filename) {
+            match host.admin_delete_backup(backup_dir, &rec.filename).await {
+                Ok(()) => info!(filename = %rec.filename, "pruned old backup"),
+                Err(e) => warn!(filename = %rec.filename, "failed to prune backup: {e}"),
+            }
+        }
+    }
+}
+
+/// Return `"YYYY-Www"` for an RFC 3339 timestamp string, or empty string on failure.
+fn iso_week_key(rfc3339: &str) -> String {
+    let date_str = rfc3339.get(..10).unwrap_or("");
+    use time::macros::format_description;
+    time::Date::parse(date_str, &format_description!("[year]-[month]-[day]"))
+        .map(|d| {
+            let (year, week, _) = d.to_iso_week_date();
+            format!("{year}-W{week:02}")
+        })
+        .unwrap_or_default()
 }
 
 // ── Tracing init ──────────────────────────────────────────────────────────────
