@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id AS \"id!\", sender AS \"sender!\", recipient,\n                      content AS \"content!\", timestamp AS \"timestamp!\"\n               FROM messages\n               WHERE (sender = ? OR recipient = ?) AND recipient IS NOT NULL AND id < ?\n               ORDER BY id DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "sender!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "recipient",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "content!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "timestamp!",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "74ec23fc44cb0d3438e7b9a48a23b86b84e2c50045f3a93c1291c8af2442c75f"
+}

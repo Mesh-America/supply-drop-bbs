@@ -35,7 +35,7 @@ use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
 
 use crate::db::{Database, MessageStore, RoomStore, UserStore};
-use crate::ids::{RoomId, UserId};
+use crate::ids::{MessageId, RoomId, UserId};
 use crate::message::Message;
 use crate::timestamp::Timestamp;
 use crate::user::UserStatus;
@@ -127,6 +127,10 @@ struct SessionRecord {
     workflow: Workflow,
     /// Current room. Starts at Lobby on login; updated by C/G/M.
     current_room: RoomId,
+    /// Position within the current room for one-at-a-time F/R navigation.
+    /// `None` means "not yet started"; F starts at the first message, R at the last.
+    /// Reset to `None` when the room changes.
+    current_message_id: Option<MessageId>,
 }
 
 // ── BbsHost ───────────────────────────────────────────────────────────────────
@@ -292,6 +296,7 @@ impl Host for BbsHost {
                 level: PermissionLevel::Unvalidated,
                 workflow: Workflow::None,
                 current_room: LOBBY_ROOM_ID,
+                current_message_id: None,
             },
         );
         let _ = self.events_tx.send(DomainEvent::SessionCreated {
@@ -1807,6 +1812,9 @@ impl BbsHost {
     async fn set_current_room(&self, session: SessionId, room_id: RoomId) {
         let mut sessions = self.sessions.write().await;
         if let Some(r) = sessions.get_mut(&session) {
+            if r.current_room != room_id {
+                r.current_message_id = None;
+            }
             r.current_room = room_id;
         }
     }
@@ -1896,64 +1904,64 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
-        let after_id = after.map(crate::ids::MessageId::new);
-        let page = if room_id == MAIL_ROOM_ID {
-            self.db
-                .list_direct(&username, after_id, MESH_PAGE)
-                .await
-                .map_err(|e| HostError::Storage(format!("{e}")))?
+        // Explicit cursor from "F <id>" overrides session state.
+        let cursor = after.map(MessageId::new).or_else(|| {
+            self.sessions
+                .try_read()
+                .ok()
+                .and_then(|s| s.get(&session).and_then(|r| r.current_message_id))
+        });
+
+        let msg = if room_id == MAIL_ROOM_ID {
+            self.db.next_direct(&username, cursor).await
         } else {
-            self.db
-                .list_in_room(room_id, after_id, MESH_PAGE)
-                .await
-                .map_err(|e| HostError::Storage(format!("{e}")))?
-        };
-
-        let blocked = self
-            .db
-            .blocks_by(username.as_str())
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-        let visible: Vec<_> = page
-            .messages
-            .iter()
-            .filter(|m| !blocked.contains(m.sender.as_str()))
-            .collect();
-
-        if let Some(last) = page.messages.last() {
-            self.db
-                .mark_read(user_id, room_id, last.id)
-                .await
-                .map_err(|e| HostError::Storage(format!("{e}")))?;
-        }
-
-        if visible.is_empty() {
-            return Ok(Response::Text(format!("No messages in {}.", room.name)));
-        }
-
-        let total = if room_id == MAIL_ROOM_ID {
-            self.db.count_direct(&username).await
-        } else {
-            self.db.count_in_room(room_id).await
+            self.db.next_in_room(room_id, cursor).await
         }
         .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        let word = if total == 1 { "message" } else { "messages" };
-        let mut parts = vec![format!(
-            "[{} — Forward Read]\nThere are {total} {word} in this room.\nType F to read forward, R for most recent.",
-            room.name
-        )];
-        for msg in &visible {
-            parts.push(format_message(msg));
+        let msg = match msg {
+            None => {
+                return Ok(Response::Text(format!(
+                    "No more messages in {}.",
+                    room.name
+                )))
+            }
+            Some(m) => m,
+        };
+
+        // Advance read pointer and update session cursor.
+        let _ = self.db.mark_read(user_id, room_id, msg.id).await;
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.current_message_id = Some(msg.id);
+            }
         }
-        if let Some(cursor) = page.next_cursor {
-            parts.push(format!("(more — type F {} to continue)", cursor.as_i64()));
+
+        // Check neighbours for conditional nav hints.
+        let has_prev = if room_id == MAIL_ROOM_ID {
+            self.db.prev_direct(&username, Some(msg.id)).await
+        } else {
+            self.db.prev_in_room(room_id, Some(msg.id)).await
         }
-        Ok(Response::MultiText(parts))
+        .map_err(|e| HostError::Storage(format!("{e}")))?
+        .is_some();
+
+        let has_next = if room_id == MAIL_ROOM_ID {
+            self.db.next_direct(&username, Some(msg.id)).await
+        } else {
+            self.db.next_in_room(room_id, Some(msg.id)).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))?
+        .is_some();
+
+        Ok(Response::Text(build_message_with_nav(
+            &msg, has_prev, has_next,
+        )))
     }
 
     async fn handle_read_reverse(&self, session: SessionId) -> Result<Response, HostError> {
-        let (username, _, _, room_id) = match self.session_auth_user(session).await {
+        let (username, user_id, _, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -1963,41 +1971,59 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
-        let messages = self
-            .db
-            .list_recent_in_room(room_id, MESH_PAGE)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // R with no position → jump to last message; otherwise go one back.
+        let cursor = self
+            .sessions
+            .try_read()
+            .ok()
+            .and_then(|s| s.get(&session).and_then(|r| r.current_message_id));
 
-        let blocked = self
-            .db
-            .blocks_by(username.as_str())
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-        let visible: Vec<_> = messages
-            .iter()
-            .filter(|m| !blocked.contains(m.sender.as_str()))
-            .collect();
+        let msg = if room_id == MAIL_ROOM_ID {
+            self.db.prev_direct(&username, cursor).await
+        } else {
+            self.db.prev_in_room(room_id, cursor).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        if visible.is_empty() {
-            return Ok(Response::Text(format!("No messages in {}.", room.name)));
+        let msg = match msg {
+            None => {
+                return Ok(Response::Text(format!(
+                    "No previous messages in {}.",
+                    room.name
+                )))
+            }
+            Some(m) => m,
+        };
+
+        // Advance read pointer and update session cursor.
+        let _ = self.db.mark_read(user_id, room_id, msg.id).await;
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.current_message_id = Some(msg.id);
+            }
         }
 
-        let total = self
-            .db
-            .count_in_room(room_id)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-
-        let word = if total == 1 { "message" } else { "messages" };
-        let mut parts = vec![format!(
-            "[{} — Most Recent]\nThere are {total} {word} in this room.\nType F to read from start, R to refresh.",
-            room.name
-        )];
-        for msg in &visible {
-            parts.push(format_message(msg));
+        // Check neighbours for conditional nav hints.
+        let has_prev = if room_id == MAIL_ROOM_ID {
+            self.db.prev_direct(&username, Some(msg.id)).await
+        } else {
+            self.db.prev_in_room(room_id, Some(msg.id)).await
         }
-        Ok(Response::MultiText(parts))
+        .map_err(|e| HostError::Storage(format!("{e}")))?
+        .is_some();
+
+        let has_next = if room_id == MAIL_ROOM_ID {
+            self.db.next_direct(&username, Some(msg.id)).await
+        } else {
+            self.db.next_in_room(room_id, Some(msg.id)).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))?
+        .is_some();
+
+        Ok(Response::Text(build_message_with_nav(
+            &msg, has_prev, has_next,
+        )))
     }
 
     async fn handle_scan(&self, session: SessionId) -> Result<Response, HostError> {
@@ -3258,6 +3284,21 @@ Sysop:\n\
  UNBAN <u>   lift a ban";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
+
+fn build_message_with_nav(msg: &Message, has_prev: bool, has_next: bool) -> String {
+    let mut nav = Vec::new();
+    if has_prev {
+        nav.push("R - Previous");
+    }
+    if has_next {
+        nav.push("F - Next");
+    }
+    if nav.is_empty() {
+        format_message(msg)
+    } else {
+        format!("{}\n{}", format_message(msg), nav.join("  "))
+    }
+}
 
 fn format_message(msg: &Message) -> String {
     let id = msg.id.as_i64();

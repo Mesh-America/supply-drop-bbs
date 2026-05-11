@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT m.id AS \"id!\", m.sender AS \"sender!\", m.recipient,\n                      m.content AS \"content!\", m.timestamp AS \"timestamp!\"\n               FROM messages m\n               JOIN room_messages rm ON rm.message_id = m.id\n               WHERE rm.room_id = ? AND m.id < ?\n               ORDER BY m.id DESC LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "sender!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "recipient",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "content!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "timestamp!",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "a00ba0bc0e8385835fecd4046a24c399d98c12b4c575b7de749ae7fbd2f8e25c"
+}

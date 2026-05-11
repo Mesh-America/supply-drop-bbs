@@ -164,6 +164,42 @@ pub trait MessageStore: Send + Sync {
 
     /// Count all direct messages involving `username` (as sender or recipient).
     async fn count_direct(&self, username: &Username) -> Result<u64, StoreError>;
+
+    /// Fetch the single message in `room_id` immediately after `after`.
+    ///
+    /// `after = None` returns the first (oldest) message.
+    async fn next_in_room(
+        &self,
+        room_id: RoomId,
+        after: Option<MessageId>,
+    ) -> Result<Option<Message>, StoreError>;
+
+    /// Fetch the single message in `room_id` immediately before `before`.
+    ///
+    /// `before = None` returns the last (newest) message.
+    async fn prev_in_room(
+        &self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+    ) -> Result<Option<Message>, StoreError>;
+
+    /// Fetch the single direct message involving `username` immediately after `after`.
+    ///
+    /// `after = None` returns the first (oldest) DM.
+    async fn next_direct(
+        &self,
+        username: &Username,
+        after: Option<MessageId>,
+    ) -> Result<Option<Message>, StoreError>;
+
+    /// Fetch the single direct message involving `username` immediately before `before`.
+    ///
+    /// `before = None` returns the last (newest) DM.
+    async fn prev_direct(
+        &self,
+        username: &Username,
+        before: Option<MessageId>,
+    ) -> Result<Option<Message>, StoreError>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────
@@ -492,5 +528,97 @@ impl MessageStore for Database {
         .fetch_one(&self.read_pool)
         .await?;
         Ok(count as u64)
+    }
+
+    async fn next_in_room(
+        &self,
+        room_id: RoomId,
+        after: Option<MessageId>,
+    ) -> Result<Option<Message>, StoreError> {
+        let rid = room_id.as_i64();
+        let after = after.map(|id| id.as_i64()).unwrap_or(i64::MIN);
+        let row = sqlx::query!(
+            r#"SELECT m.id AS "id!", m.sender AS "sender!", m.recipient,
+                      m.content AS "content!", m.timestamp AS "timestamp!"
+               FROM messages m
+               JOIN room_messages rm ON rm.message_id = m.id
+               WHERE rm.room_id = ? AND m.id > ?
+               ORDER BY m.id ASC LIMIT 1"#,
+            rid,
+            after
+        )
+        .fetch_optional(&self.read_pool)
+        .await?;
+        row.map(|r| map_message_row(r.id, r.sender, r.recipient, r.content, r.timestamp))
+            .transpose()
+    }
+
+    async fn prev_in_room(
+        &self,
+        room_id: RoomId,
+        before: Option<MessageId>,
+    ) -> Result<Option<Message>, StoreError> {
+        let rid = room_id.as_i64();
+        let before = before.map(|id| id.as_i64()).unwrap_or(i64::MAX);
+        let row = sqlx::query!(
+            r#"SELECT m.id AS "id!", m.sender AS "sender!", m.recipient,
+                      m.content AS "content!", m.timestamp AS "timestamp!"
+               FROM messages m
+               JOIN room_messages rm ON rm.message_id = m.id
+               WHERE rm.room_id = ? AND m.id < ?
+               ORDER BY m.id DESC LIMIT 1"#,
+            rid,
+            before
+        )
+        .fetch_optional(&self.read_pool)
+        .await?;
+        row.map(|r| map_message_row(r.id, r.sender, r.recipient, r.content, r.timestamp))
+            .transpose()
+    }
+
+    async fn next_direct(
+        &self,
+        username: &Username,
+        after: Option<MessageId>,
+    ) -> Result<Option<Message>, StoreError> {
+        let uname = username.as_str();
+        let after = after.map(|id| id.as_i64()).unwrap_or(i64::MIN);
+        let row = sqlx::query!(
+            r#"SELECT id AS "id!", sender AS "sender!", recipient,
+                      content AS "content!", timestamp AS "timestamp!"
+               FROM messages
+               WHERE (sender = ? OR recipient = ?) AND recipient IS NOT NULL AND id > ?
+               ORDER BY id ASC LIMIT 1"#,
+            uname,
+            uname,
+            after
+        )
+        .fetch_optional(&self.read_pool)
+        .await?;
+        row.map(|r| map_message_row(r.id, r.sender, r.recipient, r.content, r.timestamp))
+            .transpose()
+    }
+
+    async fn prev_direct(
+        &self,
+        username: &Username,
+        before: Option<MessageId>,
+    ) -> Result<Option<Message>, StoreError> {
+        let uname = username.as_str();
+        let before = before.map(|id| id.as_i64()).unwrap_or(i64::MAX);
+        let row = sqlx::query!(
+            r#"SELECT id AS "id!", sender AS "sender!", recipient,
+                      content AS "content!", timestamp AS "timestamp!"
+               FROM messages
+               WHERE (sender = ? OR recipient = ?) AND recipient IS NOT NULL AND id < ?
+               ORDER BY id DESC LIMIT 1"#,
+            uname,
+            uname,
+            before
+        )
+        .fetch_optional(&self.read_pool)
+        .await?;
+        row.map(|r| map_message_row(r.id, r.sender, r.recipient, r.content, r.timestamp))
+            .transpose()
     }
 }
