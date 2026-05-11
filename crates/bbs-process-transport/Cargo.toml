@@ -14,9 +14,17 @@ async-trait.workspace    = true
 serde.workspace          = true
 serde_json.workspace     = true
 thiserror.workspace      = true
-tokio            = { workspace = true, features = ["process", "io-util"] }
+tokio            = { workspace = true, features = ["process", "io-util", "fs"] }
 toml_edit.workspace      = true
 tracing.workspace        = true
+
+[[bin]]
+name = "echo_plugin"
+path = "tests/fixtures/echo_plugin.rs"
+
+[dev-dependencies]
+bbs-plugin-api.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

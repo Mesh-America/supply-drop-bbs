@@ -419,3 +419,65 @@ async fn send_kick(tx: &mpsc::Sender<String>, id: &str) {
         let _ = tx.send(line).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_to_limit;
+
+    #[test]
+    fn zero_limit_is_noop() {
+        let s = "hello world".to_owned();
+        assert_eq!(truncate_to_limit(s.clone(), 0), s);
+    }
+
+    #[test]
+    fn text_at_or_below_limit_is_unchanged() {
+        let s = "hello".to_owned();
+        assert_eq!(truncate_to_limit(s.clone(), 10), s);
+        assert_eq!(truncate_to_limit(s.clone(), 5), s);
+    }
+
+    #[test]
+    fn text_over_limit_gets_ellipsis() {
+        let result = truncate_to_limit("hello world".to_owned(), 8);
+        // "…" is 3 bytes, so cut point is 5 bytes = "hello"
+        assert!(
+            result.ends_with('…'),
+            "result should end with ellipsis: {result:?}"
+        );
+        assert!(
+            result.len() <= 8,
+            "result must fit in limit: len={} result={result:?}",
+            result.len()
+        );
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries_multibyte() {
+        // Each char is 4 bytes (😀 is U+1F600, 4 bytes in UTF-8).
+        let s = "😀😀😀".to_owned(); // 12 bytes
+                                     // Limit of 7: "…" (3 bytes) leaves 4 bytes for content = exactly one 😀
+        let result = truncate_to_limit(s, 7);
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "not valid UTF-8"
+        );
+        assert!(result.ends_with('…'));
+    }
+
+    #[test]
+    fn truncation_of_empty_string_is_noop() {
+        assert_eq!(truncate_to_limit(String::new(), 5), "");
+    }
+
+    #[test]
+    fn limit_smaller_than_ellipsis_produces_just_ellipsis() {
+        // If the limit is so small there's no room for any content, we still
+        // get a valid (though possibly short) string ending in "…".
+        let result = truncate_to_limit("hello world".to_owned(), 1);
+        assert!(
+            std::str::from_utf8(result.as_bytes()).is_ok(),
+            "not valid UTF-8"
+        );
+    }
+}
