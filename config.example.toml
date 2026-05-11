@@ -202,6 +202,41 @@
 # command_prefix = "!"
 
 
+# ─── Plugin: Meshtastic transport ─────────────────────────────────
+#
+# This section only applies when the BBS is built with the
+# `transport-meshtastic` cargo feature. Meshtastic can connect
+# directly to a USB radio or to meshtasticd over TCP.
+
+[plugins.meshtastic]
+# Disabled by default so existing installs are unaffected.
+# enabled = false
+
+# How to reach the radio.
+#   "serial" — connect directly to a USB Meshtastic radio (Heltec V3,
+#              T-Beam, RAK4631, etc.)
+#   "tcp"    — connect to meshtasticd, usually on a Pi HAT node
+# connection_type = "serial"
+
+# ── Serial mode (connection_type = "serial") ──────────────────────
+# serial_port = "/dev/ttyACM0"
+# baud_rate = 115200
+
+# ── TCP mode (connection_type = "tcp") ────────────────────────────
+# addr = "127.0.0.1:4403"
+
+# ── All modes ─────────────────────────────────────────────────────
+# Optional single-character command prefix. Omit to treat every direct
+# message as a command.
+# command_prefix = "!"
+# max_payload_bytes = 220
+# node_credential_ttl_days = 14
+# hop_limit = 3
+# want_ack = true
+# reconnect_delay_initial_ms = 1000
+# reconnect_delay_max_ms = 60000
+
+
 # ─── Plugin: web admin ────────────────────────────────────────────
 #
 # This section only applies when the BBS is built with the
