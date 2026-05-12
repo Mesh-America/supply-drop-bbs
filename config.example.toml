@@ -215,11 +215,13 @@
 # How to reach the radio.
 #   "serial" — connect directly to a USB Meshtastic radio (Heltec V3,
 #              T-Beam, RAK4631, etc.)
+#   "hat"    — Raspberry Pi HAT via GPIO UART (/dev/ttyAMA0 or similar);
+#              install.sh enables UART hardware automatically
 #   "tcp"    — connect to meshtasticd, usually on a Pi HAT node
 # connection_type = "serial"
 
-# ── Serial mode (connection_type = "serial") ──────────────────────
-# serial_port = "/dev/ttyACM0"
+# ── Serial / HAT mode (connection_type = "serial" or "hat") ──────
+# serial_port = "/dev/ttyACM0"   # USB; use /dev/ttyAMA0 for HAT
 # baud_rate = 115200
 
 # ── TCP mode (connection_type = "tcp") ────────────────────────────
