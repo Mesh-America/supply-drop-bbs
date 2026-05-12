@@ -243,6 +243,32 @@ supply-drop-bbs user demote alice
 
 ---
 
+### `user set-password`
+
+```
+supply-drop-bbs user set-password <USERNAME> [OPTIONS]
+```
+
+Reset a user's password without requiring the old password. Prompts for the new password interactively (input is hidden) and asks for confirmation. The BBS service does not need to be stopped.
+
+| Argument | Description |
+|----------|-------------|
+| `<USERNAME>` | BBS username whose password will be reset (case-sensitive) |
+
+```sh
+sudo supply-drop-bbs user set-password alice \
+  --config /etc/supply-drop-bbs/config.toml
+# New password for alice: ••••••••
+# Confirm password:       ••••••••
+# password reset for alice
+```
+
+The new password must be at least 6 characters. The same operation is available in the **web admin UI** — open the user's detail drawer on the Users page and click **reset password** (sysop-only; requires the BBS to be running).
+
+**Exit codes:** `0` on success; `1` if the user is not found, the password is too short, or the database cannot be opened.
+
+---
+
 ## Permission levels
 
 | Level | Value | How to set |
@@ -274,6 +300,17 @@ sudo systemctl stop supply-drop-bbs
 sudo supply-drop-bbs user promote alice \
   --config /etc/supply-drop-bbs/config.toml
 sudo systemctl start supply-drop-bbs
+```
+
+### Reset a user's password
+
+If the BBS is running and you are logged into the web admin as a sysop, open the **Users** page, click the username to open the detail drawer, and use the **reset password** form.
+
+If the web UI is unavailable, use the CLI (the BBS does not need to be stopped):
+
+```sh
+sudo supply-drop-bbs user set-password alice \
+  --config /etc/supply-drop-bbs/config.toml
 ```
 
 ### Verify config before restarting

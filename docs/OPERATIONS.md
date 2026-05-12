@@ -429,6 +429,21 @@ sudo supply-drop-bbs user promote <username> \
 sudo systemctl start supply-drop-bbs
 ```
 
+### Reset a user's password
+
+**From the web admin UI** (BBS must be running; requires sysop login):
+
+Open **Users**, click the username to open the detail drawer, then click **reset password**.
+
+**From the CLI** (BBS does not need to be stopped):
+
+```sh
+sudo supply-drop-bbs user set-password <username> \
+  --config /etc/supply-drop-bbs/config.toml
+```
+
+The new password must be at least 6 characters. The action is audit-logged when performed via the web UI.
+
 See [CLI.md](CLI.md) for the full `user` subcommand reference.
 
 ## Monitoring
