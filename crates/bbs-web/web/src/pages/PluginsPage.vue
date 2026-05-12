@@ -390,10 +390,10 @@ p { margin: 0; }
 
 .section-title {
   margin: 0 0 0.4rem;
-  font-size: 0.8em;
+  font-size: 1.2rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
-  color: var(--muted);
+  color: var(--accent);
   font-weight: 600;
 }
 
