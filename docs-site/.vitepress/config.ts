@@ -18,7 +18,7 @@ function slugify(str: string): string {
 export default defineConfig({
   title: 'Supply Drop BBS',
   description: 'Open-source BBS for MeshCore, Meshtastic, and any transport you can write a plugin for.',
-  base: '/supply-drop-bbs/',
+  base: '/',
   srcDir: '../docs',
 
   markdown: {
