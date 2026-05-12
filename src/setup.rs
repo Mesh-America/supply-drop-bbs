@@ -357,10 +357,13 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
         let conn_items = &[
             "USB / serial  (any Meshtastic-firmware radio — plug in via USB)",
+            "Pi HAT        (Waveshare LoRa HAT, RAK LoRa HAT — Meshtastic firmware via GPIO UART)",
             "TCP           (connect to a running meshtasticd, default port 4403)",
         ];
-        let conn_default = if ex.meshtastic_connection_type == "tcp" {
+        let conn_default = if ex.meshtastic_connection_type == "hat" {
             1
+        } else if ex.meshtastic_connection_type == "tcp" {
+            2
         } else {
             0
         };
@@ -381,6 +384,13 @@ pub fn run_wizard(config_out: Option<&Path>) {
                 meshtastic_conn_type = ct;
                 meshtastic_serial_port = sp;
                 meshtastic_baud_rate = br;
+                meshtastic_addr = None;
+            }
+            1 => {
+                let (port, baud) = configure_uart_hat(&theme, ex.meshtastic_serial_port.as_deref());
+                meshtastic_conn_type = "hat";
+                meshtastic_serial_port = Some(port);
+                meshtastic_baud_rate = Some(baud);
                 meshtastic_addr = None;
             }
             _ => {
@@ -700,6 +710,44 @@ fn configure_serial(
     let baud: u32 = baud_str.parse().expect("validated above");
 
     ("serial", Some(serial_port), Some(baud))
+}
+
+fn configure_uart_hat(theme: &ColorfulTheme, existing_port: Option<&str>) -> (String, u32) {
+    println!();
+    println!("The Meshtastic Pi HAT connects over the GPIO UART pins.");
+    println!("You may need to enable UART and disable the serial console.");
+    println!("Run 'sudo raspi-config' → Interface Options → Serial Port.");
+    println!();
+
+    const UART_OPTIONS: &[(&str, &str)] = &[
+        ("/dev/ttyAMA0", "primary UART — most Pi setups"),
+        ("/dev/serial0", "symlink to primary UART"),
+        ("/dev/ttyS0", "mini UART — Pi 3/4 without overlay"),
+    ];
+
+    let mut items: Vec<String> = UART_OPTIONS
+        .iter()
+        .map(|(dev, desc)| format!("{dev:<20} ({desc})"))
+        .collect();
+    items.push("Enter path manually…".into());
+
+    let default_idx = existing_port
+        .and_then(|ep| UART_OPTIONS.iter().position(|(dev, _)| *dev == ep))
+        .unwrap_or(0);
+
+    let choice = prompt_select(theme, "Select UART port", &items, default_idx);
+
+    let port = if choice == UART_OPTIONS.len() {
+        let mut prompt = Input::with_theme(theme).with_prompt("UART port path");
+        if let Some(p) = existing_port {
+            prompt = prompt.default(p.to_owned());
+        }
+        prompt.interact_text().unwrap_or_else(|_| cancelled())
+    } else {
+        UART_OPTIONS[choice].0.to_owned()
+    };
+
+    (port, 115_200)
 }
 
 // ── Region presets ────────────────────────────────────────────────────────────
@@ -1354,7 +1402,7 @@ fn build_toml(p: &TomlParams<'_>) -> String {
             )
             .unwrap();
             match p.meshtastic_connection_type {
-                "serial" => {
+                "serial" | "hat" => {
                     if let Some(port) = p.meshtastic_serial_port {
                         writeln!(s, "serial_port = {}", toml_str(port)).unwrap();
                     }
@@ -1487,7 +1535,7 @@ fn print_next_steps(
 ) {
     let needs_dialout = cfg!(target_os = "linux")
         && ((use_mesh && mesh_conn_type == "serial")
-            || (use_meshtastic && meshtastic_conn_type == "serial"));
+            || (use_meshtastic && matches!(meshtastic_conn_type, "serial" | "hat")));
 
     if needs_dialout {
         println!("To allow Supply Drop BBS to access serial ports, your user must");

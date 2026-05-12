@@ -14,6 +14,7 @@
 //! │  │  GET  /api/v1/auth/whoami          (auth)       │    │
 //! │  │  POST /api/v1/auth/logout          (auth)       │    │
 //! │  │  GET  /api/v1/status               (auth)       │    │
+//! │  │  GET  /api/v1/transports           (auth)       │    │
 //! │  │  GET  /api/v1/adverts              (auth)       │    │
 //! │  │  POST /api/v1/adverts/send         (auth)       │    │
 //! │  │  GET  /api/v1/sessions             (auth)       │    │
@@ -228,6 +229,21 @@ struct CurrentUser {
     permission_level: u8,
 }
 
+// ── Transport flags ───────────────────────────────────────────────────────────
+
+/// Which built-in transports are currently enabled.
+///
+/// Injected by `main.rs` via [`WebPlugin::set_active_transports`] before
+/// `start()` is called. Exposed at `GET /api/v1/transports` so the web UI
+/// can conditionally show transport-specific pages.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct TransportFlags {
+    /// MeshCore radio transport enabled.
+    pub meshcore: bool,
+    /// Meshtastic radio transport enabled.
+    pub meshtastic: bool,
+}
+
 // ── Shared state ──────────────────────────────────────────────────────────────
 
 struct AppState {
@@ -238,6 +254,7 @@ struct AppState {
     log_tx: broadcast::Sender<String>,
     log_buf: std::sync::Arc<Mutex<LogBuffer>>,
     plugin_registry: std::sync::Mutex<Option<Arc<dyn PluginRegistryApi>>>,
+    active_transports: std::sync::Mutex<TransportFlags>,
 }
 
 impl AppState {
@@ -251,6 +268,7 @@ impl AppState {
             log_tx,
             log_buf: std::sync::Arc::new(Mutex::new(LogBuffer::new())),
             plugin_registry: std::sync::Mutex::new(None),
+            active_transports: std::sync::Mutex::new(TransportFlags::default()),
         }
     }
 
@@ -421,6 +439,18 @@ impl WebPlugin {
             .lock()
             .expect("plugin_registry poisoned") = Some(registry);
     }
+
+    /// Inject which built-in transports are active.
+    ///
+    /// Must be called before `start()`. Exposed at `GET /api/v1/transports`
+    /// so the SPA can conditionally show transport-specific nav items.
+    pub fn set_active_transports(&self, flags: TransportFlags) {
+        *self
+            .state
+            .active_transports
+            .lock()
+            .expect("active_transports poisoned") = flags;
+    }
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -430,6 +460,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/auth/whoami", get(api_whoami))
         .route("/auth/logout", post(api_logout))
         .route("/status", get(api_status))
+        .route("/transports", get(api_active_transports))
         .route("/adverts", get(api_adverts))
         .route("/adverts/send", post(api_adverts_send))
         .route("/sessions", get(api_list_sessions))
@@ -603,6 +634,14 @@ async fn api_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: state.started_at.elapsed().as_secs(),
     })
+}
+
+async fn api_active_transports(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let flags = *state
+        .active_transports
+        .lock()
+        .expect("active_transports poisoned");
+    Json(flags)
 }
 
 // ── Adverts ───────────────────────────────────────────────────────────────────

@@ -495,6 +495,7 @@ PYEOF
 fi
 
 # Parse [plugins.meshtastic] — enabled defaults to false if key is absent.
+_meshtastic_conn_type="serial"
 if python3 - "$CONFIG_DIR/config.toml" <<'PYEOF'
 import sys, re
 path = sys.argv[1]
@@ -508,6 +509,17 @@ sys.exit(0 if enabled == 'true' else 1)
 PYEOF
 then
     _meshtastic_enabled=true
+    _meshtastic_conn_type=$(python3 - "$CONFIG_DIR/config.toml" <<'PYEOF'
+import sys, re
+path = sys.argv[1]
+text = open(path).read()
+m = re.search(r'^\[plugins\.meshtastic\](.*?)(?=^\[|\Z)', text, re.M | re.S)
+if not m: sys.exit(0)
+section = m.group(1)
+conn_m = re.search(r'^connection_type\s*=\s*"(\w+)"', section, re.M)
+print(conn_m.group(1) if conn_m else 'serial')
+PYEOF
+)
 fi
 
 # ── MeshCore Pi HAT: pymc-companion ──────────────────────────────────────────
@@ -598,16 +610,36 @@ else
     fi
 fi
 
-# ── Meshtastic: informational only ───────────────────────────────────────────
-# Meshtastic talks directly to the radio via USB serial or to meshtasticd
-# via TCP — no companion service is needed.
+# ── Meshtastic: Pi HAT UART setup or informational only ──────────────────────
 
-if [[ "$_meshtastic_enabled" == true ]]; then
+if [[ "$_meshtastic_enabled" == true && "$_meshtastic_conn_type" == "hat" ]]; then
+    echo
+    echo "─── Meshtastic Pi HAT (GPIO UART) ───────────────────────────────────────────"
+    echo
+
+    # Enable UART hardware and disable the serial console so the UART is free
+    # for the Meshtastic radio firmware.
+    if command -v raspi-config &>/dev/null; then
+        info "Enabling UART hardware and disabling serial console via raspi-config..."
+        raspi-config nonint do_serial_hw 0    # 0 = enable UART hardware
+        raspi-config nonint do_serial_cons 1  # 1 = disable login shell on serial
+        success "UART enabled, serial console disabled (takes effect after reboot)"
+    else
+        warn "raspi-config not found — add 'enable_uart=1' to /boot/firmware/config.txt"
+        warn "and comment out any 'console=serial0,...' in /boot/firmware/cmdline.txt, then reboot"
+    fi
+
+    # Service user needs dialout group to access the UART device.
+    usermod -aG dialout "$SERVICE_USER" 2>/dev/null || true
+    success "Service user added to dialout group"
+    echo
+
+elif [[ "$_meshtastic_enabled" == true ]]; then
     echo
     echo "─── Meshtastic ─────────────────────────────────────────────────────────────"
     echo
     info "Meshtastic transport enabled."
-    info "No companion service is required. USB serial talks directly to the radio; TCP connects to meshtasticd."
+    info "No companion service required — USB serial talks directly to the radio; TCP connects to meshtasticd."
     echo
 fi
 

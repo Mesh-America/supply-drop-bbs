@@ -445,6 +445,18 @@ async fn cmd_run(cli: &Cli) {
                 Arc::clone(&process_registry) as Arc<dyn bbs_plugin_api::PluginRegistryApi>;
             plugin.set_plugin_registry(registry);
         }
+        if let Some(ref plugin) = wp {
+            plugin.set_active_transports(bbs_web::TransportFlags {
+                #[cfg(feature = "transport-mesh")]
+                meshcore: cfg.plugins.mesh.enabled,
+                #[cfg(not(feature = "transport-mesh"))]
+                meshcore: false,
+                #[cfg(feature = "transport-meshtastic")]
+                meshtastic: cfg.plugins.meshtastic.enabled,
+                #[cfg(not(feature = "transport-meshtastic"))]
+                meshtastic: false,
+            });
+        }
         wp
     };
 

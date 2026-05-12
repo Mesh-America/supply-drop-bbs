@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useStatsStore } from '../stores/stats'
+import { useTransportsStore } from '../stores/transports'
 import { useRouter } from 'vue-router'
 import { useTheme } from '../composables/useTheme'
 import type { Mode, ColorTheme } from '../composables/useTheme'
@@ -12,6 +13,7 @@ const menuOpen = ref(false)
 const menuRef = ref<HTMLElement>()
 const auth = useAuthStore()
 const stats = useStatsStore()
+const transports = useTransportsStore()
 const router = useRouter()
 const { mode, color, modeLabel } = useTheme()
 
@@ -32,6 +34,7 @@ function handleClickOutside(e: MouseEvent) {
 onMounted(() => {
   document.addEventListener('click', handleClickOutside)
   stats.startPolling()
+  transports.refresh()
 })
 onUnmounted(() => {
   document.removeEventListener('click', handleClickOutside)
@@ -53,28 +56,36 @@ const modes: { value: Mode; label: string }[] = [
 interface NavItem { to: string; label: string; badge?: boolean }
 interface NavGroup { title: string; items: NavItem[] }
 
-const groups: NavGroup[] = [
-  {
-    title: 'overview',
-    items: [{ to: '/', label: 'dashboard' }],
-  },
-  {
-    title: 'mesh',
-    items: [{ to: '/adverts', label: 'adverts' }],
-  },
-  {
+const groups = computed<NavGroup[]>(() => {
+  const g: NavGroup[] = [
+    {
+      title: 'overview',
+      items: [{ to: '/', label: 'dashboard' }],
+    },
+  ]
+
+  if (transports.meshcore) {
+    g.push({
+      title: 'mesh',
+      items: [{ to: '/adverts', label: 'adverts' }],
+    })
+  }
+
+  g.push({
     title: 'sessions',
     items: [{ to: '/sessions', label: 'sessions' }],
-  },
-  {
+  })
+
+  g.push({
     title: 'admin',
     items: [
       { to: '/users', label: 'users', badge: true },
       { to: '/rooms', label: 'rooms' },
       { to: '/messages', label: 'messages' },
     ],
-  },
-  {
+  })
+
+  g.push({
     title: 'ops',
     items: [
       { to: '/reports', label: 'reports' },
@@ -84,8 +95,10 @@ const groups: NavGroup[] = [
       { to: '/audit', label: 'audit' },
       { to: '/settings', label: 'settings' },
     ],
-  },
-]
+  })
+
+  return g
+})
 </script>
 
 <template>

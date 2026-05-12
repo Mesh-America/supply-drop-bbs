@@ -51,6 +51,8 @@ pub enum MeshtasticConnectionType {
     Serial,
     /// Connect via TCP to `meshtasticd` or another Meshtastic TCP stream.
     Tcp,
+    /// Connect to a Meshtastic-firmware Pi HAT via GPIO UART (`/dev/ttyAMA0`).
+    Hat,
 }
 
 // ── Config ────────────────────────────────────────────────────────────────────
@@ -218,13 +220,18 @@ impl Plugin for MeshtasticTransport {
                     reconnect_delay_max: config.reconnect_delay_max(),
                 })
             }
-            MeshtasticConnectionType::Serial => {
+            MeshtasticConnectionType::Serial | MeshtasticConnectionType::Hat => {
                 let port = config.serial_port.clone().ok_or_else(|| {
                     PluginError::InvalidConfig(
-                        "connection_type = 'serial' requires serial_port to be set".into(),
+                        "connection_type 'serial'/'hat' requires serial_port to be set".into(),
                     )
                 })?;
-                info!(port = %port, baud = config.baud_rate, "meshtastic transport: connecting via serial");
+                let conn_label = if config.connection_type == MeshtasticConnectionType::Hat {
+                    "via GPIO UART HAT"
+                } else {
+                    "via USB serial"
+                };
+                info!(port = %port, baud = config.baud_rate, "meshtastic transport: connecting {conn_label}");
                 MeshtasticClient::connect_serial(SerialConfig {
                     port,
                     baud_rate: config.baud_rate,
@@ -903,6 +910,18 @@ mod tests {
         assert!(!cfg.enabled);
         assert_eq!(cfg.connection_type, MeshtasticConnectionType::Serial);
         assert_eq!(cfg.baud_rate, 115_200);
+    }
+
+    #[test]
+    fn hat_connection_type_round_trips_serde() {
+        let toml = r#"
+enabled = true
+connection_type = "hat"
+serial_port = "/dev/ttyAMA0"
+"#;
+        let cfg: MeshtasticConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.connection_type, MeshtasticConnectionType::Hat);
+        assert_eq!(cfg.serial_port.as_deref(), Some("/dev/ttyAMA0"));
     }
 
     #[test]

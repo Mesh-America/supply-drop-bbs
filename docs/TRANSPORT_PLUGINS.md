@@ -1146,6 +1146,26 @@ listen = "0.0.0.0:4321"
 
 ---
 
+## 10a. Serial port selection on Linux
+
+**USB port ordering is not guaranteed.** When multiple USB serial devices are connected (e.g. a MeshCore HAT's XR serial chip and a Heltec V3's CP2102), the kernel assigns `/dev/ttyUSB0` and `/dev/ttyUSB1` based on enumeration order, which can change between reboots or hot-plug events. Never hard-code a port path based on port number alone.
+
+**The setup wizard identifies ports by USB VID/PID** to help operators pick the right one:
+
+| Chip | VID:PID | Wizard label |
+|---|---|---|
+| Silicon Labs CP2102 / CP2102N | `10C4:EA60` | Meshtastic/MeshCore radio — CP2102 |
+| WCH CH340 | `1A86:7523` | Meshtastic radio — CH340 |
+| WCH CH9102 | `1A86:55D4` | Meshtastic radio — CH9102 |
+| Espressif ESP32-S3 native USB | `303A:1001` | Meshtastic radio — ESP32-S3 |
+| MaxLinear/Exar XR21V141x | `04E2:141x` | MeshCore HAT — XR serial |
+
+The XR serial chip is the USB-UART bridge on the pymc-companion MeshCore HAT. If you see it listed in the wizard, it belongs to MeshCore, not Meshtastic. Pick the CP2102/CH340/ESP32-S3 port for your Meshtastic radio.
+
+For **Meshtastic Pi HAT** (GPIO UART), use `/dev/ttyAMA0` (primary UART) or `/dev/serial0` (the canonical symlink). Make sure the serial console is disabled so the UART is free for the radio.
+
+---
+
 ## 11. Configuration
 
 Your transport's config struct is deserialized from `[plugins.<name>]` in
