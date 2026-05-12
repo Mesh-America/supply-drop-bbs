@@ -815,6 +815,7 @@ impl Host for BbsHost {
             message_count: count,
             created_at: room.created_at.to_rfc3339(),
             deletable: room_id > 5,
+            locked: (2..=4).contains(&room_id),
         })
     }
 
@@ -1217,10 +1218,11 @@ impl BbsHost {
                         let dm_body = format!(
                             "New user registered: {username}\nV {username} to verify, B {username} to ban."
                         );
+                        let bbs_sender = Username::new("bbs").expect("bbs is a valid username");
                         for sysop in sysops {
                             let _ = MessageStore::post_direct(
                                 &self.db,
-                                &username,
+                                &bbs_sender,
                                 &sysop.username,
                                 &dm_body,
                                 dm_ts,
@@ -4242,7 +4244,7 @@ mod tests {
             "sysop should receive exactly one notification DM"
         );
         let dm = &page.messages[0];
-        assert_eq!(dm.sender, Username::new("newuser").unwrap());
+        assert_eq!(dm.sender, Username::new("bbs").unwrap());
         assert_eq!(dm.recipient.as_ref(), Some(&sysop_name));
         assert!(
             dm.content.contains("newuser"),

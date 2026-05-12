@@ -59,6 +59,9 @@ pub struct AdminRoomSummary {
     /// Whether this room can be deleted. False for the five built-in system
     /// rooms (Lobby, Mail, Aides, Sysop, System).
     pub deletable: bool,
+    /// Whether name, min_permission_level, and read_only are locked and cannot
+    /// be changed. True for Mail (2), Aides (3), and Sysop (4).
+    pub locked: bool,
 }
 
 /// A message as seen by the admin.

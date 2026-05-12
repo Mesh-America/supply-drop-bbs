@@ -1190,6 +1190,17 @@ async fn api_update_room(
             .into_response();
     }
 
+    // Mail (2), Aides (3), and Sysop (4) have fixed permissions and read-only settings.
+    if (2..=4).contains(&id) && (body.read_only.is_some() || body.min_permission_level.is_some()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json_error(
+                "permission level and read-only are locked for this room",
+            )),
+        )
+            .into_response();
+    }
+
     // Convert JSON Value for description: absent key → None (leave), null → Some(None) (clear),
     // string → Some(Some(s)) (set).
     let description: Option<Option<String>> = match body.description {

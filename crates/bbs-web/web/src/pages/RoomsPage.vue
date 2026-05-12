@@ -12,6 +12,7 @@ interface Room {
   message_count: number
   created_at: string
   deletable: boolean
+  locked: boolean
 }
 
 const rooms = ref<Room[]>([])
@@ -173,20 +174,23 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
             <input v-model="editDesc" placeholder="leave blank to clear" maxlength="512" />
           </label>
 
-          <label class="field field-row">
-            <input type="checkbox" v-model="editReadOnly" />
-            <span>read-only (only aides/sysops can post)</span>
-          </label>
+          <template v-if="!editTarget.locked">
+            <label class="field field-row">
+              <input type="checkbox" v-model="editReadOnly" />
+              <span>read-only (only aides/sysops can post)</span>
+            </label>
 
-          <label class="field">
-            <span>minimum permission level</span>
-            <select v-model="editMinLevel">
-              <option :value="0">0 — unvalidated</option>
-              <option :value="10">10 — user</option>
-              <option :value="50">50 — aide</option>
-              <option :value="100">100 — sysop</option>
-            </select>
-          </label>
+            <label class="field">
+              <span>minimum permission level</span>
+              <select v-model="editMinLevel">
+                <option :value="0">0 — unvalidated</option>
+                <option :value="10">10 — user</option>
+                <option :value="50">50 — aide</option>
+                <option :value="100">100 — sysop</option>
+              </select>
+            </label>
+          </template>
+          <p v-else class="muted small">Permission level and read-only are fixed for this room.</p>
 
           <div class="modal-actions">
             <button @click="closeEdit" class="secondary">cancel</button>
