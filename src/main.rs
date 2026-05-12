@@ -765,8 +765,8 @@ fn cmd_plugin(config_path: Option<&std::path::Path>, action: PluginAction) {
             restart_delay,
         } => {
             if plugins.iter().any(|p| p.name == name) {
-                eprintln!("error: plugin '{name}' already exists");
-                std::process::exit(1);
+                println!("plugin '{name}' is already configured — no changes made.");
+                return;
             }
             plugins.push(ProcessPluginConfig {
                 name: name.clone(),

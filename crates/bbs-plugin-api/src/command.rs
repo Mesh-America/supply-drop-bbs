@@ -322,6 +322,7 @@ impl Command {
         let keyword = word.to_ascii_lowercase();
 
         match keyword.as_str() {
+            // ── Auth ─────────────────────────────────────────────────────────
             "h" | "help" | "?" => Command::Help {
                 topic: rest.map(str::to_owned),
             },
@@ -337,7 +338,122 @@ impl Command {
                     topic: Some("login".to_owned()),
                 },
             },
-            "logout" | "q" => Command::Logout,
+            "logout" | "q" | "quit" => Command::Quit,
+
+            // ── Room navigation ───────────────────────────────────────────────
+            "k" => Command::ListRooms,
+            "g" => Command::GoNextUnread,
+            "c" => Command::ChangeRoom {
+                target: rest.unwrap_or("").to_owned(),
+            },
+            "m" => Command::GoMail,
+            "i" => Command::IgnoreRoom,
+
+            // ── Message reading ───────────────────────────────────────────────
+            "n" => Command::ReadNew,
+            "f" => Command::ReadForward {
+                after: rest.and_then(|s| s.parse::<i64>().ok()),
+            },
+            "r" => Command::ReadReverse,
+            "s" => match rest {
+                Some(q) if !q.is_empty() => Command::SearchUsers {
+                    query: q.to_owned(),
+                },
+                _ => Command::ScanMessages,
+            },
+            ".ff" => Command::FastForward,
+
+            // ── Message posting / deletion ────────────────────────────────────
+            "e" => Command::EnterMessage {
+                body: rest.filter(|s| !s.is_empty()).map(str::to_owned),
+            },
+            "d" => match rest.and_then(|s| s.parse::<i64>().ok()) {
+                Some(id) => Command::DeleteMessage { id },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+
+            // ── Moderation / account ──────────────────────────────────────────
+            "w" => Command::WhoIsOnline,
+            "pending" => Command::ListPending,
+            "v" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::ValidateUser { username },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            "b" => {
+                let raw_arg = rest.unwrap_or("").trim();
+                let (force, name) = if let Some(s) = raw_arg.strip_prefix('+') {
+                    (Some(true), s.trim())
+                } else if let Some(s) = raw_arg.strip_prefix('-') {
+                    (Some(false), s.trim())
+                } else {
+                    (None, raw_arg)
+                };
+                match Username::new(name) {
+                    Ok(target) => Command::BlockUser { target, force },
+                    Err(_) => Command::Unknown {
+                        raw: text.to_owned(),
+                    },
+                }
+            }
+            "ban" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::BanUser { username },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            "unban" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::UnbanUser { username },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            "u" | "users" => Command::ListUsers {
+                filter: rest.map(str::to_owned),
+            },
+            "whois" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::UserInfo { username },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            "profile" => Command::EditProfile,
+            "passwd" => Command::ChangePassword,
+
+            // ── Room / user management ────────────────────────────────────────
+            ".c" => match rest {
+                Some(name) if !name.is_empty() => Command::CreateRoom {
+                    name: name.to_owned(),
+                },
+                _ => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            ".dr" => match rest {
+                Some(name) if !name.is_empty() => Command::DeleteRoom {
+                    name: name.to_owned(),
+                },
+                _ => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            ".er" => Command::EditRoom,
+            ".eu" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::EditUser { username },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            ".du" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::DeleteUser { username },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+
             _ => Command::Unknown {
                 raw: text.to_owned(),
             },
