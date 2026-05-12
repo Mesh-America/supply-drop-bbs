@@ -88,9 +88,19 @@ back when sending responses so you know which connection to write to.
 transport's MTU. Supply Drop truncates responses that exceed the limit. Use
 `0` or omit the field for no limit (CLI-style transports).
 
+**`text`** — The display-ready string to deliver to the user. Supply Drop
+does not append a newline; transports should add whatever framing their
+protocol requires (e.g. Telnet appends `\r\n`, Slack posts the string as-is).
+
 **`hide_input`** — When `true` in a `send` message, the user's next reply
 should be visually hidden (password entry). Transports that don't support
 input masking can ignore this.
+
+> **Telnet note:** the standard way to hide input on a Telnet connection is
+> to send `IAC WILL ECHO` (bytes `FF FB 01`) before the prompt, then
+> `IAC WONT ECHO` (bytes `FF FC 01`) after the user's next line arrives.
+> Most clients honour this and blank the echoed characters; clients that
+> ignore it will show the password in plain text. Treat it as best-effort.
 
 ---
 
@@ -463,7 +473,7 @@ If you prefer Rust, the `bbs-plugin-api` crate exports the IPC types:
 use bbs_plugin_api::ipc::{HostMsg, PluginMsg};
 use std::io::{self, BufRead, Write};
 
-fn send(msg: &HostMsg) {
+fn send(msg: &PluginMsg) {
     let line = serde_json::to_string(msg).unwrap();
     println!("{line}");
 }
@@ -544,12 +554,30 @@ supply-drop-bbs plugin logs my-plugin
 
 Or in the web admin under **Plugins → my-plugin → logs**.
 
-You can also test the protocol manually without Supply Drop by piping JSON:
+You can also test the protocol manually without Supply Drop. Remember the
+direction: **your plugin reads `HostMsg` on stdin** (`send`, `kick`,
+`shutdown`) and **writes `PluginMsg` on stdout** (`ready`, `open`, `recv`,
+`close`). To drive your plugin from the host side, pipe `HostMsg` JSON into
+its stdin:
 
 ```sh
-echo '{"t":"open","id":"test"}' | ./my-plugin
-echo '{"t":"recv","id":"test","line":"help"}' | ./my-plugin
+# Start your plugin (it will print {"t":"ready"} and wait).
+./my-plugin --port 2323 &
+
+# Send a shutdown from the fake host side (stdin of the plugin).
+echo '{"t":"shutdown"}' | ./my-plugin --port 2323
 ```
+
+For end-to-end testing of the full session flow (`open` → `recv` → `send`),
+run the plugin normally and connect with a real client:
+
+```sh
+./my-plugin --port 2323 &
+telnet localhost 2323   # drives open/recv/close; watch plugin stdout for send frames
+```
+
+Watch the plugin's stdout to see the `send` JSON frames Supply Drop would
+consume, and stderr for your own log output.
 
 ---
 
