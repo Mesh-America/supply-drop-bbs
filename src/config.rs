@@ -531,6 +531,7 @@ pub struct PluginsConfig {
 /// Plugin installers drop `<name>.toml` files here instead of editing
 /// `config.toml` directly. Supply Drop merges them at startup; the files
 /// survive BBS upgrades and reconfiguration.
+#[cfg(feature = "transport-process")]
 pub fn plugins_d_dir(config_path: &std::path::Path) -> PathBuf {
     config_path
         .parent()
