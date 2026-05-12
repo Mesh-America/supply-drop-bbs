@@ -455,6 +455,9 @@ async fn cmd_run(cli: &Cli) {
                 meshtastic: cfg.plugins.meshtastic.enabled,
                 #[cfg(not(feature = "transport-meshtastic"))]
                 meshtastic: false,
+                compiled_mesh: cfg!(feature = "transport-mesh"),
+                compiled_meshtastic: cfg!(feature = "transport-meshtastic"),
+                compiled_cli: cfg!(feature = "transport-cli"),
             });
         }
         wp

@@ -15,6 +15,8 @@
 //! │  │  POST /api/v1/auth/logout          (auth)       │    │
 //! │  │  GET  /api/v1/status               (auth)       │    │
 //! │  │  GET  /api/v1/transports           (auth)       │    │
+//! │  │  GET  /api/v1/native-plugins       (auth)       │    │
+//! │  │  PATCH /api/v1/native-plugins/:name (auth)      │    │
 //! │  │  GET  /api/v1/adverts              (auth)       │    │
 //! │  │  POST /api/v1/adverts/send         (auth)       │    │
 //! │  │  GET  /api/v1/sessions             (auth)       │    │
@@ -58,6 +60,7 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -231,17 +234,24 @@ struct CurrentUser {
 
 // ── Transport flags ───────────────────────────────────────────────────────────
 
-/// Which built-in transports are currently enabled.
+/// Which built-in transports are compiled in and/or currently enabled.
 ///
 /// Injected by `main.rs` via [`WebPlugin::set_active_transports`] before
 /// `start()` is called. Exposed at `GET /api/v1/transports` so the web UI
-/// can conditionally show transport-specific pages.
+/// can conditionally show transport-specific pages, and at
+/// `GET /api/v1/native-plugins` for the plugin management panel.
 #[derive(Debug, Clone, Copy, Default, Serialize)]
 pub struct TransportFlags {
     /// MeshCore radio transport enabled.
     pub meshcore: bool,
     /// Meshtastic radio transport enabled.
     pub meshtastic: bool,
+    /// Whether MeshCore was compiled into this binary.
+    pub compiled_mesh: bool,
+    /// Whether Meshtastic was compiled into this binary.
+    pub compiled_meshtastic: bool,
+    /// Whether the CLI (Unix socket) transport was compiled into this binary.
+    pub compiled_cli: bool,
 }
 
 // ── Shared state ──────────────────────────────────────────────────────────────
@@ -255,6 +265,7 @@ struct AppState {
     log_buf: std::sync::Arc<Mutex<LogBuffer>>,
     plugin_registry: std::sync::Mutex<Option<Arc<dyn PluginRegistryApi>>>,
     active_transports: std::sync::Mutex<TransportFlags>,
+    pending_restart: AtomicBool,
 }
 
 impl AppState {
@@ -269,6 +280,7 @@ impl AppState {
             log_buf: std::sync::Arc::new(Mutex::new(LogBuffer::new())),
             plugin_registry: std::sync::Mutex::new(None),
             active_transports: std::sync::Mutex::new(TransportFlags::default()),
+            pending_restart: AtomicBool::new(false),
         }
     }
 
@@ -461,6 +473,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/auth/logout", post(api_logout))
         .route("/status", get(api_status))
         .route("/transports", get(api_active_transports))
+        .route("/native-plugins", get(api_list_native_plugins))
+        .route("/native-plugins/:name", patch(api_update_native_plugin))
         .route("/adverts", get(api_adverts))
         .route("/adverts/send", post(api_adverts_send))
         .route("/sessions", get(api_list_sessions))
@@ -642,6 +656,189 @@ async fn api_active_transports(State(state): State<Arc<AppState>>) -> impl IntoR
         .lock()
         .expect("active_transports poisoned");
     Json(flags)
+}
+
+// ── Native plugins ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct NativePluginInfo {
+    name: &'static str,
+    label: &'static str,
+    compiled_in: bool,
+    enabled: bool,
+    connection_type: Option<String>,
+}
+
+#[derive(Serialize)]
+struct NativePluginsResponse {
+    plugins: Vec<NativePluginInfo>,
+    pending_restart: bool,
+}
+
+#[derive(Deserialize)]
+struct UpdateNativePluginBody {
+    enabled: Option<bool>,
+}
+
+async fn api_list_native_plugins(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    let pending_restart = state.pending_restart.load(Ordering::Relaxed);
+    let flags = *state
+        .active_transports
+        .lock()
+        .expect("active_transports poisoned");
+    let config_val = state
+        .config
+        .config_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(|p| read_config_toml(p).ok());
+
+    let plugins = vec![
+        NativePluginInfo {
+            name: "mesh",
+            label: "MeshCore",
+            compiled_in: flags.compiled_mesh,
+            enabled: config_val
+                .as_ref()
+                .and_then(|v| toml_plugin_bool(v, "mesh", "enabled"))
+                .unwrap_or(true),
+            connection_type: config_val
+                .as_ref()
+                .and_then(|v| toml_plugin_str(v, "mesh", "connection_type")),
+        },
+        NativePluginInfo {
+            name: "meshtastic",
+            label: "Meshtastic",
+            compiled_in: flags.compiled_meshtastic,
+            enabled: config_val
+                .as_ref()
+                .and_then(|v| toml_plugin_bool(v, "meshtastic", "enabled"))
+                .unwrap_or(false),
+            connection_type: config_val
+                .as_ref()
+                .and_then(|v| toml_plugin_str(v, "meshtastic", "connection_type")),
+        },
+        NativePluginInfo {
+            name: "cli",
+            label: "CLI (Unix socket)",
+            compiled_in: flags.compiled_cli,
+            enabled: config_val
+                .as_ref()
+                .and_then(|v| toml_plugin_bool(v, "cli", "enabled"))
+                .unwrap_or(true),
+            connection_type: None,
+        },
+    ];
+
+    Json(NativePluginsResponse {
+        plugins,
+        pending_restart,
+    })
+    .into_response()
+}
+
+async fn api_update_native_plugin(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Path(name): Path<String>,
+    Json(body): Json<UpdateNativePluginBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    let Some(enabled) = body.enabled else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("enabled field is required")),
+        )
+            .into_response();
+    };
+
+    let flags = *state
+        .active_transports
+        .lock()
+        .expect("active_transports poisoned");
+    let compiled_in = match name.as_str() {
+        "mesh" => flags.compiled_mesh,
+        "meshtastic" => flags.compiled_meshtastic,
+        "cli" => flags.compiled_cli,
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error("unknown native plugin")),
+            )
+                .into_response()
+        }
+    };
+
+    if !compiled_in {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("plugin not compiled into this binary")),
+        )
+            .into_response();
+    }
+
+    let path = match &state.config.config_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error(
+                    "config_path not set in [plugins.web] — cannot write config",
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let mut val = match read_config_toml(&path) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
+    };
+
+    toml_set_plugin_bool(&mut val, &name, "enabled", enabled);
+
+    let serialized = match toml::to_string(&val) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not serialize config: {e}"))),
+            )
+                .into_response()
+        }
+    };
+
+    if let Err(e) = std::fs::write(&path, &serialized) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("could not write config file: {e}"))),
+        )
+            .into_response();
+    }
+
+    state.pending_restart.store(true, Ordering::Relaxed);
+
+    let action = if enabled {
+        "enable_native_plugin"
+    } else {
+        "disable_native_plugin"
+    };
+    let _ = state
+        .host
+        .admin_write_audit(&format!("web:{}", user.username), action, Some(&name), None)
+        .await;
+
+    Json(serde_json::json!({ "ok": true, "pending_restart": true })).into_response()
 }
 
 // ── Adverts ───────────────────────────────────────────────────────────────────
@@ -1343,6 +1540,38 @@ fn toml_remove_key(root: &mut toml::Value, section: &str, key: &str) {
     {
         tbl.remove(key);
     }
+}
+
+/// Read a bool from `[plugins.<plugin>].<key>`.
+fn toml_plugin_bool(val: &toml::Value, plugin: &str, key: &str) -> Option<bool> {
+    val.get("plugins")?.get(plugin)?.get(key)?.as_bool()
+}
+
+/// Read a string from `[plugins.<plugin>].<key>`.
+fn toml_plugin_str(val: &toml::Value, plugin: &str, key: &str) -> Option<String> {
+    val.get("plugins")?
+        .get(plugin)?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Write a bool into `[plugins.<plugin>].<key>`, creating sections as needed.
+fn toml_set_plugin_bool(root: &mut toml::Value, plugin: &str, key: &str, v: bool) {
+    let plugins = root
+        .as_table_mut()
+        .expect("toml root is a table")
+        .entry("plugins")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let section = plugins
+        .as_table_mut()
+        .expect("plugins is a table")
+        .entry(plugin.to_owned())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    section
+        .as_table_mut()
+        .expect("plugin section is a table")
+        .insert(key.to_owned(), toml::Value::Boolean(v));
 }
 
 async fn api_get_config(
