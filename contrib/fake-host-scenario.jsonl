@@ -1,0 +1,39 @@
+# fake-host scenario file — drives a Supply Drop process transport plugin
+# through a basic register → login → post → disconnect flow.
+#
+# Lines starting with # are comments. "sleep <n>" pauses for n seconds.
+# All other lines are HostMsg JSON or shorthands (send/kick/shutdown).
+#
+# Run with:
+#   contrib/fake-host --script contrib/fake-host-scenario.jsonl ./my-plugin --port 2323
+
+# A new user connects.
+open conn-1
+sleep 0.2
+
+# BBS sends a welcome prompt — we simulate the reply sequence.
+send conn-1 register alice
+sleep 0.2
+
+# BBS will ask for a password; we send it.
+send conn-1 hunter2
+sleep 0.2
+
+# Confirm password.
+send conn-1 hunter2
+sleep 0.2
+
+# Now logged in — post a message to the current room.
+send conn-1 E Hello from the test harness!
+sleep 0.2
+
+# Read new messages.
+send conn-1 N
+sleep 0.2
+
+# Disconnect cleanly.
+send conn-1 Q
+sleep 0.2
+
+# Tear everything down.
+shutdown

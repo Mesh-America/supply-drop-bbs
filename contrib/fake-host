@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""
+fake-host — Supply Drop process-transport test harness.
+
+Spawns your plugin exactly as Supply Drop would (stdin/stdout JSON IPC),
+then lets you drive it interactively or replay a scenario script.
+
+Usage
+-----
+Interactive:
+    contrib/fake-host ./my-plugin [plugin-args ...]
+
+Scripted (JSONL file, one HostMsg per line):
+    contrib/fake-host --script contrib/fake-host-scenario.jsonl ./my-plugin [args]
+
+Shorthands accepted in interactive mode and script files:
+
+    send <id> <text>    →  {"t":"send","id":"<id>","text":"<text>"}
+    kick <id>           →  {"t":"kick","id":"<id>"}
+    shutdown            →  {"t":"shutdown"}
+    sleep <seconds>     →  pause (script files only)
+    # comment           →  ignored (script files only)
+    <raw json>          →  sent verbatim
+
+Message directions (keep these straight):
+    Plugin → fake-host  (plugin stdout):  ready, open, recv, close
+    Fake-host → plugin  (plugin stdin):   send, kick, shutdown
+"""
+
+import argparse
+import asyncio
+import json
+import sys
+
+_GREEN  = "\033[32m"   # plugin → host
+_YELLOW = "\033[33m"   # host → plugin
+_GREY   = "\033[90m"
+_RESET  = "\033[0m"
+
+
+def _expand(raw: str) -> str:
+    """Expand a shorthand into full JSON, or return the string unchanged."""
+    parts = raw.split(None, 2)
+    if not parts:
+        return raw
+    cmd = parts[0].lower()
+    if cmd == "shutdown":
+        return '{"t":"shutdown"}'
+    if cmd == "kick" and len(parts) >= 2:
+        return json.dumps({"t": "kick", "id": parts[1]})
+    if cmd == "send" and len(parts) >= 3:
+        return json.dumps({"t": "send", "id": parts[1], "text": parts[2]})
+    return raw
+
+
+def _is_shutdown(line: str) -> bool:
+    try:
+        return json.loads(line).get("t") == "shutdown"
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+async def _read_plugin_output(proc: asyncio.subprocess.Process) -> None:
+    """Forward everything the plugin writes to stdout to our terminal."""
+    while True:
+        line = await proc.stdout.readline()
+        if not line:
+            break
+        text = line.decode("utf-8", errors="replace").rstrip()
+        print(f"{_GREEN}← plugin  {text}{_RESET}", flush=True)
+
+
+async def _send(proc: asyncio.subprocess.Process, raw: str) -> bool:
+    """Validate, print, and write one HostMsg line. Returns False on bad JSON."""
+    expanded = _expand(raw.strip())
+    try:
+        json.loads(expanded)
+    except json.JSONDecodeError as exc:
+        print(f"{_GREY}  [bad json: {exc}]{_RESET}", file=sys.stderr)
+        return False
+    print(f"{_YELLOW}→ host    {expanded}{_RESET}", flush=True)
+    proc.stdin.write((expanded + "\n").encode())
+    await proc.stdin.drain()
+    return True
+
+
+async def run_interactive(proc: asyncio.subprocess.Process) -> None:
+    loop = asyncio.get_event_loop()
+    reader_task = asyncio.create_task(_read_plugin_output(proc))
+
+    print(
+        f"{_GREY}[fake-host] interactive — shorthands: send <id> <text> | kick <id> | shutdown{_RESET}",
+        file=sys.stderr,
+    )
+
+    def _prompt() -> str | None:
+        try:
+            return input("> ")
+        except EOFError:
+            return None
+
+    while True:
+        raw = await loop.run_in_executor(None, _prompt)
+        if raw is None:
+            break
+        raw = raw.strip()
+        if not raw:
+            continue
+        ok = await _send(proc, raw)
+        if ok and _is_shutdown(_expand(raw)):
+            break
+
+    reader_task.cancel()
+    try:
+        await reader_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def run_script(proc: asyncio.subprocess.Process, path: str) -> None:
+    reader_task = asyncio.create_task(_read_plugin_output(proc))
+
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.lower().startswith("sleep "):
+                try:
+                    secs = float(line.split()[1])
+                    await asyncio.sleep(secs)
+                except (IndexError, ValueError):
+                    pass
+                continue
+            ok = await _send(proc, line)
+            if ok and _is_shutdown(_expand(line)):
+                break
+
+    # Give the plugin a moment to respond before we cancel the reader.
+    await asyncio.sleep(0.3)
+    reader_task.cancel()
+    try:
+        await reader_task
+    except asyncio.CancelledError:
+        pass
+
+
+async def main() -> None:
+    ap = argparse.ArgumentParser(
+        description="Supply Drop process-transport test harness",
+        epilog="Example: contrib/fake-host ./my-plugin --port 2323",
+    )
+    ap.add_argument(
+        "--script",
+        metavar="FILE",
+        help="JSONL scenario file to replay (omit for interactive mode)",
+    )
+    ap.add_argument(
+        "command",
+        nargs=argparse.REMAINDER,
+        help="Plugin executable and its arguments",
+    )
+    args = ap.parse_args()
+
+    if not args.command:
+        ap.error("specify a plugin command — e.g.  contrib/fake-host ./my-plugin --port 2323")
+
+    print(f"{_GREY}[fake-host] spawning: {' '.join(args.command)}{_RESET}", file=sys.stderr)
+
+    proc = await asyncio.create_subprocess_exec(
+        *args.command,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=sys.stderr,
+    )
+
+    # Wait for the ready message before doing anything else.
+    ready_line = await proc.stdout.readline()
+    if not ready_line:
+        print("[fake-host] plugin exited before sending ready — check stderr above", file=sys.stderr)
+        sys.exit(1)
+
+    ready_text = ready_line.decode().strip()
+    print(f"{_GREEN}← plugin  {ready_text}{_RESET}  {_GREY}(ready){_RESET}", flush=True)
+
+    try:
+        msg = json.loads(ready_text)
+        limit = msg.get("payload_limit")
+        if limit:
+            print(f"{_GREY}[fake-host] payload_limit={limit}{_RESET}", file=sys.stderr)
+    except json.JSONDecodeError:
+        print(f"{_GREY}[fake-host] warning: ready line is not valid JSON{_RESET}", file=sys.stderr)
+
+    if args.script:
+        await run_script(proc, args.script)
+    else:
+        await run_interactive(proc)
+
+    # Give the plugin up to 5 s to exit cleanly after shutdown.
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        print("[fake-host] plugin did not exit within 5 s — killing", file=sys.stderr)
+        proc.kill()
+
+    print(f"{_GREY}[fake-host] plugin exited with code {proc.returncode}{_RESET}", file=sys.stderr)
+
+
+asyncio.run(main())

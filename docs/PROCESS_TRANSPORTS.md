@@ -579,6 +579,84 @@ telnet localhost 2323   # drives open/recv/close; watch plugin stdout for send f
 Watch the plugin's stdout to see the `send` JSON frames Supply Drop would
 consume, and stderr for your own log output.
 
+### fake-host harness
+
+For fuller testing without a running BBS, use the harness in
+`contrib/fake-host`. It spawns your plugin, waits for `ready`, then lets
+you drive it interactively or replay a scenario file:
+
+```sh
+# Interactive — type HostMsg shorthands or raw JSON at the prompt.
+python3 contrib/fake-host ./my-plugin --port 2323
+
+# Scripted — replay the bundled example scenario.
+python3 contrib/fake-host --script contrib/fake-host-scenario.jsonl \
+        ./my-plugin --port 2323
+```
+
+**Shorthands** accepted in both modes:
+
+| Input | Sends |
+|-------|-------|
+| `send <id> <text>` | `{"t":"send","id":"<id>","text":"<text>"}` |
+| `kick <id>` | `{"t":"kick","id":"<id>"}` |
+| `shutdown` | `{"t":"shutdown"}` |
+| `sleep <n>` | pause *n* seconds (script files only) |
+| any JSON object | sent verbatim |
+
+Traffic is colour-coded: **green** for plugin → host, **yellow** for
+host → plugin, so you can see both sides at a glance.
+
+The scenario file (`contrib/fake-host-scenario.jsonl`) walks through
+register → login → post → read → disconnect → shutdown. Copy and edit it
+to build regression scenarios for your own transport.
+
+---
+
+## Transport author checklist
+
+Before shipping a process transport plugin, run through this list:
+
+**Protocol basics**
+- [ ] Plugin prints `{"t":"ready"}` (or `{"t":"ready","payload_limit":N}`)
+  before accepting any connections — not after the first client arrives
+- [ ] Connection IDs are unique for the lifetime of each connection;
+  an ID may be reused only after `close` has been sent for the old one
+- [ ] `{"t":"close","id":"..."}` is sent whenever the remote end drops,
+  whether the client initiated it or the plugin did
+
+**Host message handling**
+- [ ] `send` messages are handled at any time, not only in direct response
+  to a `recv` — unsolicited DMs, broadcasts, and validation notices arrive
+  between turns
+- [ ] `kick` closes the connection and removes it from your tracking map;
+  the BBS has already ended the session — do not send `close` after a kick
+- [ ] `shutdown` stops accepting new connections, sends `close` for any
+  still-open connections (optional but polite), then exits within 10 s
+
+**Framing**
+- [ ] Your transport adds the appropriate terminator to `send.text`
+  (Telnet: `\r\n`; Slack/HTTP: none — post the string as-is)
+- [ ] Inbound text has transport framing stripped before it goes into
+  `recv.line` (trailing `\r\n`, leading prompts, etc.)
+
+**Robustness**
+- [ ] A `send` frame that arrives for a connection your plugin already
+  closed is silently dropped, not logged as an error
+- [ ] All diagnostic output goes to **stderr** — stdout is reserved for
+  the IPC protocol
+- [ ] Plugin exits with code `0` after a clean `shutdown`; non-zero on
+  unexpected failure (Supply Drop logs the exit code)
+
+**Optional but recommended**
+- [ ] `payload_limit` declared in `ready` if your transport has a per-frame
+  MTU (LoRa, SMS, APRS — leave at `0` or omit for unlimited transports)
+- [ ] `hide_input` honoured, or explicitly noted as unsupported in your
+  README
+- [ ] `restart_on_crash = true` in the production config entry
+- [ ] Tested end-to-end with `contrib/fake-host` and at least one scenario
+  covering open → login → command → disconnect → shutdown
+
 ---
 
 ## Protocol changelog
