@@ -237,6 +237,22 @@ H BAN        — explain the BAN command
 Rooms are the public spaces of the BBS. Think of them like channels or
 bulletin boards — everyone who can access a room sees the same messages.
 
+### Built-in rooms
+
+Every Supply Drop BBS ships with five permanent rooms that cannot be deleted
+or reconfigured by the sysop:
+
+| Room | Who can access | Purpose |
+|------|---------------|---------|
+| **Lobby** | Everyone (Unvalidated and up) | General public space |
+| **Mail** | Users and up | Private one-on-one messages — see [section 10](#10-mail-private-messages) |
+| **Aides** | Aides and Sysops only | Moderator coordination |
+| **Sysop** | Sysops only | System operator space |
+| **System** | Sysops only (read-only for others) | System announcements |
+
+Sysops can create additional rooms and configure their minimum access level.
+Your room list (`K`) only shows rooms you have access to.
+
 ### List rooms
 
 ```
@@ -444,7 +460,12 @@ D 14
 ## 10. Mail (private messages)
 
 Mail is the BBS private-message system. Messages go directly to one recipient
-and are only visible to the sender and recipient.
+and are only visible to the sender and that recipient — no one else, including
+sysops and aides, can read your mail through the BBS interface.
+
+> **System notifications** — the BBS itself occasionally sends you mail from
+> the username `bbs` (for example, when your account is validated). These are
+> one-way notifications; you cannot reply to `bbs`.
 
 ### Go to Mail
 
@@ -632,8 +653,9 @@ or `H sysop` from within a session to see the current list.
 
 ### Viewing pending registrations
 
-New users start as **Unvalidated**. The BBS automatically sends you a direct
-mail message when someone registers, so you know to check.
+New users start as **Unvalidated**. When someone registers, the BBS
+automatically sends a direct mail message from `bbs` to every active sysop,
+so you know to check. The new user does **not** see this notification.
 
 To list all accounts waiting for approval:
 
@@ -734,7 +756,7 @@ supply-drop-bbs room create "Net Control" --description "Weekly net check-ins"
 .DR Ham Radio
 ```
 
-System rooms (Lobby, Mail, and the Aides room) cannot be deleted.
+The five built-in rooms (Lobby, Mail, Aides, Sysop, System) cannot be deleted.
 
 ### Web admin panel
 

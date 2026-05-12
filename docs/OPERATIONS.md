@@ -406,6 +406,58 @@ Or use the **Trigger backup** button in the web admin UI.
               backup-host:/srv/bbs-backups/$(hostname)/
 ```
 
+## Rooms and access control
+
+### Built-in rooms
+
+Supply Drop BBS ships with five permanent rooms that cannot be deleted.
+Three of them (**Mail**, **Aides**, **Sysop**) also have locked permission
+settings — their minimum access level and read-only flag cannot be changed,
+even by a sysop.
+
+| Room | ID | Min access | Read-only | Locked |
+|------|----|-----------|-----------|--------|
+| Lobby | 1 | Unvalidated | No | No |
+| Mail | 2 | User | No | **Yes** |
+| Aides | 3 | Aide | No | **Yes** |
+| Sysop | 4 | Sysop | No | **Yes** |
+| System | 5 | Sysop | Yes | No |
+
+**Locked** means the web admin edit form and the REST API will refuse any
+attempt to change the permission level or read-only setting for that room.
+The description field remains editable on all rooms.
+
+### Mail privacy
+
+Mail is strictly private. Every message stored in Mail has an explicit sender
+and recipient; the database query enforces that a user can only retrieve
+messages where they are the sender or the recipient. There is no admin view
+that bypasses this.
+
+**System notifications** (such as new-user registration alerts) are sent as
+mail from the reserved sender `bbs`. The new user is never the sender of their
+own registration notification, so they cannot see it in their own inbox.
+Only the addressed sysops receive it.
+
+### User-created rooms
+
+Rooms created with `.C <name>` (in-session) or `supply-drop-bbs room create`
+(CLI) start with:
+
+- **min permission level** — User (10)
+- **read-only** — false
+
+Sysops can change these through the web admin **Rooms** page or a future
+in-session command. Any min-level from Unvalidated (0) to Sysop (100) is
+valid.
+
+### Web admin — Rooms page
+
+The Rooms table shows all rooms. For **Mail**, **Aides**, and **Sysop** the
+edit form shows only the description field; the permission-level and read-only
+controls are hidden. Any API attempt to set those fields on those rooms returns
+`422 Unprocessable Entity`.
+
 ## Disaster recovery
 
 ### Corrupted database
