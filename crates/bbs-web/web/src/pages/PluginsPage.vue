@@ -261,7 +261,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
         </tbody>
       </table>
       <p class="muted small config-hint">
-        Connection settings are managed via <a href="/settings">settings</a> or
+        Connection settings are managed via <router-link to="/settings">settings</router-link> or
         <code>config.toml</code> directly. Enable/disable changes take effect after restart.
       </p>
     </section>
