@@ -183,6 +183,15 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_update_user".into()))
     }
 
+    /// Reset a user's password without requiring the old password.
+    ///
+    /// Sysop-only operation.  Returns `HostError::NotFound` when the username is
+    /// unknown and `HostError::NotSupported` in minimal implementations.
+    async fn admin_set_password(&self, username: &str, password: &str) -> Result<(), HostError> {
+        let _ = (username, password);
+        Err(HostError::NotSupported("admin_set_password".into()))
+    }
+
     /// List all rooms with message counts.
     async fn admin_list_rooms(&self) -> Result<Vec<AdminRoomSummary>, HostError> {
         Err(HostError::NotSupported("admin_list_rooms".into()))

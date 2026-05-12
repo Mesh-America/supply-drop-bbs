@@ -113,8 +113,40 @@ async function bulkValidateAll() {
 
 // ── Detail drawer ─────────────────────────────────────────────────────────────
 const drawerUser = ref<UserInfo | null>(null)
-function openDrawer(u: UserInfo) { drawerUser.value = u }
+function openDrawer(u: UserInfo) {
+  drawerUser.value = u
+  showPwReset.value = false
+  pwNew.value = ''
+  pwConfirm.value = ''
+  pwError.value = null
+}
 function closeDrawer() { drawerUser.value = null }
+
+// ── Password reset (drawer) ───────────────────────────────────────────────────
+const showPwReset = ref(false)
+const pwNew = ref('')
+const pwConfirm = ref('')
+const pwError = ref<string | null>(null)
+const resettingPw = ref(false)
+
+async function submitPasswordReset() {
+  pwError.value = null
+  if (pwNew.value.length < 6) { pwError.value = 'Password must be at least 6 characters'; return }
+  if (pwNew.value !== pwConfirm.value) { pwError.value = 'Passwords do not match'; return }
+  if (!drawerUser.value) return
+  resettingPw.value = true
+  try {
+    await api.patch(`/api/v1/users/${encodeURIComponent(drawerUser.value.username)}`, { password: pwNew.value })
+    toast.ok(`Password reset for ${drawerUser.value.username}`)
+    showPwReset.value = false
+    pwNew.value = ''
+    pwConfirm.value = ''
+  } catch (e: any) {
+    pwError.value = e?.message ?? 'password reset failed'
+  } finally {
+    resettingPw.value = false
+  }
+}
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
 onMounted(() => {
@@ -277,7 +309,27 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
               :disabled="acting"
               @click="unban(drawerUser.username); closeDrawer()"
             >unban</button>
+            <button
+              v-if="auth.isSysop"
+              class="secondary"
+              @click="showPwReset = !showPwReset; pwError = null"
+            >{{ showPwReset ? 'cancel' : 'reset password' }}</button>
           </div>
+
+          <form v-if="auth.isSysop && showPwReset" @submit.prevent="submitPasswordReset" class="pw-reset-form">
+            <label>
+              new password
+              <input v-model="pwNew" type="password" autocomplete="new-password" placeholder="min 6 chars" required />
+            </label>
+            <label>
+              confirm password
+              <input v-model="pwConfirm" type="password" autocomplete="new-password" placeholder="repeat password" required />
+            </label>
+            <p v-if="pwError" class="error pw-error">{{ pwError }}</p>
+            <button type="submit" :disabled="resettingPw">
+              {{ resettingPw ? 'resetting…' : 'set password' }}
+            </button>
+          </form>
         </aside>
       </div>
     </Teleport>
@@ -331,4 +383,16 @@ dt { color: var(--muted); font-size: 0.82em; text-transform: uppercase; letter-s
 dd { margin: 0; }
 .drawer-links { display: flex; flex-direction: column; gap: 0.4rem; font-size: 0.9em; }
 .drawer-actions { display: flex; gap: 0.5rem; flex-wrap: wrap; padding-top: 0.5rem; border-top: 1px solid var(--border); }
+
+.pw-reset-form {
+  display: flex; flex-direction: column; gap: 0.5rem;
+  padding: 0.8rem; background: var(--row-alt);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.pw-reset-form label {
+  display: flex; flex-direction: column; gap: 0.2rem;
+  font-size: 0.82em; color: var(--muted);
+}
+.pw-reset-form input { font-size: 0.9em; }
+.pw-error { font-size: 0.85em; margin: 0; }
 </style>

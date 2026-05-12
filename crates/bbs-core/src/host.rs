@@ -560,6 +560,24 @@ impl Host for BbsHost {
         Ok(())
     }
 
+    async fn admin_set_password(&self, username: &str, password: &str) -> Result<(), HostError> {
+        let uname = Username::new(username)
+            .map_err(|_| HostError::NotFound(format!("user {username:?}")))?;
+
+        let user = UserStore::get_by_username(&self.db, &uname)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+            .ok_or_else(|| HostError::NotFound(format!("user {username:?}")))?;
+
+        self.db
+            .credentials()
+            .set_password(user.id, password, Timestamp::now())
+            .await
+            .map_err(|e| HostError::Storage(format!("set password: {e}")))?;
+
+        Ok(())
+    }
+
     async fn admin_list_rooms(&self) -> Result<Vec<AdminRoomSummary>, HostError> {
         self.db
             .admin_list_rooms()

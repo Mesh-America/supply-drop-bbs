@@ -150,6 +150,13 @@ enum UserAction {
         /// BBS username to demote.
         username: String,
     },
+    /// Reset a user's password without requiring the old password.
+    ///
+    /// Prompts for the new password interactively (input is hidden).
+    SetPassword {
+        /// BBS username whose password will be reset.
+        username: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1050,11 +1057,42 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
             }
         }
 
+        UserAction::SetPassword { username } => {
+            let password = dialoguer::Password::new()
+                .with_prompt(format!("New password for {username}"))
+                .with_confirmation("Confirm password", "passwords do not match")
+                .interact()
+                .unwrap_or_else(|e| {
+                    eprintln!("error reading password: {e}");
+                    std::process::exit(1);
+                });
+
+            if password.len() < 6 {
+                eprintln!("error: password must be at least 6 characters");
+                std::process::exit(1);
+            }
+
+            match host.admin_set_password(&username, &password).await {
+                Ok(()) => println!("password reset for {username}"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         action => {
             let (username, new_level, label) = match action {
                 UserAction::Promote { username } => (username, 100u8, "sysop"),
                 UserAction::Demote { username } => (username, 10u8, "user"),
-                UserAction::Create { .. } | UserAction::List { .. } | UserAction::Verify { .. } => {
+                UserAction::Create { .. }
+                | UserAction::List { .. }
+                | UserAction::Verify { .. }
+                | UserAction::SetPassword { .. } => {
                     unreachable!()
                 }
             };

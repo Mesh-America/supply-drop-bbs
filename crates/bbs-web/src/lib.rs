@@ -996,6 +996,7 @@ async fn api_list_users(
 struct UpdateUserBody {
     status: Option<u8>,
     permission_level: Option<u8>,
+    password: Option<String>,
 }
 
 async fn api_update_user(
@@ -1004,16 +1005,16 @@ async fn api_update_user(
     Path(username): Path<String>,
     Json(body): Json<UpdateUserBody>,
 ) -> Response {
-    if body.status.is_none() && body.permission_level.is_none() {
+    if body.status.is_none() && body.permission_level.is_none() && body.password.is_none() {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error(
-                "at least one of status or permission_level is required",
+                "at least one of status, permission_level, or password is required",
             )),
         )
             .into_response();
     }
-    // Only Sysop (level 100) may change permission levels.
+    // Only Sysop (level 100) may change permission levels or reset passwords.
     if body.permission_level.is_some() && caller.permission_level < 100 {
         return (
             StatusCode::FORBIDDEN,
@@ -1021,45 +1022,84 @@ async fn api_update_user(
         )
             .into_response();
     }
-    match state
-        .host
-        .admin_update_user(&username, body.status, body.permission_level)
-        .await
-    {
-        Ok(()) => {
-            let actor_str = format!("web:{}", caller.username);
-            if let Some(s) = body.status {
-                let action = if s == 1 { "ban" } else { "unban" };
-                if let Err(e) = state
-                    .host
-                    .admin_write_audit(&actor_str, action, Some(username.as_str()), None)
-                    .await
-                {
-                    warn!("audit write failed: {e}");
-                }
-            }
-            if let Some(lvl) = body.permission_level {
-                let detail = format!("level -> {lvl}");
-                if let Err(e) = state
-                    .host
-                    .admin_write_audit(
-                        &actor_str,
-                        "set_permission",
-                        Some(username.as_str()),
-                        Some(&detail),
-                    )
-                    .await
-                {
-                    warn!("audit write failed: {e}");
-                }
-            }
-            Json(serde_json::json!({"ok": true})).into_response()
-        }
-        Err(HostError::NotFound(_)) => {
-            (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response()
-        }
-        Err(e) => server_error(&e.to_string()),
+    if body.password.is_some() && caller.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop required to reset a password")),
+        )
+            .into_response();
     }
+    if let Some(ref pw) = body.password {
+        if pw.len() < 6 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("password must be at least 6 characters")),
+            )
+                .into_response();
+        }
+    }
+
+    let actor_str = format!("web:{}", caller.username);
+
+    if body.status.is_some() || body.permission_level.is_some() {
+        match state
+            .host
+            .admin_update_user(&username, body.status, body.permission_level)
+            .await
+        {
+            Ok(()) => {
+                if let Some(s) = body.status {
+                    let action = if s == 1 { "ban" } else { "unban" };
+                    if let Err(e) = state
+                        .host
+                        .admin_write_audit(&actor_str, action, Some(username.as_str()), None)
+                        .await
+                    {
+                        warn!("audit write failed: {e}");
+                    }
+                }
+                if let Some(lvl) = body.permission_level {
+                    let detail = format!("level -> {lvl}");
+                    if let Err(e) = state
+                        .host
+                        .admin_write_audit(
+                            &actor_str,
+                            "set_permission",
+                            Some(username.as_str()),
+                            Some(&detail),
+                        )
+                        .await
+                    {
+                        warn!("audit write failed: {e}");
+                    }
+                }
+            }
+            Err(HostError::NotFound(_)) => {
+                return (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response();
+            }
+            Err(e) => return server_error(&e.to_string()),
+        }
+    }
+
+    if let Some(ref pw) = body.password {
+        match state.host.admin_set_password(&username, pw).await {
+            Ok(()) => {
+                if let Err(e) = state
+                    .host
+                    .admin_write_audit(&actor_str, "reset_password", Some(username.as_str()), None)
+                    .await
+                {
+                    warn!("audit write failed: {e}");
+                }
+            }
+            Err(HostError::NotFound(_)) => {
+                return (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response();
+            }
+            Err(e) => return server_error(&e.to_string()),
+        }
+    }
+
+    Json(serde_json::json!({"ok": true})).into_response()
 }
 
 // ── Rooms ─────────────────────────────────────────────────────────────────────
