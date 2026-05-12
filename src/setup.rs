@@ -50,6 +50,8 @@ struct Existing {
     // GPS
     latitude: Option<f64>,
     longitude: Option<f64>,
+    // Process plugins — preserved verbatim through reconfigure
+    process_plugins_toml: Option<String>,
 }
 
 fn load_existing(out_path: &Path) -> Existing {
@@ -57,6 +59,10 @@ fn load_existing(out_path: &Path) -> Existing {
     let toml_val: toml::Value = toml_raw
         .parse()
         .unwrap_or(toml::Value::Table(Default::default()));
+
+    // Preserve [[plugins.process]] entries verbatim so reconfigure doesn't
+    // wipe process plugins that were added after initial setup.
+    let process_plugins_toml = extract_process_plugins_block(&toml_raw);
 
     let bbs = toml_val.get("bbs");
     let mesh = toml_val.get("plugins").and_then(|p| p.get("mesh"));
@@ -169,6 +175,41 @@ fn load_existing(out_path: &Path) -> Existing {
         hat_idx: match_hat_preset(&yaml),
         latitude,
         longitude,
+        process_plugins_toml,
+    }
+}
+
+/// Extract the raw `[[plugins.process]]` blocks from a TOML string.
+/// Returns them as a block of text to be appended to the regenerated config,
+/// or `None` if there are no process plugins.
+fn extract_process_plugins_block(raw: &str) -> Option<String> {
+    let mut in_block = false;
+    let mut lines: Vec<&str> = Vec::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[[plugins.process]]" {
+            in_block = true;
+            lines.push(line);
+        } else if in_block {
+            // Any section header that isn't another [[plugins.process]] ends the block.
+            if trimmed.starts_with('[') {
+                in_block = false;
+            } else {
+                lines.push(line);
+            }
+        }
+    }
+
+    // Remove trailing blank lines.
+    while lines.last().map(|l| l.trim().is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
+
+    if lines.is_empty() {
+        None
+    } else {
+        Some(lines.join("\n"))
     }
 }
 
@@ -572,6 +613,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         web_backup_dir: web_backup_dir.as_deref(),
         latitude: gps_lat,
         longitude: gps_lon,
+        process_plugins_toml: ex.process_plugins_toml.as_deref(),
     });
 
     if let Some(parent) = out_path.parent() {
@@ -1337,6 +1379,8 @@ struct TomlParams<'a> {
     // GPS
     latitude: Option<f64>,
     longitude: Option<f64>,
+    // Process plugins — preserved verbatim from the previous config
+    process_plugins_toml: Option<&'a str>,
 }
 
 fn build_toml(p: &TomlParams<'_>) -> String {
@@ -1450,6 +1494,12 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 writeln!(s, "backup_dir = {}", toml_str(dir)).unwrap();
             }
         }
+    }
+
+    // [[plugins.process]] — preserved verbatim from previous config
+    if let Some(block) = p.process_plugins_toml {
+        writeln!(s).unwrap();
+        writeln!(s, "{block}").unwrap();
     }
 
     s
