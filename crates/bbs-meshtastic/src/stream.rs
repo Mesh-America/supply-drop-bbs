@@ -152,6 +152,11 @@ async fn attempt_serial_session(
         }
     };
     info!(port = %config.port, baud = config.baud_rate, "meshtastic/serial: opened");
+    // CP210x and CH34x chips assert DTR on port open which can trigger a
+    // brief Heltec/T-Beam reset. Give the firmware time to boot before
+    // sending WantConfig, otherwise the handshake packet is lost and the
+    // radio sits silent until reconnect.
+    sleep(Duration::from_secs(2)).await;
     let (mut reader, mut writer) = tokio::io::split(stream);
     run_session(&mut reader, &mut writer, cmd_rx, event_tx).await
 }
