@@ -385,10 +385,11 @@ usermod -aG dialout "$SERVICE_USER"
 
 # ── Directories ───────────────────────────────────────────────────────────────
 
-mkdir -p "$CONFIG_DIR" "$DATA_DIR"
+mkdir -p "$CONFIG_DIR" "$CONFIG_DIR/plugins.d" "$DATA_DIR"
 chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
 # Config dir stays root-owned but readable by the service user.
-chmod 755 "$CONFIG_DIR"
+# plugins.d is writable by root only; the BBS reads it as the service user.
+chmod 755 "$CONFIG_DIR" "$CONFIG_DIR/plugins.d"
 
 success "Directories created"
 

@@ -421,7 +421,17 @@ async fn cmd_run(cli: &Cli) {
                 .find(|p| p.exists())
                 .and_then(|p| p.canonicalize().ok())
             });
-        ProcessPluginManager::new(cfg.plugins.process.clone(), Arc::clone(&host), config_path).await
+        let plugins_d = config_path
+            .as_deref()
+            .map(config::plugins_d_dir)
+            .filter(|d| d.exists());
+        ProcessPluginManager::new(
+            cfg.plugins.process.clone(),
+            Arc::clone(&host),
+            config_path,
+            plugins_d,
+        )
+        .await
     };
 
     #[cfg(feature = "admin-web")]
@@ -688,10 +698,11 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
     }
 }
 
-/// Manage process transport plugins by editing config.toml directly.
+/// Manage process transport plugins.
 ///
-/// Changes take effect on the next BBS restart. Use the web admin UI
-/// for live runtime management (start/stop/restart without restarting).
+/// New plugins are written to `plugins.d/<name>.toml` alongside `config.toml`.
+/// Legacy entries already in `config.toml` continue to be managed there.
+/// Changes take effect on the next BBS restart (or immediately via the web UI).
 #[cfg(feature = "transport-process")]
 fn cmd_plugin(config_path: Option<&std::path::Path>, action: PluginAction) {
     use bbs_plugin_api::ProcessPluginConfig;
@@ -704,52 +715,45 @@ fn cmd_plugin(config_path: Option<&std::path::Path>, action: PluginAction) {
         }
     };
 
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error reading config: {e}");
-            std::process::exit(1);
-        }
-    };
+    let plugins_d = config::plugins_d_dir(&path);
 
-    let mut doc: toml_edit::DocumentMut = match raw.parse() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error parsing config: {e}");
-            std::process::exit(1);
-        }
-    };
-
-    // Read current plugins list.
-    let mut plugins: Vec<ProcessPluginConfig> = {
+    // Load plugins from config.toml.
+    let mut toml_plugins: Vec<ProcessPluginConfig> = {
         let cfg = config::load(config_path).unwrap_or_default();
-        #[cfg(feature = "transport-process")]
-        {
-            cfg.plugins.process
-        }
-        #[cfg(not(feature = "transport-process"))]
-        {
-            vec![]
-        }
+        cfg.plugins.process
     };
+
+    // Load plugins from plugins.d (plugins.d takes precedence on name conflicts).
+    let mut d_plugins: Vec<ProcessPluginConfig> = load_plugins_d_configs(&plugins_d);
+
+    // Merged view (plugins.d wins): remove config.toml entries shadowed by plugins.d.
+    let d_names: std::collections::HashSet<&str> =
+        d_plugins.iter().map(|p| p.name.as_str()).collect();
+    toml_plugins.retain(|p| !d_names.contains(p.name.as_str()));
+
+    // Combined list for listing / existence checks.
+    let all_plugins: Vec<&ProcessPluginConfig> =
+        toml_plugins.iter().chain(d_plugins.iter()).collect();
 
     match action {
         PluginAction::List => {
-            if plugins.is_empty() {
+            if all_plugins.is_empty() {
                 println!("No process plugins configured.");
                 return;
             }
-            println!("{:<20} {:<12} COMMAND", "NAME", "ENABLED");
-            for p in &plugins {
+            println!("{:<20} {:<12} {:<10} COMMAND", "NAME", "ENABLED", "SOURCE");
+            for p in &all_plugins {
+                let in_d = d_names.contains(p.name.as_str());
                 let args = if p.args.is_empty() {
                     String::new()
                 } else {
                     format!(" {}", p.args.join(" "))
                 };
                 println!(
-                    "{:<20} {:<12} {}{}",
+                    "{:<20} {:<12} {:<10} {}{}",
                     p.name,
                     if p.enabled { "yes" } else { "no" },
+                    if in_d { "plugins.d" } else { "config.toml" },
                     p.command,
                     args
                 );
@@ -764,63 +768,175 @@ fn cmd_plugin(config_path: Option<&std::path::Path>, action: PluginAction) {
             no_restart,
             restart_delay,
         } => {
-            if plugins.iter().any(|p| p.name == name) {
+            if all_plugins.iter().any(|p| p.name == name) {
                 println!("plugin '{name}' is already configured — no changes made.");
                 return;
             }
-            plugins.push(ProcessPluginConfig {
+            let cfg = ProcessPluginConfig {
                 name: name.clone(),
                 command,
                 args,
                 enabled: !disabled,
                 restart_on_crash: !no_restart,
                 restart_delay_secs: restart_delay,
-            });
-            write_plugins(&mut doc, &plugins, &path);
-            println!("Added plugin '{name}'. Restart the BBS to start it (or use the web UI).");
+            };
+            // Always write new plugins to plugins.d.
+            if let Err(e) = std::fs::create_dir_all(&plugins_d) {
+                eprintln!("error: cannot create plugins.d directory: {e}");
+                std::process::exit(1);
+            }
+            write_plugin_file_sync(&plugins_d, &cfg);
+            println!(
+                "Added plugin '{name}' to {}. Restart the BBS to start it (or use the web UI).",
+                plugins_d.display()
+            );
         }
 
         PluginAction::Remove { name } => {
-            let before = plugins.len();
-            plugins.retain(|p| p.name != name);
-            if plugins.len() == before {
+            let in_d = d_names.contains(name.as_str());
+            let in_toml = toml_plugins.iter().any(|p| p.name == name);
+            if !in_d && !in_toml {
                 eprintln!("error: plugin '{name}' not found");
                 std::process::exit(1);
             }
-            write_plugins(&mut doc, &plugins, &path);
+            if in_d {
+                let file = plugins_d.join(format!("{name}.toml"));
+                if let Err(e) = std::fs::remove_file(&file) {
+                    eprintln!("error: cannot remove {}: {e}", file.display());
+                    std::process::exit(1);
+                }
+            }
+            if in_toml {
+                toml_plugins.retain(|p| p.name != name);
+                let raw = std::fs::read_to_string(&path).unwrap_or_default();
+                let mut doc: toml_edit::DocumentMut = raw.parse().unwrap_or_default();
+                write_plugins(&mut doc, &toml_plugins, &path);
+            }
             println!("Removed plugin '{name}'.");
         }
 
         PluginAction::Enable { name } => {
-            let p = plugins.iter_mut().find(|p| p.name == name);
-            match p {
-                Some(p) => {
-                    p.enabled = true;
-                    write_plugins(&mut doc, &plugins, &path);
-                    println!("Enabled '{name}'.");
-                }
-                None => {
-                    eprintln!("error: plugin '{name}' not found");
-                    std::process::exit(1);
-                }
-            }
+            update_plugin_enabled(
+                &name,
+                true,
+                &mut toml_plugins,
+                &mut d_plugins,
+                &path,
+                &plugins_d,
+            );
         }
 
         PluginAction::Disable { name } => {
-            let p = plugins.iter_mut().find(|p| p.name == name);
-            match p {
-                Some(p) => {
-                    p.enabled = false;
-                    write_plugins(&mut doc, &plugins, &path);
-                    println!("Disabled '{name}'.");
-                }
-                None => {
-                    eprintln!("error: plugin '{name}' not found");
-                    std::process::exit(1);
-                }
+            update_plugin_enabled(
+                &name,
+                false,
+                &mut toml_plugins,
+                &mut d_plugins,
+                &path,
+                &plugins_d,
+            );
+        }
+    }
+}
+
+/// Load `[[plugins.process]]` entries from all `.toml` files in `dir`.
+#[cfg(feature = "transport-process")]
+fn load_plugins_d_configs(dir: &std::path::Path) -> Vec<bbs_plugin_api::ProcessPluginConfig> {
+    use bbs_plugin_api::ProcessPluginConfig;
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "toml").unwrap_or(false))
+        .collect();
+    paths.sort();
+
+    #[derive(serde::Deserialize)]
+    struct PluginFile {
+        plugins: Option<PluginsSection>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PluginsSection {
+        process: Option<Vec<ProcessPluginConfig>>,
+    }
+
+    let mut out = Vec::new();
+    for path in &paths {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("warning: cannot read {}: {e}", path.display());
+                continue;
+            }
+        };
+        if let Ok(f) = toml::from_str::<PluginFile>(&raw) {
+            if let Some(plugins) = f.plugins.and_then(|p| p.process) {
+                out.extend(plugins);
             }
         }
     }
+    out
+}
+
+/// Write a single plugin config to `plugins.d/<name>.toml` (sync version for CLI).
+#[cfg(feature = "transport-process")]
+fn write_plugin_file_sync(dir: &std::path::Path, cfg: &bbs_plugin_api::ProcessPluginConfig) {
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        plugins: OutPlugins<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct OutPlugins<'a> {
+        process: &'a [bbs_plugin_api::ProcessPluginConfig],
+    }
+    let content = match toml::to_string_pretty(&Out {
+        plugins: OutPlugins {
+            process: std::slice::from_ref(cfg),
+        },
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: cannot serialise plugin config: {e}");
+            std::process::exit(1);
+        }
+    };
+    let path = dir.join(format!("{}.toml", cfg.name));
+    if let Err(e) = std::fs::write(&path, content) {
+        eprintln!("error: cannot write {}: {e}", path.display());
+        std::process::exit(1);
+    }
+}
+
+/// Enable or disable a plugin, writing to the appropriate file.
+#[cfg(feature = "transport-process")]
+fn update_plugin_enabled(
+    name: &str,
+    enabled: bool,
+    toml_plugins: &mut [bbs_plugin_api::ProcessPluginConfig],
+    d_plugins: &mut [bbs_plugin_api::ProcessPluginConfig],
+    config_path: &std::path::Path,
+    plugins_d: &std::path::Path,
+) {
+    let verb = if enabled { "Enabled" } else { "Disabled" };
+    if let Some(p) = d_plugins.iter_mut().find(|p| p.name == name) {
+        p.enabled = enabled;
+        write_plugin_file_sync(plugins_d, p);
+        println!("{verb} '{name}'.");
+        return;
+    }
+    if let Some(p) = toml_plugins.iter_mut().find(|p| p.name == name) {
+        p.enabled = enabled;
+        let raw = std::fs::read_to_string(config_path).unwrap_or_default();
+        let mut doc: toml_edit::DocumentMut = raw.parse().unwrap_or_default();
+        write_plugins(&mut doc, toml_plugins, config_path);
+        println!("{verb} '{name}'.");
+        return;
+    }
+    eprintln!("error: plugin '{name}' not found");
+    std::process::exit(1);
 }
 
 #[cfg(feature = "transport-process")]

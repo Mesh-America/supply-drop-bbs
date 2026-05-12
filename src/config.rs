@@ -524,6 +524,20 @@ pub struct PluginsConfig {
     pub process: Vec<bbs_plugin_api::ProcessPluginConfig>,
 }
 
+// ── plugins.d ─────────────────────────────────────────────────────────────────
+
+/// Returns the `plugins.d` drop-in directory for the given config file.
+///
+/// Plugin installers drop `<name>.toml` files here instead of editing
+/// `config.toml` directly. Supply Drop merges them at startup; the files
+/// survive BBS upgrades and reconfiguration.
+pub fn plugins_d_dir(config_path: &std::path::Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("plugins.d")
+}
+
 // ── File resolution ───────────────────────────────────────────────────────────
 
 /// Locate the config file to use.

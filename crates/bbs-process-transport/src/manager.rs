@@ -26,11 +26,82 @@ const LOG_TAIL: usize = 50;
 
 struct ManagedPlugin {
     config: ProcessPluginConfig,
+    /// True when this plugin was loaded from `plugins.d/<name>.toml`.
+    /// False means it lives in the `[[plugins.process]]` section of config.toml.
+    from_plugins_d: bool,
     state: PluginState,
     restart_count: u32,
     log_buffer: Arc<std::sync::Mutex<VecDeque<String>>>,
     /// Shutdown sender for the running transport (None when stopped/disabled).
     transport: Option<ProcessTransport>,
+}
+
+// ── plugins.d helpers ─────────────────────────────────────────────────────────
+
+/// Parse all `[[plugins.process]]` entries from a single drop-in file.
+fn parse_plugin_file(raw: &str) -> Vec<ProcessPluginConfig> {
+    #[derive(serde::Deserialize)]
+    struct PluginFile {
+        plugins: Option<PluginsSection>,
+    }
+    #[derive(serde::Deserialize)]
+    struct PluginsSection {
+        process: Option<Vec<ProcessPluginConfig>>,
+    }
+    toml::from_str::<PluginFile>(raw)
+        .ok()
+        .and_then(|f| f.plugins)
+        .and_then(|p| p.process)
+        .unwrap_or_default()
+}
+
+/// Load all plugins from `plugins.d/*.toml`, sorted by file name.
+fn load_plugins_d(dir: &std::path::Path) -> Vec<ProcessPluginConfig> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
+    let mut paths: Vec<_> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|e| e == "toml").unwrap_or(false))
+        .collect();
+    paths.sort();
+
+    let mut out = Vec::new();
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => out.extend(parse_plugin_file(&raw)),
+            Err(e) => warn!(path = %path.display(), "plugins.d: cannot read file: {e}"),
+        }
+    }
+    out
+}
+
+/// Write a single plugin's config to `plugins.d/<name>.toml`.
+async fn write_plugin_file(dir: &std::path::Path, cfg: &ProcessPluginConfig) {
+    #[derive(serde::Serialize)]
+    struct Out<'a> {
+        plugins: OutPlugins<'a>,
+    }
+    #[derive(serde::Serialize)]
+    struct OutPlugins<'a> {
+        process: &'a [ProcessPluginConfig],
+    }
+    let content = match toml::to_string_pretty(&Out {
+        plugins: OutPlugins {
+            process: std::slice::from_ref(cfg),
+        },
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(name = %cfg.name, "plugins.d: cannot serialise plugin config: {e}");
+            return;
+        }
+    };
+    let path = dir.join(format!("{}.toml", cfg.name));
+    if let Err(e) = tokio::fs::write(&path, content).await {
+        warn!(path = %path.display(), "plugins.d: cannot write plugin file: {e}");
+    }
 }
 
 // ── ProcessPluginManager ──────────────────────────────────────────────────────
@@ -46,33 +117,55 @@ pub struct ProcessPluginManager {
     /// given that `new()` returns `Arc<Self>`).
     plugins: Arc<Mutex<HashMap<String, ManagedPlugin>>>,
     host: Arc<dyn Host>,
-    /// Path to `config.toml` for persisting add/remove/enable changes.
+    /// Path to `config.toml` for persisting legacy (non-plugins.d) entries.
     config_path: Option<PathBuf>,
+    /// Path to the `plugins.d/` drop-in directory.
+    plugins_d: Option<PathBuf>,
 }
 
 impl ProcessPluginManager {
-    /// Create a manager from an initial list of configured plugins.
+    /// Create a manager from an initial list of configured plugins and an
+    /// optional `plugins.d` drop-in directory.
     ///
+    /// `configs` comes from `[[plugins.process]]` blocks in `config.toml`.
+    /// Any `.toml` files found in `plugins_d` are merged in as well, with
+    /// plugins.d entries taking precedence on name collisions.
     /// Enabled plugins are started immediately.
     pub async fn new(
         configs: Vec<ProcessPluginConfig>,
         host: Arc<dyn Host>,
         config_path: Option<PathBuf>,
+        plugins_d: Option<PathBuf>,
     ) -> Arc<Self> {
         let mgr = Arc::new(Self {
             plugins: Arc::new(Mutex::new(HashMap::new())),
             host,
             config_path,
+            plugins_d: plugins_d.clone(),
         });
 
+        // Load config.toml plugins first (lower precedence).
         for cfg in configs {
-            let _ = mgr.init_plugin(cfg).await;
+            let _ = mgr.init_plugin(cfg, false).await;
+        }
+
+        // Load plugins.d — overrides config.toml on name collision.
+        if let Some(ref dir) = plugins_d {
+            for cfg in load_plugins_d(dir) {
+                // Remove any config.toml entry with the same name.
+                mgr.plugins.lock().await.remove(&cfg.name);
+                let _ = mgr.init_plugin(cfg, true).await;
+            }
         }
 
         mgr
     }
 
-    async fn init_plugin(&self, config: ProcessPluginConfig) -> Result<(), RegistryError> {
+    async fn init_plugin(
+        &self,
+        config: ProcessPluginConfig,
+        from_plugins_d: bool,
+    ) -> Result<(), RegistryError> {
         let name = config.name.clone();
         let enabled = config.enabled;
 
@@ -100,6 +193,7 @@ impl ProcessPluginManager {
 
         let managed = ManagedPlugin {
             config,
+            from_plugins_d,
             state,
             restart_count: 0,
             log_buffer,
@@ -181,61 +275,63 @@ impl ProcessPluginManager {
         }
     }
 
-    /// Persist the current plugin list to config.toml using toml_edit.
+    /// Persist all in-memory plugin state back to disk.
+    ///
+    /// - Plugins from `config.toml` are written back to that file's
+    ///   `[[plugins.process]]` section.
+    /// - Plugins from `plugins.d` are written to their individual
+    ///   `plugins.d/<name>.toml` files.
     async fn persist_config(&self, plugins: &HashMap<String, ManagedPlugin>) {
-        let Some(path) = &self.config_path else {
-            return;
-        };
-
-        let raw = match tokio::fs::read_to_string(path).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("plugin manager: cannot read config for update: {e}");
-                return;
-            }
-        };
-
-        let mut doc: toml_edit::DocumentMut = match raw.parse() {
-            Ok(d) => d,
-            Err(e) => {
-                warn!("plugin manager: cannot parse config for update: {e}");
-                return;
-            }
-        };
-
-        // Rebuild the [[plugins.process]] array from current state.
-        let arr = toml_edit::Array::default();
-        // toml_edit uses ArrayOfTables for [[...]] blocks.
-        let mut aot = toml_edit::ArrayOfTables::new();
-        for m in plugins.values() {
-            let mut tbl = toml_edit::Table::new();
-            tbl.insert("name", toml_edit::value(&m.config.name));
-            tbl.insert("command", toml_edit::value(&m.config.command));
-            if !m.config.args.is_empty() {
-                let mut args_arr = toml_edit::Array::default();
-                for a in &m.config.args {
-                    args_arr.push(a.as_str());
+        // ── config.toml plugins ───────────────────────────────────────────────
+        if let Some(path) = &self.config_path {
+            let raw = match tokio::fs::read_to_string(path).await {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("plugin manager: cannot read config for update: {e}");
+                    return;
                 }
-                tbl.insert("args", toml_edit::value(args_arr));
+            };
+            let mut doc: toml_edit::DocumentMut = match raw.parse() {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!("plugin manager: cannot parse config for update: {e}");
+                    return;
+                }
+            };
+            let mut aot = toml_edit::ArrayOfTables::new();
+            for m in plugins.values().filter(|m| !m.from_plugins_d) {
+                let mut tbl = toml_edit::Table::new();
+                tbl.insert("name", toml_edit::value(&m.config.name));
+                tbl.insert("command", toml_edit::value(&m.config.command));
+                if !m.config.args.is_empty() {
+                    let mut args_arr = toml_edit::Array::default();
+                    for a in &m.config.args {
+                        args_arr.push(a.as_str());
+                    }
+                    tbl.insert("args", toml_edit::value(args_arr));
+                }
+                tbl.insert("enabled", toml_edit::value(m.config.enabled));
+                tbl.insert(
+                    "restart_on_crash",
+                    toml_edit::value(m.config.restart_on_crash),
+                );
+                tbl.insert(
+                    "restart_delay_secs",
+                    toml_edit::value(m.config.restart_delay_secs as i64),
+                );
+                aot.push(tbl);
             }
-            tbl.insert("enabled", toml_edit::value(m.config.enabled));
-            tbl.insert(
-                "restart_on_crash",
-                toml_edit::value(m.config.restart_on_crash),
-            );
-            tbl.insert(
-                "restart_delay_secs",
-                toml_edit::value(m.config.restart_delay_secs as i64),
-            );
-            aot.push(tbl);
+            doc["plugins"]["process"] = toml_edit::Item::ArrayOfTables(aot);
+            if let Err(e) = tokio::fs::write(path, doc.to_string()).await {
+                warn!("plugin manager: failed to write config: {e}");
+            }
         }
-        let _ = arr; // unused
 
-        // Set or clear [[plugins.process]].
-        doc["plugins"]["process"] = toml_edit::Item::ArrayOfTables(aot);
-
-        if let Err(e) = tokio::fs::write(path, doc.to_string()).await {
-            warn!("plugin manager: failed to write config: {e}");
+        // ── plugins.d plugins ─────────────────────────────────────────────────
+        if let Some(ref dir) = self.plugins_d {
+            for m in plugins.values().filter(|m| m.from_plugins_d) {
+                write_plugin_file(dir, &m.config).await;
+            }
         }
     }
 }
@@ -258,20 +354,35 @@ impl PluginRegistryApi for ProcessPluginManager {
                 return Err(RegistryError::AlreadyExists(name));
             }
         }
-        self.init_plugin(config).await?;
+        // New plugins always go to plugins.d when available.
+        let to_plugins_d = self.plugins_d.is_some();
+        self.init_plugin(config, to_plugins_d).await?;
         let plugins = self.plugins.lock().await;
         self.persist_config(&plugins).await;
         Ok(())
     }
 
     async fn remove_plugin(&self, name: &str) -> Result<(), RegistryError> {
-        let mut plugins = self.plugins.lock().await;
-        let m = plugins
-            .remove(name)
-            .ok_or_else(|| RegistryError::NotFound(name.to_owned()))?;
-        if let Some(t) = m.transport {
+        let (from_plugins_d, transport) = {
+            let mut plugins = self.plugins.lock().await;
+            let m = plugins
+                .remove(name)
+                .ok_or_else(|| RegistryError::NotFound(name.to_owned()))?;
+            (m.from_plugins_d, m.transport)
+        };
+        if let Some(t) = transport {
             let _ = t.stop().await;
         }
+        // Delete the drop-in file when removing a plugins.d plugin.
+        if from_plugins_d {
+            if let Some(ref dir) = self.plugins_d {
+                let file = dir.join(format!("{name}.toml"));
+                if let Err(e) = tokio::fs::remove_file(&file).await {
+                    warn!(path = %file.display(), "plugins.d: failed to delete plugin file: {e}");
+                }
+            }
+        }
+        let plugins = self.plugins.lock().await;
         self.persist_config(&plugins).await;
         Ok(())
     }

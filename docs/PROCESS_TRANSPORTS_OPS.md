@@ -28,20 +28,19 @@ Drop handles the rest.
 ## Quick start
 
 1. Install the plugin executable (e.g. `/usr/local/bin/supply-drop-telnet`).
-2. Add it to your config:
+2. Register it with Supply Drop:
 
-```toml
-[[plugins.process]]
-name    = "telnet"
-command = "/usr/local/bin/supply-drop-telnet"
-args    = ["--port", "2323"]
-enabled = true
-restart_on_crash   = true
-restart_delay_secs = 5
+```sh
+supply-drop-bbs plugin add \
+  --name telnet \
+  --command /usr/local/bin/supply-drop-telnet \
+  --args "--bind 0.0.0.0:2323"
 ```
 
-3. Restart Supply Drop (or use `supply-drop-bbs plugin add` if the daemon is
-   already running and you do not want to restart it).
+This creates `/etc/supply-drop-bbs/plugins.d/telnet.toml` and is safe to run
+on every upgrade — it is a no-op if the plugin is already registered.
+
+3. Restart Supply Drop: `sudo systemctl restart supply-drop-bbs`
 4. Tail the plugin's stderr: `supply-drop-bbs plugin logs telnet`.
 
 ---
@@ -90,47 +89,55 @@ are visible to it.
 
 ---
 
-## Configuring plugins in config.toml
+## How plugin config works
 
-Each plugin gets one `[[plugins.process]]` table (note the double brackets —
-it is an array of tables, so you can have many):
+Supply Drop reads plugin configuration from two places, merged at startup:
+
+1. **`plugins.d/` drop-in files** (recommended) —
+   `/etc/supply-drop-bbs/plugins.d/<name>.toml`
+2. **`config.toml`** (legacy) — `[[plugins.process]]` blocks in the main config
+
+The `plugins.d/` approach is strongly preferred. Drop-in files survive BBS
+upgrades and reconfiguration — the setup wizard never touches them.
+
+### What a drop-in file looks like
+
+`/etc/supply-drop-bbs/plugins.d/telnet.toml`:
 
 ```toml
 [[plugins.process]]
-name               = "telnet"           # unique name, used in CLI and web UI
+name               = "telnet"
 command            = "/usr/local/bin/supply-drop-telnet"
-args               = ["--port", "2323"] # passed verbatim to the executable
-enabled            = true               # false → not started at all
-restart_on_crash   = true               # re-spawn if the process exits unexpectedly
-restart_delay_secs = 5                  # seconds to wait before re-spawning
+args               = ["--bind", "0.0.0.0:2323"]
+enabled            = true
+restart_on_crash   = true
+restart_delay_secs = 5
 ```
 
 All fields except `name` and `command` are optional (defaults shown above).
 
-### Multiple plugins
+**Plugin installers** should create this file (or run `supply-drop-bbs plugin add`,
+which creates it for you) and **never edit `config.toml` directly**.
 
-```toml
-[[plugins.process]]
-name    = "telnet"
-command = "/usr/local/bin/supply-drop-telnet"
-args    = ["--port", "2323"]
-enabled = true
+### Using config.toml for legacy entries
 
-[[plugins.process]]
-name    = "slack"
-command = "/usr/local/bin/supply-drop-slack"
-enabled = true
-restart_on_crash   = true
-restart_delay_secs = 10
+If you added plugins to `config.toml` before `plugins.d/` was introduced, they
+continue to work. The `plugin list` command shows a `SOURCE` column so you can
+see where each plugin is configured. You can migrate a legacy entry:
+
+```sh
+# Remove from config.toml and re-add to plugins.d in one step:
+supply-drop-bbs plugin remove telnet
+supply-drop-bbs plugin add --name telnet --command /usr/local/bin/supply-drop-telnet --args "--bind 0.0.0.0:2323"
 ```
 
 ---
 
 ## Managing plugins from the CLI
 
-The `supply-drop-bbs plugin` sub-command lets you manage plugins without
-editing config.toml by hand. It writes changes back to the config file for
-you, preserving comments and formatting.
+The `supply-drop-bbs plugin` sub-command manages plugins without hand-editing
+any config file. New plugins are written to `plugins.d/<name>.toml`
+automatically.
 
 ```
 supply-drop-bbs plugin <action>
@@ -138,9 +145,9 @@ supply-drop-bbs plugin <action>
 
 | Command | Description |
 |---------|-------------|
-| `plugin list` | Show all configured plugins and their current state |
-| `plugin add --name NAME --command CMD [--args "…"] [--disabled] [--no-restart] [--restart-delay N]` | Add a new plugin |
-| `plugin remove NAME` | Remove a plugin (stops it if running) |
+| `plugin list` | Show all configured plugins, their state, and which file they come from |
+| `plugin add --name NAME --command CMD [--args "…"] [--disabled] [--no-restart] [--restart-delay N]` | Register a new plugin (writes to `plugins.d/`) |
+| `plugin remove NAME` | Remove a plugin (deletes `plugins.d/<name>.toml` or removes from `config.toml`) |
 | `plugin enable NAME` | Enable a disabled plugin |
 | `plugin disable NAME` | Disable a running plugin (stops it immediately) |
 | `plugin logs NAME` | Show the last 100 stderr lines from a plugin |
@@ -197,9 +204,9 @@ The table shows all configured plugins with:
 | Button | What it does |
 |--------|-------------|
 | **logs** | Opens a side drawer showing the last 100 stderr lines |
-| **enable / disable** | Toggle the plugin on or off; change persists to config.toml |
+| **enable / disable** | Toggle the plugin on or off; change persists to `plugins.d/<name>.toml` (or `config.toml` for legacy entries) |
 | **restart** | Stop and immediately re-start the plugin process |
-| **remove** | Stop the plugin and delete its config entry |
+| **remove** | Stop the plugin and delete its config entry from `plugins.d/` (or `config.toml`) |
 
 ### Adding a plugin
 

@@ -12,6 +12,7 @@ license-file    = "../../LICENSE"
 bbs-plugin-api.workspace = true
 async-trait.workspace    = true
 serde.workspace          = true
+toml.workspace           = true
 serde_json.workspace     = true
 thiserror.workspace      = true
 tokio            = { workspace = true, features = ["process", "io-util", "fs"] }
