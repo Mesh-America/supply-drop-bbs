@@ -1419,6 +1419,22 @@ struct PortInfo {
     description: Option<String>,
 }
 
+fn usb_port_hint(vid: u16, pid: u16) -> Option<&'static str> {
+    match (vid, pid) {
+        // Silicon Labs CP2102 / CP2102N — Heltec V3, T-Beam, RAK4631
+        (0x10C4, 0xEA60) => Some("Meshtastic/MeshCore radio — CP2102"),
+        // WCH CH340 — common on budget ESP32 boards
+        (0x1A86, 0x7523) => Some("Meshtastic radio — CH340"),
+        // WCH CH9102 — newer Heltec and TTGO boards
+        (0x1A86, 0x55D4) => Some("Meshtastic radio — CH9102"),
+        // Espressif native USB (ESP32-S3) — Heltec V3 alt mode, some T-Beam S3
+        (0x303A, 0x1001) => Some("Meshtastic radio — ESP32-S3 native USB"),
+        // MaxLinear/Exar XR21V1410/1412 — pymc-companion MeshCore HAT
+        (0x04E2, 0x1410 | 0x1412 | 0x1414) => Some("MeshCore HAT — XR serial"),
+        _ => None,
+    }
+}
+
 fn list_serial_ports() -> Vec<PortInfo> {
     match tokio_serial::available_ports() {
         Err(_) => vec![],
@@ -1427,6 +1443,7 @@ fn list_serial_ports() -> Vec<PortInfo> {
             .map(|p| {
                 let description = match &p.port_type {
                     tokio_serial::SerialPortType::UsbPort(info) => {
+                        let hint = usb_port_hint(info.vid, info.pid);
                         let mut parts: Vec<&str> = Vec::new();
                         if let Some(ref mfr) = info.manufacturer {
                             parts.push(mfr);
@@ -1434,10 +1451,15 @@ fn list_serial_ports() -> Vec<PortInfo> {
                         if let Some(ref prod) = info.product {
                             parts.push(prod);
                         }
-                        if parts.is_empty() {
-                            Some("USB".into())
+                        let base = if parts.is_empty() {
+                            "USB".to_owned()
                         } else {
-                            Some(parts.join(" "))
+                            parts.join(" ")
+                        };
+                        if let Some(h) = hint {
+                            Some(format!("{base} — {h}"))
+                        } else {
+                            Some(base)
                         }
                     }
                     tokio_serial::SerialPortType::PciPort => Some("PCI".into()),
