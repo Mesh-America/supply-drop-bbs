@@ -800,25 +800,30 @@ async fn api_update_native_plugin(
         }
     };
 
-    let mut val = match read_config_toml(&path) {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
-    };
-
-    toml_set_plugin_bool(&mut val, &name, "enabled", enabled);
-
-    let serialized = match toml::to_string(&val) {
+    let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json_error(&format!("could not serialize config: {e}"))),
+                Json(json_error(&format!("could not read config file: {e}"))),
+            )
+                .into_response()
+        }
+    };
+    let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not parse config file: {e}"))),
             )
                 .into_response()
         }
     };
 
-    if let Err(e) = std::fs::write(&path, &serialized) {
+    doc["plugins"][name.as_str()]["enabled"] = toml_edit::value(enabled);
+
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error(&format!("could not write config file: {e}"))),
@@ -1527,58 +1532,12 @@ fn toml_f64_field(val: &toml::Value, section: &str, key: &str) -> Option<f64> {
     val.get(section)?.get(key)?.as_float()
 }
 
-/// Set a string value inside a TOML Value tree, creating sections as needed.
-fn toml_set_str(root: &mut toml::Value, section: &str, key: &str, v: String) {
-    let tbl = root
-        .as_table_mut()
-        .expect("toml root is a table")
-        .entry(section)
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    tbl.as_table_mut()
-        .expect("section is a table")
-        .insert(key.to_owned(), toml::Value::String(v));
-}
-
-fn toml_set_bool(root: &mut toml::Value, section: &str, key: &str, v: bool) {
-    let tbl = root
-        .as_table_mut()
-        .expect("toml root is a table")
-        .entry(section)
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    tbl.as_table_mut()
-        .expect("section is a table")
-        .insert(key.to_owned(), toml::Value::Boolean(v));
-}
-
-fn toml_set_u64(root: &mut toml::Value, section: &str, key: &str, v: u64) {
-    let tbl = root
-        .as_table_mut()
-        .expect("toml root is a table")
-        .entry(section)
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    tbl.as_table_mut()
-        .expect("section is a table")
-        .insert(key.to_owned(), toml::Value::Integer(v as i64));
-}
-
-fn toml_set_f64(root: &mut toml::Value, section: &str, key: &str, v: f64) {
-    let tbl = root
-        .as_table_mut()
-        .expect("toml root is a table")
-        .entry(section)
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    tbl.as_table_mut()
-        .expect("section is a table")
-        .insert(key.to_owned(), toml::Value::Float(v));
-}
-
-fn toml_remove_key(root: &mut toml::Value, section: &str, key: &str) {
-    if let Some(tbl) = root
-        .as_table_mut()
-        .and_then(|t| t.get_mut(section))
-        .and_then(|s| s.as_table_mut())
-    {
-        tbl.remove(key);
+/// Remove a key from a section in a [`toml_edit::DocumentMut`], if it exists.
+fn doc_remove_key(doc: &mut toml_edit::DocumentMut, section: &str, key: &str) {
+    if let Some(item) = doc.get_mut(section) {
+        if let Some(t) = item.as_table_mut() {
+            t.remove(key);
+        }
     }
 }
 
@@ -1594,24 +1553,6 @@ fn toml_plugin_str(val: &toml::Value, plugin: &str, key: &str) -> Option<String>
         .get(key)?
         .as_str()
         .map(str::to_owned)
-}
-
-/// Write a bool into `[plugins.<plugin>].<key>`, creating sections as needed.
-fn toml_set_plugin_bool(root: &mut toml::Value, plugin: &str, key: &str, v: bool) {
-    let plugins = root
-        .as_table_mut()
-        .expect("toml root is a table")
-        .entry("plugins")
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let section = plugins
-        .as_table_mut()
-        .expect("plugins is a table")
-        .entry(plugin.to_owned())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    section
-        .as_table_mut()
-        .expect("plugin section is a table")
-        .insert(key.to_owned(), toml::Value::Boolean(v));
 }
 
 async fn api_get_config(
@@ -1688,9 +1629,25 @@ async fn api_patch_config(
         }
     };
 
-    let mut val = match read_config_toml(&path) {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not read config file: {e}"))),
+            )
+                .into_response()
+        }
+    };
+    let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not parse config file: {e}"))),
+            )
+                .into_response()
+        }
     };
 
     // Validate logging level before mutating anything.
@@ -1711,73 +1668,62 @@ async fn api_patch_config(
 
     // Apply patches — only touch keys explicitly present in the request.
     if let Some(v) = patch.bbs_name {
-        toml_set_str(&mut val, "bbs", "name", v);
+        doc["bbs"]["name"] = toml_edit::value(v);
     }
     if let Some(v) = patch.bbs_starting_room {
-        toml_set_str(&mut val, "bbs", "starting_room", v);
+        doc["bbs"]["starting_room"] = toml_edit::value(v);
     }
     if let Some(v) = patch.bbs_welcome_msg {
-        toml_set_str(&mut val, "bbs", "welcome_msg", v);
+        doc["bbs"]["welcome_msg"] = toml_edit::value(v);
     }
     if let Some(v) = patch.bbs_timezone {
-        toml_set_str(&mut val, "bbs", "timezone", v);
+        doc["bbs"]["timezone"] = toml_edit::value(v);
     }
     // Latitude/longitude: JSON null removes the key; a number sets it.
     let location_touched = patch.location_latitude.is_some() || patch.location_longitude.is_some();
     if let Some(v) = patch.location_latitude {
         if v.is_null() {
-            toml_remove_key(&mut val, "location", "latitude");
+            doc_remove_key(&mut doc, "location", "latitude");
         } else if let Some(f) = v.as_f64() {
-            toml_set_f64(&mut val, "location", "latitude", f);
+            doc["location"]["latitude"] = toml_edit::value(f);
         }
     }
     if let Some(v) = patch.location_longitude {
         if v.is_null() {
-            toml_remove_key(&mut val, "location", "longitude");
+            doc_remove_key(&mut doc, "location", "longitude");
         } else if let Some(f) = v.as_f64() {
-            toml_set_f64(&mut val, "location", "longitude", f);
+            doc["location"]["longitude"] = toml_edit::value(f);
         }
     }
     if let Some(v) = patch.backup_enabled {
-        toml_set_bool(&mut val, "backup", "enabled", v);
+        doc["backup"]["enabled"] = toml_edit::value(v);
     }
     if let Some(v) = patch.backup_interval_hours {
-        toml_set_u64(&mut val, "backup", "interval_hours", v as u64);
+        doc["backup"]["interval_hours"] = toml_edit::value(v as i64);
     }
     if let Some(v) = patch.backup_keep_daily {
-        toml_set_u64(&mut val, "backup", "keep_daily", v as u64);
+        doc["backup"]["keep_daily"] = toml_edit::value(v as i64);
     }
     if let Some(v) = patch.backup_keep_weekly {
-        toml_set_u64(&mut val, "backup", "keep_weekly", v as u64);
+        doc["backup"]["keep_weekly"] = toml_edit::value(v as i64);
     }
     if let Some(v) = patch.security_session_web_secs {
-        toml_set_u64(&mut val, "security", "session_lifetime_web_secs", v);
+        doc["security"]["session_lifetime_web_secs"] = toml_edit::value(v as i64);
     }
     if let Some(v) = patch.security_session_mesh_secs {
-        toml_set_u64(&mut val, "security", "session_lifetime_mesh_secs", v);
+        doc["security"]["session_lifetime_mesh_secs"] = toml_edit::value(v as i64);
     }
     if let Some(v) = patch.security_login_rate_per_min {
-        toml_set_u64(&mut val, "security", "login_rate_per_min", v as u64);
+        doc["security"]["login_rate_per_min"] = toml_edit::value(v as i64);
     }
     if let Some(v) = patch.security_command_rate_per_min {
-        toml_set_u64(&mut val, "security", "command_rate_per_min", v as u64);
+        doc["security"]["command_rate_per_min"] = toml_edit::value(v as i64);
     }
     if let Some(v) = patch.logging_level {
-        toml_set_str(&mut val, "logging", "level", v.to_ascii_uppercase());
+        doc["logging"]["level"] = toml_edit::value(v.to_ascii_uppercase());
     }
 
-    let serialized = match toml::to_string(&val) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json_error(&format!("could not serialize config: {e}"))),
-            )
-                .into_response()
-        }
-    };
-
-    if let Err(e) = std::fs::write(&path, &serialized) {
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error(&format!("could not write config file: {e}"))),
@@ -1789,8 +1735,12 @@ async fn api_patch_config(
     // reconnect without a restart.
     if location_touched {
         let new_location = match (
-            toml_f64_field(&val, "location", "latitude"),
-            toml_f64_field(&val, "location", "longitude"),
+            doc.get("location")
+                .and_then(|s| s.get("latitude"))
+                .and_then(|v| v.as_float()),
+            doc.get("location")
+                .and_then(|s| s.get("longitude"))
+                .and_then(|v| v.as_float()),
         ) {
             (Some(lat), Some(lon)) => Some((lat, lon)),
             _ => None,
