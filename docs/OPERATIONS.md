@@ -3,10 +3,14 @@
 How to install, configure, update, back up, and remove Supply Drop BBS.
 
 ::: tip Quick install
-Download the `.deb` for your hardware from the [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest) — `arm64` for Pi 4/5, `armhf` for Pi 2/3/Zero 2, `amd64` for x86-64 — then:
+Auto-detects your architecture (`arm64`, `armhf`, or `amd64`):
 
 ```sh
-sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
+ARCH=$(dpkg --print-architecture)
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/latest/download/supply-drop-bbs_${ARCH}.deb" \
+  -o supply-drop-bbs.deb
+sudo dpkg -i supply-drop-bbs.deb
 sudo supply-drop-bbs setup
 sudo systemctl start supply-drop-bbs
 ```
