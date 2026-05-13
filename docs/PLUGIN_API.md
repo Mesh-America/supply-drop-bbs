@@ -31,9 +31,11 @@ You need a running Supply Drop BBS instance to test against. The
 fastest way to get one is the Debian package:
 
 ```sh
-# Download arm64 / armhf / amd64 from:
-# https://github.com/Mesh-America/supply-drop-bbs/releases/latest
-sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
+ARCH=$(dpkg --print-architecture)
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/latest/download/supply-drop-bbs_${ARCH}.deb" \
+  -o supply-drop-bbs.deb
+sudo dpkg -i supply-drop-bbs.deb
 sudo supply-drop-bbs setup   # answer the wizard; pick USB transport
 sudo systemctl start supply-drop-bbs
 ```
@@ -521,14 +523,30 @@ in existing out-of-tree plugins. No entry means no action needed.
 
 #### v0.6.0
 
-**No API changes.** Recompile against `0.6.0` and everything works.
+**No API changes.** The plugin API is identical to 0.5.8. No code
+changes are required.
 
-What changed in the wider project:
+**You must edit `Cargo.toml` — `cargo update` alone is not enough.**
+This is a minor-version bump (`0.5` → `0.6`). Cargo semver ranges are
+scoped to the minor version, so any pin in the `0.5` series will never
+resolve to 0.6.0:
+
+```toml
+# Before (any of these will NOT pick up 0.6.0):
+bbs-plugin-api = { ..., version = "0.5" }
+bbs-plugin-api = { ..., version = "0.5.8" }
+bbs-plugin-api = { ..., version = "0.5.9" }
+
+# After — edit Cargo.toml, then run cargo update:
+bbs-plugin-api = { ..., version = "0.6" }
+```
+
+Other changes in the wider project:
 - Installation guide restructured; `.deb` is now the primary install
-  method (see [Installation & Operations](OPERATIONS.md)).
+  method (see [Installation & Operations](OPERATIONS.md)). If your
+  plugin's README tells operators how to install the BBS, update those
+  instructions to use the one-liner from OPERATIONS.md.
 - Plugin API and transport plugin documentation expanded.
-- Version pin: if you reference `bbs-plugin-api = "0.5"` exactly,
-  bump it to `"0.6"` (or use `"0.6.0"` for strict reproducibility).
 
 #### v0.5.9
 
