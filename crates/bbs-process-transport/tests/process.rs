@@ -174,7 +174,16 @@ async fn notify_delivers_to_open_session() {
     let transport = start(hold_config("notify-deliver"), Arc::clone(&host)).await;
 
     // hold mode sends recv("whoami") so we have a command → session ID.
-    let cmds = host.commands_received();
+    let cmds = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let c = host.commands_received();
+            if !c.is_empty() || tokio::time::Instant::now() >= deadline {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
     assert!(
         !cmds.is_empty(),
         "plugin should have sent at least one command"
