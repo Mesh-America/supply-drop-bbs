@@ -86,15 +86,27 @@ const groups = computed<NavGroup[]>(() => {
   })
 
   g.push({
-    title: 'ops',
+    title: 'monitoring',
     items: [
-      { to: '/reports', label: 'reports' },
       { to: '/errors', label: 'errors', errorBadge: true },
       { to: '/metrics', label: 'metrics', rssBadge: true },
+      { to: '/logs', label: 'logs' },
+      { to: '/reports', label: 'reports' },
+    ],
+  })
+
+  g.push({
+    title: 'manage',
+    items: [
       { to: '/backups', label: 'backups' },
       { to: '/plugins', label: 'plugins' },
-      { to: '/logs', label: 'logs' },
       { to: '/audit', label: 'audit' },
+    ],
+  })
+
+  g.push({
+    title: 'config',
+    items: [
       { to: '/settings', label: 'settings' },
     ],
   })
