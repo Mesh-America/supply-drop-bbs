@@ -111,6 +111,14 @@ const groups = computed<NavGroup[]>(() => {
       <span class="brand-sub muted">admin</span>
     </div>
     <div class="user-area">
+      <router-link
+        v-if="stats.pendingUsers > 0"
+        to="/users"
+        class="pending-alert"
+        :title="`${stats.pendingUsers} user${stats.pendingUsers === 1 ? '' : 's'} pending verification`"
+      >
+        {{ stats.pendingUsers }} pending
+      </router-link>
       <div class="user-menu" ref="menuRef">
         <button
           class="secondary small-btn user-btn"
@@ -195,7 +203,19 @@ const groups = computed<NavGroup[]>(() => {
 .brand { display: flex; align-items: center; gap: 0.5rem; }
 .brand-logo { height: 32px; width: 32px; object-fit: contain; border-radius: 4px; }
 .brand-sub { font-size: 0.75em; font-weight: 400; }
-.user-area { margin-left: auto; display: flex; align-items: center; font-size: 0.85em; }
+.user-area { margin-left: auto; display: flex; align-items: center; gap: 0.75rem; font-size: 0.85em; }
+
+.pending-alert {
+  font-size: 0.78em;
+  font-weight: 700;
+  background: var(--warn, #b45309);
+  color: #fff;
+  border-radius: 999px;
+  padding: 0.2em 0.7em;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.pending-alert:hover { opacity: 0.85; text-decoration: none; }
 
 /* ── Username button ─────────────────────────────────────────────────────── */
 .user-menu { position: relative; }
