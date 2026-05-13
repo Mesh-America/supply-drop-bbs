@@ -46,7 +46,7 @@ transport at it from your dev machine. See
 [Installation & Operations](OPERATIONS.md) for the full install
 guide.
 
-The current workspace version is **0.6.1**. See the
+The current workspace version is **0.6.2**. See the
 [Plugin API guide § Versioning](PLUGIN_API.md#versioning) for the
 version history and migration notes for existing plugins.
 
@@ -1384,7 +1384,7 @@ thiserror                = "1"
 ```
 
 ::: tip Current version
-The workspace version is **0.6.1**. Out-of-tree plugins (not inside
+The workspace version is **0.6.2**. Out-of-tree plugins (not inside
 this workspace) reference the crate directly:
 
 ```toml

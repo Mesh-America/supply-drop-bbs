@@ -159,7 +159,7 @@ verify its checksum, then install it and the service unit manually.
 
 ```sh
 # Set these for your system
-TAG=v0.6.1   # replace with the latest release tag
+TAG=v0.6.2   # replace with the latest release tag
 ARCH=$(uname -m)
 case "$ARCH" in
   aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
