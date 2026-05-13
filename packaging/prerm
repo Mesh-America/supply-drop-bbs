@@ -1,9 +1,18 @@
 #!/bin/sh
 # prerm — Supply Drop BBS Debian pre-remove script
+#
+# $1 = "remove"   on uninstall
+# $1 = "upgrade"  before an upgrade (postinst of new version follows)
 set -e
 
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl stop supply-drop-bbs.service 2>/dev/null || true
-    systemctl disable supply-drop-bbs.service 2>/dev/null || true
-    systemctl daemon-reload || true
-fi
+case "$1" in
+  remove|upgrade|deconfigure)
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl stop supply-drop-bbs.service 2>/dev/null || true
+      if [ "$1" = "remove" ]; then
+        systemctl disable supply-drop-bbs.service 2>/dev/null || true
+        systemctl daemon-reload || true
+      fi
+    fi
+    ;;
+esac

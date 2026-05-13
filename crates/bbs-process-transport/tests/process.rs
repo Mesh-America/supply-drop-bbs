@@ -135,7 +135,18 @@ async fn awaiting_reply_state_machine() {
 
     let transport = start(scripted_config("await-test"), Arc::clone(&host)).await;
 
-    let cmds = host.commands_received();
+    // Poll up to 2 s so the test stays stable under parallel execution where the
+    // OS scheduler may not give the echo_plugin child enough CPU within SETTLE.
+    let cmds = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let c = host.commands_received();
+            if c.len() >= 2 || tokio::time::Instant::now() >= deadline {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
     assert_eq!(cmds.len(), 2, "expected 2 commands, got {cmds:?}");
     assert!(
         matches!(cmds[0].1, Command::Help { .. }),

@@ -2,11 +2,16 @@
 
 How to install, configure, update, back up, and remove Supply Drop BBS.
 
-::: tip Quick start
+::: tip Quick install
+Download the `.deb` for your hardware from the [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest) — `arm64` for Pi 4/5, `armhf` for Pi 2/3/Zero 2, `amd64` for x86-64 — then:
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
+sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
+sudo supply-drop-bbs setup
+sudo systemctl start supply-drop-bbs
 ```
-Downloads a pre-built binary, runs a setup wizard, and configures a systemd service. Takes under a minute on a Pi 4. Jump to the [full installation section](#installation) for details.
+
+Jump to the [full installation section](#installation) for all options and details.
 :::
 
 ::: info This guide covers MeshCore
@@ -88,42 +93,128 @@ breaking the other.
 
 ## Installation
 
-### One-line install (recommended)
+Before installing, have ready:
+
+- **Radio type** — USB companion device or Pi HAT
+- **HAT model** — if using a Pi HAT (ZebraHat, Waveshare, PiMesh, etc.)
+- **Region / frequency** — US (910.525 MHz) or EU (869.618 MHz), or your local frequency
+
+### Option 1 — Debian package (recommended)
+
+The `.deb` package is the easiest way to install on Raspberry Pi OS, Ubuntu,
+or any Debian-based system. It creates the service user, sets up the directory
+layout, and registers the systemd unit — no cloning required.
+
+**Step 1.** Download the `.deb` for your architecture from the
+[latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest):
+
+| Hardware | File to download |
+|---|---|
+| Raspberry Pi 4 / 5 (64-bit) | `supply-drop-bbs_VERSION_arm64.deb` |
+| Raspberry Pi 2 / 3 / Zero 2 (32-bit) | `supply-drop-bbs_VERSION_armhf.deb` |
+| x86-64 Linux | `supply-drop-bbs_VERSION_amd64.deb` |
+
+**Step 2.** Install:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
+sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
 ```
 
-The script downloads a pre-built binary for your architecture, installs it,
-and walks you through configuration. **Install typically takes under a minute**
-on supported hardware (Raspberry Pi aarch64/armv7, x86-64 Linux). If no
-pre-built binary is available for your architecture, the script falls back to
-building from source (5–15 minutes on a Pi).
+The package:
 
-Before running, have ready:
+1. Creates the `supply-drop` system user
+2. Creates `/var/lib/supply-drop-bbs` (data) and `/etc/supply-drop-bbs` (config)
+3. Installs the `supply-drop-bbs.service` systemd unit and enables it
 
-- **Radio type** - USB companion device or Pi HAT
-- **HAT model** - if using a Pi HAT (ZebraHat, Waveshare, PiMesh, etc.)
-- **Region** - US (910.525 MHz) or EU (869.618 MHz), or your local frequency
+**Step 3.** Run the setup wizard:
 
-### What the installer does
+```sh
+sudo supply-drop-bbs setup
+```
+
+**Step 4.** Start the service:
+
+```sh
+sudo systemctl start supply-drop-bbs
+```
+
+::: info Pi HAT users
+The `.deb` installs the BBS itself. For Pi HAT support you still need
+`pymc-companion` (the Python radio bridge). After the BBS is running, follow
+the [Pi HAT section](#pi-hat-additional-wizard-steps-in-the-installer) below,
+or use the guided setup script (Option 3) which handles the full HAT setup
+automatically.
+:::
+
+### Option 2 — Raw binary
+
+Works on **any systemd-based Linux** — not just Debian. Download the binary,
+verify its checksum, then install it and the service unit manually.
+
+```sh
+# Set these for your system
+TAG=v0.5.9   # replace with the latest release tag
+ARCH=$(uname -m)
+case "$ARCH" in
+  aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+  armv7l)  TARGET="armv7-unknown-linux-gnueabihf" ;;
+  x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
+esac
+
+# Download binary and checksum file
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/supply-drop-bbs-${TAG}-${TARGET}" \
+  -o supply-drop-bbs
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/SHA256SUMS" \
+  -o SHA256SUMS
+
+# Verify before installing
+grep "supply-drop-bbs-${TAG}-${TARGET}" SHA256SUMS | sha256sum -c
+
+# Install binary and service unit
+sudo install -m 755 supply-drop-bbs /usr/local/bin/supply-drop-bbs
+sudo useradd --system --no-create-home --shell /sbin/nologin \
+  --home-dir /var/lib/supply-drop-bbs supply-drop 2>/dev/null || true
+sudo mkdir -p /var/lib/supply-drop-bbs /etc/supply-drop-bbs
+sudo chown supply-drop:supply-drop /var/lib/supply-drop-bbs
+sudo curl -fsSL \
+  "https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/${TAG}/supply-drop-bbs.service" \
+  -o /lib/systemd/system/supply-drop-bbs.service
+sudo systemctl daemon-reload
+sudo systemctl enable supply-drop-bbs
+
+# Run setup then start
+sudo supply-drop-bbs setup
+sudo systemctl start supply-drop-bbs
+```
+
+Append `-headless` to the binary name for a smaller build without the admin web UI (e.g. `supply-drop-bbs-${TAG}-${TARGET}-headless`).
+
+### Option 3 — Guided setup script
+
+The `install.sh` script handles the full stack including Pi HAT configuration
+(`pymc_core`, SPI, `pymc-companion.service`). Download and read it before running:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
+  -o install.sh
+less install.sh    # review before running
+sudo bash install.sh
+```
+
+#### What the script does
 
 1. Installs minimal system packages (`curl`, `git`, `figlet`)
-2. Clones (or updates) the repository to `/opt/supply-drop-bbs` — always
-   needed for service files and pymc-companion scripts
-3. **Tries to download a pre-built binary** from the latest GitHub release for
-   your architecture, and verifies its SHA256 checksum before installing
-4. **If no pre-built binary is available** (unusual architecture, no network
-   access, or checksum failure), installs build packages (`build-essential`,
-   `pkg-config`, `libssl-dev`, `nodejs`, `npm`, Rust) and compiles from source
+2. Clones (or updates) the repository to `/opt/supply-drop-bbs`
+3. Downloads the pre-built binary for your architecture and verifies its SHA256 checksum
+4. Falls back to building from source if no pre-built binary is available (5–15 min on a Pi)
 5. Installs the binary to `/usr/local/bin/supply-drop-bbs`
-6. Creates the `supply-drop` system user
-7. Creates config (`/etc/supply-drop-bbs`) and data (`/var/lib/supply-drop-bbs`) directories
-8. Installs the `supply-drop-bbs.service` systemd unit
-9. Runs the **setup wizard** (see below)
-10. **Pi HAT only:** installs `pymc_core` in a Python venv, writes
-    `pymc-companion.yaml`, and enables `pymc-companion.service`
-11. Enables and starts both services
+6. Creates the `supply-drop` system user and the config/data directories
+7. Installs the `supply-drop-bbs.service` systemd unit
+8. Runs the **setup wizard**
+9. **Pi HAT only:** installs `pymc_core` in a Python venv, writes `pymc-companion.yaml`, and enables `pymc-companion.service`
+10. Enables and starts both services
 
 ### What the setup wizard asks
 
@@ -136,7 +227,7 @@ Before running, have ready:
 The wizard writes `/etc/supply-drop-bbs/config.toml`. Run
 `supply-drop-bbs setup` at any time to reconfigure.
 
-### Pi HAT - additional wizard steps (in the installer)
+### Pi HAT additional wizard steps (in the installer)
 
 After the BBS wizard, the installer asks:
 
@@ -222,15 +313,29 @@ binary with the same settings used in the official releases (`opt-level = "z"`,
 
 ## Uninstall
 
+### Debian package uninstall
+
 ```sh
-sudo bash /opt/supply-drop-bbs/install.sh --uninstall
+sudo dpkg -r supply-drop-bbs
 ```
 
-Or, if you no longer have the source directory:
+This stops the service and removes the binary and systemd unit. Config
+(`/etc/supply-drop-bbs`) and data (`/var/lib/supply-drop-bbs`) are
+**intentionally preserved** — remove them manually when you're sure you no
+longer need them:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
-  | sudo bash -s -- --uninstall
+sudo rm -rf /etc/supply-drop-bbs
+sudo rm -rf /var/lib/supply-drop-bbs   # contains your message store!
+sudo userdel supply-drop 2>/dev/null || true
+```
+
+### Script-installed uninstall
+
+If you installed via `install.sh`, use the built-in uninstall flag:
+
+```sh
+sudo bash /opt/supply-drop-bbs/install.sh --uninstall
 ```
 
 The uninstaller:
@@ -323,51 +428,58 @@ automatically if `pymc-companion` restarts.
 
 ## Update
 
-### One-line update (recommended)
+### Debian package update (recommended)
 
-Re-run the installer. It downloads the latest pre-built binary, updates
-service files, and leaves your config and data completely untouched:
+Download the new `.deb` from the [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest) and install it. `dpkg` stops the running service, replaces the binary, and restarts it automatically — your config and data are untouched.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
-  | sudo bash
+sudo dpkg -i supply-drop-bbs_NEW_VERSION_ARCH.deb
 ```
 
-When asked **"Reconfigure now?"**, answer **N** to keep your existing
-`/etc/supply-drop-bbs/config.toml` unchanged. The service restarts
-automatically at the end.
-
-**Typical update time: under a minute** on supported architectures.
+**Typical update time: under a minute.**
 
 ### Manual binary-only update
 
-If you prefer to update only the binary without running the full installer,
-download the pre-built binary for your architecture directly:
+For non-Debian systems, download the new binary directly:
 
 ```sh
-# Detect your architecture
 ARCH=$(uname -m)
 case "$ARCH" in
-    aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-    armv7l)  TARGET="armv7-unknown-linux-gnueabihf" ;;
-    x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
+  aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
+  armv7l)  TARGET="armv7-unknown-linux-gnueabihf" ;;
+  x86_64)  TARGET="x86_64-unknown-linux-gnu" ;;
 esac
 
-# Find the latest release tag
 TAG=$(curl -sSf https://api.github.com/repos/Mesh-America/supply-drop-bbs/releases/latest \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['tag_name'])")
 
-# Download and install
 curl -fsSL \
-    "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/supply-drop-bbs-${TAG}-${TARGET}" \
-    -o /tmp/supply-drop-bbs-new
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/supply-drop-bbs-${TAG}-${TARGET}" \
+  -o /tmp/supply-drop-bbs-new
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/SHA256SUMS" \
+  | grep "${TARGET}" | sha256sum -c
+
 sudo systemctl stop supply-drop-bbs
 sudo install -m 755 /tmp/supply-drop-bbs-new /usr/local/bin/supply-drop-bbs
 sudo systemctl start supply-drop-bbs
 supply-drop-bbs --version
 ```
 
-### Manual source build update
+### Guided script update
+
+If you originally installed via the setup script and want it to handle everything (including updating `pymc-companion` for Pi HAT users):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
+  -o install.sh
+less install.sh    # review before running
+sudo bash install.sh
+```
+
+When asked **"Reconfigure now?"**, answer **N** to keep your existing config unchanged.
+
+### Source build update
 
 Use this path only if no pre-built binary is available for your architecture:
 

@@ -34,18 +34,26 @@ features:
     details: New transports and behaviors are Rust crates gated behind Cargo features. If you don't compile it in, it isn't there.
 ---
 
-## Quick start
+## Quick install
+
+**Debian / Ubuntu / Raspberry Pi OS** — download the `.deb` for your hardware from the [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest):
+
+| Hardware | File |
+|---|---|
+| Raspberry Pi 4 / 5 (64-bit) | `supply-drop-bbs_VERSION_arm64.deb` |
+| Raspberry Pi 2 / 3 / Zero 2 (32-bit) | `supply-drop-bbs_VERSION_armhf.deb` |
+| x86-64 Linux | `supply-drop-bbs_VERSION_amd64.deb` |
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
+sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
+sudo supply-drop-bbs setup
+sudo systemctl start supply-drop-bbs
 ```
 
-The script downloads a pre-built binary for your architecture, runs a setup wizard, and configures a systemd service. Takes under a minute on a Pi 4. Older hardware or unusual architectures fall back to building from source (5–15 minutes).
+Have these on hand before running setup:
 
-Before you run it, have these on hand:
-
-- Radio type: USB companion device or Pi HAT
-- HAT model (if using a HAT)
-- Your region/frequency
+- **Radio type** — USB companion device or Pi HAT
+- **HAT model** — if using a HAT (ZebraHat, Waveshare, PiMesh, etc.)
+- **Region / frequency** — US (910.525 MHz), EU (869.618 MHz), or your local frequency
 
 [Full installation guide](/OPERATIONS) · [Configuration reference](/CONFIG)
