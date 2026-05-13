@@ -494,6 +494,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/restart", post(api_restart))
         .route("/logs", get(api_logs))
         .route("/sse/logs", get(api_sse_logs))
+        .route("/sse/events", get(api_sse_events))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
         .route(
             "/backups/:filename",
@@ -1820,6 +1821,28 @@ async fn api_sse_logs(
 
     Sse::new(tokio_stream::StreamExt::chain(init, live))
         .keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+// ── SSE domain events ─────────────────────────────────────────────────────────
+
+async fn api_sse_events(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let rx = state.host.events();
+
+    let stream = BroadcastStream::new(rx).filter_map(|result| match result {
+        Ok(event) => {
+            let kind = match &event {
+                DomainEvent::UserCreated { .. } => Some("user_created"),
+                DomainEvent::UserValidated { .. } => Some("user_validated"),
+                _ => None,
+            };
+            kind.map(|k| Ok(Event::default().event(k).data("{}")))
+        }
+        Err(_) => None,
+    });
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── Backups ───────────────────────────────────────────────────────────────────

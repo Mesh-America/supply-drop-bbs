@@ -73,6 +73,11 @@ enum Workflow {
     ChangePassword {
         stage: ChangePwdStage,
     },
+    /// Resetting another user's password (.PW command, Sysop+).
+    SetUserPassword {
+        target: Username,
+        stage: SetUserPwdStage,
+    },
     /// Browsing messages one-at-a-time with F/R navigation.
     /// E replies to the current message; any other input exits.
     Reading,
@@ -95,6 +100,14 @@ enum ChangePwdStage {
     /// Waiting for the user to enter their current password.
     VerifyOld { attempts: u32 },
     /// Current password verified; waiting for the new password.
+    EnterNew,
+    /// New password entered; waiting for confirmation.
+    ConfirmNew { new_password: String },
+}
+
+#[derive(Clone, Debug)]
+enum SetUserPwdStage {
+    /// Waiting for the new password.
     EnterNew,
     /// New password entered; waiting for confirmation.
     ConfirmNew { new_password: String },
@@ -292,6 +305,9 @@ impl Host for BbsHost {
             Command::SearchUsers { query } => self.handle_search_users(session, query).await,
             Command::UserInfo { username } => self.handle_user_info(session, username).await,
             Command::DeleteUser { username } => self.handle_delete_user(session, username).await,
+            Command::SetUserPassword { username } => {
+                self.handle_set_user_password(session, username).await
+            }
 
             Command::Unknown { .. } => {
                 Ok(Response::Text("Unknown command. Type H for help.".into()))
@@ -1218,7 +1234,7 @@ impl BbsHost {
                         let dm_body = format!(
                             "New user registered: {username}\nV {username} to verify, B {username} to ban."
                         );
-                        let bbs_sender = Username::new("bbs").expect("bbs is a valid username");
+                        let bbs_sender = Username::__internal_system("bbs");
                         for sysop in sysops {
                             let _ = MessageStore::post_direct(
                                 &self.db,
@@ -1676,6 +1692,106 @@ impl BbsHost {
                 }
                 info!(%session, "user changed password");
                 Ok(Response::Text("Password changed successfully.".into()))
+            }
+
+            // ── Set another user's password (Sysop+) ────────────────────────
+            Workflow::SetUserPassword {
+                target,
+                stage: SetUserPwdStage::EnterNew,
+            } => {
+                if reply.chars().count() < 8 {
+                    return Ok(Response::Prompt {
+                        text: "Too short (min 8 characters). New password:".into(),
+                        hide_input: true,
+                    });
+                }
+                let mut sessions = self.sessions.write().await;
+                if let Some(r) = sessions.get_mut(&session) {
+                    r.workflow = Workflow::SetUserPassword {
+                        target,
+                        stage: SetUserPwdStage::ConfirmNew {
+                            new_password: reply,
+                        },
+                    };
+                }
+                Ok(Response::Prompt {
+                    text: "Confirm new password:".into(),
+                    hide_input: true,
+                })
+            }
+
+            Workflow::SetUserPassword {
+                target,
+                stage: SetUserPwdStage::ConfirmNew { new_password },
+            } => {
+                if reply != new_password {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::SetUserPassword {
+                            target,
+                            stage: SetUserPwdStage::EnterNew,
+                        };
+                    }
+                    return Ok(Response::Prompt {
+                        text: "Passwords don't match. New password:".into(),
+                        hide_input: true,
+                    });
+                }
+                let (actor, _, level, _) = match self.session_auth_user(session).await {
+                    Ok(t) => t,
+                    Err(r) => return Ok(r),
+                };
+                if level < PermissionLevel::Sysop {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                    }
+                    return Ok(Response::Error("Sysop access required.".into()));
+                }
+                let user = UserStore::get_by_username(&self.db, &target)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("{e}")))?;
+                let user = match user {
+                    Some(u) => u,
+                    None => {
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            r.workflow = Workflow::None;
+                        }
+                        return Ok(Response::Error(format!(
+                            "User '{}' not found.",
+                            target.as_str()
+                        )));
+                    }
+                };
+                self.db
+                    .credentials()
+                    .set_password(user.id, &new_password, Timestamp::now())
+                    .await
+                    .map_err(|e| HostError::Storage(format!("set_password: {e}")))?;
+                {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                    }
+                }
+                if let Err(e) = self
+                    .db
+                    .audit_write(
+                        actor.as_str(),
+                        "set_user_password",
+                        Some(target.as_str()),
+                        None,
+                    )
+                    .await
+                {
+                    tracing::warn!("audit write failed: {e}");
+                }
+                info!(%actor, %target, "sysop reset user password");
+                Ok(Response::Text(format!(
+                    "Password for '{}' updated.",
+                    target.as_str()
+                )))
             }
 
             // ── Message reading ──────────────────────────────────────────────
@@ -3359,6 +3475,52 @@ impl BbsHost {
         })
     }
 
+    async fn handle_set_user_password(
+        &self,
+        session: SessionId,
+        target: Username,
+    ) -> Result<Response, HostError> {
+        let (_, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Sysop {
+            return Ok(Response::Error("Sysop access required.".into()));
+        }
+        let user = UserStore::get_by_username(&self.db, &target)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        if user.is_none() {
+            return Ok(Response::Error(format!(
+                "User '{}' not found.",
+                target.as_str()
+            )));
+        }
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(r) = sessions.get(&session) {
+                if !matches!(r.workflow, Workflow::None) {
+                    return Ok(Response::Error(
+                        "A workflow is already in progress. Type 'cancel' first.".into(),
+                    ));
+                }
+            }
+        }
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::SetUserPassword {
+                    target: target.clone(),
+                    stage: SetUserPwdStage::EnterNew,
+                };
+            }
+        }
+        Ok(Response::Prompt {
+            text: format!("New password for {}:", target.as_str()),
+            hide_input: true,
+        })
+    }
+
     async fn handle_create_room(
         &self,
         session: SessionId,
@@ -3607,6 +3769,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".c" if is_sysop => ".C — create a new room\nEnters the room creation workflow.",
         ".dr" if is_sysop => ".DR <name> — delete a room",
         ".du" if is_sysop => ".DU <user> — soft-delete a user account\nSets status to deleted and ends active sessions.",
+        ".pw" if is_sysop => ".PW <user> — reset another user's password\nDoes not require knowing their current password.",
 
         other => {
             return format!(
@@ -3707,6 +3870,7 @@ Sysop:\n\
  .C <name>   create room\n\
  .DR <name>  delete room\n\
  .DU <user>  delete user\n\
+ .PW <user>  reset user password\n\
  UNBAN <u>   lift a ban";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
@@ -4244,7 +4408,7 @@ mod tests {
             "sysop should receive exactly one notification DM"
         );
         let dm = &page.messages[0];
-        assert_eq!(dm.sender, Username::new("bbs").unwrap());
+        assert_eq!(dm.sender, Username::__internal_system("bbs"));
         assert_eq!(dm.recipient.as_ref(), Some(&sysop_name));
         assert!(
             dm.content.contains("newuser"),

@@ -29,10 +29,10 @@ fn map_message_row(
     content: String,
     timestamp: String,
 ) -> Result<Message, StoreError> {
-    let sender = Username::new(sender)
+    let sender = Username::try_from(sender)
         .map_err(|e| StoreError::Decode(format!("invalid stored sender: {e}")))?;
     let recipient = recipient
-        .map(Username::new)
+        .map(Username::try_from)
         .transpose()
         .map_err(|e| StoreError::Decode(format!("invalid stored recipient: {e}")))?;
     let timestamp = Timestamp::parse_rfc3339(&timestamp)

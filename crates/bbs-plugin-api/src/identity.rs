@@ -96,6 +96,18 @@ impl Username {
     }
 
     fn validate(raw: &str) -> Result<(), InvalidUsername> {
+        Self::validate_chars(raw)?;
+        // Reserved system usernames — blocked at registration but allowed in
+        // storage/serde so the host can round-trip messages it sent as "bbs".
+        if matches!(raw, "bbs" | "system") {
+            return Err(InvalidUsername::Reserved(raw.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Character-level validation only (no reserved-name check).
+    /// Used by `TryFrom<String>` so stored system messages can be read back.
+    fn validate_chars(raw: &str) -> Result<(), InvalidUsername> {
         if raw.is_empty() {
             return Err(InvalidUsername::Empty);
         }
@@ -120,6 +132,17 @@ impl Username {
             return Err(InvalidUsername::BracketCharacter);
         }
         Ok(())
+    }
+
+    /// Construct a reserved system username, bypassing the reserved-name check.
+    ///
+    /// Intended for the host implementation (`bbs-core`) only — the `"bbs"` and
+    /// `"system"` senders used for host-generated messages. Plugin authors should
+    /// never call this; `Username::new` rejects those names deliberately.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn __internal_system(raw: &'static str) -> Self {
+        Self(raw.to_owned())
     }
 
     /// Borrow the validated string.
@@ -151,7 +174,15 @@ impl TryFrom<String> for Username {
     type Error = InvalidUsername;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
+        // Use character-level validation only so system senders ("bbs", "system")
+        // stored in the database round-trip correctly. The reserved-name check is
+        // enforced in Username::new(), which is the registration/input path.
+        let raw = value
+            .strip_prefix('@')
+            .unwrap_or(&value)
+            .to_ascii_lowercase();
+        Self::validate_chars(&raw)?;
+        Ok(Self(raw))
     }
 }
 
@@ -182,6 +213,10 @@ pub enum InvalidUsername {
     /// Starts or ends with `-` or `_`.
     #[error("username must not start or end with `-` or `_`")]
     BracketCharacter,
+
+    /// Reserved system username.
+    #[error("'{0}' is a reserved username")]
+    Reserved(String),
 }
 
 #[cfg(test)]
@@ -256,6 +291,16 @@ mod tests {
                 Username::new(bad),
                 Err(InvalidUsername::BracketCharacter),
                 "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn username_rejects_reserved_names() {
+        for reserved in ["bbs", "system"] {
+            assert!(
+                matches!(Username::new(reserved), Err(InvalidUsername::Reserved(_))),
+                "expected {reserved:?} to be rejected as reserved"
             );
         }
     }

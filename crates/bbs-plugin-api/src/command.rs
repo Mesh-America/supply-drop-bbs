@@ -247,6 +247,15 @@ pub enum Command {
         /// The username of the account to delete.
         username: Username,
     },
+
+    /// Reset another user's password (Sysop+). (.PW <username>)
+    ///
+    /// Starts a two-prompt workflow: new password, then confirm.
+    /// The caller does not need to know the target's current password.
+    SetUserPassword {
+        /// The account whose password will be reset.
+        username: Username,
+    },
 }
 
 /// A protocol-neutral response from the BBS to a session.
@@ -449,6 +458,13 @@ impl Command {
             },
             ".du" => match rest.and_then(|s| Username::new(s).ok()) {
                 Some(username) => Command::DeleteUser { username },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+
+            ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::SetUserPassword { username },
                 None => Command::Unknown {
                     raw: text.to_owned(),
                 },

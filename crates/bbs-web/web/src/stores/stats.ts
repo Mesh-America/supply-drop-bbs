@@ -9,7 +9,8 @@ interface Stats {
 
 export const useStatsStore = defineStore('stats', () => {
   const pendingUsers = ref(0)
-  let timer: ReturnType<typeof setInterval> | null = null
+  let pollTimer: ReturnType<typeof setInterval> | null = null
+  let eventSource: EventSource | null = null
 
   async function refresh() {
     try {
@@ -21,13 +22,24 @@ export const useStatsStore = defineStore('stats', () => {
   }
 
   function startPolling() {
-    if (timer !== null) return
+    if (pollTimer !== null) return
     refresh()
-    timer = setInterval(refresh, 60_000)
+    // Slow background poll as fallback in case SSE misses an event.
+    pollTimer = setInterval(refresh, 120_000)
+
+    // Subscribe to domain events for immediate badge updates.
+    if (eventSource !== null) return
+    eventSource = new EventSource('/api/v1/sse/events')
+    eventSource.addEventListener('user_created', () => refresh())
+    eventSource.addEventListener('user_validated', () => refresh())
+    eventSource.onerror = () => {
+      // EventSource reconnects automatically; nothing to do here.
+    }
   }
 
   function stopPolling() {
-    if (timer !== null) { clearInterval(timer); timer = null }
+    if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null }
+    if (eventSource !== null) { eventSource.close(); eventSource = null }
   }
 
   return { pendingUsers, refresh, startPolling, stopPolling }
