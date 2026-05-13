@@ -54,16 +54,16 @@ cargo build --release
 ./target/release/supply-drop-bbs setup
 ```
 
-The current `bbs-plugin-api` version is **0.5.9**. Reference it in
+The current `bbs-plugin-api` version is **0.6.0**. Reference it in
 your plugin's `Cargo.toml`:
 
 ```toml
 [dependencies]
-bbs-plugin-api = { git = "https://github.com/Mesh-America/supply-drop-bbs", version = "0.5" }
+bbs-plugin-api = { git = "https://github.com/Mesh-America/supply-drop-bbs", version = "0.6" }
 ```
 
-Using the semver range `"0.5"` picks up patch releases automatically.
-Pin to an exact version (`"0.5.9"`) only if you need strict
+Using the semver range `"0.6"` picks up patch releases automatically.
+Pin to an exact version (`"0.6.0"`) only if you need strict
 reproducibility.
 
 ## What is a plugin
@@ -518,6 +518,17 @@ canonical reference.
 
 Each release section below lists whether it requires code changes
 in existing out-of-tree plugins. No entry means no action needed.
+
+#### v0.6.0
+
+**No API changes.** Recompile against `0.6.0` and everything works.
+
+What changed in the wider project:
+- Installation guide restructured; `.deb` is now the primary install
+  method (see [Installation & Operations](OPERATIONS.md)).
+- Plugin API and transport plugin documentation expanded.
+- Version pin: if you reference `bbs-plugin-api = "0.5"` exactly,
+  bump it to `"0.6"` (or use `"0.6.0"` for strict reproducibility).
 
 #### v0.5.9
 
