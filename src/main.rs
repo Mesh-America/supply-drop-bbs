@@ -109,6 +109,9 @@ enum Commands {
         #[command(subcommand)]
         action: PluginAction,
     },
+
+    /// Print a system metrics snapshot (CPU, memory, disk, network) and exit.
+    Metrics,
 }
 
 #[derive(Subcommand)]
@@ -248,6 +251,7 @@ async fn main() {
         Some(Commands::Room { action }) => cmd_room(config_path.as_deref(), action).await,
         #[cfg(feature = "transport-process")]
         Some(Commands::Plugin { action }) => cmd_plugin(config_path.as_deref(), action),
+        Some(Commands::Metrics) => cmd_metrics(),
     }
 }
 
@@ -699,6 +703,112 @@ async fn init_web_plugin(
     }
 
     Some(plugin)
+}
+
+fn cmd_metrics() {
+    use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
+
+    let mut sys = System::new();
+    sys.refresh_cpu_usage();
+    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
+    sys.refresh_cpu_usage();
+    let cpu = sys.global_cpu_usage();
+
+    sys.refresh_memory();
+    let mem_used = sys.used_memory();
+    let mem_total = sys.total_memory();
+    let swap_used = sys.used_swap();
+    let swap_total = sys.total_swap();
+
+    let rss = sysinfo::get_current_pid().ok().and_then(|pid| {
+        sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), false);
+        sys.process(pid).map(|p| p.memory())
+    });
+
+    println!("── System Metrics ──────────────────────────────────────");
+    println!("  CPU        : {cpu:.1}%");
+    println!(
+        "  Memory     : {} / {} ({:.0}%)",
+        fmt_bytes(mem_used),
+        fmt_bytes(mem_total),
+        if mem_total > 0 {
+            mem_used as f64 / mem_total as f64 * 100.0
+        } else {
+            0.0
+        }
+    );
+    if swap_total > 0 {
+        println!(
+            "  Swap       : {} / {} ({:.0}%)",
+            fmt_bytes(swap_used),
+            fmt_bytes(swap_total),
+            swap_used as f64 / swap_total as f64 * 100.0
+        );
+    }
+    if let Some(r) = rss {
+        println!("  Process RSS: {}", fmt_bytes(r));
+    }
+
+    let disks = Disks::new_with_refreshed_list();
+    if !disks.is_empty() {
+        println!("── Disks ───────────────────────────────────────────────");
+        println!(
+            "  {:<20} {:<8} {:>8} {:>8} {:>8}  used%",
+            "mount", "fs", "used", "free", "total"
+        );
+        for d in disks.iter() {
+            let avail = d.available_space();
+            let total = d.total_space();
+            let used = total.saturating_sub(avail);
+            let pct = if total > 0 {
+                used as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "  {:<20} {:<8} {:>8} {:>8} {:>8}  {:.0}%",
+                d.mount_point().to_string_lossy(),
+                d.file_system().to_string_lossy(),
+                fmt_bytes(used),
+                fmt_bytes(avail),
+                fmt_bytes(total),
+                pct
+            );
+        }
+    }
+
+    let networks = Networks::new_with_refreshed_list();
+    let active: Vec<_> = networks
+        .iter()
+        .filter(|(_, d)| d.total_received() > 0 || d.total_transmitted() > 0)
+        .collect();
+    if !active.is_empty() {
+        println!("── Network (since boot) ────────────────────────────────");
+        println!("  {:<16} {:>12} {:>12}", "interface", "RX", "TX");
+        for (name, data) in &active {
+            println!(
+                "  {:<16} {:>12} {:>12}",
+                name,
+                fmt_bytes(data.total_received()),
+                fmt_bytes(data.total_transmitted())
+            );
+        }
+    }
+}
+
+fn fmt_bytes(b: u64) -> String {
+    const GB: u64 = 1_073_741_824;
+    const MB: u64 = 1_048_576;
+    const KB: u64 = 1_024;
+    if b >= GB {
+        format!("{:.1}GB", b as f64 / GB as f64)
+    } else if b >= MB {
+        format!("{:.1}MB", b as f64 / MB as f64)
+    } else if b >= KB {
+        format!("{:.0}KB", b as f64 / KB as f64)
+    } else {
+        format!("{b}B")
+    }
 }
 
 fn cmd_setup(config_path: Option<&std::path::Path>) {

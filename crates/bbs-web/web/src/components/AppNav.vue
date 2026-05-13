@@ -90,6 +90,7 @@ const groups = computed<NavGroup[]>(() => {
     items: [
       { to: '/reports', label: 'reports' },
       { to: '/errors', label: 'errors', errorBadge: true },
+      { to: '/metrics', label: 'metrics' },
       { to: '/backups', label: 'backups' },
       { to: '/plugins', label: 'plugins' },
       { to: '/logs', label: 'logs' },

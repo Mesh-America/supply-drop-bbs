@@ -45,6 +45,7 @@ toml.workspace            = true
 toml_edit.workspace       = true
 tracing.workspace            = true
 tracing-subscriber.workspace = true
+sysinfo.workspace            = true
 dialoguer.workspace          = true
 tokio-serial.workspace       = true
 time.workspace               = true
@@ -112,6 +113,7 @@ mime_guess  = "2"
 tokio-stream = { version = "0.1", features = ["sync"] }
 zip         = { version = "2", default-features = false, features = ["deflate"] }
 toml_edit   = { version = "0.22", features = ["serde"] }
+sysinfo     = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
 
 # Workspace-wide lint config. Applied to every member crate via
 # `[lints] workspace = true` in their Cargo.toml. Centralising here

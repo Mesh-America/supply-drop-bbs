@@ -33,6 +33,7 @@
 //! │  │  GET  /api/v1/config               (auth)       │    │
 //! │  │  PATCH /api/v1/config              (auth)       │    │
 //! │  │  GET  /api/v1/errors               (auth)       │    │
+//! │  │  GET  /api/v1/metrics              (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
 //! │  │  GET  /api/v1/sse/errors           (auth)       │    │
 //! │  │  POST /api/v1/backups              (auth)       │    │
@@ -60,6 +61,7 @@
 #![allow(missing_docs)]
 
 pub mod error_tracker;
+pub mod metrics;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -532,6 +534,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/sse/events", get(api_sse_events))
         .route("/sse/errors", get(api_sse_errors))
         .route("/errors", get(api_errors))
+        .route("/metrics", get(api_metrics))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
         .route(
             "/backups/:filename",
@@ -1465,6 +1468,15 @@ async fn api_sse_errors(
         };
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+// ── System metrics ───────────────────────────────────────────────────────────
+
+async fn api_metrics() -> Response {
+    match tokio::task::spawn_blocking(metrics::collect).await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(e) => server_error(&format!("metrics collection panicked: {e}")),
+    }
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
