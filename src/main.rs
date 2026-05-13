@@ -305,6 +305,9 @@ async fn cmd_run(cli: &Cli) {
 
     // ── 2. Tracing ────────────────────────────────────────────────────────────
     let log_reload = init_tracing(&cfg.logging);
+    // Non-web builds have no consumer for the reload handle; silence the warning.
+    #[cfg(not(feature = "admin-web"))]
+    let _ = log_reload;
 
     // ADR-0009: announce CLI-level stomps loudly.
     if let Some(ref s) = cli_level_str {
