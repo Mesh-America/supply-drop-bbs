@@ -95,7 +95,13 @@ jobs:
             x86_64-unknown-linux-gnu)      DEB_ARCH=amd64 ;;
           esac
 
+          # Build tree uses versioned name (good for dpkg-deb internals);
+          # the output .deb is renamed to the unversioned form so that
+          # GitHub's /releases/latest/download/<file> static URL works —
+          # operators can always curl the same URL regardless of version.
           PKG="supply-drop-bbs_${VERSION}_${DEB_ARCH}"
+          DEB_OUT="supply-drop-bbs_${DEB_ARCH}.deb"
+
           mkdir -p "${PKG}/DEBIAN"
           mkdir -p "${PKG}/usr/local/bin"
           mkdir -p "${PKG}/lib/systemd/system"
@@ -132,7 +138,7 @@ jobs:
           chmod 755 "${PKG}/DEBIAN/postinst" "${PKG}/DEBIAN/prerm"
 
           dpkg-deb --build --root-owner-group "${PKG}"
-          mv "${PKG}.deb" dist/
+          mv "${PKG}.deb" "dist/${DEB_OUT}"
 
       # 2. Headless — no admin web UI; smaller binary for resource-constrained nodes
       - name: Build — headless (cli + mesh, no web)

@@ -77,32 +77,25 @@ The `.deb` is the easiest way to install on Raspberry Pi OS, Ubuntu, or any
 Debian-based system. It handles user creation, directory layout, and systemd
 service registration automatically.
 
-1. Download the `.deb` for your architecture from the
-   [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest):
+Run this on your Pi or Linux box — it auto-detects your architecture:
 
-   | Hardware | File to download |
-   |---|---|
-   | Raspberry Pi 4/5 (64-bit) | `supply-drop-bbs_VERSION_arm64.deb` |
-   | Raspberry Pi 2/3/Zero 2 (32-bit) | `supply-drop-bbs_VERSION_armhf.deb` |
-   | x86-64 Linux | `supply-drop-bbs_VERSION_amd64.deb` |
+```sh
+ARCH=$(dpkg --print-architecture)   # arm64, armhf, or amd64
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/latest/download/supply-drop-bbs_${ARCH}.deb" \
+  -o supply-drop-bbs.deb
+sudo dpkg -i supply-drop-bbs.deb
+sudo supply-drop-bbs setup
+sudo systemctl start supply-drop-bbs
+```
 
-2. Install it:
+Or download manually from the [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest):
 
-   ```sh
-   sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
-   ```
-
-3. Run the setup wizard to create your config:
-
-   ```sh
-   sudo supply-drop-bbs setup
-   ```
-
-4. Start the service:
-
-   ```sh
-   sudo systemctl start supply-drop-bbs
-   ```
+| Hardware | File |
+|---|---|
+| Raspberry Pi 4/5 (64-bit) | `supply-drop-bbs_arm64.deb` |
+| Raspberry Pi 2/3/Zero 2 (32-bit) | `supply-drop-bbs_armhf.deb` |
+| x86-64 Linux | `supply-drop-bbs_amd64.deb` |
 
 ### Option 2 — Raw binary
 

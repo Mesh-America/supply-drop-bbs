@@ -105,20 +105,27 @@ The `.deb` package is the easiest way to install on Raspberry Pi OS, Ubuntu,
 or any Debian-based system. It creates the service user, sets up the directory
 layout, and registers the systemd unit — no cloning required.
 
-**Step 1.** Download the `.deb` for your architecture from the
-[latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest):
-
-| Hardware | File to download |
-|---|---|
-| Raspberry Pi 4 / 5 (64-bit) | `supply-drop-bbs_VERSION_arm64.deb` |
-| Raspberry Pi 2 / 3 / Zero 2 (32-bit) | `supply-drop-bbs_VERSION_armhf.deb` |
-| x86-64 Linux | `supply-drop-bbs_VERSION_amd64.deb` |
-
-**Step 2.** Install:
+**One-liner install** — auto-detects your architecture:
 
 ```sh
-sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
+ARCH=$(dpkg --print-architecture)   # arm64, armhf, or amd64
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/latest/download/supply-drop-bbs_${ARCH}.deb" \
+  -o supply-drop-bbs.deb
+sudo dpkg -i supply-drop-bbs.deb
+sudo supply-drop-bbs setup
+sudo systemctl start supply-drop-bbs
 ```
+
+Or download manually from the
+[latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest)
+if you prefer to inspect the file first:
+
+| Hardware | File |
+|---|---|
+| Raspberry Pi 4 / 5 (64-bit) | `supply-drop-bbs_arm64.deb` |
+| Raspberry Pi 2 / 3 / Zero 2 (32-bit) | `supply-drop-bbs_armhf.deb` |
+| x86-64 Linux | `supply-drop-bbs_amd64.deb` |
 
 The package:
 
@@ -126,15 +133,10 @@ The package:
 2. Creates `/var/lib/supply-drop-bbs` (data) and `/etc/supply-drop-bbs` (config)
 3. Installs the `supply-drop-bbs.service` systemd unit and enables it
 
-**Step 3.** Run the setup wizard:
+Then run the setup wizard and start:
 
 ```sh
 sudo supply-drop-bbs setup
-```
-
-**Step 4.** Start the service:
-
-```sh
 sudo systemctl start supply-drop-bbs
 ```
 
@@ -430,10 +432,14 @@ automatically if `pymc-companion` restarts.
 
 ### Debian package update (recommended)
 
-Download the new `.deb` from the [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest) and install it. `dpkg` stops the running service, replaces the binary, and restarts it automatically — your config and data are untouched.
+`dpkg` stops the running service, replaces the binary, and restarts it automatically — your config and data are untouched.
 
 ```sh
-sudo dpkg -i supply-drop-bbs_NEW_VERSION_ARCH.deb
+ARCH=$(dpkg --print-architecture)
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/latest/download/supply-drop-bbs_${ARCH}.deb" \
+  -o supply-drop-bbs.deb
+sudo dpkg -i supply-drop-bbs.deb
 ```
 
 **Typical update time: under a minute.**

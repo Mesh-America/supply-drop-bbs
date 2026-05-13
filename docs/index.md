@@ -36,16 +36,14 @@ features:
 
 ## Quick install
 
-**Debian / Ubuntu / Raspberry Pi OS** — download the `.deb` for your hardware from the [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest):
-
-| Hardware | File |
-|---|---|
-| Raspberry Pi 4 / 5 (64-bit) | `supply-drop-bbs_VERSION_arm64.deb` |
-| Raspberry Pi 2 / 3 / Zero 2 (32-bit) | `supply-drop-bbs_VERSION_armhf.deb` |
-| x86-64 Linux | `supply-drop-bbs_VERSION_amd64.deb` |
+**Debian / Ubuntu / Raspberry Pi OS** — auto-detects your architecture:
 
 ```sh
-sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
+ARCH=$(dpkg --print-architecture)
+curl -fsSL \
+  "https://github.com/Mesh-America/supply-drop-bbs/releases/latest/download/supply-drop-bbs_${ARCH}.deb" \
+  -o supply-drop-bbs.deb
+sudo dpkg -i supply-drop-bbs.deb
 sudo supply-drop-bbs setup
 sudo systemctl start supply-drop-bbs
 ```
