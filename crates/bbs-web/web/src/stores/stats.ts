@@ -4,11 +4,15 @@ import { api } from '../api/client'
 
 interface Stats {
   pending_users: number
+  active_users: number
+  active_sessions: number
   [key: string]: unknown
 }
 
 export const useStatsStore = defineStore('stats', () => {
   const pendingUsers = ref(0)
+  const activeUsers = ref(0)
+  const activeSessions = ref(0)
   const errorAlerts = ref(0)
   const rssAlertActive = ref(false)
   const rssGrowthBytes = ref(0)
@@ -21,6 +25,8 @@ export const useStatsStore = defineStore('stats', () => {
     try {
       const s = await api.get<Stats>('/api/v1/stats')
       pendingUsers.value = s.pending_users
+      activeUsers.value = s.active_users
+      activeSessions.value = s.active_sessions
     } catch {
       // non-fatal — badge just won't update
     }
@@ -81,6 +87,8 @@ export const useStatsStore = defineStore('stats', () => {
 
   return {
     pendingUsers,
+    activeUsers,
+    activeSessions,
     errorAlerts,
     rssAlertActive,
     rssGrowthBytes,

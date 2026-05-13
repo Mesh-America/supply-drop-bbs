@@ -53,7 +53,7 @@ const modes: { value: Mode; label: string }[] = [
   { value: 'system', label: modeLabel.system },
 ]
 
-interface NavItem { to: string; label: string; badge?: boolean; errorBadge?: boolean; rssBadge?: boolean }
+interface NavItem { to: string; label: string; badge?: boolean; errorBadge?: boolean; rssBadge?: boolean; count?: () => number }
 interface NavGroup { title: string; items: NavItem[] }
 
 const groups = computed<NavGroup[]>(() => {
@@ -73,13 +73,13 @@ const groups = computed<NavGroup[]>(() => {
 
   g.push({
     title: 'sessions',
-    items: [{ to: '/sessions', label: 'sessions' }],
+    items: [{ to: '/sessions', label: 'sessions', count: () => stats.activeSessions }],
   })
 
   g.push({
     title: 'admin',
     items: [
-      { to: '/users', label: 'users', badge: true },
+      { to: '/users', label: 'users', badge: true, count: () => stats.activeUsers },
       { to: '/rooms', label: 'rooms' },
       { to: '/messages', label: 'messages' },
     ],
@@ -181,6 +181,7 @@ const groups = computed<NavGroup[]>(() => {
           <li v-for="item in g.items" :key="item.to">
             <router-link :to="item.to" @click="close">
               {{ item.label }}
+              <span v-if="item.count" class="nav-count">{{ item.count() }}</span>
               <span
                 v-if="item.badge && stats.pendingUsers > 0"
                 class="nav-badge"
@@ -352,7 +353,9 @@ const groups = computed<NavGroup[]>(() => {
 }
 .sidebar ul { list-style: none; margin: 0; padding: 0; }
 .sidebar li a {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
   padding: 0.4rem 1rem;
   color: var(--fg);
   border-left: 2px solid transparent;
@@ -365,6 +368,13 @@ const groups = computed<NavGroup[]>(() => {
   border-left-color: var(--accent);
   background: var(--accent-bg);
 }
+.nav-count {
+  margin-left: auto;
+  font-size: 0.78em;
+  color: var(--muted);
+  font-weight: 400;
+}
+
 .nav-badge {
   display: inline-block;
   margin-left: 0.4rem;
