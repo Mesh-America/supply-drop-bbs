@@ -103,7 +103,7 @@ Download the binary directly and verify the checksum before running it.
 
 ```sh
 # Example for Raspberry Pi 4 (arm64):
-TAG=v0.6.0   # replace with the latest release tag
+TAG=v0.6.1   # replace with the latest release tag
 curl -fsSL "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/supply-drop-bbs-${TAG}-aarch64-unknown-linux-gnu" \
      -o supply-drop-bbs
 curl -fsSL "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/SHA256SUMS" \

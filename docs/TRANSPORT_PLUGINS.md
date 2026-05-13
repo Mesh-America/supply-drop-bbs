@@ -46,7 +46,7 @@ transport at it from your dev machine. See
 [Installation & Operations](OPERATIONS.md) for the full install
 guide.
 
-The current workspace version is **0.6.0**. See the
+The current workspace version is **0.6.1**. See the
 [Plugin API guide § Versioning](PLUGIN_API.md#versioning) for the
 version history and migration notes for existing plugins.
 
@@ -1384,15 +1384,15 @@ thiserror                = "1"
 ```
 
 ::: tip Current version
-The workspace version is **0.6.0**. Out-of-tree plugins (not inside
+The workspace version is **0.6.1**. Out-of-tree plugins (not inside
 this workspace) reference the crate directly:
 
 ```toml
 [dependencies]
-bbs-plugin-api = { git = "https://github.com/Mesh-America/supply-drop-bbs", version = "0.5" }
+bbs-plugin-api = { git = "https://github.com/Mesh-America/supply-drop-bbs", version = "0.6" }
 ```
 
-Use the `"0.5"` range rather than pinning to an exact patch version.
+Use the `"0.6"` range rather than pinning to an exact patch version.
 :::
 
 ### `crates/bbs-meshtastic/src/lib.rs`
