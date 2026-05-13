@@ -361,6 +361,7 @@ dependencies = [
  "toml_edit",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zip",
 ]

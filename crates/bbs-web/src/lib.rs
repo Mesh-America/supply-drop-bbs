@@ -32,7 +32,9 @@
 //! │  │  GET  /api/v1/settings             (auth)       │    │
 //! │  │  GET  /api/v1/config               (auth)       │    │
 //! │  │  PATCH /api/v1/config              (auth)       │    │
+//! │  │  GET  /api/v1/errors               (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
+//! │  │  GET  /api/v1/sse/errors           (auth)       │    │
 //! │  │  POST /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups/:filename    (auth)       │    │
@@ -57,12 +59,16 @@
 
 #![allow(missing_docs)]
 
+pub mod error_tracker;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+use error_tracker::{ErrorEntry, ErrorStore};
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, Request, State};
@@ -269,6 +275,8 @@ struct AppState {
     active_transports: std::sync::Mutex<TransportFlags>,
     pending_restart: AtomicBool,
     log_reload: std::sync::Mutex<Option<LogReloadFn>>,
+    error_store: std::sync::Mutex<Option<Arc<Mutex<ErrorStore>>>>,
+    error_tx: std::sync::Mutex<Option<broadcast::Sender<ErrorEntry>>>,
 }
 
 impl AppState {
@@ -285,6 +293,8 @@ impl AppState {
             active_transports: std::sync::Mutex::new(TransportFlags::default()),
             pending_restart: AtomicBool::new(false),
             log_reload: std::sync::Mutex::new(None),
+            error_store: std::sync::Mutex::new(None),
+            error_tx: std::sync::Mutex::new(None),
         }
     }
 
@@ -475,6 +485,19 @@ impl WebPlugin {
     pub fn set_log_reload(&self, reload: LogReloadFn) {
         *self.state.log_reload.lock().expect("log_reload poisoned") = Some(reload);
     }
+
+    /// Inject the error tracker store and broadcast sender.
+    ///
+    /// Must be called before `start()`.  Enables the `GET /api/v1/errors`
+    /// endpoint and the `GET /api/v1/sse/errors` stream.
+    pub fn set_error_store(
+        &self,
+        store: Arc<Mutex<ErrorStore>>,
+        tx: broadcast::Sender<ErrorEntry>,
+    ) {
+        *self.state.error_store.lock().expect("error_store poisoned") = Some(store);
+        *self.state.error_tx.lock().expect("error_tx poisoned") = Some(tx);
+    }
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -507,6 +530,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/logs", get(api_logs))
         .route("/sse/logs", get(api_sse_logs))
         .route("/sse/events", get(api_sse_events))
+        .route("/sse/errors", get(api_sse_errors))
+        .route("/errors", get(api_errors))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
         .route(
             "/backups/:filename",
@@ -1400,6 +1425,46 @@ async fn api_reports(State(state): State<Arc<AppState>>) -> Response {
         Ok(r) => Json(r).into_response(),
         Err(e) => server_error(&e.to_string()),
     }
+}
+
+// ── Error report ─────────────────────────────────────────────────────────────
+
+async fn api_errors(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let store_guard = state.error_store.lock().expect("error_store poisoned");
+    let entries = match store_guard.as_ref() {
+        Some(store) => store
+            .lock()
+            .expect("error_store inner poisoned")
+            .list_sorted(),
+        None => vec![],
+    };
+    Json(entries)
+}
+
+async fn api_sse_errors(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let rx_opt = state
+        .error_tx
+        .lock()
+        .expect("error_tx poisoned")
+        .as_ref()
+        .map(|tx| tx.subscribe());
+
+    let stream: Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + Unpin> =
+        match rx_opt {
+            Some(rx) => Box::new(BroadcastStream::new(rx).filter_map(|res| {
+                match res {
+                    Ok(entry) => serde_json::to_string(&entry)
+                        .ok()
+                        .map(|json| Ok(Event::default().event("error_alert").data(json))),
+                    Err(_) => None,
+                }
+            })),
+            None => Box::new(tokio_stream::empty()),
+        };
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────

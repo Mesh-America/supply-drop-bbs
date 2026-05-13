@@ -53,7 +53,7 @@ const modes: { value: Mode; label: string }[] = [
   { value: 'system', label: modeLabel.system },
 ]
 
-interface NavItem { to: string; label: string; badge?: boolean }
+interface NavItem { to: string; label: string; badge?: boolean; errorBadge?: boolean }
 interface NavGroup { title: string; items: NavItem[] }
 
 const groups = computed<NavGroup[]>(() => {
@@ -89,6 +89,7 @@ const groups = computed<NavGroup[]>(() => {
     title: 'ops',
     items: [
       { to: '/reports', label: 'reports' },
+      { to: '/errors', label: 'errors', errorBadge: true },
       { to: '/backups', label: 'backups' },
       { to: '/plugins', label: 'plugins' },
       { to: '/logs', label: 'logs' },
@@ -172,6 +173,11 @@ const groups = computed<NavGroup[]>(() => {
                 class="nav-badge"
                 :title="`${stats.pendingUsers} pending verification`"
               >{{ stats.pendingUsers }}</span>
+              <span
+                v-if="item.errorBadge && stats.errorAlerts > 0"
+                class="nav-badge error-badge"
+                :title="`${stats.errorAlerts} new error event${stats.errorAlerts === 1 ? '' : 's'}`"
+              >{{ stats.errorAlerts }}</span>
             </router-link>
           </li>
         </ul>
@@ -353,6 +359,8 @@ const groups = computed<NavGroup[]>(() => {
   vertical-align: middle;
   line-height: 1.4;
 }
+
+.error-badge { background: #dc2626; }
 
 .sidebar-footer {
   font-size: 0.75em;

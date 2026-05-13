@@ -304,7 +304,19 @@ async fn cmd_run(cli: &Cli) {
     }
 
     // ── 2. Tracing ────────────────────────────────────────────────────────────
+
+    // With the admin-web feature the error tracker layer is wired into the
+    // subscriber registry so WARN/ERROR events are captured.  Without it we
+    // use the plain init_tracing path.
+    #[cfg(feature = "admin-web")]
+    let (error_tracker_layer, error_store, error_tx) = bbs_web::error_tracker::new_error_tracker();
+
+    #[cfg(feature = "admin-web")]
+    let log_reload = init_tracing_with_error_layer(&cfg.logging, error_tracker_layer);
+
+    #[cfg(not(feature = "admin-web"))]
     let log_reload = init_tracing(&cfg.logging);
+
     // Non-web builds have no consumer for the reload handle; silence the warning.
     #[cfg(not(feature = "admin-web"))]
     let _ = log_reload;
@@ -465,6 +477,8 @@ async fn cmd_run(cli: &Cli) {
             Arc::clone(&host),
             cfg_abs,
             Arc::clone(&log_reload),
+            error_store,
+            error_tx,
         )
         .await;
         #[cfg(feature = "transport-process")]
@@ -651,6 +665,8 @@ async fn init_web_plugin(
     host: Arc<dyn bbs_plugin_api::Host>,
     config_file_path: Option<String>,
     log_reload: LogReloadFn,
+    error_store: std::sync::Arc<std::sync::Mutex<bbs_web::error_tracker::ErrorStore>>,
+    error_tx: tokio::sync::broadcast::Sender<bbs_web::error_tracker::ErrorEntry>,
 ) -> Option<bbs_web::WebPlugin> {
     use bbs_plugin_api::Plugin;
 
@@ -675,6 +691,7 @@ async fn init_web_plugin(
         }
     };
     plugin.set_log_reload(log_reload);
+    plugin.set_error_store(error_store, error_tx);
 
     if let Err(e) = plugin.start().await {
         error!("web admin start failed: {e}");
@@ -1368,6 +1385,65 @@ fn iso_week_key(rfc3339: &str) -> String {
 /// log level at runtime without a restart. Accepts a level string such as
 /// `"DEBUG"` or `"INFO"`. Target-specific overrides from config are NOT
 /// preserved after a runtime reload (the reload replaces the whole filter).
+/// Tracing init that also installs the in-process error tracker layer.
+///
+/// Compiled only when the `admin-web` feature is active.  The concrete
+/// `ErrorTrackerLayer` type is generic over any `Subscriber`, so it
+/// composes cleanly with the reload and fmt layers.
+#[cfg(feature = "admin-web")]
+fn init_tracing_with_error_layer(
+    cfg: &config::LoggingConfig,
+    error_layer: bbs_web::error_tracker::ErrorTrackerLayer,
+) -> LogReloadFn {
+    let root_level: tracing::Level = cfg.level.into();
+
+    let mut filter = EnvFilter::builder()
+        .with_default_directive(root_level.into())
+        .from_env_lossy();
+
+    for (target, target_level) in &cfg.targets {
+        let tl: tracing::Level = (*target_level).into();
+        if let Ok(directive) = format!("{target}={}", tl.as_str()).parse() {
+            filter = filter.add_directive(directive);
+        }
+    }
+
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
+
+    match cfg.format {
+        config::LogFormat::Pretty => {
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(error_layer)
+                .with(tracing_subscriber::fmt::layer().pretty())
+                .init();
+        }
+        config::LogFormat::Json => {
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(error_layer)
+                .with(tracing_subscriber::fmt::layer().json())
+                .init();
+        }
+        config::LogFormat::Compact => {
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(error_layer)
+                .with(tracing_subscriber::fmt::layer().compact())
+                .init();
+        }
+    }
+
+    Arc::new(move |level: &str| {
+        let new_filter =
+            EnvFilter::try_new(level).map_err(|e| format!("invalid log filter: {e}"))?;
+        reload_handle
+            .reload(new_filter)
+            .map_err(|e| format!("reload failed: {e}"))
+    })
+}
+
+#[cfg(not(feature = "admin-web"))]
 fn init_tracing(cfg: &config::LoggingConfig) -> LogReloadFn {
     let root_level: tracing::Level = cfg.level.into();
 
