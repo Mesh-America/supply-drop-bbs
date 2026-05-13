@@ -62,6 +62,7 @@
 #![allow(missing_docs)]
 
 pub mod error_tracker;
+pub mod log_capture;
 pub mod metrics;
 pub mod rss_monitor;
 
@@ -188,46 +189,8 @@ fn default_config_path() -> Option<String> {
 const SESSION_COOKIE: &str = "bbs_web_session";
 const SESSION_TTL_SECS: u64 = 12 * 60 * 60; // 12 h
 const LOG_CHANNEL_CAP: usize = 256;
-const LOG_BUF_CAP: usize = 500;
 
-// ── In-memory log ring buffer ─────────────────────────────────────────────────
-
-/// A monotonically-sequenced ring buffer for recent log lines.
-///
-/// Each line gets a unique `seq` number. Clients send `?after=N` to receive
-/// only lines with `seq >= N`, enabling efficient incremental polling.
-struct LogBuffer {
-    lines: std::collections::VecDeque<(u64, String)>,
-    next_seq: u64,
-}
-
-impl LogBuffer {
-    fn new() -> Self {
-        Self {
-            lines: std::collections::VecDeque::new(),
-            next_seq: 0,
-        }
-    }
-
-    fn push(&mut self, text: String) {
-        self.lines.push_back((self.next_seq, text));
-        self.next_seq += 1;
-        while self.lines.len() > LOG_BUF_CAP {
-            self.lines.pop_front();
-        }
-    }
-
-    /// Return all lines with `seq >= after` and the next cursor value.
-    fn since(&self, after: u64) -> (u64, Vec<String>) {
-        let lines = self
-            .lines
-            .iter()
-            .filter(|(seq, _)| *seq >= after)
-            .map(|(_, text)| text.clone())
-            .collect();
-        (self.next_seq, lines)
-    }
-}
+use log_capture::LogBuffer;
 
 #[derive(Debug)]
 struct WebSession {
@@ -275,7 +238,12 @@ struct AppState {
     sessions: Mutex<HashMap<String, WebSession>>,
     started_at: Instant,
     log_tx: broadcast::Sender<String>,
+    /// Domain-event-only ring buffer (BBS sessions, auth, messages).
+    /// Used as fallback when no application-level log buffer is injected.
     log_buf: std::sync::Arc<Mutex<LogBuffer>>,
+    /// Application-level log buffer shared with the LogCaptureLayer in main.rs.
+    /// When set, combines tracing events + BBS domain events; preferred by api_logs.
+    ext_log_buf: std::sync::Mutex<Option<Arc<Mutex<LogBuffer>>>>,
     plugin_registry: std::sync::Mutex<Option<Arc<dyn PluginRegistryApi>>>,
     active_transports: std::sync::Mutex<TransportFlags>,
     pending_restart: AtomicBool,
@@ -295,6 +263,7 @@ impl AppState {
             started_at: Instant::now(),
             log_tx,
             log_buf: std::sync::Arc::new(Mutex::new(LogBuffer::new())),
+            ext_log_buf: std::sync::Mutex::new(None),
             plugin_registry: std::sync::Mutex::new(None),
             active_transports: std::sync::Mutex::new(TransportFlags::default()),
             pending_restart: AtomicBool::new(false),
@@ -408,6 +377,12 @@ impl Plugin for WebPlugin {
         // Spawn domain-event → SSE + ring-buffer log bridge.
         let log_tx = self.state.log_tx.clone();
         let log_buf = std::sync::Arc::clone(&self.state.log_buf);
+        let ext_log_buf = self
+            .state
+            .ext_log_buf
+            .lock()
+            .expect("ext_log_buf poisoned")
+            .clone();
         let mut events = self.state.host.events();
         tokio::spawn(async move {
             loop {
@@ -415,11 +390,17 @@ impl Plugin for WebPlugin {
                     Ok(event) => {
                         let line = format_domain_event(&event);
                         log_buf.lock().expect("log_buf poisoned").push(line.clone());
+                        if let Some(ref buf) = ext_log_buf {
+                            buf.lock().expect("ext_log_buf poisoned").push(line.clone());
+                        }
                         let _ = log_tx.send(line);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         let warn = format!("[warn] event stream lagged by {n}");
                         log_buf.lock().expect("log_buf poisoned").push(warn.clone());
+                        if let Some(ref buf) = ext_log_buf {
+                            buf.lock().expect("ext_log_buf poisoned").push(warn.clone());
+                        }
                         let _ = log_tx.send(warn);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -499,6 +480,15 @@ impl WebPlugin {
     /// Must be called before `start()`.
     pub fn set_log_reload(&self, reload: LogReloadFn) {
         *self.state.log_reload.lock().expect("log_reload poisoned") = Some(reload);
+    }
+
+    /// Inject the application-level log buffer shared with the `LogCaptureLayer`.
+    ///
+    /// When set, `GET /api/v1/logs` returns tracing-level events (INFO/WARN/ERROR)
+    /// from all crates in addition to BBS domain events.  Must be called before
+    /// `start()`.
+    pub fn set_log_buffer(&self, buf: Arc<Mutex<LogBuffer>>) {
+        *self.state.ext_log_buf.lock().expect("ext_log_buf poisoned") = Some(buf);
     }
 
     /// Inject the error tracker store and broadcast sender.
@@ -1949,7 +1939,14 @@ async fn api_logs(
     Query(q): Query<LogsQuery>,
 ) -> impl IntoResponse {
     let after = q.after.unwrap_or(0);
-    let (cursor, lines) = state.log_buf.lock().expect("log_buf poisoned").since(after);
+    // Prefer the application log buffer (tracing events + BBS events) when
+    // available; fall back to the BBS-only domain event buffer.
+    let (cursor, lines) =
+        if let Some(ref buf) = *state.ext_log_buf.lock().expect("ext_log_buf poisoned") {
+            buf.lock().expect("ext_log_buf inner poisoned").since(after)
+        } else {
+            state.log_buf.lock().expect("log_buf poisoned").since(after)
+        };
     Json(LogsResponse { cursor, lines })
 }
 
