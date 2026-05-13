@@ -64,7 +64,7 @@ discriminator.
 
 | `t` | Other fields | Meaning |
 |-----|-------------|---------|
-| `ready` | `payload_limit?` | You have initialised and are ready to accept connections |
+| `ready` | `payload_limit?`, `version?` | You have initialised and are ready to accept connections |
 | `open` | `id` | A new user connection arrived |
 | `recv` | `id`, `line` | A user sent a line of text |
 | `close` | `id` | A connection was closed by the remote end |
@@ -87,6 +87,11 @@ back when sending responses so you know which connection to write to.
 **`payload_limit`** — Maximum bytes per response text frame. Set this to your
 transport's MTU. Supply Drop truncates responses that exceed the limit. Use
 `0` or omit the field for no limit (CLI-style transports).
+
+**`version`** — A human-readable version string for your plugin, shown in the
+admin web UI's plugins table. Use `env!("CARGO_PKG_VERSION")` in Rust or the
+equivalent in your language. Optional — omit it if not meaningful, and `—`
+will appear in the UI.
 
 **`text`** — The display-ready string to deliver to the user. Supply Drop
 does not append a newline; transports should add whatever framing their
@@ -129,7 +134,7 @@ password or message body). Supply Drop tracks this internally and sets
 Your process must:
 
 1. Start up and initialise (open sockets, connect to APIs, etc.)
-2. Print `{"t":"ready"}` (or `{"t":"ready","payload_limit":156}`) to stdout
+2. Print `{"t":"ready"}` (or `{"t":"ready","payload_limit":156,"version":"1.0.0"}`) to stdout
 3. Begin accepting connections and printing `open`/`recv`/`close` events
 
 Supply Drop logs your startup and treats any delay before `ready` as normal.
@@ -312,7 +317,7 @@ async def main():
     print(f"listening on {addr}", file=sys.stderr, flush=True)
 
     # Signal readiness to Supply Drop.
-    send_to_bbs({"t": "ready", "payload_limit": 0})
+    send_to_bbs({"t": "ready", "payload_limit": 0, "version": VERSION})
 
     async with server:
         await asyncio.gather(
@@ -439,7 +444,7 @@ if __name__ == "__main__":
     slack_thread.start()
 
     # Signal readiness (unlimited payload for Slack).
-    send_to_bbs({"t": "ready", "payload_limit": 0})
+    send_to_bbs({"t": "ready", "payload_limit": 0, "version": VERSION})
     print("ready", file=sys.stderr, flush=True)
 
     asyncio.run(stdin_reader())
@@ -480,7 +485,10 @@ fn send(msg: &PluginMsg) {
 
 fn main() {
     // Signal readiness.
-    send(&PluginMsg::Ready { payload_limit: 0 });
+    send(&PluginMsg::Ready {
+        payload_limit: 0,
+        version: Some(env!("CARGO_PKG_VERSION").to_owned()),
+    });
 
     // Read commands from Supply Drop.
     let stdin = io::stdin();
@@ -651,6 +659,7 @@ Before shipping a process transport plugin, run through this list:
 **Optional but recommended**
 - [ ] `payload_limit` declared in `ready` if your transport has a per-frame
   MTU (LoRa, SMS, APRS — leave at `0` or omit for unlimited transports)
+- [ ] `version` declared in `ready` — shown in the admin UI plugins table
 - [ ] `hide_input` honoured, or explicitly noted as unsupported in your
   README
 - [ ] `restart_on_crash = true` in the production config entry
