@@ -79,6 +79,61 @@ jobs:
           cp "target/${TARGET}/release-min/supply-drop-bbs" \
              "dist/supply-drop-bbs-${TAG}-${TARGET}"
 
+      # Package the full binary as a .deb for Debian/Ubuntu/Raspberry Pi OS.
+      # The headless variant is intentionally not packaged — operators who need
+      # it can use the raw binary. The .deb installs to the standard paths and
+      # wires up the systemd unit without requiring a cloned repo or root curl.
+      - name: Package as .deb
+        run: |
+          TARGET="${{ matrix.target }}"
+          TAG="${{ github.ref_name }}"
+          VERSION="${TAG#v}"
+
+          case "$TARGET" in
+            aarch64-unknown-linux-gnu)     DEB_ARCH=arm64 ;;
+            armv7-unknown-linux-gnueabihf) DEB_ARCH=armhf ;;
+            x86_64-unknown-linux-gnu)      DEB_ARCH=amd64 ;;
+          esac
+
+          PKG="supply-drop-bbs_${VERSION}_${DEB_ARCH}"
+          mkdir -p "${PKG}/DEBIAN"
+          mkdir -p "${PKG}/usr/local/bin"
+          mkdir -p "${PKG}/lib/systemd/system"
+          mkdir -p "${PKG}/etc/supply-drop-bbs"
+          mkdir -p "${PKG}/var/lib/supply-drop-bbs"
+
+          # Binary
+          cp "dist/supply-drop-bbs-${TAG}-${TARGET}" \
+             "${PKG}/usr/local/bin/supply-drop-bbs"
+          chmod 755 "${PKG}/usr/local/bin/supply-drop-bbs"
+
+          # Systemd service unit
+          cp supply-drop-bbs.service \
+             "${PKG}/lib/systemd/system/supply-drop-bbs.service"
+
+          # control — dpkg extended description continuation lines need exactly
+          # one leading space, which is produced here by the YAML indentation.
+          cat > "${PKG}/DEBIAN/control" <<EOF
+          Package: supply-drop-bbs
+          Version: ${VERSION}
+          Architecture: ${DEB_ARCH}
+          Maintainer: Mesh America <hello@meshamerica.com>
+          Depends: systemd
+          Section: net
+          Priority: optional
+          Description: Bulletin-board system for LoRa mesh networks
+           Supply Drop BBS is a bulletin-board server for LoRa mesh networks.
+           It supports MeshCore and Meshtastic transports and includes an
+           optional admin web UI for sysop administration.
+          EOF
+
+          cp packaging/postinst "${PKG}/DEBIAN/postinst"
+          cp packaging/prerm    "${PKG}/DEBIAN/prerm"
+          chmod 755 "${PKG}/DEBIAN/postinst" "${PKG}/DEBIAN/prerm"
+
+          dpkg-deb --build --root-owner-group "${PKG}"
+          mv "${PKG}.deb" dist/
+
       # 2. Headless — no admin web UI; smaller binary for resource-constrained nodes
       - name: Build — headless (cli + mesh, no web)
         run: |

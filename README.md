@@ -67,17 +67,79 @@ Specifically, this project bakes in from day 1:
 
 ## Installation
 
-Pre-built binaries for Raspberry Pi (aarch64, armv7) and x86-64 Linux are
-attached to each [GitHub Release](https://github.com/Mesh-America/supply-drop-bbs/releases).
+Pre-built packages and binaries for Raspberry Pi (aarch64, armv7) and x86-64
+Linux are attached to each
+[GitHub Release](https://github.com/Mesh-America/supply-drop-bbs/releases).
 
-For a one-command Pi setup:
+### Option 1 — Debian package (recommended)
+
+The `.deb` is the easiest way to install on Raspberry Pi OS, Ubuntu, or any
+Debian-based system. It handles user creation, directory layout, and systemd
+service registration automatically.
+
+1. Download the `.deb` for your architecture from the
+   [latest release](https://github.com/Mesh-America/supply-drop-bbs/releases/latest):
+
+   | Hardware | File to download |
+   |---|---|
+   | Raspberry Pi 4/5 (64-bit) | `supply-drop-bbs_VERSION_arm64.deb` |
+   | Raspberry Pi 2/3/Zero 2 (32-bit) | `supply-drop-bbs_VERSION_armhf.deb` |
+   | x86-64 Linux | `supply-drop-bbs_VERSION_amd64.deb` |
+
+2. Install it:
+
+   ```sh
+   sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
+   ```
+
+3. Run the setup wizard to create your config:
+
+   ```sh
+   sudo supply-drop-bbs setup
+   ```
+
+4. Start the service:
+
+   ```sh
+   sudo systemctl start supply-drop-bbs
+   ```
+
+### Option 2 — Raw binary
+
+Download the binary directly and verify the checksum before running it.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh | sudo bash
+# Example for Raspberry Pi 4 (arm64):
+TAG=v0.5.9   # replace with the latest release tag
+curl -fsSL "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/supply-drop-bbs-${TAG}-aarch64-unknown-linux-gnu" \
+     -o supply-drop-bbs
+curl -fsSL "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/SHA256SUMS" \
+     -o SHA256SUMS
+grep "supply-drop-bbs-${TAG}-aarch64-unknown-linux-gnu" SHA256SUMS | sha256sum -c
+sudo install -m 755 supply-drop-bbs /usr/local/bin/supply-drop-bbs
 ```
 
-See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for full installation and
-configuration instructions.
+Other available targets: `armv7-unknown-linux-gnueabihf` (armhf),
+`x86_64-unknown-linux-gnu` (amd64). Append `-headless` for a smaller build
+without the admin web UI.
+
+### Option 3 — Guided setup script
+
+If you prefer a wizard that handles everything (including optional
+[pymc-companion](https://github.com/Mesh-America/pymc-companion) HAT
+configuration), download and review the script first, then run it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
+     -o install.sh
+less install.sh    # read it before running
+sudo bash install.sh
+```
+
+---
+
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for full configuration
+reference and upgrade instructions.
 
 ## License
 

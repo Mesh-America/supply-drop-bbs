@@ -1,0 +1,43 @@
+#!/bin/sh
+# postinst — Supply Drop BBS Debian post-install script
+set -e
+
+# Create the service account if it doesn't already exist.
+if ! id -u supply-drop >/dev/null 2>&1; then
+    useradd \
+        --system \
+        --no-create-home \
+        --shell /sbin/nologin \
+        --home-dir /var/lib/supply-drop-bbs \
+        --comment "Supply Drop BBS service account" \
+        supply-drop
+fi
+
+# Data directory — writeable only by the service account.
+mkdir -p /var/lib/supply-drop-bbs
+chown supply-drop:supply-drop /var/lib/supply-drop-bbs
+chmod 750 /var/lib/supply-drop-bbs
+
+# Config directory — readable by root; populated by the setup wizard.
+mkdir -p /etc/supply-drop-bbs
+
+# Register and enable the systemd service (but don't start it yet —
+# the operator must run `supply-drop-bbs setup` first).
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    systemctl enable supply-drop-bbs.service || true
+fi
+
+echo ""
+echo "╔══════════════════════════════════════════════════════════════╗"
+echo "║              Supply Drop BBS installed                      ║"
+echo "╠══════════════════════════════════════════════════════════════╣"
+echo "║  1. Run the setup wizard to create your config:             ║"
+echo "║                                                              ║"
+echo "║       sudo supply-drop-bbs setup                            ║"
+echo "║                                                              ║"
+echo "║  2. Start the service:                                       ║"
+echo "║                                                              ║"
+echo "║       sudo systemctl start supply-drop-bbs                  ║"
+echo "╚══════════════════════════════════════════════════════════════╝"
+echo ""

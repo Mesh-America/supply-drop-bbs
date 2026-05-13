@@ -1,0 +1,9 @@
+#!/bin/sh
+# prerm — Supply Drop BBS Debian pre-remove script
+set -e
+
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl stop supply-drop-bbs.service 2>/dev/null || true
+    systemctl disable supply-drop-bbs.service 2>/dev/null || true
+    systemctl daemon-reload || true
+fi
