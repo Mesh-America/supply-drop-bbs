@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, computed } from 'vue'
 import { api } from '../api/client'
+import { useStatsStore } from '../stores/stats'
+
+const stats = useStatsStore()
 
 interface DiskInfo {
   name: string
@@ -97,6 +100,13 @@ onUnmounted(() => {
 
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="loading && !snap" class="muted">Loading…</p>
+
+    <div v-if="stats.rssAlertActive" class="rss-alert-banner">
+      <strong>Memory growth detected</strong> — process RSS has increased
+      monotonically for at least 5 minutes
+      <span v-if="stats.rssGrowthBytes > 0"> (+{{ fmt(stats.rssGrowthBytes) }})</span>.
+      This may indicate a memory leak. Monitor closely or consider restarting.
+    </div>
 
     <div v-if="snap" class="metrics-grid">
 
@@ -278,4 +288,14 @@ p { margin: 0; }
 .pct-label { font-size: 0.82em; margin-left: 0.4rem; }
 
 .sampled-at { font-size: 0.8em; }
+
+.rss-alert-banner {
+  background: rgba(217, 119, 6, 0.12);
+  border: 1px solid #d97706;
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  font-size: 0.9em;
+  color: var(--fg);
+}
+.rss-alert-banner strong { color: #d97706; }
 </style>

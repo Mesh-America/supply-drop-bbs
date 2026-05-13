@@ -36,6 +36,7 @@
 //! │  │  GET  /api/v1/metrics              (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
 //! │  │  GET  /api/v1/sse/errors           (auth)       │    │
+//! │  │  GET  /api/v1/sse/rss-alert        (auth)       │    │
 //! │  │  POST /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups/:filename    (auth)       │    │
@@ -62,6 +63,7 @@
 
 pub mod error_tracker;
 pub mod metrics;
+pub mod rss_monitor;
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -71,6 +73,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use error_tracker::{ErrorEntry, ErrorStore};
+use rss_monitor::RssAlert;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, Request, State};
@@ -279,6 +282,7 @@ struct AppState {
     log_reload: std::sync::Mutex<Option<LogReloadFn>>,
     error_store: std::sync::Mutex<Option<Arc<Mutex<ErrorStore>>>>,
     error_tx: std::sync::Mutex<Option<broadcast::Sender<ErrorEntry>>>,
+    rss_alert_tx: std::sync::Mutex<Option<broadcast::Sender<RssAlert>>>,
 }
 
 impl AppState {
@@ -297,6 +301,7 @@ impl AppState {
             log_reload: std::sync::Mutex::new(None),
             error_store: std::sync::Mutex::new(None),
             error_tx: std::sync::Mutex::new(None),
+            rss_alert_tx: std::sync::Mutex::new(None),
         }
     }
 
@@ -422,6 +427,14 @@ impl Plugin for WebPlugin {
             }
         });
 
+        // Start RSS trend monitor and store its broadcast sender in shared state.
+        let rss_tx = rss_monitor::start();
+        *self
+            .state
+            .rss_alert_tx
+            .lock()
+            .expect("rss_alert_tx poisoned") = Some(rss_tx);
+
         let state = Arc::clone(&self.state);
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -533,6 +546,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/sse/logs", get(api_sse_logs))
         .route("/sse/events", get(api_sse_events))
         .route("/sse/errors", get(api_sse_errors))
+        .route("/sse/rss-alert", get(api_sse_rss_alert))
         .route("/errors", get(api_errors))
         .route("/metrics", get(api_metrics))
         .route("/backups", get(api_list_backups).post(api_trigger_backup))
@@ -1461,6 +1475,32 @@ async fn api_sse_errors(
                     Ok(entry) => serde_json::to_string(&entry)
                         .ok()
                         .map(|json| Ok(Event::default().event("error_alert").data(json))),
+                    Err(_) => None,
+                }
+            })),
+            None => Box::new(tokio_stream::empty()),
+        };
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+async fn api_sse_rss_alert(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    let rx_opt = state
+        .rss_alert_tx
+        .lock()
+        .expect("rss_alert_tx poisoned")
+        .as_ref()
+        .map(|tx| tx.subscribe());
+
+    let stream: Box<dyn tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + Unpin> =
+        match rx_opt {
+            Some(rx) => Box::new(BroadcastStream::new(rx).filter_map(|res| {
+                match res {
+                    Ok(alert) => serde_json::to_string(&alert)
+                        .ok()
+                        .map(|json| Ok(Event::default().event("rss_alert").data(json))),
                     Err(_) => None,
                 }
             })),

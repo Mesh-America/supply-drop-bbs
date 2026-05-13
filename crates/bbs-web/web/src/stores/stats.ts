@@ -10,9 +10,12 @@ interface Stats {
 export const useStatsStore = defineStore('stats', () => {
   const pendingUsers = ref(0)
   const errorAlerts = ref(0)
+  const rssAlertActive = ref(false)
+  const rssGrowthBytes = ref(0)
   let pollTimer: ReturnType<typeof setInterval> | null = null
   let eventSource: EventSource | null = null
   let errorSource: EventSource | null = null
+  let rssSource: EventSource | null = null
 
   async function refresh() {
     try {
@@ -49,13 +52,41 @@ export const useStatsStore = defineStore('stats', () => {
       errorSource.addEventListener('error_alert', () => { errorAlerts.value++ })
       errorSource.onerror = () => { /* auto-reconnects */ }
     }
+
+    // Subscribe to RSS growth alerts for the metrics-page badge.
+    if (rssSource === null) {
+      rssSource = new EventSource('/api/v1/sse/rss-alert')
+      rssSource.addEventListener('rss_alert', (e: MessageEvent) => {
+        try {
+          const data = JSON.parse(e.data)
+          if (data.cleared) {
+            rssAlertActive.value = false
+            rssGrowthBytes.value = 0
+          } else {
+            rssAlertActive.value = true
+            rssGrowthBytes.value = data.growth_bytes ?? 0
+          }
+        } catch { /* ignore malformed events */ }
+      })
+      rssSource.onerror = () => { /* auto-reconnects */ }
+    }
   }
 
   function stopPolling() {
     if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null }
     if (eventSource !== null) { eventSource.close(); eventSource = null }
     if (errorSource !== null) { errorSource.close(); errorSource = null }
+    if (rssSource !== null) { rssSource.close(); rssSource = null }
   }
 
-  return { pendingUsers, errorAlerts, refresh, clearErrorAlerts, startPolling, stopPolling }
+  return {
+    pendingUsers,
+    errorAlerts,
+    rssAlertActive,
+    rssGrowthBytes,
+    refresh,
+    clearErrorAlerts,
+    startPolling,
+    stopPolling,
+  }
 })

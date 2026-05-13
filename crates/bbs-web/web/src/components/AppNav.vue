@@ -53,7 +53,7 @@ const modes: { value: Mode; label: string }[] = [
   { value: 'system', label: modeLabel.system },
 ]
 
-interface NavItem { to: string; label: string; badge?: boolean; errorBadge?: boolean }
+interface NavItem { to: string; label: string; badge?: boolean; errorBadge?: boolean; rssBadge?: boolean }
 interface NavGroup { title: string; items: NavItem[] }
 
 const groups = computed<NavGroup[]>(() => {
@@ -90,7 +90,7 @@ const groups = computed<NavGroup[]>(() => {
     items: [
       { to: '/reports', label: 'reports' },
       { to: '/errors', label: 'errors', errorBadge: true },
-      { to: '/metrics', label: 'metrics' },
+      { to: '/metrics', label: 'metrics', rssBadge: true },
       { to: '/backups', label: 'backups' },
       { to: '/plugins', label: 'plugins' },
       { to: '/logs', label: 'logs' },
@@ -179,6 +179,11 @@ const groups = computed<NavGroup[]>(() => {
                 class="nav-badge error-badge"
                 :title="`${stats.errorAlerts} new error event${stats.errorAlerts === 1 ? '' : 's'}`"
               >{{ stats.errorAlerts }}</span>
+              <span
+                v-if="item.rssBadge && stats.rssAlertActive"
+                class="nav-badge rss-badge"
+                title="RSS memory growing — possible leak"
+              >mem↑</span>
             </router-link>
           </li>
         </ul>
@@ -362,6 +367,7 @@ const groups = computed<NavGroup[]>(() => {
 }
 
 .error-badge { background: #dc2626; }
+.rss-badge { background: #d97706; font-size: 0.6em; }
 
 .sidebar-footer {
   font-size: 0.75em;
