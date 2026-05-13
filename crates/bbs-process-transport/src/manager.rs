@@ -155,8 +155,16 @@ impl ProcessPluginManager {
         // Load plugins.d — overrides config.toml on name collision.
         if let Some(ref dir) = plugins_d {
             for cfg in load_plugins_d(dir) {
-                // Remove any config.toml entry with the same name.
-                mgr.plugins.lock().await.remove(&cfg.name);
+                // Stop and remove any config.toml entry with the same name before
+                // re-spawning from plugins.d.  Just dropping the ManagedPlugin is
+                // not enough: the child process and its crash-restart loop would
+                // both keep running and fight with the new instance.
+                let evicted = mgr.plugins.lock().await.remove(&cfg.name);
+                if let Some(m) = evicted {
+                    if let Some(t) = m.transport {
+                        let _ = t.stop().await;
+                    }
+                }
                 let _ = mgr.init_plugin(cfg, true).await;
             }
         }
