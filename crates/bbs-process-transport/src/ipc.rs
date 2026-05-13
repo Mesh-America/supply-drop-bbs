@@ -30,23 +30,39 @@ mod tests {
 
     #[test]
     fn plugin_msg_ready_with_limit() {
-        let msg = PluginMsg::Ready { payload_limit: 156 };
+        let msg = PluginMsg::Ready {
+            payload_limit: 156,
+            version: Some("1.2.3".to_owned()),
+        };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(
             json.contains(r#""t":"ready""#),
             "discriminator missing: {json}"
         );
         assert!(json.contains("156"), "payload_limit missing: {json}");
+        assert!(json.contains("1.2.3"), "version missing: {json}");
         let back: PluginMsg = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, PluginMsg::Ready { payload_limit: 156 }));
+        assert!(matches!(
+            back,
+            PluginMsg::Ready {
+                payload_limit: 156,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn plugin_msg_ready_default_limit_when_field_absent() {
-        // Omitting payload_limit should deserialise to 0 (the #[serde(default)]).
+        // Omitting payload_limit and version should deserialise to defaults.
         let json = r#"{"t":"ready"}"#;
         let msg: PluginMsg = serde_json::from_str(json).unwrap();
-        assert!(matches!(msg, PluginMsg::Ready { payload_limit: 0 }));
+        assert!(matches!(
+            msg,
+            PluginMsg::Ready {
+                payload_limit: 0,
+                version: None
+            }
+        ));
     }
 
     #[test]
@@ -178,6 +194,10 @@ pub enum PluginMsg {
         /// Supply Drop truncates `MultiText` frames that exceed this limit.
         #[serde(default)]
         payload_limit: usize,
+        /// Human-readable version string for the plugin, reported in the admin UI.
+        /// Convention: `env!("CARGO_PKG_VERSION")`. Omit if not meaningful.
+        #[serde(default)]
+        version: Option<String>,
     },
 
     /// A new user connection has been established.

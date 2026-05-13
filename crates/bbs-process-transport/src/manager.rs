@@ -34,6 +34,9 @@ struct ManagedPlugin {
     log_buffer: Arc<std::sync::Mutex<VecDeque<String>>>,
     /// Shutdown sender for the running transport (None when stopped/disabled).
     transport: Option<ProcessTransport>,
+    /// Last version string reported by the plugin process in its `ready` message.
+    /// Cached so it survives across restarts while the transport is stopped.
+    version: Option<String>,
 }
 
 // ── plugins.d helpers ─────────────────────────────────────────────────────────
@@ -198,6 +201,7 @@ impl ProcessPluginManager {
             restart_count: 0,
             log_buffer,
             transport,
+            version: None,
         };
 
         self.plugins.lock().await.insert(name, managed);
@@ -263,6 +267,13 @@ impl ProcessPluginManager {
                 .rev()
                 .collect()
         };
+        // Prefer the live value from the running transport; fall back to the
+        // cached value from the last time the plugin reported ready.
+        let version = m
+            .transport
+            .as_ref()
+            .and_then(|t| t.reported_version())
+            .or_else(|| m.version.clone());
         PluginStatus {
             name: name.to_owned(),
             command: m.config.command.clone(),
@@ -272,6 +283,7 @@ impl ProcessPluginManager {
             state: m.state.clone(),
             restart_count: m.restart_count,
             recent_logs,
+            version,
         }
     }
 
@@ -421,6 +433,10 @@ impl PluginRegistryApi for ProcessPluginManager {
             }
         } else if !enabled {
             if let Some(t) = m.transport.take() {
+                // Cache the version before the transport is dropped.
+                if let Some(v) = t.reported_version() {
+                    m.version = Some(v);
+                }
                 let _ = t.stop().await;
             }
             m.state = PluginState::Disabled;
@@ -438,6 +454,10 @@ impl PluginRegistryApi for ProcessPluginManager {
                 .get_mut(name)
                 .ok_or_else(|| RegistryError::NotFound(name.to_owned()))?;
             if let Some(t) = m.transport.take() {
+                // Cache the version before the transport is dropped.
+                if let Some(v) = t.reported_version() {
+                    m.version = Some(v);
+                }
                 let _ = t.stop().await;
             }
             m.state = PluginState::Stopped;

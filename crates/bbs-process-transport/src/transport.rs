@@ -61,6 +61,8 @@ pub struct ProcessTransport {
     sessions: Arc<Mutex<SessionMap>>,
     /// 0 = unlimited; set from the plugin's `ready` message.
     payload_limit: Arc<AtomicUsize>,
+    /// Version string reported by the plugin in its `ready` message.
+    plugin_version: Arc<std::sync::Mutex<Option<String>>>,
     shutdown_tx: watch::Sender<bool>,
     /// Fires `()` when the child exits with a non-zero code (crash).
     /// Only populated when `config.restart_on_crash` is true.
@@ -87,6 +89,7 @@ impl ProcessTransport {
             stdin_tx: OnceLock::new(),
             sessions: Arc::new(Mutex::new(SessionMap::new())),
             payload_limit: Arc::new(AtomicUsize::new(0)),
+            plugin_version: Arc::new(std::sync::Mutex::new(None)),
             shutdown_tx: watch::channel(false).0,
             crash_tx,
             crash_rx: std::sync::Mutex::new(crash_rx),
@@ -99,6 +102,15 @@ impl ProcessTransport {
     /// Must be called before [`Plugin::start`].
     pub(crate) fn take_crash_receiver(&self) -> Option<mpsc::Receiver<()>> {
         self.crash_rx.lock().expect("crash_rx poisoned").take()
+    }
+
+    /// Version string reported by the plugin in its `ready` message.
+    /// Returns `None` if the plugin has not yet sent `ready` or omitted the field.
+    pub(crate) fn reported_version(&self) -> Option<String> {
+        self.plugin_version
+            .lock()
+            .expect("plugin_version poisoned")
+            .clone()
     }
 
     /// Spawn the child and return it along with the stdin sender channel.
@@ -203,6 +215,7 @@ impl Plugin for ProcessTransport {
         let host = Arc::clone(&self.host);
         let transport_name = self.transport_name;
         let payload_limit = Arc::clone(&self.payload_limit);
+        let plugin_version = Arc::clone(&self.plugin_version);
         let stdin_tx = tx.clone();
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         let plugin_name = self.config.name.clone();
@@ -217,7 +230,7 @@ impl Plugin for ProcessTransport {
                             Ok(Some(raw)) => {
                                 handle_plugin_msg(
                                     &raw, &sessions, &host, transport_name,
-                                    &payload_limit, &stdin_tx,
+                                    &payload_limit, &plugin_version, &stdin_tx,
                                 ).await;
                             }
                             _ => {
@@ -331,6 +344,7 @@ async fn handle_plugin_msg(
     host: &Arc<dyn Host>,
     transport_name: &'static str,
     payload_limit: &Arc<AtomicUsize>,
+    plugin_version: &Arc<std::sync::Mutex<Option<String>>>,
     stdin_tx: &mpsc::Sender<String>,
 ) {
     let msg: PluginMsg = match serde_json::from_str(raw) {
@@ -344,8 +358,12 @@ async fn handle_plugin_msg(
     match msg {
         PluginMsg::Ready {
             payload_limit: limit,
+            version,
         } => {
             payload_limit.store(limit, Ordering::Relaxed);
+            if let Some(v) = version {
+                *plugin_version.lock().expect("plugin_version poisoned") = Some(v);
+            }
             debug!(transport = transport_name, limit, "plugin ready");
         }
 

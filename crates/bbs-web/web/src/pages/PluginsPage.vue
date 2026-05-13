@@ -14,6 +14,7 @@ interface PluginStatus {
   reason?: string        // only when state === 'crashed'
   restart_count: number
   recent_logs: string[]
+  version?: string       // reported by plugin in its ready message
 }
 
 interface NativePlugin {
@@ -296,6 +297,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
         <thead>
           <tr>
             <th>name</th>
+            <th>version</th>
             <th>command</th>
             <th>state</th>
             <th>restarts</th>
@@ -305,6 +307,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
         <tbody>
           <tr v-for="p in plugins" :key="p.name">
             <td><strong>{{ p.name }}</strong></td>
+            <td class="muted small">{{ p.version ?? '—' }}</td>
             <td class="muted small">
               <code>{{ p.command }}{{ p.args.length ? ' ' + p.args.join(' ') : '' }}</code>
             </td>

@@ -88,6 +88,9 @@ pub struct PluginStatus {
     pub restart_count: u32,
     /// Most recent stderr lines (up to the last 50).
     pub recent_logs: Vec<String>,
+    /// Version string reported by the plugin in its `ready` message, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 // ── Errors ────────────────────────────────────────────────────────────────────

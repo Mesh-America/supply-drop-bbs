@@ -40,8 +40,11 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "scripted".to_owned());
 
-    // Signal readiness (no payload limit).
-    emit(&PluginMsg::Ready { payload_limit: 0 });
+    // Signal readiness (no payload limit, report version for tests).
+    emit(&PluginMsg::Ready {
+        payload_limit: 0,
+        version: Some("test-echo-plugin".to_owned()),
+    });
 
     // Open one connection.
     emit(&PluginMsg::Open {
