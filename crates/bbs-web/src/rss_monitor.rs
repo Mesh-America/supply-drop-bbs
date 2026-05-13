@@ -1,9 +1,9 @@
 //! Rolling RSS (resident set size) trend monitor.
 //!
 //! Samples the current process's RSS every 30 seconds into a 60-sample
-//! rolling window (~30 minutes of history). When [`ALERT_CONSECUTIVE`]
-//! consecutive samples each show an increase AND the total growth over those
-//! samples exceeds [`ALERT_MIN_GROWTH`], an [`RssAlert`] is broadcast.
+//! rolling window (~30 minutes of history). When 10 consecutive samples each
+//! show an increase AND the total growth over those samples exceeds 5 MB,
+//! an [`RssAlert`] is broadcast.
 //!
 //! A second `cleared: true` alert fires when the RSS stops growing, so the
 //! web UI can dismiss its badge automatically.
