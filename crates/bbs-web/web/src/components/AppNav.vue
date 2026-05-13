@@ -176,7 +176,7 @@ const groups = computed<NavGroup[]>(() => {
   <aside class="sidebar" :class="{ open }">
     <nav>
       <div v-for="g in groups" :key="g.title" class="group">
-        <div class="group-title">{{ g.title }}</div>
+        <div v-if="g.items.length > 1" class="group-title">{{ g.title }}</div>
         <ul>
           <li v-for="item in g.items" :key="item.to">
             <router-link :to="item.to" @click="close">
@@ -334,7 +334,7 @@ const groups = computed<NavGroup[]>(() => {
   width: 200px;
   border-right: 1px solid var(--border);
   background: var(--bg);
-  padding: 0.8rem 0;
+  padding: 0.5rem 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -342,24 +342,24 @@ const groups = computed<NavGroup[]>(() => {
 }
 .sidebar nav { flex: 1; }
 
-.group { padding: 0.2rem 0 0.5rem; }
-.group + .group { border-top: 1px dashed var(--border); margin-top: 0.4rem; padding-top: 0.6rem; }
+.group { padding: 0.1rem 0 0.3rem; }
+.group + .group { border-top: 1px dashed var(--border); margin-top: 0.25rem; padding-top: 0.35rem; }
 .group-title {
-  font-size: 0.7em;
+  font-size: 0.67em;
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--muted);
-  padding: 0 1rem 0.25rem;
+  padding: 0 1rem 0.15rem;
 }
 .sidebar ul { list-style: none; margin: 0; padding: 0; }
 .sidebar li a {
   display: flex;
   align-items: center;
   gap: 0.25rem;
-  padding: 0.4rem 1rem;
+  padding: 0.25rem 1rem;
   color: var(--fg);
   border-left: 2px solid transparent;
-  font-size: 0.92em;
+  font-size: 0.88em;
 }
 .sidebar li a:hover { background: var(--row-alt); text-decoration: none; }
 .sidebar li a.router-link-active {
@@ -370,9 +370,9 @@ const groups = computed<NavGroup[]>(() => {
 }
 .nav-count {
   margin-left: auto;
-  font-size: 0.78em;
-  color: var(--muted);
-  font-weight: 400;
+  font-size: 0.75em;
+  color: var(--accent);
+  font-weight: 500;
 }
 
 .nav-badge {
