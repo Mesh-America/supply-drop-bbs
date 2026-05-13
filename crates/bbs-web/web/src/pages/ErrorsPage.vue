@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, watch, onMounted, onUnmounted } from 'vue'
 import { api } from '../api/client'
 import { useStatsStore } from '../stores/stats'
 
@@ -41,6 +41,15 @@ function levelClass(level: string): string {
 }
 
 let pollTimer: ReturnType<typeof setInterval> | null = null
+
+// Reload the list whenever a new error fires via SSE so the page stays
+// current without waiting up to 30 s for the poll timer.
+watch(() => stats.errorAlerts, (next, prev) => {
+  if (next > prev) {
+    load()
+    stats.clearErrorAlerts()
+  }
+})
 
 onMounted(() => {
   stats.clearErrorAlerts()

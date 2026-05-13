@@ -480,6 +480,7 @@ async fn cmd_run(cli: &Cli) {
             &cfg.plugins.web,
             Arc::clone(&host),
             cfg_abs,
+            cfg.backup.directory.clone(),
             Arc::clone(&log_reload),
             error_store,
             error_tx,
@@ -668,6 +669,7 @@ async fn init_web_plugin(
     web_cfg: &bbs_web::WebConfig,
     host: Arc<dyn bbs_plugin_api::Host>,
     config_file_path: Option<String>,
+    backup_directory: Option<std::path::PathBuf>,
     log_reload: LogReloadFn,
     error_store: std::sync::Arc<std::sync::Mutex<bbs_web::error_tracker::ErrorStore>>,
     error_tx: tokio::sync::broadcast::Sender<bbs_web::error_tracker::ErrorEntry>,
@@ -679,12 +681,24 @@ async fn init_web_plugin(
         return None;
     }
 
+    let mut web_cfg = web_cfg.clone();
+
     // Inject the resolved absolute config path so backup zips always bundle
     // the correct file, even when running from a different working directory
     // (e.g. systemd services that start from /).
-    let mut web_cfg = web_cfg.clone();
     if let Some(abs_path) = config_file_path {
         web_cfg.config_path = Some(abs_path);
+    }
+
+    // Wire the automatic backup directory into the web plugin when the
+    // operator hasn't explicitly set [plugins.web] backup_dir.  Without
+    // this the web UI lists a different directory than where the automatic
+    // task writes, so manual-UI backups and automatic backups appear in
+    // separate places.
+    if web_cfg.backup_dir.is_none() {
+        if let Some(dir) = backup_directory {
+            web_cfg.backup_dir = Some(dir.to_string_lossy().into_owned());
+        }
     }
 
     let plugin = match bbs_web::WebPlugin::init(web_cfg, host).await {
