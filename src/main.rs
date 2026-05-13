@@ -18,7 +18,9 @@ use std::{path::PathBuf, sync::Arc};
 use bbs_core::{BbsHost, Database};
 use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
+
+type LogReloadFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -302,7 +304,7 @@ async fn cmd_run(cli: &Cli) {
     }
 
     // ── 2. Tracing ────────────────────────────────────────────────────────────
-    init_tracing(&cfg.logging);
+    let log_reload = init_tracing(&cfg.logging);
 
     // ADR-0009: announce CLI-level stomps loudly.
     if let Some(ref s) = cli_level_str {
@@ -455,7 +457,13 @@ async fn cmd_run(cli: &Cli) {
             .and_then(|p| p.canonicalize().ok())
             .map(|abs| abs.to_string_lossy().into_owned())
         };
-        let wp = init_web_plugin(&cfg.plugins.web, Arc::clone(&host), cfg_abs).await;
+        let wp = init_web_plugin(
+            &cfg.plugins.web,
+            Arc::clone(&host),
+            cfg_abs,
+            Arc::clone(&log_reload),
+        )
+        .await;
         #[cfg(feature = "transport-process")]
         if let Some(ref plugin) = wp {
             let registry =
@@ -639,6 +647,7 @@ async fn init_web_plugin(
     web_cfg: &bbs_web::WebConfig,
     host: Arc<dyn bbs_plugin_api::Host>,
     config_file_path: Option<String>,
+    log_reload: LogReloadFn,
 ) -> Option<bbs_web::WebPlugin> {
     use bbs_plugin_api::Plugin;
 
@@ -662,6 +671,7 @@ async fn init_web_plugin(
             std::process::exit(1);
         }
     };
+    plugin.set_log_reload(log_reload);
 
     if let Err(e) = plugin.start().await {
         error!("web admin start failed: {e}");
@@ -1350,7 +1360,12 @@ fn iso_week_key(rfc3339: &str) -> String {
 ///
 /// Per-target overrides from `logging.targets` are added as env-filter
 /// directives after the root directive.
-fn init_tracing(cfg: &config::LoggingConfig) {
+///
+/// Returns a type-erased closure that the web admin can call to change the
+/// log level at runtime without a restart. Accepts a level string such as
+/// `"DEBUG"` or `"INFO"`. Target-specific overrides from config are NOT
+/// preserved after a runtime reload (the reload replaces the whole filter).
+fn init_tracing(cfg: &config::LoggingConfig) -> LogReloadFn {
     let root_level: tracing::Level = cfg.level.into();
 
     let mut filter = EnvFilter::builder()
@@ -1364,24 +1379,34 @@ fn init_tracing(cfg: &config::LoggingConfig) {
         }
     }
 
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
+
     match cfg.format {
         config::LogFormat::Pretty => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .pretty()
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(tracing_subscriber::fmt::layer().pretty())
                 .init();
         }
         config::LogFormat::Json => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .json()
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(tracing_subscriber::fmt::layer().json())
                 .init();
         }
         config::LogFormat::Compact => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .compact()
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(tracing_subscriber::fmt::layer().compact())
                 .init();
         }
     }
+
+    Arc::new(move |level: &str| {
+        let new_filter =
+            EnvFilter::try_new(level).map_err(|e| format!("invalid log filter: {e}"))?;
+        reload_handle
+            .reload(new_filter)
+            .map_err(|e| format!("reload failed: {e}"))
+    })
 }

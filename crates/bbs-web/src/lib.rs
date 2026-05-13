@@ -256,6 +256,8 @@ pub struct TransportFlags {
 
 // ── Shared state ──────────────────────────────────────────────────────────────
 
+type LogReloadFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 struct AppState {
     host: Arc<dyn Host>,
     config: WebConfig,
@@ -266,6 +268,7 @@ struct AppState {
     plugin_registry: std::sync::Mutex<Option<Arc<dyn PluginRegistryApi>>>,
     active_transports: std::sync::Mutex<TransportFlags>,
     pending_restart: AtomicBool,
+    log_reload: std::sync::Mutex<Option<LogReloadFn>>,
 }
 
 impl AppState {
@@ -281,6 +284,7 @@ impl AppState {
             plugin_registry: std::sync::Mutex::new(None),
             active_transports: std::sync::Mutex::new(TransportFlags::default()),
             pending_restart: AtomicBool::new(false),
+            log_reload: std::sync::Mutex::new(None),
         }
     }
 
@@ -462,6 +466,14 @@ impl WebPlugin {
             .active_transports
             .lock()
             .expect("active_transports poisoned") = flags;
+    }
+
+    /// Inject the tracing-subscriber reload handle so the web API can change
+    /// the log level at runtime without a restart.
+    ///
+    /// Must be called before `start()`.
+    pub fn set_log_reload(&self, reload: LogReloadFn) {
+        *self.state.log_reload.lock().expect("log_reload poisoned") = Some(reload);
     }
 }
 
@@ -1731,6 +1743,7 @@ async fn api_patch_config(
     if let Some(v) = patch.security_command_rate_per_min {
         doc["security"]["command_rate_per_min"] = toml_edit::value(v as i64);
     }
+    let logging_level_changed = patch.logging_level.is_some();
     if let Some(v) = patch.logging_level {
         doc["logging"]["level"] = toml_edit::value(v.to_ascii_uppercase());
     }
@@ -1741,6 +1754,28 @@ async fn api_patch_config(
             Json(json_error(&format!("could not write config file: {e}"))),
         )
             .into_response();
+    }
+
+    // Apply log level change immediately without a restart.
+    if logging_level_changed {
+        if let Some(level) = doc
+            .get("logging")
+            .and_then(|s| s.get("level"))
+            .and_then(|v| v.as_str())
+        {
+            if let Some(reload) = state
+                .log_reload
+                .lock()
+                .expect("log_reload poisoned")
+                .as_ref()
+            {
+                if let Err(e) = reload(level) {
+                    warn!("log level reload failed: {e}");
+                } else {
+                    info!(level, "log level changed at runtime");
+                }
+            }
+        }
     }
 
     // Update in-memory GPS location so the mesh transport picks it up on next
@@ -1773,7 +1808,7 @@ async fn api_patch_config(
 
     Json(serde_json::json!({
         "ok": true,
-        "message": "Config saved. Restart the server to apply most changes."
+        "message": "Config saved. Log level takes effect immediately; other changes require a restart."
     }))
     .into_response()
 }

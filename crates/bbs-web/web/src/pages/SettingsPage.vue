@@ -461,7 +461,7 @@ chmod g+w {{ configFile }}</pre>
           <select v-model="form.logging_level">
             <option v-for="l in LOG_LEVELS" :key="l" :value="l">{{ l }}</option>
           </select>
-          <p class="hint">Requires restart to take effect.</p>
+          <p class="hint">Takes effect immediately — no restart needed.</p>
         </div>
       </section>
 
