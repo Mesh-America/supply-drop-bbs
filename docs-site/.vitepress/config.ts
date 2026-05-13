@@ -73,6 +73,10 @@ export default defineConfig({
         items: [{ text: 'Plugin API Guide', link: '/PLUGIN_API' }],
       },
       {
+        text: 'Plugins',
+        items: [{ text: 'Available Plugins', link: '/PLUGINS' }],
+      },
+      {
         text: 'Architecture Decision Records',
         collapsed: true,
         items: [
