@@ -15,6 +15,7 @@ Lets classic Telnet clients connect to your Supply Drop BBS on port 2323. Handle
 - **Prebuilt binaries** for Linux, macOS, and Windows
 - **One-command install** — an included script registers the plugin and restarts the BBS
 - Runs as an independent process; no BBS recompile needed
+- **Requires:** Supply Drop BBS v0.6.0 or newer
 
 > **Security note:** Telnet is plaintext. Run it on a trusted LAN, or put it behind a VPN or SSH tunnel before exposing it further.
 
