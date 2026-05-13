@@ -75,7 +75,9 @@ onUnmounted(() => {
     <p v-if="loading && entries.length === 0" class="muted">Loading…</p>
 
     <div v-if="!loading && entries.length === 0 && !error" class="empty-state">
-      <p class="muted">No WARN or ERROR events recorded since last restart.</p>
+      <p class="healthy-icon">✓</p>
+      <p>No errors recorded</p>
+      <p class="muted">No WARN or ERROR events since the last restart — the server is healthy.</p>
     </div>
 
     <div v-if="entries.length > 0" class="table-wrap">
@@ -118,7 +120,8 @@ onUnmounted(() => {
 h1 { margin: 0; }
 p { margin: 0; }
 
-.empty-state { padding: 2rem; text-align: center; }
+.empty-state { padding: 2rem; text-align: center; display: flex; flex-direction: column; align-items: center; gap: 0.4rem; }
+.healthy-icon { font-size: 2rem; color: #2a8a2a; margin: 0; }
 
 .table-wrap { overflow-x: auto; }
 .data-table { width: 100%; border-collapse: collapse; font-size: 0.875em; }

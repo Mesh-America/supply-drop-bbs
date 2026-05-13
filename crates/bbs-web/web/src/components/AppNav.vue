@@ -6,6 +6,7 @@ import { useTransportsStore } from '../stores/transports'
 import { useRouter } from 'vue-router'
 import { useTheme } from '../composables/useTheme'
 import type { Mode, ColorTheme } from '../composables/useTheme'
+import { api } from '../api/client'
 import logoUrl from '../assets/supply-drop-icon-transparent.svg'
 
 const open = ref(false)
@@ -16,6 +17,7 @@ const stats = useStatsStore()
 const transports = useTransportsStore()
 const router = useRouter()
 const { mode, color, modeLabel } = useTheme()
+const appVersion = ref<string | null>(null)
 
 function close() { open.value = false }
 
@@ -31,10 +33,14 @@ function handleClickOutside(e: MouseEvent) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
   document.addEventListener('click', handleClickOutside)
   stats.startPolling()
   transports.refresh()
+  try {
+    const s = await api.get<{ version: string }>('/api/v1/status')
+    appVersion.value = s.version
+  } catch { /* non-fatal */ }
 })
 onUnmounted(() => {
   document.removeEventListener('click', handleClickOutside)
@@ -203,7 +209,7 @@ const groups = computed<NavGroup[]>(() => {
       </div>
     </nav>
     <div class="sidebar-footer muted">
-      <span>supply drop bbs</span>
+      <span>supply drop bbs<span v-if="appVersion" class="version-tag">v{{ appVersion }}</span></span>
       <p>open source project by <a href="http://meshamerica.com" target="_blank">Mesh America</a></p>
       <p>please consider <a href="https://meshamerica.com/pitch-in/" target="_blank">supporting our mission</a></p>
     </div>
@@ -371,8 +377,12 @@ const groups = computed<NavGroup[]>(() => {
 .nav-count {
   margin-left: auto;
   font-size: 0.75em;
-  color: var(--accent);
   font-weight: 500;
+}
+/* Explicit high-specificity rule so the accent color beats the link's color: var(--fg) */
+.sidebar li a .nav-count,
+.sidebar li a.router-link-active .nav-count {
+  color: var(--accent);
 }
 
 .nav-badge {
@@ -397,6 +407,11 @@ const groups = computed<NavGroup[]>(() => {
   padding: 0.6rem 1rem 0;
   border-top: 1px dashed var(--border);
   margin-top: 0.4rem;
+}
+.version-tag {
+  margin-left: 0.4em;
+  color: var(--accent);
+  font-size: 0.9em;
 }
 
 .scrim { display: none; position: fixed; top: var(--topbar-h); inset-inline: 0; bottom: 0; background: rgba(0,0,0,0.4); z-index: 15; }

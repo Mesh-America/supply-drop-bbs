@@ -90,8 +90,8 @@ impl ErrorStore {
             fingerprint: fp,
         };
 
-        // Notify SSE subscribers for ERROR-level events.
-        if level == "ERROR" {
+        // Notify SSE subscribers for WARN and ERROR events.
+        if level == "ERROR" || level == "WARN" {
             let _ = self.error_tx.send(entry.clone());
         }
         self.entries.push(entry);

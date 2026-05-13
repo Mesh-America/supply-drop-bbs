@@ -309,14 +309,19 @@ async fn cmd_run(cli: &Cli) {
 
     // ── 2. Tracing ────────────────────────────────────────────────────────────
 
-    // With the admin-web feature the error tracker layer is wired into the
-    // subscriber registry so WARN/ERROR events are captured.  Without it we
-    // use the plain init_tracing path.
+    // With the admin-web feature the error tracker and log capture layers are
+    // wired into the subscriber registry so WARN/ERROR events are captured and
+    // all INFO+ events appear in the web log view.  Without it we use the
+    // plain init_tracing path.
     #[cfg(feature = "admin-web")]
     let (error_tracker_layer, error_store, error_tx) = bbs_web::error_tracker::new_error_tracker();
 
     #[cfg(feature = "admin-web")]
-    let log_reload = init_tracing_with_error_layer(&cfg.logging, error_tracker_layer);
+    let (log_capture_layer, app_log_buf) = bbs_web::log_capture::new_log_capture_layer();
+
+    #[cfg(feature = "admin-web")]
+    let log_reload =
+        init_tracing_with_error_layer(&cfg.logging, error_tracker_layer, log_capture_layer);
 
     #[cfg(not(feature = "admin-web"))]
     let log_reload = init_tracing(&cfg.logging);
@@ -484,6 +489,7 @@ async fn cmd_run(cli: &Cli) {
             Arc::clone(&log_reload),
             error_store,
             error_tx,
+            app_log_buf,
         )
         .await;
         #[cfg(feature = "transport-process")]
@@ -665,6 +671,7 @@ async fn init_cli_plugin(
 /// the running `WebPlugin` handle so the supervisor can stop it on
 /// shutdown.
 #[cfg(feature = "admin-web")]
+#[allow(clippy::too_many_arguments)]
 async fn init_web_plugin(
     web_cfg: &bbs_web::WebConfig,
     host: Arc<dyn bbs_plugin_api::Host>,
@@ -673,6 +680,7 @@ async fn init_web_plugin(
     log_reload: LogReloadFn,
     error_store: std::sync::Arc<std::sync::Mutex<bbs_web::error_tracker::ErrorStore>>,
     error_tx: tokio::sync::broadcast::Sender<bbs_web::error_tracker::ErrorEntry>,
+    app_log_buf: std::sync::Arc<std::sync::Mutex<bbs_web::log_capture::LogBuffer>>,
 ) -> Option<bbs_web::WebPlugin> {
     use bbs_plugin_api::Plugin;
 
@@ -710,6 +718,7 @@ async fn init_web_plugin(
     };
     plugin.set_log_reload(log_reload);
     plugin.set_error_store(error_store, error_tx);
+    plugin.set_log_buffer(app_log_buf);
 
     if let Err(e) = plugin.start().await {
         error!("web admin start failed: {e}");
@@ -1518,6 +1527,7 @@ fn iso_week_key(rfc3339: &str) -> String {
 fn init_tracing_with_error_layer(
     cfg: &config::LoggingConfig,
     error_layer: bbs_web::error_tracker::ErrorTrackerLayer,
+    log_layer: bbs_web::log_capture::LogCaptureLayer,
 ) -> LogReloadFn {
     let root_level: tracing::Level = cfg.level.into();
 
@@ -1539,6 +1549,7 @@ fn init_tracing_with_error_layer(
             tracing_subscriber::registry()
                 .with(filter_layer)
                 .with(error_layer)
+                .with(log_layer)
                 .with(tracing_subscriber::fmt::layer().pretty())
                 .init();
         }
@@ -1546,6 +1557,7 @@ fn init_tracing_with_error_layer(
             tracing_subscriber::registry()
                 .with(filter_layer)
                 .with(error_layer)
+                .with(log_layer)
                 .with(tracing_subscriber::fmt::layer().json())
                 .init();
         }
@@ -1553,6 +1565,7 @@ fn init_tracing_with_error_layer(
             tracing_subscriber::registry()
                 .with(filter_layer)
                 .with(error_layer)
+                .with(log_layer)
                 .with(tracing_subscriber::fmt::layer().compact())
                 .init();
         }

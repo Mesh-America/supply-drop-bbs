@@ -61,12 +61,17 @@ function clear() {
 }
 
 function lineClass(text: string): string {
-  if (text.startsWith('[auth]')) return 'log-auth'
-  if (text.startsWith('[msg]')) return 'log-msg'
-  if (text.startsWith('[user]')) return 'log-user'
-  if (text.startsWith('[warn]')) return 'log-warn'
+  // Application tracing events — [LEVEL target] message
+  if (text.startsWith('[ERROR ')) return 'log-error'
+  if (text.startsWith('[WARN '))  return 'log-warn'
+  if (text.startsWith('[INFO '))  return 'log-info'
+  // BBS domain events (written by the domain-event bridge)
+  if (text.startsWith('[auth]'))    return 'log-auth'
+  if (text.startsWith('[msg]'))     return 'log-msg'
+  if (text.startsWith('[user]'))    return 'log-user'
+  if (text.startsWith('[warn]'))    return 'log-warn'
   if (text.startsWith('[session]')) return 'log-session'
-  if (text.startsWith('[system]')) return 'log-system'
+  if (text.startsWith('[system]'))  return 'log-system'
   return 'log-event'
 }
 
@@ -99,7 +104,7 @@ onUnmounted(stop)
       </div>
       <div v-else class="empty-state">
         <p class="muted" v-if="!running">Press <strong>start</strong> to begin streaming log events.</p>
-        <p class="muted" v-else>Waiting for events…</p>
+        <p class="muted" v-else>No log events yet — application events will appear here as they occur.</p>
       </div>
     </div>
   </div>
@@ -140,11 +145,13 @@ h1 { margin: 0; }
 }
 .log-text { word-break: break-all; white-space: pre-wrap; }
 
+.log-error   { border-left-color: #dc2626; color: #dc2626; }
+.log-warn    { border-left-color: var(--warn, #b45309); color: var(--warn, #b45309); }
+.log-info    { border-left-color: var(--muted); opacity: 0.9; }
 .log-auth    { border-left-color: #2a8a2a; }
 .log-auth .log-ts { color: #2a8a2a; opacity: 0.7; }
 .log-msg     { border-left-color: var(--accent); }
 .log-user    { border-left-color: #7c5cbc; }
-.log-warn    { border-left-color: var(--warning); color: var(--warning); }
 .log-session { border-left-color: var(--muted); }
 .log-system  { border-left-color: var(--border); opacity: 0.5; font-style: italic; }
 .log-event   { opacity: 0.65; }
