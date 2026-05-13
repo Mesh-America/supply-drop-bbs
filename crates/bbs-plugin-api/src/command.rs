@@ -248,7 +248,7 @@ pub enum Command {
         username: Username,
     },
 
-    /// Reset another user's password (Sysop+). (.PW <username>)
+    /// Reset another user's password (Sysop+). (`.PW <username>`)
     ///
     /// Starts a two-prompt workflow: new password, then confirm.
     /// The caller does not need to know the target's current password.

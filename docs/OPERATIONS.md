@@ -483,6 +483,13 @@ sudo systemctl start supply-drop-bbs
 
 ### Reset a user's password
 
+Three options, from most to least convenient:
+
+**In-session** (BBS must be running; no server access needed):
+
+A logged-in sysop types `.PW <username>` and follows two prompts (new
+password, then confirm). The change takes effect immediately.
+
 **From the web admin UI** (BBS must be running; requires sysop login):
 
 Open **Users**, click the username to open the detail drawer, then click **reset password**.
@@ -494,7 +501,7 @@ sudo supply-drop-bbs user set-password <username> \
   --config /etc/supply-drop-bbs/config.toml
 ```
 
-The new password must be at least 6 characters. The action is audit-logged when performed via the web UI.
+The new password must be at least 8 characters. The action is audit-logged when performed via the web UI.
 
 See [CLI.md](CLI.md) for the full `user` subcommand reference.
 
@@ -525,6 +532,11 @@ journalctl -u supply-drop-bbs -f                             # tail
 journalctl -u supply-drop-bbs --since "1 hour ago" -p err   # errors only
 journalctl -u pymc-companion -f                              # Pi HAT radio bridge
 ```
+
+The default log level is `INFO`. To increase verbosity temporarily, change
+the **Log level** dropdown in the web admin **Settings** page — the change
+takes effect immediately without restarting the service. To make it permanent,
+edit `[logging] level = "DEBUG"` in `config.toml`.
 
 ## Reverse-proxy setup (HTTPS)
 

@@ -76,6 +76,7 @@ REGISTER alice
 - Letters, digits, hyphens, and underscores only
 - 3–32 characters
 - Case-insensitive at login (stored exactly as typed)
+- The names `bbs` and `system` are reserved and cannot be registered
 
 The BBS will walk you through three prompts:
 
@@ -758,6 +759,32 @@ supply-drop-bbs room create "Net Control" --description "Weekly net check-ins"
 
 The five built-in rooms (Lobby, Mail, Aides, Sysop, System) cannot be deleted.
 
+### Resetting a user's password (Sysop only)
+
+```
+.PW <username>
+```
+
+Starts a two-step workflow to set a new password for any account without
+needing to know their current password:
+
+```
+New password for alice (min 8 chars):
+> ••••••••
+
+Confirm new password:
+> ••••••••
+
+Password updated for alice.
+```
+
+If the confirmation doesn't match you are asked to try again. Use `CANCEL`
+to abort without changing anything.
+
+This is the quickest path for password resets — no CLI access to the server
+required. The equivalent CLI command (`supply-drop-bbs user set-password`) is
+also available and documented in section 15.
+
 ### Web admin panel
 
 If the web admin is enabled, sysops can manage users, rooms, messages, and
@@ -782,19 +809,16 @@ accounts waiting for approval.
 
 ### Option 1 — Contact the sysop
 
-Tell the sysop your username. They can reset your password from the command
-line on the server:
+Tell the sysop your username. They can reset your password in three ways,
+from most to least convenient:
 
-```bash
-# The sysop runs this on the Pi / server:
-supply-drop-bbs user create <username> --sysop   # if creating fresh
-```
-
-For an existing account, the sysop can also:
-
-1. Log into the **web admin panel** → Users → find your account → reset
-   password (if password-reset UI is implemented in your version)
-2. Or use the CLI to demote/re-promote the account
+1. **In-session** — while connected to the BBS, the sysop types `.PW <username>` and follows the two prompts. No server access needed.
+2. **Web admin** — log into the **web admin panel** → Users → find your account → reset password.
+3. **CLI** — on the server, run:
+   ```bash
+   supply-drop-bbs user set-password <username> \
+     --config /etc/supply-drop-bbs/config.toml
+   ```
 
 ### Option 2 — Delete and re-register
 
@@ -894,6 +918,7 @@ account and you can re-register with the same username.
 | `UNBAN <user>` | Lift a ban |
 | `.C <name>` | Create a new room |
 | `.DR <name>` | Delete a room |
+| `.PW <user>` | Reset a user's password (two-step workflow) |
 
 ---
 
