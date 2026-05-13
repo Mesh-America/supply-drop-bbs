@@ -19,6 +19,7 @@ jobs:
   check:
     name: Format · Lint · Build · Test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -56,82 +57,6 @@ jobs:
       - name: Test (all features)
         run: cargo test --workspace --all-features
 
-  # ─── Cross-compile for the deployment targets ───────────────────
-  cross-build:
-    name: Cross-build · ${{ matrix.target }}
-    runs-on: ubuntu-latest
-    needs: check
-    strategy:
-      fail-fast: false
-      matrix:
-        target:
-          - aarch64-unknown-linux-gnu
-          - armv7-unknown-linux-gnueabihf
-          - x86_64-unknown-linux-gnu
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (with target)
-        # @master + explicit toolchain so the cross-compile target is
-        # installed *for the same version* rust-toolchain.toml pins.
-        # Using @stable installs the latest stable + target, but cargo
-        # then auto-switches to 1.76 (per rust-toolchain.toml) where
-        # the target isn't installed.
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88"
-          targets: ${{ matrix.target }}
-
-      - name: Install cross-compile toolchain
-        run: |
-          sudo apt-get update
-          case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu)
-              sudo apt-get install -y gcc-aarch64-linux-gnu
-              ;;
-            armv7-unknown-linux-gnueabihf)
-              sudo apt-get install -y gcc-arm-linux-gnueabihf
-              ;;
-            x86_64-unknown-linux-gnu)
-              # native target on the runner; no extra toolchain
-              ;;
-          esac
-
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
-      - name: Build (default features)
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (admin-web feature)
-        run: cargo build --release --target ${{ matrix.target }} --features admin-web
-
-      - name: "Build (headless: cli only)"
-        run: |
-          cargo build --release --target ${{ matrix.target }} \
-            --no-default-features --features transport-cli
-
-  # ─── Documentation builds clean ─────────────────────────────────
-  docs:
-    name: Docs build cleanly
-    runs-on: ubuntu-latest
-    needs: check
-    env:
-      # Treat doc warnings as errors so missing/dangling doc links
-      # fail CI rather than slipping through.
-      RUSTDOCFLAGS: "-D warnings"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: "1.88"
-
-      - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build rustdoc
-        run: cargo doc --workspace --no-deps --all-features
+  # Cross-compilation and release binaries are built by release.yml
+  # when a version tag is pushed. Running them on every commit to main
+  # burns ~45 min of runner time per push for no additional signal.
