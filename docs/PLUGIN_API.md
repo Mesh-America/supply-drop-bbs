@@ -25,6 +25,47 @@ You should read this if you're:
 If you're an operator looking to enable or configure a plugin, see
 [CONFIG.md](CONFIG.md) instead.
 
+## Development environment
+
+You need a running Supply Drop BBS instance to test against. The
+fastest way to get one is the Debian package:
+
+```sh
+# Download arm64 / armhf / amd64 from:
+# https://github.com/Mesh-America/supply-drop-bbs/releases/latest
+sudo dpkg -i supply-drop-bbs_VERSION_ARCH.deb
+sudo supply-drop-bbs setup   # answer the wizard; pick USB transport
+sudo systemctl start supply-drop-bbs
+```
+
+For plugin development you typically want **no radio hardware** —
+just enable the CLI socket transport in the wizard (enabled by
+default) and leave the mesh transport disabled. You can then drive
+the BBS from the CLI (`supply-drop-bbs connect`) while your plugin
+runs alongside it.
+
+**Building from source** (needed if you are modifying `bbs-plugin-api`
+itself or want to test unreleased changes):
+
+```sh
+git clone https://github.com/Mesh-America/supply-drop-bbs
+cd supply-drop-bbs
+cargo build --release
+./target/release/supply-drop-bbs setup
+```
+
+The current `bbs-plugin-api` version is **0.5.9**. Reference it in
+your plugin's `Cargo.toml`:
+
+```toml
+[dependencies]
+bbs-plugin-api = { git = "https://github.com/Mesh-America/supply-drop-bbs", version = "0.5" }
+```
+
+Using the semver range `"0.5"` picks up patch releases automatically.
+Pin to an exact version (`"0.5.9"`) only if you need strict
+reproducibility.
+
 ## What is a plugin
 
 A plugin is a Rust crate in the `crates/` directory of the
@@ -472,6 +513,33 @@ the host, so they automatically pick up `bbs-plugin-api` changes.
 Out-of-tree plugins (community-maintained forks) need to track
 upstream more carefully; the `bbs-plugin-api` changelog is their
 canonical reference.
+
+### Migrating existing plugins
+
+Each release section below lists whether it requires code changes
+in existing out-of-tree plugins. No entry means no action needed.
+
+#### v0.5.9
+
+**No API changes.** Recompile against `0.5.9` and everything works.
+
+What changed in the wider project:
+- BBS is now distributed as a `.deb` package (see
+  [Installation & Operations](OPERATIONS.md)). If your plugin's
+  README or install script tells operators how to install the BBS
+  first, update those instructions accordingly.
+- Version pin: if you reference `bbs-plugin-api = "0.5.7"` or
+  `"0.5.8"` exactly, bump it to `"0.5.9"` (or switch to the range
+  `"0.5"` so future patch releases are picked up automatically).
+
+#### v0.5.8
+
+**No API changes.** Recompile against `0.5.8`.
+
+#### v0.5.7 and earlier
+
+Initial pre-release versions. The API is considered experimental
+and not yet committed to backward compatibility.
 
 ## Style guide
 

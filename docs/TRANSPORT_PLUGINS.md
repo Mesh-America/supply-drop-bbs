@@ -22,6 +22,34 @@ bridge, Matrix, or any other channel by writing a new transport crate.
 > this guide. Read it alongside this document, or fork it as your starting
 > point. Run its tests with `cargo test -p bbs-hello-transport`.
 
+## Development environment
+
+Clone the repository and build:
+
+```sh
+git clone https://github.com/Mesh-America/supply-drop-bbs
+cd supply-drop-bbs
+cargo build                          # debug build — fast iteration
+cargo test -p bbs-hello-transport   # run the reference transport tests
+```
+
+To run a live BBS for integration testing, build and start it locally:
+
+```sh
+cargo run -- setup    # one-time config wizard
+cargo run -- run      # start the BBS
+```
+
+Alternatively, install the latest release `.deb` on a separate
+machine (or a Pi), run `supply-drop-bbs setup`, and point your
+transport at it from your dev machine. See
+[Installation & Operations](OPERATIONS.md) for the full install
+guide.
+
+The current workspace version is **0.5.9**. See the
+[Plugin API guide § Versioning](PLUGIN_API.md#versioning) for the
+version history and migration notes for existing plugins.
+
 ---
 
 ## Table of contents
@@ -1341,7 +1369,7 @@ not production-ready but demonstrates every integration point.
 
 ```toml
 [package]
-name    = "bbs-meshtastic"
+name             = "bbs-meshtastic"
 version.workspace  = true
 edition.workspace  = true
 
@@ -1354,6 +1382,18 @@ serde.workspace          = true
 thiserror                = "1"
 # meshtastic = "0.1"   # hypothetical Meshtastic Rust client crate
 ```
+
+::: tip Current version
+The workspace version is **0.5.9**. Out-of-tree plugins (not inside
+this workspace) reference the crate directly:
+
+```toml
+[dependencies]
+bbs-plugin-api = { git = "https://github.com/Mesh-America/supply-drop-bbs", version = "0.5" }
+```
+
+Use the `"0.5"` range rather than pinning to an exact patch version.
+:::
 
 ### `crates/bbs-meshtastic/src/lib.rs`
 
