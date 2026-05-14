@@ -149,6 +149,60 @@ supply-drop-bbs config show --config /etc/supply-drop-bbs/config.toml
 SUPPLY_DROP__BBS__DATA_DIR=/tmp/test supply-drop-bbs config show
 ```
 
+### `config require-verify`
+
+```
+supply-drop-bbs config require-verify <on|off> [OPTIONS]
+```
+
+Enable or disable sysop verification for new registrations. Writes `require_verify` to the `[bbs]` section of the config file. **Takes effect on the next BBS restart.**
+
+| Argument | Meaning |
+|----------|---------|
+| `on` | New accounts must be verified by an aide or sysop before they can access rooms (default) |
+| `off` | New accounts are treated as `User` immediately — no verification step required (SHTF mode) |
+
+```sh
+# Disable verification for emergency / SHTF deployments
+sudo supply-drop-bbs config require-verify off \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Restore normal verification
+sudo supply-drop-bbs config require-verify on \
+  --config /etc/supply-drop-bbs/config.toml
+```
+
+> **Tip:** Use the in-BBS sysop command `OPENACCESS` / `CLOSEACCESS` instead if you need the change to take effect immediately without a restart.
+
+---
+
+### `config guest-room`
+
+```
+supply-drop-bbs config guest-room <name|off> [OPTIONS]
+```
+
+Set or clear the guest room. Writes (or removes) `guest_room` in the `[bbs]` section of the config file. **Takes effect on the next BBS restart.**
+
+When a guest room is configured, unverified users are placed in that room after registration and can only read and post there. All other rooms and mail are invisible until a sysop verifies them. The room is created automatically on startup if it does not already exist.
+
+| Argument | Meaning |
+|----------|---------|
+| `<name>` | Room name to use as the guest room (e.g. `Guests`) |
+| `off` | Disable the guest room feature |
+
+```sh
+# Set a guest room
+sudo supply-drop-bbs config guest-room Guests \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Disable
+sudo supply-drop-bbs config guest-room off \
+  --config /etc/supply-drop-bbs/config.toml
+```
+
+> **Tip:** Use the in-BBS sysop command `GUESTROOM <name>` / `GUESTROOM OFF` for an immediate live change without a restart.
+
 ---
 
 ### `migrate`

@@ -580,6 +580,79 @@ edit form shows only the description field; the permission-level and read-only
 controls are hidden. Any API attempt to set those fields on those rooms returns
 `422 Unprocessable Entity`.
 
+### Open access and guest rooms (SHTF mode)
+
+In normal operation every new account must be verified by an aide or sysop
+before the user can read or post in any room.  When sysops are unreachable
+(off-grid emergency / SHTF scenario) two complementary knobs keep the BBS
+useful.
+
+#### `require_verify = false` — open access
+
+All registrations are immediately treated as `User`-level.  No aide or sysop
+action is required.  Set this in `config.toml`:
+
+```toml
+[bbs]
+require_verify = false
+```
+
+Or via the CLI (restart required):
+
+```sh
+sudo supply-drop-bbs config require-verify off \
+  --config /etc/supply-drop-bbs/config.toml
+sudo systemctl restart supply-drop-bbs
+```
+
+Or live from within the BBS (sysop session, no restart):
+
+```
+OPENACCESS          # disable verification immediately
+CLOSEACCESS         # restore verification immediately
+```
+
+The web admin **Settings → Access policy** card also exposes this toggle.
+
+#### `guest_room = "Guests"` — guest room confinement
+
+Unverified users land in a single designated room and can only read and post
+there.  All other rooms and mail are invisible until a sysop verifies them.
+The room is created automatically on startup if it does not already exist.
+
+```toml
+[bbs]
+guest_room = "Guests"
+```
+
+Or via the CLI (restart required):
+
+```sh
+sudo supply-drop-bbs config guest-room Guests \
+  --config /etc/supply-drop-bbs/config.toml
+sudo systemctl restart supply-drop-bbs
+```
+
+Or live from within the BBS (sysop session, no restart):
+
+```
+GUESTROOM Guests    # set guest room (created automatically if needed)
+GUESTROOM OFF       # disable guest room
+```
+
+The web admin **Settings → Access policy** card also exposes this field.
+
+#### Composing the two options
+
+The options are independent and compose naturally:
+
+| `require_verify` | `guest_room` set | Behaviour |
+|-----------------|-----------------|-----------|
+| `true` (default) | no | Default strict mode — no access until verified |
+| `true` | yes | Unverified users confined to the guest room |
+| `false` | no | All registrations get full access immediately |
+| `false` | yes | Full access immediately; guest room exists as an ordinary room |
+
 ## Disaster recovery
 
 ### Corrupted database
