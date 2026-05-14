@@ -32,6 +32,8 @@
 //! │  │  GET  /api/v1/settings             (auth)       │    │
 //! │  │  GET  /api/v1/config               (auth)       │    │
 //! │  │  PATCH /api/v1/config              (auth)       │    │
+//! │  │  GET  /api/v1/access-policy        (auth)       │    │
+//! │  │  PATCH /api/v1/access-policy       (auth)       │    │
 //! │  │  GET  /api/v1/errors               (auth)       │    │
 //! │  │  GET  /api/v1/metrics              (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
@@ -531,6 +533,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/reports", get(api_reports))
         .route("/settings", get(api_settings))
         .route("/config", get(api_get_config).patch(api_patch_config))
+        .route(
+            "/access-policy",
+            get(api_get_access_policy).patch(api_patch_access_policy),
+        )
         .route("/restart", post(api_restart))
         .route("/logs", get(api_logs))
         .route("/sse/logs", get(api_sse_logs))
@@ -1918,6 +1924,116 @@ async fn api_patch_config(
         "message": "Config saved. Log level takes effect immediately; other changes require a restart."
     }))
     .into_response()
+}
+
+// ── Access policy ─────────────────────────────────────────────────────────────
+
+/// Response body for `GET /api/v1/access-policy`.
+#[derive(Debug, Serialize)]
+struct AccessPolicyResponse {
+    require_verify: bool,
+    guest_room: Option<String>,
+    guest_room_id: Option<i64>,
+}
+
+/// Patch body for `PATCH /api/v1/access-policy`.
+/// Only fields explicitly included in the request are changed.
+#[derive(Debug, Deserialize)]
+struct AccessPolicyPatch {
+    /// When present, sets `require_verify`.
+    require_verify: Option<bool>,
+    /// When present, sets the guest-room name.
+    /// Send `null` (JSON null) to disable the guest room.
+    guest_room: Option<serde_json::Value>,
+}
+
+async fn api_get_access_policy(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_access_policy().await {
+        Ok(p) => Json(AccessPolicyResponse {
+            require_verify: p.require_verify,
+            guest_room: p.guest_room,
+            guest_room_id: p.guest_room_id,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_patch_access_policy(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(patch): Json<AccessPolicyPatch>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    if let Some(rv) = patch.require_verify {
+        if let Err(e) = state.host.admin_set_require_verify(rv).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("set require_verify: {e}"))),
+            )
+                .into_response();
+        }
+    }
+
+    if let Some(gr) = patch.guest_room {
+        let name: Option<String> = if gr.is_null() {
+            None
+        } else if let Some(s) = gr.as_str() {
+            Some(s.to_owned())
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("guest_room must be a string or null")),
+            )
+                .into_response();
+        };
+        if let Err(e) = state.host.admin_set_guest_room(name).await {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("set guest_room: {e}"))),
+            )
+                .into_response();
+        }
+    }
+
+    // Audit — best-effort.
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", user.username),
+            "access_policy_change",
+            None,
+            None,
+        )
+        .await;
+
+    // Return the updated policy so the frontend can refresh without a second GET.
+    match state.host.admin_get_access_policy().await {
+        Ok(p) => Json(AccessPolicyResponse {
+            require_verify: p.require_verify,
+            guest_room: p.guest_room,
+            guest_room_id: p.guest_room_id,
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
 }
 
 // ── HTTP log poll ─────────────────────────────────────────────────────────────

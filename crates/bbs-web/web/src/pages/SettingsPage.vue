@@ -23,6 +23,12 @@ interface ConfigData {
   logging_level: string | null
 }
 
+interface AccessPolicyData {
+  require_verify: boolean
+  guest_room: string | null
+  guest_room_id: number | null
+}
+
 interface RoomSummary {
   name: string
 }
@@ -277,9 +283,65 @@ async function restartService() {
   restartError.value = 'Service did not come back within 60 s. Check: journalctl -u supply-drop-bbs -f'
 }
 
+// ── Access policy ─────────────────────────────────────────────────────────────
+
+const accessPolicy = ref<AccessPolicyData | null>(null)
+const accessPolicyLoading = ref(false)
+const accessPolicyError = ref<string | null>(null)
+
+// Working copy, updated independently of the main config form.
+const apRequireVerify = ref(true)
+const apGuestRoom = ref('')
+const apGuestRoomEnabled = ref(false)
+
+const accessPolicySaving = ref(false)
+const accessPolicySaveOk = ref<string | null>(null)
+const accessPolicySaveError = ref<string | null>(null)
+
+async function loadAccessPolicy() {
+  accessPolicyLoading.value = true
+  accessPolicyError.value = null
+  try {
+    const p = await api.get<AccessPolicyData>('/api/v1/access-policy')
+    accessPolicy.value = p
+    apRequireVerify.value    = p.require_verify
+    apGuestRoomEnabled.value = p.guest_room != null
+    apGuestRoom.value        = p.guest_room ?? ''
+  } catch (e: any) {
+    accessPolicyError.value = e?.message ?? 'failed to load access policy'
+  } finally {
+    accessPolicyLoading.value = false
+  }
+}
+
+async function saveAccessPolicy() {
+  accessPolicySaving.value   = true
+  accessPolicySaveOk.value   = null
+  accessPolicySaveError.value = null
+  try {
+    const patch: Record<string, unknown> = {
+      require_verify: apRequireVerify.value,
+      guest_room: apGuestRoomEnabled.value
+        ? (apGuestRoom.value.trim() || null)
+        : null,
+    }
+    const updated = await api.patch<AccessPolicyData>('/api/v1/access-policy', patch)
+    accessPolicy.value       = updated
+    apRequireVerify.value    = updated.require_verify
+    apGuestRoomEnabled.value = updated.guest_room != null
+    apGuestRoom.value        = updated.guest_room ?? ''
+    accessPolicySaveOk.value = 'Access policy updated. Changes take effect immediately.'
+  } catch (e: any) {
+    accessPolicySaveError.value = e?.message ?? 'failed to save access policy'
+  } finally {
+    accessPolicySaving.value = false
+  }
+}
+
 onMounted(() => {
   load()
   loadRooms()
+  loadAccessPolicy()
 })
 </script>
 
@@ -472,6 +534,67 @@ chmod g+w {{ configFile }}</pre>
         <span v-if="!writable" class="hint">config file is not writable</span>
         <span v-else-if="!isDirty" class="hint">no unsaved changes</span>
       </div>
+
+      <!-- Access policy -->
+      <section class="card">
+        <h2>Access policy</h2>
+        <p class="hint">
+          Controls how new registrations are handled. Changes take effect
+          immediately — no restart required. See also the in-BBS
+          <code>OPENACCESS</code> / <code>CLOSEACCESS</code> / <code>GUESTROOM</code> commands.
+        </p>
+
+        <div v-if="accessPolicyError" class="notice error-notice">{{ accessPolicyError }}</div>
+        <div v-if="accessPolicySaveOk" class="notice ok-notice">{{ accessPolicySaveOk }}</div>
+        <div v-if="accessPolicySaveError" class="notice error-notice">{{ accessPolicySaveError }}</div>
+
+        <div class="field checkbox-field">
+          <label>
+            <input type="checkbox" v-model="apRequireVerify" :disabled="accessPolicyLoading" />
+            Require sysop verification before users can access rooms
+          </label>
+          <p class="hint">
+            Uncheck for SHTF mode — new users get full access immediately on
+            registration. When unchecked, the guest room (below) still exists but
+            has no access restriction.
+          </p>
+        </div>
+
+        <div class="field checkbox-field">
+          <label>
+            <input type="checkbox" v-model="apGuestRoomEnabled" :disabled="accessPolicyLoading" />
+            Restrict unverified users to a guest room
+          </label>
+          <p class="hint">
+            Unverified users can only read and post in the named room.
+            The room is created automatically on startup if it does not exist.
+          </p>
+        </div>
+
+        <div v-if="apGuestRoomEnabled" class="field">
+          <label>Guest room name</label>
+          <input
+            v-model="apGuestRoom"
+            type="text"
+            placeholder="e.g. Guests"
+            :disabled="accessPolicyLoading"
+            style="max-width: 260px"
+          />
+          <p v-if="accessPolicy?.guest_room_id != null" class="hint">
+            Room ID: {{ accessPolicy.guest_room_id }}
+          </p>
+        </div>
+
+        <div class="actions">
+          <button
+            type="button"
+            :disabled="accessPolicySaving || accessPolicyLoading"
+            @click="saveAccessPolicy"
+          >
+            {{ accessPolicySaving ? 'saving…' : 'save access policy' }}
+          </button>
+        </div>
+      </section>
 
       <!-- Service restart -->
       <section class="card">
