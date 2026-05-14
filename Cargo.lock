@@ -272,6 +272,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "toml_edit",
  "tracing",
 ]
 

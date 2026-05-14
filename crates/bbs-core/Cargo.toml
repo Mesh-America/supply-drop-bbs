@@ -15,14 +15,15 @@ publish      = false
 # concrete impl, and that's us.
 bbs-plugin-api.workspace = true
 
-argon2.workspace    = true
+argon2.workspace      = true
 async-trait.workspace = true
-serde.workspace     = true
-sqlx.workspace      = true
-thiserror.workspace = true
-time.workspace      = true
-tokio.workspace     = true
-tracing.workspace   = true
+serde.workspace       = true
+sqlx.workspace        = true
+thiserror.workspace   = true
+time.workspace        = true
+tokio.workspace       = true
+toml_edit.workspace   = true
+tracing.workspace     = true
 
 [dev-dependencies]
 proptest    = { workspace = true }

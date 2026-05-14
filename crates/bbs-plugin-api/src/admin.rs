@@ -194,6 +194,22 @@ pub struct AdminBackupRecord {
     pub config_size_bytes: Option<u64>,
 }
 
+/// The current access policy for the BBS.
+///
+/// Returned by [`crate::host::Host::admin_get_access_policy`] and consumed by
+/// the web admin UI and in-BBS `OPENACCESS` / `CLOSEACCESS` / `GUESTROOM`
+/// commands.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAccessPolicy {
+    /// When `false`, accounts are treated as `User` immediately after
+    /// registration — no sysop verification is required.
+    pub require_verify: bool,
+    /// Name of the guest room, or `None` when the feature is disabled.
+    pub guest_room: Option<String>,
+    /// Database row ID of the guest room, or `None` when not configured.
+    pub guest_room_id: Option<i64>,
+}
+
 /// One entry in the durable audit log.
 ///
 /// Written whenever a privileged action is performed: ban, unban, validate,

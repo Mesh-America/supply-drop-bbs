@@ -130,6 +130,33 @@ pub struct BbsConfig {
     /// IANA timezone name for display timestamps. Storage is always UTC.
     #[serde(default = "default_timezone")]
     pub timezone: String,
+
+    /// When `false`, skip the sysop-verification step entirely.
+    ///
+    /// Every account is treated as `User` the moment registration completes —
+    /// no aide or sysop action is required.  Intended for SHTF deployments
+    /// where sysops may be unreachable but the community still needs
+    /// to communicate.
+    ///
+    /// Default: `true` (verification required, current behaviour).
+    #[serde(default = "default_require_verify")]
+    pub require_verify: bool,
+
+    /// Name of a "guest room" that unverified users are confined to.
+    ///
+    /// When set, accounts that have not yet been verified by an aide can
+    /// log in but may only list, navigate to, and post in this single room.
+    /// All other rooms (and mail) are invisible to them until they are
+    /// promoted to `User`.
+    ///
+    /// The room is created automatically on BBS startup if it does not
+    /// already exist; it is created with `min_permission_level = Unvalidated`
+    /// so both guests and regular users can post there.
+    ///
+    /// Omit (or set to `null`) to keep the strict "no access until verified"
+    /// behaviour.
+    #[serde(default)]
+    pub guest_room: Option<String>,
 }
 
 impl Default for BbsConfig {
@@ -140,6 +167,8 @@ impl Default for BbsConfig {
             starting_room: default_starting_room(),
             welcome_msg: default_welcome_msg(),
             timezone: default_timezone(),
+            require_verify: default_require_verify(),
+            guest_room: None,
         }
     }
 }
@@ -155,6 +184,9 @@ fn default_welcome_msg() -> String {
 }
 fn default_timezone() -> String {
     "UTC".to_owned()
+}
+fn default_require_verify() -> bool {
+    true
 }
 
 // ── [location] ───────────────────────────────────────────────────────────────

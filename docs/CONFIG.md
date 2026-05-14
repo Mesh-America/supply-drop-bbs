@@ -105,13 +105,59 @@ which plugin sections are valid.
 
 ## `[bbs]` - system identity
 
-| Key            | Type   | Default                  | Required | Description                                      |
-|----------------|--------|--------------------------|----------|--------------------------------------------------|
-| `name`         | string | `"Supply Drop BBS"`      | no       | Display name shown to users on connect           |
-| `data_dir`     | path   | `/var/lib/supply-drop-bbs` (root) or `~/.local/share/supply-drop-bbs` (user) | no | Where the BBS stores its data |
-| `starting_room`| string | `"Lobby"`                | no       | Room a newly logged-in user lands in             |
-| `welcome_msg`  | string | `"Welcome to {name}."`   | no       | Banner shown on connect; supports `{name}` substitution |
-| `timezone`     | string | `"UTC"`                  | no       | Display timezone for sysop UI; storage is always UTC |
+| Key              | Type   | Default                  | Required | Description                                      |
+|------------------|--------|--------------------------|----------|--------------------------------------------------|
+| `name`           | string | `"Supply Drop BBS"`      | no       | Display name shown to users on connect           |
+| `data_dir`       | path   | `/var/lib/supply-drop-bbs` (root) or `~/.local/share/supply-drop-bbs` (user) | no | Where the BBS stores its data |
+| `starting_room`  | string | `"Lobby"`                | no       | Room a newly logged-in user lands in             |
+| `welcome_msg`    | string | `"Welcome to {name}."`   | no       | Banner shown on connect; supports `{name}` substitution |
+| `timezone`       | string | `"UTC"`                  | no       | Display timezone for sysop UI; storage is always UTC |
+| `require_verify` | bool   | `true`                   | no       | When `false`, skip sysop verification — new accounts are treated as `User` immediately (SHTF mode) |
+| `guest_room`     | string | (unset)                  | no       | Name of a room unverified users are confined to; created automatically on startup if it does not exist |
+
+### Access control and SHTF mode
+
+By default every new account must be validated by an aide or sysop before the
+user can post or read messages.  In emergency situations (sysops unreachable)
+two knobs relax this:
+
+**Open access (`require_verify = false`)** — all registrations immediately
+receive full User-level access.  No aide or sysop action is required.
+
+```toml
+[bbs]
+require_verify = false
+```
+
+**Guest room (`guest_room = "Guests"`)** — unverified users are placed in a
+single designated room and can read and post there, but all other rooms and
+mail are invisible until a sysop verifies them.  The room is created
+automatically on the first BBS start after this key is set.
+
+```toml
+[bbs]
+guest_room = "Guests"
+```
+
+The two options compose: with `require_verify = false` the guest room still
+exists as an ordinary room but carries no access restriction.
+
+Both settings can be changed without a restart via in-BBS sysop commands:
+
+```
+OPENACCESS              # disable verification immediately
+CLOSEACCESS             # restore verification immediately
+GUESTROOM Guests        # set guest room (created if needed)
+GUESTROOM OFF           # disable guest room
+```
+
+…or via the CLI (takes effect on the next restart):
+
+```sh
+supply-drop-bbs config require-verify off
+supply-drop-bbs config guest-room "Guests"
+supply-drop-bbs config guest-room off
+```
 
 ## `[location]` - GPS coordinates
 

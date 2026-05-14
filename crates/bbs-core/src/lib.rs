@@ -39,7 +39,7 @@ pub mod user;
 // ── Re-exports of the most-used items ────────────────────────────
 
 pub use db::{Database, DbOpenError, MessagePage, MessageStore, RoomStore, StoreError, UserStore};
-pub use host::BbsHost;
+pub use host::{AccessPolicy, BbsHost};
 pub use ids::{MessageId, RoomId, UserId};
 pub use message::{InvalidMessageContent, Message};
 pub use room::{InvalidRoomDescription, InvalidRoomName, Room};

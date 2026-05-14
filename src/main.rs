@@ -231,6 +231,27 @@ enum ConfigAction {
     /// Print the effective configuration as TOML (defaults filled in,
     /// environment overrides applied).
     Show,
+
+    /// Enable or disable the verification requirement.
+    ///
+    /// When disabled (`off`), all registrations immediately receive
+    /// User-level access without aide/sysop validation.
+    /// Changes take effect on the next BBS restart.
+    RequireVerify {
+        /// `on` to require verification (default), `off` to skip it.
+        enabled: String,
+    },
+
+    /// Set or clear the guest room.
+    ///
+    /// Unverified users are placed in this room and cannot navigate elsewhere.
+    /// The room is created automatically on the next BBS start if it does not exist.
+    /// Use `off` to disable the guest room feature.
+    /// Changes take effect on the next BBS restart.
+    GuestRoom {
+        /// Room name, or `off` to disable.
+        value: String,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -374,8 +395,41 @@ async fn cmd_run(cli: &Cli) {
     };
 
     // ── 5. Host ───────────────────────────────────────────────────────────────
-    let host: Arc<dyn bbs_plugin_api::Host> =
-        Arc::new(BbsHost::with_location(db, cfg.location.as_coords()));
+
+    // Resolve the config file path (same search order used by the process
+    // transport and web plugin) so the host can persist policy changes.
+    let host_config_path: Option<std::path::PathBuf> = cli
+        .config
+        .as_deref()
+        .and_then(|p| p.canonicalize().ok())
+        .or_else(|| {
+            [
+                std::path::PathBuf::from("config.toml"),
+                std::path::PathBuf::from("/etc/supply-drop-bbs/config.toml"),
+            ]
+            .iter()
+            .find(|p| p.exists())
+            .and_then(|p| p.canonicalize().ok())
+        });
+
+    let access_policy = bbs_core::host::AccessPolicy {
+        require_verify: cfg.bbs.require_verify,
+        guest_room_name: cfg.bbs.guest_room.clone(),
+    };
+
+    let bbs = BbsHost::with_config(
+        db,
+        cfg.location.as_coords(),
+        access_policy,
+        host_config_path,
+    );
+
+    if let Err(e) = bbs.ensure_guest_room().await {
+        error!("guest room setup failed: {e}");
+        std::process::exit(1);
+    }
+
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(bbs);
     info!("host initialised");
 
     // ── 6. Backup task ───────────────────────────────────────────────────────
@@ -858,6 +912,119 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                 std::process::exit(1);
             }
         },
+        ConfigAction::RequireVerify { enabled } => {
+            let value = match enabled.to_ascii_lowercase().as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                other => {
+                    eprintln!("error: expected on|off, got '{other}'");
+                    std::process::exit(1);
+                }
+            };
+            config_edit_bbs_bool(config_path, "require_verify", value);
+            println!("require_verify = {value}. Restart the BBS for the change to take effect.");
+        }
+        ConfigAction::GuestRoom { value } => {
+            if value.eq_ignore_ascii_case("off") {
+                config_remove_bbs_key(config_path, "guest_room");
+                println!("guest_room cleared. Restart the BBS for the change to take effect.");
+            } else {
+                config_edit_bbs_string(config_path, "guest_room", &value);
+                println!(
+                    "guest_room = \"{value}\". Restart the BBS for the change to take effect."
+                );
+            }
+        }
+    }
+}
+
+// ── Config-edit helpers ───────────────────────────────────────────────────────
+//
+// Used by `config require-verify` and `config guest-room` to update
+// config.toml in place via toml_edit.
+
+/// Open the config file and return its parsed document + resolved path.
+fn open_config_for_edit(
+    config_path: Option<&std::path::Path>,
+) -> (std::path::PathBuf, toml_edit::DocumentMut) {
+    #[cfg(feature = "transport-process")]
+    let path = match config::resolve_config_path(config_path) {
+        Some(p) => p,
+        None => {
+            eprintln!("error: no config file found");
+            std::process::exit(1);
+        }
+    };
+    #[cfg(not(feature = "transport-process"))]
+    let path = {
+        let explicit = config_path.map(|p| p.to_path_buf());
+        let found = explicit.or_else(|| {
+            [
+                std::path::PathBuf::from("config.toml"),
+                std::path::PathBuf::from("/etc/supply-drop-bbs/config.toml"),
+            ]
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+        });
+        match found {
+            Some(p) => p,
+            None => {
+                eprintln!("error: no config file found");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error reading {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    let doc = match content.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error parsing {}: {e}", path.display());
+            std::process::exit(1);
+        }
+    };
+    (path, doc)
+}
+
+fn config_edit_bbs_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
+    let (path, mut doc) = open_config_for_edit(config_path);
+    if doc.get("bbs").is_none() {
+        doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["bbs"][key] = toml_edit::value(value);
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+        eprintln!("error writing {}: {e}", path.display());
+        std::process::exit(1);
+    }
+}
+
+fn config_edit_bbs_string(config_path: Option<&std::path::Path>, key: &str, value: &str) {
+    let (path, mut doc) = open_config_for_edit(config_path);
+    if doc.get("bbs").is_none() {
+        doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["bbs"][key] = toml_edit::value(value);
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+        eprintln!("error writing {}: {e}", path.display());
+        std::process::exit(1);
+    }
+}
+
+fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
+    let (path, mut doc) = open_config_for_edit(config_path);
+    if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
+        bbs.remove(key);
+    }
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+        eprintln!("error writing {}: {e}", path.display());
+        std::process::exit(1);
     }
 }
 

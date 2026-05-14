@@ -25,8 +25,8 @@
 use std::sync::Arc;
 
 use crate::admin::{
-    AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports, AdminRoomSummary,
-    AdminSessionInfo, AdminStats, AdminUserInfo,
+    AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports,
+    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -338,6 +338,37 @@ pub trait Host: Send + Sync {
     ) -> Result<Vec<AdminMessageRecord>, HostError> {
         let _ = (sender, query, limit);
         Err(HostError::NotSupported("admin_search_messages".into()))
+    }
+
+    // ── Access policy ────────────────────────────────────────────────────────────
+
+    /// Return the current access policy.
+    ///
+    /// Returns `HostError::NotSupported` in minimal implementations.
+    async fn admin_get_access_policy(&self) -> Result<AdminAccessPolicy, HostError> {
+        Err(HostError::NotSupported("admin_get_access_policy".into()))
+    }
+
+    /// Enable or disable the verification requirement.
+    ///
+    /// When `require_verify = false`, newly-registered accounts are treated
+    /// as `User` immediately without aide/sysop validation.
+    ///
+    /// Takes effect immediately and is persisted to `config.toml`.
+    async fn admin_set_require_verify(&self, require_verify: bool) -> Result<(), HostError> {
+        let _ = require_verify;
+        Err(HostError::NotSupported("admin_set_require_verify".into()))
+    }
+
+    /// Set or clear the guest room.
+    ///
+    /// `name = Some("RoomName")` enables the guest room (created if needed).
+    /// `name = None` disables the feature.
+    ///
+    /// Takes effect immediately and is persisted to `config.toml`.
+    async fn admin_set_guest_room(&self, name: Option<String>) -> Result<(), HostError> {
+        let _ = name;
+        Err(HostError::NotSupported("admin_set_guest_room".into()))
     }
 
     // ── Node location ────────────────────────────────────────────────────────────

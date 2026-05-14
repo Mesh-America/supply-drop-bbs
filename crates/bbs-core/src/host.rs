@@ -19,6 +19,7 @@
 //! Per-user read state is persisted in `user_room_state` via `MessageStore`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -27,8 +28,8 @@ use async_trait::async_trait;
 use bbs_plugin_api::advert::AdvertBus;
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
-    AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo, AdminStats,
-    AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient, PermissionCtx,
+    AdminAccessPolicy, AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo,
+    AdminStats, AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient, PermissionCtx,
     PermissionLevel, Response, SessionId, Username,
 };
 use tokio::sync::{broadcast, RwLock};
@@ -161,6 +162,32 @@ struct SessionRecord {
     current_message_id: Option<MessageId>,
 }
 
+// ── Access policy ─────────────────────────────────────────────────────────────
+
+/// Runtime access policy — controls verification and guest-room behaviour.
+///
+/// Constructed from config on startup and held inside a `RwLock` so
+/// in-BBS sysop commands (`OPENACCESS`, `CLOSEACCESS`, `GUESTROOM`) can
+/// update it without a restart.
+#[derive(Debug, Clone)]
+pub struct AccessPolicy {
+    /// When `false`, Unvalidated users are treated as `User` immediately after
+    /// registration — no aide/sysop verification step is required.
+    pub require_verify: bool,
+    /// Name of the room that unverified users are confined to.
+    /// `None` keeps the strict "no access until verified" behaviour.
+    pub guest_room_name: Option<String>,
+}
+
+impl Default for AccessPolicy {
+    fn default() -> Self {
+        Self {
+            require_verify: true,
+            guest_room_name: None,
+        }
+    }
+}
+
 // ── BbsHost ───────────────────────────────────────────────────────────────────
 
 /// Concrete [`Host`] implementation backed by the bbs-core [`Database`].
@@ -176,6 +203,15 @@ pub struct BbsHost {
     /// Optional GPS coordinates from `[location]` config section.
     /// Wrapped in a RwLock so the web admin can update it without a restart.
     location: std::sync::RwLock<Option<(f64, f64)>>,
+    /// Access policy — controls verification and guest-room behaviour.
+    /// Wrapped in a `RwLock` so in-BBS sysop commands can update it live.
+    access_policy: RwLock<AccessPolicy>,
+    /// Resolved guest room ID — populated by [`Self::ensure_guest_room`].
+    /// `None` when the guest room feature is disabled or not yet initialised.
+    guest_room_id: std::sync::RwLock<Option<RoomId>>,
+    /// Absolute path to `config.toml`, used by in-BBS commands that persist
+    /// policy changes to disk.  `None` in tests and minimal CLI runs.
+    config_path: Option<PathBuf>,
 }
 
 impl BbsHost {
@@ -186,6 +222,19 @@ impl BbsHost {
 
     /// Create a [`BbsHost`] with an optional GPS location.
     pub fn with_location(db: Database, location: Option<(f64, f64)>) -> Self {
+        Self::with_config(db, location, AccessPolicy::default(), None)
+    }
+
+    /// Create a [`BbsHost`] with a full configuration.
+    ///
+    /// `config_path` should be the canonicalized path to `config.toml` so
+    /// in-BBS sysop commands can persist policy changes to disk.
+    pub fn with_config(
+        db: Database,
+        location: Option<(f64, f64)>,
+        policy: AccessPolicy,
+        config_path: Option<PathBuf>,
+    ) -> Self {
         let (events_tx, _) = broadcast::channel(256);
         Self {
             db,
@@ -195,7 +244,59 @@ impl BbsHost {
             advert_bus: Arc::new(AdvertBus::new()),
             login_failures: tokio::sync::Mutex::new(HashMap::new()),
             location: std::sync::RwLock::new(location),
+            access_policy: RwLock::new(policy),
+            guest_room_id: std::sync::RwLock::new(None),
+            config_path,
         }
+    }
+
+    /// Ensure the guest room exists in the database (creating it if needed)
+    /// and cache its ID.
+    ///
+    /// Must be called **before** wrapping `self` in an `Arc` (i.e., before
+    /// handing it to transports).  Returns `Ok(())` immediately when the
+    /// guest room feature is not configured.
+    pub async fn ensure_guest_room(&self) -> Result<(), String> {
+        let name = {
+            let policy = self.access_policy.read().await;
+            policy.guest_room_name.clone()
+        };
+        let Some(name) = name else {
+            return Ok(());
+        };
+
+        let room = match self.db.get_by_name(&name).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                // Create with min_permission_level = Unvalidated so both
+                // guests and regular users can read and post.
+                let id = RoomStore::create(
+                    &self.db,
+                    &name,
+                    Some("Open room — all users welcome."),
+                    false,
+                    PermissionLevel::Unvalidated,
+                    crate::timestamp::Timestamp::now(),
+                )
+                .await
+                .map_err(|e| format!("guest room create: {e}"))?;
+
+                RoomStore::get_by_id(&self.db, id)
+                    .await
+                    .map_err(|e| format!("guest room fetch: {e}"))?
+                    .ok_or_else(|| "guest room missing after create".to_owned())?
+            }
+            Err(e) => return Err(format!("guest room lookup: {e}")),
+        };
+
+        *self.guest_room_id.write().expect("guest_room_id poisoned") = Some(room.id);
+        info!(room_id = %room.id.as_i64(), room_name = %room.name, "guest room configured");
+        Ok(())
+    }
+
+    /// Return the cached guest room ID, if any.
+    fn guest_room_id(&self) -> Option<RoomId> {
+        *self.guest_room_id.read().expect("guest_room_id poisoned")
     }
 }
 
@@ -308,6 +409,11 @@ impl Host for BbsHost {
             Command::SetUserPassword { username } => {
                 self.handle_set_user_password(session, username).await
             }
+
+            // Access policy (Sysop only)
+            Command::OpenAccess => self.handle_open_access(session).await,
+            Command::CloseAccess => self.handle_close_access(session).await,
+            Command::SetGuestRoom { name } => self.handle_set_guest_room(session, name).await,
 
             Command::Unknown { .. } => {
                 Ok(Response::Text("Unknown command. Type H for help.".into()))
@@ -848,6 +954,38 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    async fn admin_get_access_policy(&self) -> Result<AdminAccessPolicy, HostError> {
+        let policy = self.access_policy.read().await;
+        Ok(AdminAccessPolicy {
+            require_verify: policy.require_verify,
+            guest_room: policy.guest_room_name.clone(),
+            guest_room_id: self.guest_room_id().map(|id| id.as_i64()),
+        })
+    }
+
+    async fn admin_set_require_verify(&self, require_verify: bool) -> Result<(), HostError> {
+        {
+            let mut policy = self.access_policy.write().await;
+            policy.require_verify = require_verify;
+        }
+        self.persist_access_policy().await;
+        Ok(())
+    }
+
+    async fn admin_set_guest_room(&self, name: Option<String>) -> Result<(), HostError> {
+        {
+            let mut policy = self.access_policy.write().await;
+            policy.guest_room_name = name.clone();
+        }
+        if name.is_some() {
+            self.ensure_guest_room().await.map_err(HostError::Storage)?;
+        } else {
+            *self.guest_room_id.write().expect("guest_room_id poisoned") = None;
+        }
+        self.persist_access_policy().await;
+        Ok(())
+    }
+
     async fn mesh_node_restore(
         &self,
         session: SessionId,
@@ -1200,13 +1338,20 @@ impl BbsHost {
                     .map_err(|e| HostError::Storage(format!("set password: {e}")))?;
 
                 {
+                    // Unvalidated users land in the guest room (if configured);
+                    // sysop / first-user lands in Lobby as usual.
+                    let initial_room = if initial_level < PermissionLevel::User {
+                        self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
+                    } else {
+                        LOBBY_ROOM_ID
+                    };
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.username = Some(username.clone());
                         r.user_id = Some(user_id);
                         r.level = initial_level;
                         r.workflow = Workflow::None;
-                        r.current_room = LOBBY_ROOM_ID;
+                        r.current_room = initial_room;
                     }
                 }
                 let _ = self.events_tx.send(DomainEvent::UserCreated {
@@ -1282,13 +1427,19 @@ impl BbsHost {
                         .await
                         .map_err(|e| HostError::Storage(format!("update last_login: {e}")))?;
                     {
+                        // Unverified users land in the guest room (if configured).
+                        let initial_room = if user.permission_level < PermissionLevel::User {
+                            self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
+                        } else {
+                            LOBBY_ROOM_ID
+                        };
                         let mut sessions = self.sessions.write().await;
                         if let Some(r) = sessions.get_mut(&session) {
                             r.username = Some(username.clone());
                             r.user_id = Some(user.id);
                             r.level = user.permission_level;
                             r.workflow = Workflow::None;
-                            r.current_room = LOBBY_ROOM_ID;
+                            r.current_room = initial_room;
                         }
                     }
                     let _ = self.events_tx.send(DomainEvent::SessionAuthenticated {
@@ -1941,6 +2092,10 @@ impl BbsHost {
     /// When the cached level is Unvalidated, the DB is re-read once to catch
     /// out-of-process promotions (e.g. `supply-drop-bbs user promote`) without
     /// requiring the user to log out and back in.
+    ///
+    /// When `access_policy.require_verify` is `false`, Unvalidated sessions
+    /// are promoted to `User` in-memory so they pass this check without a
+    /// sysop having to manually validate them.
     async fn session_auth_user(
         &self,
         session: SessionId,
@@ -1969,6 +2124,16 @@ impl BbsHost {
             return Ok((username, user_id, fresh_level, room_id));
         }
 
+        // If require_verify is disabled, treat Unvalidated as User-level.
+        let require_verify = self.access_policy.read().await.require_verify;
+        if !require_verify {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.level = PermissionLevel::User;
+            }
+            return Ok((username, user_id, PermissionLevel::User, room_id));
+        }
+
         Err(Response::Text(
             "Your account is pending validation by an aide.\n\
              Type H for help, WHOAMI to see your status, or Q to log out."
@@ -1976,17 +2141,58 @@ impl BbsHost {
         ))
     }
 
-    async fn handle_list_rooms(&self, session: SessionId) -> Result<Response, HostError> {
-        let (username, user_id, level, current_room) = match self.session_auth_user(session).await {
-            Ok(t) => t,
-            Err(r) => return Ok(r),
-        };
+    /// Like [`session_auth_user`] but also allows Unvalidated users through
+    /// when a guest room is configured.
+    ///
+    /// Returns the same tuple as `session_auth_user`; callers check
+    /// `level < PermissionLevel::User` to detect guest-only access and
+    /// restrict navigation/posting to the guest room.
+    async fn session_auth_or_guest(
+        &self,
+        session: SessionId,
+    ) -> Result<(Username, UserId, PermissionLevel, RoomId), Response> {
+        match self.session_auth_user(session).await {
+            ok @ Ok(_) => ok,
+            Err(pending_response) => {
+                // If a guest room is configured, let Unvalidated sessions
+                // through with their real (Unvalidated) level so handlers
+                // can restrict them to that room.
+                if self.guest_room_id().is_some() {
+                    self.session_auth(session)
+                        .await
+                        .map_err(|_| pending_response)
+                } else {
+                    Err(pending_response)
+                }
+            }
+        }
+    }
 
-        let rooms = self
-            .db
-            .list_readable(level)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+    async fn handle_list_rooms(&self, session: SessionId) -> Result<Response, HostError> {
+        let (username, user_id, level, current_room) =
+            match self.session_auth_or_guest(session).await {
+                Ok(t) => t,
+                Err(r) => return Ok(r),
+            };
+
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
+
+        let rooms = {
+            let all = self
+                .db
+                .list_readable(level)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            if is_guest {
+                // Guests only see the guest room.
+                all.into_iter()
+                    .filter(|r| Some(r.id) == guest_rid)
+                    .collect::<Vec<_>>()
+            } else {
+                all
+            }
+        };
 
         let mut lines = Vec::new();
         for room in &rooms {
@@ -2042,16 +2248,29 @@ impl BbsHost {
     }
 
     async fn handle_go_next_unread(&self, session: SessionId) -> Result<Response, HostError> {
-        let (username, user_id, level, current_room) = match self.session_auth_user(session).await {
-            Ok(t) => t,
-            Err(r) => return Ok(r),
-        };
+        let (username, user_id, level, current_room) =
+            match self.session_auth_or_guest(session).await {
+                Ok(t) => t,
+                Err(r) => return Ok(r),
+            };
 
-        let rooms = self
-            .db
-            .list_readable(level)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
+
+        let rooms = {
+            let all = self
+                .db
+                .list_readable(level)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            if is_guest {
+                all.into_iter()
+                    .filter(|r| Some(r.id) == guest_rid)
+                    .collect::<Vec<_>>()
+            } else {
+                all
+            }
+        };
 
         // Walk the room list starting just after the current room,
         // wrapping around. Skip the current room if encountered during wrap.
@@ -2091,10 +2310,13 @@ impl BbsHost {
             return Ok(Response::Text("Usage: C <room name or number>".into()));
         }
 
-        let (username, user_id, level, _) = match self.session_auth_user(session).await {
+        let (username, user_id, level, _) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
 
         // Try by name first; then by numeric ID.
         let room = if let Ok(id) = target.parse::<i64>() {
@@ -2118,6 +2340,13 @@ impl BbsHost {
                 "You don't have permission to enter '{}'.",
                 room.name
             )));
+        }
+
+        // Guests may only navigate to the guest room.
+        if is_guest && Some(room.id) != guest_rid {
+            return Ok(Response::Text(
+                "You must be verified to access that room.".into(),
+            ));
         }
 
         self.set_current_room(session, room.id).await;
@@ -2294,14 +2523,209 @@ impl BbsHost {
     }
 }
 
+// ── Access-policy sysop command handlers ─────────────────────────────────────
+
+impl BbsHost {
+    /// Handle `OPENACCESS` — disable the verification requirement immediately.
+    async fn handle_open_access(&self, session: SessionId) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Sysop {
+            return Ok(Response::Text("Sysop permission required.".into()));
+        }
+        {
+            let mut policy = self.access_policy.write().await;
+            policy.require_verify = false;
+        }
+        self.persist_access_policy().await;
+        if let Err(e) = self
+            .db
+            .audit_write(actor.as_str(), "open_access", None, None)
+            .await
+        {
+            warn!("audit write failed: {e}");
+        }
+        Ok(Response::Text(
+            "Open access enabled. New registrations no longer require verification.".into(),
+        ))
+    }
+
+    /// Handle `CLOSEACCESS` — restore the verification requirement immediately.
+    async fn handle_close_access(&self, session: SessionId) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Sysop {
+            return Ok(Response::Text("Sysop permission required.".into()));
+        }
+        {
+            let mut policy = self.access_policy.write().await;
+            policy.require_verify = true;
+        }
+        self.persist_access_policy().await;
+        if let Err(e) = self
+            .db
+            .audit_write(actor.as_str(), "close_access", None, None)
+            .await
+        {
+            warn!("audit write failed: {e}");
+        }
+        Ok(Response::Text(
+            "Verification requirement restored. New accounts must be validated.".into(),
+        ))
+    }
+
+    /// Handle `GUESTROOM <name>` / `GUESTROOM OFF`.
+    async fn handle_set_guest_room(
+        &self,
+        session: SessionId,
+        name: Option<String>,
+    ) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Sysop {
+            return Ok(Response::Text("Sysop permission required.".into()));
+        }
+
+        let reply = match name {
+            None => {
+                // Disable guest room.
+                {
+                    let mut policy = self.access_policy.write().await;
+                    policy.guest_room_name = None;
+                }
+                *self.guest_room_id.write().expect("guest_room_id poisoned") = None;
+                self.persist_access_policy().await;
+                if let Err(e) = self
+                    .db
+                    .audit_write(actor.as_str(), "set_guest_room", Some("off"), None)
+                    .await
+                {
+                    warn!("audit write failed: {e}");
+                }
+                "Guest room disabled. Unverified users will see the pending-validation message."
+                    .to_owned()
+            }
+            Some(ref room_name) => {
+                // Enable / change guest room — ensure it exists.
+                {
+                    let mut policy = self.access_policy.write().await;
+                    policy.guest_room_name = Some(room_name.clone());
+                }
+                // Re-run ensure_guest_room to create it if needed.
+                if let Err(e) = self.ensure_guest_room().await {
+                    // Roll back in-memory change on failure.
+                    let mut policy = self.access_policy.write().await;
+                    policy.guest_room_name = None;
+                    return Ok(Response::Text(format!("Failed to set guest room: {e}")));
+                }
+                self.persist_access_policy().await;
+                if let Err(e) = self
+                    .db
+                    .audit_write(
+                        actor.as_str(),
+                        "set_guest_room",
+                        Some(room_name.as_str()),
+                        None,
+                    )
+                    .await
+                {
+                    warn!("audit write failed: {e}");
+                }
+                format!("Guest room set to '{room_name}'. Unverified users will be placed there.")
+            }
+        };
+
+        Ok(Response::Text(reply))
+    }
+
+    /// Persist the current access policy to `config.toml`.
+    ///
+    /// Failures are logged as warnings but not propagated — the in-memory
+    /// state is already updated and the sysop can restart to re-read the file.
+    async fn persist_access_policy(&self) {
+        let Some(ref path) = self.config_path else {
+            warn!("no config_path set — access policy change will not survive restart");
+            return;
+        };
+
+        let (require_verify, guest_room_name) = {
+            let policy = self.access_policy.read().await;
+            (policy.require_verify, policy.guest_room_name.clone())
+        };
+
+        let content = match std::fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(
+                    "persist_access_policy: could not read {}: {e}",
+                    path.display()
+                );
+                return;
+            }
+        };
+
+        let mut doc = match content.parse::<toml_edit::DocumentMut>() {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    "persist_access_policy: could not parse {}: {e}",
+                    path.display()
+                );
+                return;
+            }
+        };
+
+        // Ensure [bbs] table exists.
+        if doc.get("bbs").is_none() {
+            doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+
+        doc["bbs"]["require_verify"] = toml_edit::value(require_verify);
+
+        match guest_room_name {
+            Some(name) => {
+                doc["bbs"]["guest_room"] = toml_edit::value(name);
+            }
+            None => {
+                if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
+                    bbs.remove("guest_room");
+                }
+            }
+        }
+
+        if let Err(e) = std::fs::write(path, doc.to_string()) {
+            warn!(
+                "persist_access_policy: could not write {}: {e}",
+                path.display()
+            );
+        } else {
+            info!(path = %path.display(), "access policy persisted to config");
+        }
+    }
+}
+
 // ── Message helpers ───────────────────────────────────────────────────────────
 
 impl BbsHost {
     async fn handle_read_new(&self, session: SessionId) -> Result<Response, HostError> {
-        let (username, user_id, _, room_id) = match self.session_auth_user(session).await {
+        let (username, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
+        if is_guest && Some(room_id) != guest_rid {
+            return Ok(Response::Text(
+                "You can only read messages in the Guests room.".into(),
+            ));
+        }
 
         let room = RoomStore::get_by_id(&self.db, room_id)
             .await
@@ -2368,10 +2792,18 @@ impl BbsHost {
         session: SessionId,
         after: Option<i64>,
     ) -> Result<Response, HostError> {
-        let (username, user_id, _, room_id) = match self.session_auth_user(session).await {
+        let (username, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
+        if is_guest && Some(room_id) != guest_rid {
+            return Ok(Response::Text(
+                "You can only read messages in the Guests room.".into(),
+            ));
+        }
 
         let room = RoomStore::get_by_id(&self.db, room_id)
             .await
@@ -2465,10 +2897,18 @@ impl BbsHost {
     }
 
     async fn handle_read_reverse(&self, session: SessionId) -> Result<Response, HostError> {
-        let (username, user_id, _, room_id) = match self.session_auth_user(session).await {
+        let (username, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
+        if is_guest && Some(room_id) != guest_rid {
+            return Ok(Response::Text(
+                "You can only read messages in the Guests room.".into(),
+            ));
+        }
 
         let room = RoomStore::get_by_id(&self.db, room_id)
             .await
@@ -2563,10 +3003,18 @@ impl BbsHost {
     }
 
     async fn handle_scan(&self, session: SessionId) -> Result<Response, HostError> {
-        let (username, _, _, room_id) = match self.session_auth_user(session).await {
+        let (username, _, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
+        if is_guest && Some(room_id) != guest_rid {
+            return Ok(Response::Text(
+                "You can only read messages in the Guests room.".into(),
+            ));
+        }
 
         let room = RoomStore::get_by_id(&self.db, room_id)
             .await
@@ -2618,10 +3066,23 @@ impl BbsHost {
         session: SessionId,
         inline_body: Option<String>,
     ) -> Result<Response, HostError> {
-        let (_sender, _, level, room_id) = match self.session_auth_user(session).await {
+        let (_sender, _, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
+        if is_guest && Some(room_id) != guest_rid {
+            return Ok(Response::Text(
+                "You can only post messages in the Guests room.".into(),
+            ));
+        }
+
+        // Guests cannot send mail.
+        if is_guest && room_id == MAIL_ROOM_ID {
+            return Ok(Response::Text("You must be verified to send mail.".into()));
+        }
 
         {
             let sessions = self.sessions.read().await;
@@ -2815,10 +3276,18 @@ impl BbsHost {
     }
 
     async fn handle_fast_forward(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, _, room_id) = match self.session_auth_user(session).await {
+        let (_, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+
+        let is_guest = level < PermissionLevel::User;
+        let guest_rid = self.guest_room_id();
+        if is_guest && Some(room_id) != guest_rid {
+            return Ok(Response::Text(
+                "You can only read messages in the Guests room.".into(),
+            ));
+        }
 
         let recent = self
             .db
@@ -3770,6 +4239,22 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".dr" if is_sysop => ".DR <name> — delete a room",
         ".du" if is_sysop => ".DU <user> — soft-delete a user account\nSets status to deleted and ends active sessions.",
         ".pw" if is_sysop => ".PW <user> — reset another user's password\nDoes not require knowing their current password.",
+        "openaccess" if is_sysop => {
+            "OPENACCESS — disable verification requirement (SHTF mode)\n\
+             All registrations immediately receive User-level access.\n\
+             Takes effect immediately and persists to config.toml."
+        }
+        "closeaccess" if is_sysop => {
+            "CLOSEACCESS — restore verification requirement\n\
+             New accounts must be validated by an aide or sysop.\n\
+             Takes effect immediately and persists to config.toml."
+        }
+        "guestroom" if is_sysop => {
+            "GUESTROOM <name> — set guest room (created if needed)\n\
+             Unverified users are placed here and cannot leave.\n\
+             GUESTROOM OFF to disable.\n\
+             Takes effect immediately and persists to config.toml."
+        }
 
         other => {
             return format!(
@@ -3867,11 +4352,11 @@ Users:\n\
 
 const HELP_SYSOP: &str = "\
 Sysop:\n\
- .C <name>   create room\n\
- .DR <name>  delete room\n\
- .DU <user>  delete user\n\
- .PW <user>  reset user password\n\
- UNBAN <u>   lift a ban";
+ .C .DR .DU .PW rooms/users\n\
+ UNBAN <u>   lift a ban\n\
+ OPENACCESS  skip verify\n\
+ CLOSEACCESS require verify\n\
+ GUESTROOM <name>|OFF";
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
@@ -4651,5 +5136,197 @@ mod tests {
             page.messages.is_empty(),
             "first registrant should not get a DM about themselves"
         );
+    }
+
+    // ── Access policy tests ───────────────────────────────────────────────────
+
+    async fn make_host_with_policy(policy: AccessPolicy) -> (Arc<BbsHost>, NamedTempFile) {
+        let f = NamedTempFile::new().unwrap();
+        let db = Database::open(&f.path().to_string_lossy())
+            .await
+            .expect("db open");
+        let host = BbsHost::with_config(db, None, policy, None);
+        host.ensure_guest_room().await.expect("ensure_guest_room");
+        (Arc::new(host), f)
+    }
+
+    /// require_verify = false: unvalidated user gets full access right after registration.
+    #[tokio::test]
+    async fn open_access_unvalidated_treated_as_user() {
+        let policy = AccessPolicy {
+            require_verify: false,
+            guest_room_name: None,
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        // First user (sysop).
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        // Second user — Unvalidated in DB but require_verify = false.
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        // alice should get a room list (Prompt), not a "pending" text.
+        let r = host.process_command(s2, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(r, Response::Prompt { .. }),
+            "expected room list prompt, got: {r:?}"
+        );
+    }
+
+    /// guest_room configured: guest user only sees the guest room in K.
+    #[tokio::test]
+    async fn guest_room_list_only_shows_guest_room() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        // Register sysop (first).
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        // Register alice (unvalidated guest).
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        // K should return a prompt listing only "Guests" room.
+        let r = host.process_command(s2, Command::ListRooms).await.unwrap();
+        match r {
+            Response::Prompt { text, .. } => {
+                assert!(
+                    text.contains("Guests"),
+                    "guest room should be listed: {text}"
+                );
+                assert!(
+                    !text.contains("Lobby"),
+                    "Lobby should be hidden from guests: {text}"
+                );
+            }
+            other => panic!("expected Prompt, got: {other:?}"),
+        }
+    }
+
+    /// guest_room configured: guest cannot navigate to Lobby.
+    #[tokio::test]
+    async fn guest_cannot_change_to_non_guest_room() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        let r = host
+            .process_command(
+                s2,
+                Command::ChangeRoom {
+                    target: "Lobby".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Text(ref t) if t.contains("verified")),
+            "expected verification required message, got: {r:?}"
+        );
+    }
+
+    /// guest_room configured: guest can post in the guest room.
+    #[tokio::test]
+    async fn guest_can_post_in_guest_room() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        // alice starts in guest room after registration.
+        // EnterMessage in guest room should give a compose prompt.
+        let r = host
+            .process_command(
+                s2,
+                Command::EnterMessage {
+                    body: Some("hello from guest".to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Prompt { .. }),
+            "expected compose prompt, got: {r:?}"
+        );
+    }
+
+    /// guest_room configured: after validation, user lands in Lobby on next login.
+    #[tokio::test]
+    async fn verified_user_lands_in_lobby() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        // alice should be in guest room (not Lobby).
+        {
+            let sessions = host.sessions.read().await;
+            let r = sessions.get(&s2).unwrap();
+            assert_ne!(
+                r.current_room, LOBBY_ROOM_ID,
+                "unverified user should not start in Lobby"
+            );
+        }
+
+        // Promote alice to User.
+        let alice_name = Username::new("alice").unwrap();
+        force_validate(&host, &alice_name).await;
+
+        // Log alice out and back in.
+        host.end_session(s2).await.unwrap();
+        let s3 = host.create_session("test").await.unwrap();
+        host.process_command(
+            s3,
+            Command::Login {
+                username: alice_name,
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            s3,
+            Command::WorkflowReply {
+                reply: "alice123!!".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        {
+            let sessions = host.sessions.read().await;
+            let r = sessions.get(&s3).unwrap();
+            assert_eq!(
+                r.current_room, LOBBY_ROOM_ID,
+                "verified user should land in Lobby after login"
+            );
+        }
     }
 }

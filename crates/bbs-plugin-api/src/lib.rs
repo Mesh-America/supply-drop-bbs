@@ -50,9 +50,9 @@ pub mod transport;
 // without spelunking the module tree for every type.
 
 pub use admin::{
-    AdminAuditEntry, AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity, AdminMessageRecord,
-    AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStaleRoom, AdminStats, AdminTopRoom,
-    AdminTopSender, AdminUserInfo, AdminWeeklySignups,
+    AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity,
+    AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStaleRoom,
+    AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups,
 };
 pub use advert::{AdvertBus, AdvertRecord};
 pub use command::{Command, Response};

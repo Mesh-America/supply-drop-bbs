@@ -256,6 +256,31 @@ pub enum Command {
         /// The account whose password will be reset.
         username: Username,
     },
+
+    // ── Access policy (Sysop only) ────────────────────────────────────
+    /// Enable open access — disable the verification requirement (Sysop+).
+    ///
+    /// Takes effect immediately in-memory and is persisted to `config.toml`.
+    /// Keyword: `OPENACCESS`
+    OpenAccess,
+
+    /// Restore the verification requirement (Sysop+).
+    ///
+    /// Takes effect immediately in-memory and is persisted to `config.toml`.
+    /// Keyword: `CLOSEACCESS`
+    CloseAccess,
+
+    /// Set or clear the guest room (Sysop+).
+    ///
+    /// `name = Some("RoomName")` enables the guest room (created if needed).
+    /// `name = None` disables the feature.
+    ///
+    /// Takes effect immediately in-memory and is persisted to `config.toml`.
+    /// Keyword: `GUESTROOM <name>` or `GUESTROOM OFF`
+    SetGuestRoom {
+        /// Room name, or `None` to disable.
+        name: Option<String>,
+    },
 }
 
 /// A protocol-neutral response from the BBS to a session.
@@ -466,6 +491,21 @@ impl Command {
             ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
                 Some(username) => Command::SetUserPassword { username },
                 None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+
+            // ── Access policy ─────────────────────────────────────────────────
+            "openaccess" => Command::OpenAccess,
+            "closeaccess" => Command::CloseAccess,
+            "guestroom" => match rest {
+                Some(arg) if arg.eq_ignore_ascii_case("off") => {
+                    Command::SetGuestRoom { name: None }
+                }
+                Some(name) if !name.is_empty() => Command::SetGuestRoom {
+                    name: Some(name.to_owned()),
+                },
+                _ => Command::Unknown {
                     raw: text.to_owned(),
                 },
             },
