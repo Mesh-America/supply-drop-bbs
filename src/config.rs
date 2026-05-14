@@ -142,12 +142,11 @@ pub struct BbsConfig {
     #[serde(default = "default_require_verify")]
     pub require_verify: bool,
 
-    /// Name of a "guest room" that unverified users are confined to.
+    /// Name of a "guest room" that unverified users are allowed into.
     ///
     /// When set, accounts that have not yet been verified by an aide can
-    /// log in but may only list, navigate to, and post in this single room.
-    /// All other rooms (and mail) are invisible to them until they are
-    /// promoted to `User`.
+    /// log in and access this single room. All other rooms (and mail) are
+    /// invisible to them until they are promoted to `User`.
     ///
     /// The room is created automatically on BBS startup if it does not
     /// already exist; it is created with `min_permission_level = Unvalidated`

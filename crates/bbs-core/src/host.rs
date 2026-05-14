@@ -174,7 +174,7 @@ pub struct AccessPolicy {
     /// When `false`, Unvalidated users are treated as `User` immediately after
     /// registration — no aide/sysop verification step is required.
     pub require_verify: bool,
-    /// Name of the room that unverified users are confined to.
+    /// Name of the room that unverified users are allowed into.
     /// `None` keeps the strict "no access until verified" behaviour.
     pub guest_room_name: Option<String>,
 }

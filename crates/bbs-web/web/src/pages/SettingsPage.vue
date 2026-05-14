@@ -563,7 +563,7 @@ chmod g+w {{ configFile }}</pre>
         <div class="field checkbox-field">
           <label>
             <input type="checkbox" v-model="apGuestRoomEnabled" :disabled="accessPolicyLoading" />
-            Restrict unverified users to a guest room
+            Allow unverified users to access a guest room
           </label>
           <p class="hint">
             Unverified users can only read and post in the named room.

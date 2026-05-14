@@ -113,7 +113,7 @@ which plugin sections are valid.
 | `welcome_msg`    | string | `"Welcome to {name}."`   | no       | Banner shown on connect; supports `{name}` substitution |
 | `timezone`       | string | `"UTC"`                  | no       | Display timezone for sysop UI; storage is always UTC |
 | `require_verify` | bool   | `true`                   | no       | When `false`, skip sysop verification — new accounts are treated as `User` immediately (SHTF mode) |
-| `guest_room`     | string | (unset)                  | no       | Name of a room unverified users are confined to; created automatically on startup if it does not exist |
+| `guest_room`     | string | (unset)                  | no       | Name of a room unverified users are allowed into; created automatically on startup if it does not exist |
 
 ### Access control and SHTF mode
 

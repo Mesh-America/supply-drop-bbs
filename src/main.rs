@@ -244,7 +244,7 @@ enum ConfigAction {
 
     /// Set or clear the guest room.
     ///
-    /// Unverified users are placed in this room and cannot navigate elsewhere.
+    /// Unverified users are allowed into this room and nowhere else.
     /// The room is created automatically on the next BBS start if it does not exist.
     /// Use `off` to disable the guest room feature.
     /// Changes take effect on the next BBS restart.

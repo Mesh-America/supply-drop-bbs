@@ -649,7 +649,7 @@ The options are independent and compose naturally:
 | `require_verify` | `guest_room` set | Behaviour |
 |-----------------|-----------------|-----------|
 | `true` (default) | no | Default strict mode — no access until verified |
-| `true` | yes | Unverified users confined to the guest room |
+| `true` | yes | Unverified users allowed into the guest room only |
 | `false` | no | All registrations get full access immediately |
 | `false` | yes | Full access immediately; guest room exists as an ordinary room |
 
