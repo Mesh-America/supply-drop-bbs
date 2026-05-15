@@ -24,34 +24,6 @@ The two transports run as independent tasks inside the same BBS process. They do
 
 ---
 
-## Prerequisites
-
-### Binary
-
-The Meshtastic transport is gated behind a Cargo feature. Confirm your binary includes it:
-
-```sh
-supply-drop-bbs version
-```
-
-Look for `transport-meshtastic` in the features list. If it's missing, use the `-meshtastic` release tarball or build from source:
-
-```sh
-cargo build --release --features transport-meshtastic
-```
-
-### pymc_core
-
-The Pi HAT transport connects to `pymc_core` over TCP. If you installed with the one-line installer and selected `hat` as your radio type, `pymc_core` is already installed and enabled as a systemd unit. Verify it's running:
-
-```sh
-systemctl status pymc-core
-```
-
-If it's not installed, see the [Installation guide](OPERATIONS.md) for the HAT setup steps.
-
----
-
 ## Meshtastic device setup
 
 The Heltec V3's channel, frequency, region, and network settings are all configured through Meshtastic firmware, not through the BBS. Use the [Meshtastic app](https://meshtastic.org/downloads/) (Android, iOS, or desktop) over Bluetooth or USB to configure it before connecting it to the Pi.
