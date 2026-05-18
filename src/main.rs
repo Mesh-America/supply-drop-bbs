@@ -435,25 +435,6 @@ async fn cmd_run(cli: &Cli) {
     // ── 6. Backup task ───────────────────────────────────────────────────────
     if cfg.backup.enabled {
         if let Some(backup_dir) = cfg.backup.directory.clone() {
-            // Warn if the web plugin's backup_dir differs from where the
-            // automatic task will write.  This is the most common source of
-            // "backups not appearing in the UI" — the operator set
-            // [plugins.web] backup_dir to a custom path but left
-            // [backup] directory at its default.
-            #[cfg(feature = "admin-web")]
-            if let Some(ref web_dir) = cfg.plugins.web.backup_dir {
-                let task_dir = backup_dir.to_string_lossy();
-                if web_dir.as_str() != task_dir.as_ref() {
-                    warn!(
-                        task_dir = %task_dir,
-                        web_dir = %web_dir,
-                        "backup directory mismatch: automatic backups write to task_dir \
-                         but the web UI reads from web_dir — set [backup] directory = \"{web_dir}\" \
-                         in config.toml to align them"
-                    );
-                }
-            }
-
             let keep_daily = cfg.backup.keep_daily;
             let keep_weekly = cfg.backup.keep_weekly;
             let interval_hours = cfg.backup.interval_hours;
@@ -558,13 +539,22 @@ async fn cmd_run(cli: &Cli) {
             &cfg.plugins.web,
             Arc::clone(&host),
             cfg_abs,
-            cfg.backup.directory.clone(),
             Arc::clone(&log_reload),
             error_store,
             error_tx,
             app_log_buf,
         )
         .await;
+        if let Some(ref plugin) = wp {
+            // Wire the backup directory: single source of truth is [backup] directory.
+            // The web plugin has no separate backup_dir setting of its own.
+            let backup_dir = cfg
+                .backup
+                .directory
+                .as_ref()
+                .map(|d| d.to_string_lossy().into_owned());
+            plugin.set_backup_dir(backup_dir);
+        }
         #[cfg(feature = "transport-process")]
         if let Some(ref plugin) = wp {
             let registry =
@@ -744,12 +734,10 @@ async fn init_cli_plugin(
 /// the running `WebPlugin` handle so the supervisor can stop it on
 /// shutdown.
 #[cfg(feature = "admin-web")]
-#[allow(clippy::too_many_arguments)]
 async fn init_web_plugin(
     web_cfg: &bbs_web::WebConfig,
     host: Arc<dyn bbs_plugin_api::Host>,
     config_file_path: Option<String>,
-    backup_directory: Option<std::path::PathBuf>,
     log_reload: LogReloadFn,
     error_store: std::sync::Arc<std::sync::Mutex<bbs_web::error_tracker::ErrorStore>>,
     error_tx: tokio::sync::broadcast::Sender<bbs_web::error_tracker::ErrorEntry>,
@@ -769,17 +757,6 @@ async fn init_web_plugin(
     // (e.g. systemd services that start from /).
     if let Some(abs_path) = config_file_path {
         web_cfg.config_path = Some(abs_path);
-    }
-
-    // Wire the automatic backup directory into the web plugin when the
-    // operator hasn't explicitly set [plugins.web] backup_dir.  Without
-    // this the web UI lists a different directory than where the automatic
-    // task writes, so manual-UI backups and automatic backups appear in
-    // separate places.
-    if web_cfg.backup_dir.is_none() {
-        if let Some(dir) = backup_directory {
-            web_cfg.backup_dir = Some(dir.to_string_lossy().into_owned());
-        }
     }
 
     let plugin = match bbs_web::WebPlugin::init(web_cfg, host).await {

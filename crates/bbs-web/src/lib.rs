@@ -144,12 +144,6 @@ pub struct WebConfig {
     #[serde(default)]
     pub csp: Option<String>,
 
-    /// Directory to store SQLite backup files created by the web admin.
-    ///
-    /// When `None`, the backup endpoints return 400 Bad Request.
-    #[serde(default)]
-    pub backup_dir: Option<String>,
-
     /// Path to the main config file to include in each backup snapshot.
     ///
     /// Defaults to `config.toml` in the current working directory.
@@ -167,7 +161,6 @@ impl Default for WebConfig {
             cookie_secure: default_cookie_secure(),
             prometheus: false,
             csp: None,
-            backup_dir: None,
             config_path: default_config_path(),
         }
     }
@@ -237,6 +230,12 @@ type LogReloadFn = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 struct AppState {
     host: Arc<dyn Host>,
     config: WebConfig,
+    /// Directory where backup files are stored.
+    ///
+    /// Sourced from `[backup] directory` in the operator config and injected
+    /// by the host binary after plugin init via [`WebPlugin::set_backup_dir`].
+    /// When `None` the backup endpoints return 503.
+    backup_dir: std::sync::Mutex<Option<String>>,
     sessions: Mutex<HashMap<String, WebSession>>,
     started_at: Instant,
     log_tx: broadcast::Sender<String>,
@@ -261,6 +260,7 @@ impl AppState {
         Self {
             host,
             config,
+            backup_dir: std::sync::Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             log_tx,
@@ -274,6 +274,11 @@ impl AppState {
             error_tx: std::sync::Mutex::new(None),
             rss_alert_tx: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Return the configured backup directory, if any.
+    fn backup_dir(&self) -> Option<String> {
+        self.backup_dir.lock().expect("backup_dir poisoned").clone()
     }
 
     fn create_session(&self, username: String, permission_level: u8) -> String {
@@ -504,6 +509,15 @@ impl WebPlugin {
     ) {
         *self.state.error_store.lock().expect("error_store poisoned") = Some(store);
         *self.state.error_tx.lock().expect("error_tx poisoned") = Some(tx);
+    }
+
+    /// Set the directory where backup files are stored.
+    ///
+    /// Always sourced from `[backup] directory` in the operator config —
+    /// there is no separate `[plugins.web] backup_dir` setting.  Must be
+    /// called before `start()`.
+    pub fn set_backup_dir(&self, dir: Option<String>) {
+        *self.state.backup_dir.lock().expect("backup_dir poisoned") = dir;
     }
 }
 
@@ -1524,7 +1538,7 @@ struct SettingsResponse {
 
 async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(SettingsResponse {
-        backup_dir: state.config.backup_dir.clone(),
+        backup_dir: state.backup_dir(),
     })
 }
 
@@ -2116,8 +2130,8 @@ async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
     use std::io::Write as _;
     use zip::{write::SimpleFileOptions, CompressionMethod};
 
-    let dir = match &state.config.backup_dir {
-        Some(d) => d.clone(),
+    let dir = match state.backup_dir() {
+        Some(d) => d,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -2196,8 +2210,8 @@ async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
-    let dir = match &state.config.backup_dir {
-        Some(d) => d.clone(),
+    let dir = match state.backup_dir() {
+        Some(d) => d,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -2225,8 +2239,8 @@ async fn api_download_backup(
             .into_response();
     }
 
-    let dir = match &state.config.backup_dir {
-        Some(d) => d.clone(),
+    let dir = match state.backup_dir() {
+        Some(d) => d,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -2261,8 +2275,8 @@ async fn api_delete_backup(
     State(state): State<Arc<AppState>>,
     Path(filename): Path<String>,
 ) -> Response {
-    let dir = match &state.config.backup_dir {
-        Some(d) => d.clone(),
+    let dir = match state.backup_dir() {
+        Some(d) => d,
         None => {
             return (
                 StatusCode::BAD_REQUEST,
