@@ -435,6 +435,25 @@ async fn cmd_run(cli: &Cli) {
     // ── 6. Backup task ───────────────────────────────────────────────────────
     if cfg.backup.enabled {
         if let Some(backup_dir) = cfg.backup.directory.clone() {
+            // Warn if the web plugin's backup_dir differs from where the
+            // automatic task will write.  This is the most common source of
+            // "backups not appearing in the UI" — the operator set
+            // [plugins.web] backup_dir to a custom path but left
+            // [backup] directory at its default.
+            #[cfg(feature = "admin-web")]
+            if let Some(ref web_dir) = cfg.plugins.web.backup_dir {
+                let task_dir = backup_dir.to_string_lossy();
+                if web_dir.as_str() != task_dir.as_ref() {
+                    warn!(
+                        task_dir = %task_dir,
+                        web_dir = %web_dir,
+                        "backup directory mismatch: automatic backups write to task_dir \
+                         but the web UI reads from web_dir — set [backup] directory = \"{web_dir}\" \
+                         in config.toml to align them"
+                    );
+                }
+            }
+
             let keep_daily = cfg.backup.keep_daily;
             let keep_weekly = cfg.backup.keep_weekly;
             let interval_hours = cfg.backup.interval_hours;
