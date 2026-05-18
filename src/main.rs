@@ -1627,6 +1627,14 @@ async fn prune_backups(
     // Newest first.
     backups.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
+    info!(
+        dir = backup_dir,
+        total = backups.len(),
+        keep_daily,
+        keep_weekly,
+        "backup pruning: evaluating retention"
+    );
+
     let mut daily_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut weekly_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1646,6 +1654,16 @@ async fn prune_backups(
             keep.insert(rec.filename.clone());
         }
     }
+
+    let prune_count = backups
+        .iter()
+        .filter(|r| !keep.contains(&r.filename))
+        .count();
+    info!(
+        keeping = keep.len(),
+        pruning = prune_count,
+        "backup pruning: retention decision"
+    );
 
     for rec in &backups {
         if !keep.contains(&rec.filename) {

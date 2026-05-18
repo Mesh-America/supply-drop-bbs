@@ -56,8 +56,10 @@ function stop() {
 }
 
 function clear() {
+  // Reset the display only — do NOT rewind cursor.  Resetting cursor to 0
+  // would cause the next poll to re-fetch all buffered history, immediately
+  // repopulating lines with everything that was just cleared.
   lines.value = []
-  cursor = 0
 }
 
 function lineClass(text: string): string {

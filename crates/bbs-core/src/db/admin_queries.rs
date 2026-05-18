@@ -362,7 +362,13 @@ impl Database {
         let dir = Path::new(backup_dir);
         let mut entries = match tokio::fs::read_dir(dir).await {
             Ok(e) => e,
-            Err(_) => return Ok(Vec::new()),
+            Err(e) => {
+                // Directory does not exist yet or is unreadable.  This is
+                // normal on first startup before the backup task has run and
+                // created the directory, so we log at debug rather than warn.
+                tracing::debug!(path = %dir.display(), err = %e, "backup: cannot read backup directory");
+                return Ok(Vec::new());
+            }
         };
 
         let mut records = Vec::new();

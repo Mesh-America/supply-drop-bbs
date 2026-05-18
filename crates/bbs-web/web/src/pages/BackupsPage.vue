@@ -103,16 +103,22 @@ onMounted(load)
     </header>
 
     <div v-if="settings && !backupDirConfigured" class="config-notice">
-      <strong>backup_dir not configured.</strong>
-      Add <code>backup_dir = "/path/to/backups"</code> to the <code>[plugins.web]</code> section of your
-      config file and restart the server to enable backups.
+      <strong>Backup directory not configured.</strong>
+      The server resolves the backup directory from the <code>[backup]</code> section of your
+      config file. Ensure <code>backup.enabled = true</code> and optionally set
+      <code>backup.directory</code>; then restart the server.
+    </div>
+
+    <div v-if="backupDirConfigured" class="dir-info muted small">
+      directory: <code>{{ settings!.backup_dir }}</code>
     </div>
 
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="actionOk" class="ok">{{ actionOk }}</p>
 
     <p v-if="backupDirConfigured && !loading && backups.length === 0 && !error" class="muted">
-      No backups found in <code>{{ settings!.backup_dir }}</code>. Create one above.
+      No backups found. Automatic backups (`.db` files) are created on the configured interval
+      and will appear here. You can also create one manually above.
     </p>
 
     <table v-if="backups.length > 0">
@@ -166,6 +172,7 @@ p { margin: 0; }
 .small { font-size: 0.85em; }
 .ok { color: #2a8a2a; }
 
+.dir-info { margin-top: -0.25rem; }
 .config-notice {
   padding: 0.9rem 1.1rem;
   border: 1px solid var(--warning);
