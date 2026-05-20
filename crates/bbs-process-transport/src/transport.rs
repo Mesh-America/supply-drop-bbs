@@ -444,10 +444,21 @@ async fn handle_plugin_msg(
                 }
             }
 
-            if let Some(mut text) = response.render() {
-                let limit = payload_limit.load(Ordering::Relaxed);
-                text = truncate_to_limit(text, limit);
-                send_text(stdin_tx, &id, text, hide_input);
+            match response {
+                Response::MultiText(parts) => {
+                    for part in parts {
+                        let limit = payload_limit.load(Ordering::Relaxed);
+                        let text = truncate_to_limit(part, limit);
+                        send_text(stdin_tx, &id, text, hide_input);
+                    }
+                }
+                _ => {
+                    if let Some(mut text) = response.render() {
+                        let limit = payload_limit.load(Ordering::Relaxed);
+                        text = truncate_to_limit(text, limit);
+                        send_text(stdin_tx, &id, text, hide_input);
+                    }
+                }
             }
         }
 
