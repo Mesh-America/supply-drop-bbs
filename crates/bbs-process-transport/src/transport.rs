@@ -40,6 +40,27 @@ pub(crate) enum ExitEvent {
     Stopped,
 }
 
+// ── Static name intern table ──────────────────────────────────────────────────
+//
+// `host.create_session()` requires a `&'static str` transport name.  We want
+// to avoid calling `Box::leak` every time a plugin is restarted (which would
+// grow the heap unboundedly), so we intern each unique name exactly once.
+
+static NAME_INTERN: OnceLock<std::sync::Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+
+/// Return a `&'static str` for `name`, leaking at most once per unique value.
+fn intern_name(name: &str) -> &'static str {
+    let cache = NAME_INTERN.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = cache.lock().expect("NAME_INTERN poisoned");
+    if let Some(&s) = map.get(name) {
+        return s;
+    }
+    // First time we see this name — leak once and remember it.
+    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
+    map.insert(name.to_owned(), leaked);
+    leaked
+}
+
 // ── Session state ─────────────────────────────────────────────────────────────
 
 struct SessionEntry {
@@ -93,9 +114,10 @@ pub struct ProcessTransport {
 
 impl ProcessTransport {
     pub(crate) fn new(config: ProcessPluginConfig, host: Arc<dyn Host>) -> Self {
-        // Leak the name string once to get a &'static str.
-        // This is a deliberate one-time allocation per plugin name.
-        let transport_name: &'static str = Box::leak(config.name.clone().into_boxed_str());
+        // Intern the name so we get a stable `&'static str` without leaking on
+        // every restart.  The same string is reused across all restarts of this
+        // plugin (and any plugin that happens to share the same name).
+        let transport_name: &'static str = intern_name(&config.name);
         let (exit_tx, exit_rx) = mpsc::channel(4);
         Self {
             transport_name,
