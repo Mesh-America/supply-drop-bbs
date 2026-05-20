@@ -787,6 +787,11 @@ async fn dispatch_message(
     // On UnknownSession (e.g. server restarted while the transport retained a
     // stale session ID), evict the stale mapping, mint a fresh session, and
     // retry the command once with the new ID.
+    //
+    // `active_sid` tracks whichever session ID was actually used to process the
+    // command so that subsequent credential operations (mesh_node_bind) target
+    // the correct — potentially refreshed — session.
+    let mut active_sid = session;
     let response = match host.process_command(session, cmd.clone()).await {
         Ok(r) => r,
         Err(HostError::UnknownSession(stale)) => {
@@ -806,6 +811,8 @@ async fn dispatch_message(
                 .lock()
                 .expect("state mutex poisoned")
                 .get_or_insert(sender_prefix, fresh);
+            // Track the fresh session so credential operations below use it.
+            active_sid = fresh_sid;
             // Attempt auto-login on the refreshed session before replaying the command.
             if node_credential_ttl_days > 0 {
                 if let Err(e) = host
@@ -833,8 +840,8 @@ async fn dispatch_message(
     if node_credential_ttl_days > 0 {
         match &response {
             Response::LoggedIn { .. } => {
-                if let Err(e) = host.mesh_node_bind(session, sender_prefix).await {
-                    warn!(?session, "mesh: node_bind error: {e}");
+                if let Err(e) = host.mesh_node_bind(active_sid, sender_prefix).await {
+                    warn!(?active_sid, "mesh: node_bind error: {e}");
                 }
             }
             Response::LoggedOut => {
