@@ -73,7 +73,11 @@ pub struct ProcessTransport {
     config: ProcessPluginConfig,
     host: Arc<dyn Host>,
     /// Sender for JSON lines to the child's stdin.  Set in `start()`.
-    stdin_tx: OnceLock<mpsc::Sender<String>>,
+    ///
+    /// Unbounded so that callers are never blocked waiting for the child's
+    /// stdin writer to drain.  Back-pressure from a slow process manifests as
+    /// growing memory rather than a blocked async task.
+    stdin_tx: OnceLock<mpsc::UnboundedSender<String>>,
     sessions: Arc<Mutex<SessionMap>>,
     /// 0 = unlimited; set from the plugin's `ready` message.
     payload_limit: Arc<AtomicUsize>,
@@ -127,7 +131,7 @@ impl ProcessTransport {
     /// Spawn the child and return it along with the stdin sender channel.
     fn spawn_child(
         config: &ProcessPluginConfig,
-    ) -> Result<(Child, mpsc::Sender<String>), PluginError> {
+    ) -> Result<(Child, mpsc::UnboundedSender<String>), PluginError> {
         let mut cmd = TokioCommand::new(&config.command);
         cmd.args(&config.args)
             .stdin(std::process::Stdio::piped())
@@ -143,7 +147,10 @@ impl ProcessTransport {
         })?;
 
         let stdin = child.stdin.take().expect("stdin piped");
-        let (tx, mut rx) = mpsc::channel::<String>(256);
+        // Use an unbounded channel so the caller is never blocked waiting for
+        // the child's stdin writer to drain (BUG-11).  The writer task owns
+        // the receiver and drains it at the speed of the child process.
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
         // Dedicated writer task: reads from the channel and writes to stdin.
         tokio::spawn(async move {
@@ -312,7 +319,7 @@ impl Plugin for ProcessTransport {
         let _ = self.shutdown_tx.send(true);
         if let Some(tx) = self.stdin_tx.get() {
             if let Ok(msg) = serde_json::to_string(&HostMsg::Shutdown) {
-                let _ = tx.send(msg).await;
+                let _ = tx.send(msg);
             }
         }
         Ok(())
@@ -345,8 +352,10 @@ impl TransportEngine for ProcessTransport {
             hide_input: false,
         };
         match serde_json::to_string(&msg) {
-            Ok(line) => match tx.try_send(line) {
+            Ok(line) => match tx.send(line) {
                 Ok(()) => Ok(NotifyOutcome::Delivered),
+                // UnboundedSender::send only fails when the receiver is dropped
+                // (i.e. the writer task exited because the process died).
                 Err(_) => Ok(NotifyOutcome::Dropped),
             },
             Err(e) => Ok(NotifyOutcome::PermanentFailure(e.to_string())),
@@ -363,7 +372,7 @@ async fn handle_plugin_msg(
     transport_name: &'static str,
     payload_limit: &Arc<AtomicUsize>,
     plugin_version: &Arc<std::sync::Mutex<Option<String>>>,
-    stdin_tx: &mpsc::Sender<String>,
+    stdin_tx: &mpsc::UnboundedSender<String>,
 ) {
     let msg: PluginMsg = match serde_json::from_str(raw) {
         Ok(m) => m,
@@ -402,7 +411,7 @@ async fn handle_plugin_msg(
                 Err(e) => {
                     warn!(transport = transport_name, conn = %id, "create_session failed: {e}");
                     // Kick the connection so the plugin doesn't expect IPC responses.
-                    send_kick(stdin_tx, &id).await;
+                    send_kick(stdin_tx, &id);
                 }
             }
         }
@@ -438,7 +447,7 @@ async fn handle_plugin_msg(
             if let Some(mut text) = response.render() {
                 let limit = payload_limit.load(Ordering::Relaxed);
                 text = truncate_to_limit(text, limit);
-                send_text(stdin_tx, &id, text, hide_input).await;
+                send_text(stdin_tx, &id, text, hide_input);
             }
         }
 
@@ -460,21 +469,21 @@ async fn handle_plugin_msg(
     }
 }
 
-async fn send_text(tx: &mpsc::Sender<String>, id: &str, text: String, hide_input: bool) {
+fn send_text(tx: &mpsc::UnboundedSender<String>, id: &str, text: String, hide_input: bool) {
     let msg = HostMsg::Send {
         id: id.to_owned(),
         text,
         hide_input,
     };
     if let Ok(line) = serde_json::to_string(&msg) {
-        let _ = tx.send(line).await;
+        let _ = tx.send(line);
     }
 }
 
-async fn send_kick(tx: &mpsc::Sender<String>, id: &str) {
+fn send_kick(tx: &mpsc::UnboundedSender<String>, id: &str) {
     let msg = HostMsg::Kick { id: id.to_owned() };
     if let Ok(line) = serde_json::to_string(&msg) {
-        let _ = tx.send(line).await;
+        let _ = tx.send(line);
     }
 }
 
