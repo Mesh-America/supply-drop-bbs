@@ -263,11 +263,17 @@ async fn run_tcp_worker(
                 info!("companion/tcp: clean shutdown");
                 break;
             }
-            SessionOutcome::IoError(e) => {
+            SessionOutcome::IoError(e, session_ran) => {
                 warn!("companion/tcp: session error: {e}");
                 let _ = event_tx
                     .send(ClientEvent::Disconnected { will_retry: true })
                     .await;
+                if session_ran {
+                    // A real session ran before this error; reset the backoff
+                    // so a brief hiccup doesn't impose the saturated maximum
+                    // delay on the very next reconnect attempt.
+                    backoff = config.reconnect_delay_initial;
+                }
                 debug!("companion/tcp: reconnecting in {backoff:?}");
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(config.reconnect_delay_max);
@@ -287,7 +293,7 @@ async fn attempt_tcp_session(
 ) -> SessionOutcome {
     let stream = match TcpStream::connect(config.addr).await {
         Ok(s) => s,
-        Err(e) => return SessionOutcome::IoError(e),
+        Err(e) => return SessionOutcome::IoError(e, false),
     };
     info!(addr = %config.addr, "companion/tcp: connected");
 
@@ -298,7 +304,7 @@ async fn attempt_tcp_session(
     }
 
     let (mut reader, mut writer) = stream.into_split();
-    run_session(
+    match run_session(
         &mut reader,
         &mut writer,
         config.app_target_version,
@@ -306,6 +312,10 @@ async fn attempt_tcp_session(
         event_tx,
     )
     .await
+    {
+        SessionOutcome::IoError(e, _) => SessionOutcome::IoError(e, true),
+        other => other,
+    }
 }
 
 // ── Serial worker ─────────────────────────────────────────────────────────────
@@ -324,11 +334,17 @@ async fn run_serial_worker(
                 info!("companion/serial: clean shutdown");
                 break;
             }
-            SessionOutcome::IoError(e) => {
+            SessionOutcome::IoError(e, session_ran) => {
                 warn!("companion/serial: session error: {e}");
                 let _ = event_tx
                     .send(ClientEvent::Disconnected { will_retry: true })
                     .await;
+                if session_ran {
+                    // A real session ran before this error; reset the backoff
+                    // so a brief hiccup doesn't impose the saturated maximum
+                    // delay on the very next reconnect attempt.
+                    backoff = config.reconnect_delay_initial;
+                }
                 debug!("companion/serial: reopening in {backoff:?}");
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(config.reconnect_delay_max);
@@ -349,16 +365,16 @@ async fn attempt_serial_session(
     let stream = match tokio_serial::new(&config.port, config.baud_rate).open_native_async() {
         Ok(s) => s,
         Err(e) => {
-            return SessionOutcome::IoError(io::Error::other(format!(
-                "could not open serial port {}: {e}",
-                config.port
-            )));
+            return SessionOutcome::IoError(
+                io::Error::other(format!("could not open serial port {}: {e}", config.port)),
+                false,
+            );
         }
     };
     info!(port = %config.port, baud = config.baud_rate, "companion/serial: port opened");
 
     let (mut reader, mut writer) = tokio::io::split(stream);
-    run_session(
+    match run_session(
         &mut reader,
         &mut writer,
         config.app_target_version,
@@ -366,6 +382,10 @@ async fn attempt_serial_session(
         event_tx,
     )
     .await
+    {
+        SessionOutcome::IoError(e, _) => SessionOutcome::IoError(e, true),
+        other => other,
+    }
 }
 
 // ── Shared session logic ──────────────────────────────────────────────────────
@@ -375,7 +395,13 @@ enum SessionOutcome {
     /// Command channel or event channel closed — exit the reconnect loop.
     Shutdown,
     /// I/O or protocol error — reconnect after backoff.
-    IoError(io::Error),
+    ///
+    /// The `bool` is `true` when the transport was successfully opened before
+    /// the error occurred (i.e. a real session ran), and `false` when the
+    /// connection attempt itself failed.  The reconnect loop resets the backoff
+    /// counter to its initial value in the former case so that a brief hiccup
+    /// after a long-lived session does not impose the maximum retry delay.
+    IoError(io::Error, bool),
 }
 
 /// Handshake + event loop shared by TCP and serial sessions.
@@ -396,18 +422,21 @@ where
     // ── AppStart handshake ────────────────────────────────────────────────────
     let handshake = encode_outbound(&OutboundFrame::AppStart { app_target_version });
     if let Err(e) = writer.write_all(&handshake).await {
-        return SessionOutcome::IoError(e);
+        return SessionOutcome::IoError(e, false);
     }
 
     let self_info = match read_frame(reader).await {
-        Err(e) => return SessionOutcome::IoError(e),
+        Err(e) => return SessionOutcome::IoError(e, false),
         Ok(InboundFrame::SelfInfo(info)) => info,
         Ok(other) => {
             warn!("companion: expected SelfInfo after AppStart, got {other:?}");
-            return SessionOutcome::IoError(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "no SelfInfo after AppStart handshake",
-            ));
+            return SessionOutcome::IoError(
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "no SelfInfo after AppStart handshake",
+                ),
+                false,
+            );
         }
     };
 
@@ -431,7 +460,7 @@ where
                             return SessionOutcome::Shutdown;
                         }
                     }
-                    Err(e) => return SessionOutcome::IoError(e),
+                    Err(e) => return SessionOutcome::IoError(e, false),
                 }
             }
 
@@ -441,7 +470,7 @@ where
                         debug!("companion: tx {frame:?}");
                         let wire = encode_outbound(&frame);
                         if let Err(e) = writer.write_all(&wire).await {
-                            return SessionOutcome::IoError(e);
+                            return SessionOutcome::IoError(e, false);
                         }
                     }
                     None => return SessionOutcome::Shutdown,
