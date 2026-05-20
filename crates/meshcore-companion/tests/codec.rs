@@ -594,3 +594,21 @@ fn strip_then_decode_curr_time() {
     let frame = decode_inbound(stripped).unwrap();
     assert_eq!(frame, InboundFrame::CurrTime { unix_time: t });
 }
+
+// ── wrap_payload overflow guard ───────────────────────────────────────────────
+
+/// `encode_outbound` (via `wrap_payload`) must panic with a clear message when
+/// the serialised payload exceeds `u16::MAX` bytes rather than silently
+/// truncating the length field (BUG-13).
+#[test]
+#[should_panic(expected = "payload length")]
+fn encode_raw_oversized_payload_panics() {
+    // Build a Raw frame whose body is 65_536 bytes (u16::MAX + 1).
+    // The 1-byte command code + body puts the total payload at 65_537 bytes,
+    // which cannot be encoded in the 2-byte length field.
+    let oversized_body = vec![0u8; u16::MAX as usize + 1];
+    let _ = encode_outbound(&OutboundFrame::Raw {
+        code: 0xFF,
+        body: oversized_body,
+    });
+}

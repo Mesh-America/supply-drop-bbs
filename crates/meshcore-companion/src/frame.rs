@@ -558,6 +558,12 @@ pub fn encode_outbound(frame: &OutboundFrame) -> Vec<u8> {
 }
 
 fn wrap_payload(payload: &[u8]) -> Vec<u8> {
+    assert!(
+        payload.len() <= u16::MAX as usize,
+        "wrap_payload: payload length {} exceeds u16::MAX (65535); \
+         the frame header can only encode a 2-byte length",
+        payload.len()
+    );
     let mut wire = Vec::with_capacity(3 + payload.len());
     wire.push(FRAME_INBOUND_PREFIX);
     wire.extend_from_slice(&(payload.len() as u16).to_le_bytes());
