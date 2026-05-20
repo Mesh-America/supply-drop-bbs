@@ -250,7 +250,18 @@ async fn session_ended_after_plugin_close() {
 
     let transport = start(scripted_config("close-test"), Arc::clone(&host)).await;
 
-    let cmds = host.commands_received();
+    // Poll up to 10 s so the test stays stable under parallel execution where
+    // the OS scheduler may not give the echo_plugin child enough CPU within SETTLE.
+    let cmds = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let c = host.commands_received();
+            if !c.is_empty() || tokio::time::Instant::now() >= deadline {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
     assert!(!cmds.is_empty(), "expected at least one command");
     let session_id = cmds[0].0;
 
@@ -315,6 +326,33 @@ async fn stop_is_graceful() {
     let result = tokio::time::timeout(Duration::from_secs(5), transport.stop()).await;
     assert!(result.is_ok(), "stop() timed out");
     assert!(result.unwrap().is_ok(), "stop() returned an error");
+}
+
+/// Calling `start()` a second time returns `StartFailed` instead of silently
+/// routing messages to the dead first child's pipe.
+#[tokio::test]
+async fn double_start_returns_error() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+
+    let transport = ProcessTransport::init(
+        scripted_config("double-start-test"),
+        Arc::clone(&host) as Arc<dyn Host>,
+    )
+    .await
+    .unwrap();
+
+    // First start must succeed.
+    transport.start().await.unwrap();
+
+    // Second start must return an error -- not silently succeed.
+    let err = transport.start().await.unwrap_err();
+    assert!(
+        matches!(err, bbs_plugin_api::PluginError::StartFailed(_)),
+        "expected StartFailed on double start, got {err:?}"
+    );
+
+    transport.stop().await.unwrap();
 }
 
 /// A `recv` for an unknown connection ID is silently ignored.
