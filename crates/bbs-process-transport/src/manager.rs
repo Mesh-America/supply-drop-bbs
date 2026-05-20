@@ -415,8 +415,12 @@ impl PluginRegistryApi for ProcessPluginManager {
 
         m.config.enabled = enabled;
 
-        if enabled && m.transport.is_none() {
-            // Start it.
+        if enabled && m.transport.is_none() && m.state != PluginState::Starting {
+            // Mark the plugin as Starting *before* releasing the lock so that
+            // any concurrent set_enabled(true) call sees the transitional state
+            // and bails out without spawning a second orphaned child process
+            // (TOCTOU fix).
+            m.state = PluginState::Starting;
             let log_buffer = Arc::clone(&m.log_buffer);
             let config = m.config.clone();
             drop(plugins);
@@ -432,9 +436,8 @@ impl PluginRegistryApi for ProcessPluginManager {
                 Err(e) => {
                     let mut plugins = self.plugins.lock().await;
                     if let Some(m) = plugins.get_mut(name) {
-                        m.state = PluginState::Crashed {
-                            reason: e.to_string(),
-                        };
+                        // Roll back to Stopped so a future call can retry.
+                        m.state = PluginState::Stopped;
                     }
                     return Err(e);
                 }

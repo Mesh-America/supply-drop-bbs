@@ -59,6 +59,13 @@ pub enum PluginState {
     Running,
     /// Configured but not started (not yet launched or cleanly stopped).
     Stopped,
+    /// The plugin is being started — the spawn is in progress.
+    ///
+    /// This is a transitional state set under the mutex *before* the lock is
+    /// released for the spawn attempt.  A concurrent `set_enabled(true)` call
+    /// that sees this state will bail out rather than spawning a second
+    /// orphaned child process.
+    Starting,
     /// The process exited unexpectedly.
     Crashed {
         /// Human-readable exit reason (exit code, signal, etc.).

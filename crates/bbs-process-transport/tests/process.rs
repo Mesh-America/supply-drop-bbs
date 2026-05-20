@@ -33,9 +33,6 @@ use bbs_process_transport::ProcessTransport;
 /// Path to the compiled echo_plugin binary (injected by Cargo at test time).
 const ECHO_PLUGIN: &str = env!("CARGO_BIN_EXE_echo_plugin");
 
-/// How long to wait for the plugin to emit its scripted sequence after start.
-const SETTLE: Duration = Duration::from_millis(250);
-
 fn scripted_config(name: &str) -> ProcessPluginConfig {
     ProcessPluginConfig {
         name: name.to_owned(),
@@ -58,13 +55,24 @@ fn hold_config(name: &str) -> ProcessPluginConfig {
     }
 }
 
-/// Start a transport, give the plugin time to emit its messages, and return
-/// the transport for further inspection / stopping.
+/// Start a transport, wait until `min_commands` have been dispatched to
+/// `host` (or the 10-second deadline passes), then return the transport.
 async fn start(config: ProcessPluginConfig, host: Arc<MockHost>) -> ProcessTransport {
-    let host: Arc<dyn Host> = host;
-    let t = ProcessTransport::init(config, host).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mock = Arc::clone(&host);
+    let t = ProcessTransport::init(config, host as Arc<dyn Host>)
+        .await
+        .unwrap();
     t.start().await.unwrap();
-    tokio::time::sleep(SETTLE).await;
+    // Poll until at least one command arrives (scripted plugin always sends
+    // at least one recv before closing) so tests don't race against the child
+    // process startup time.
+    loop {
+        if !mock.commands_received().is_empty() || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     t
 }
 
@@ -87,7 +95,17 @@ async fn scripted_plugin_session() {
 
     let transport = start(scripted_config("scripted-session"), Arc::clone(&host)).await;
 
-    let cmds = host.commands_received();
+    // The scripted plugin sends two recv messages; poll until both arrive.
+    let cmds = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let c = host.commands_received();
+            if c.len() >= 2 || tokio::time::Instant::now() >= deadline {
+                break c;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
     assert_eq!(cmds.len(), 2, "expected exactly 2 commands; got {cmds:?}");
 
     // First recv: "help" → Command::Help
@@ -135,8 +153,8 @@ async fn awaiting_reply_state_machine() {
 
     let transport = start(scripted_config("await-test"), Arc::clone(&host)).await;
 
-    // Poll up to 2 s so the test stays stable under parallel execution where the
-    // OS scheduler may not give the echo_plugin child enough CPU within SETTLE.
+    // Poll up to 10 s so the test stays stable under parallel execution where the
+    // OS scheduler may not give the echo_plugin child CPU immediately.
     let cmds = {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -237,10 +255,21 @@ async fn session_ended_after_plugin_close() {
     let session_id = cmds[0].0;
 
     // After close the session should be gone from the map → notify Dropped.
-    let outcome = transport
-        .notify(session_id, Notification::Text("late mail".to_owned()))
-        .await
-        .unwrap();
+    // Poll until the transport processes the close event; the scripted plugin
+    // sends close immediately after its two recv messages.
+    let outcome = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let o = transport
+                .notify(session_id, Notification::Text("late mail".to_owned()))
+                .await
+                .unwrap();
+            if matches!(o, NotifyOutcome::Dropped) || tokio::time::Instant::now() >= deadline {
+                break o;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
 
     assert!(
         matches!(outcome, NotifyOutcome::Dropped),
