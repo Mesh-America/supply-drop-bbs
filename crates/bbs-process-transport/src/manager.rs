@@ -367,18 +367,48 @@ impl PluginRegistryApi for ProcessPluginManager {
 
     async fn add_plugin(&self, config: ProcessPluginConfig) -> Result<(), RegistryError> {
         let name = config.name.clone();
+
+        // Insert a `Starting` placeholder under the lock so that any concurrent
+        // `add_plugin` call with the same name sees a non-absent entry and
+        // returns `AlreadyExists` instead of racing past the uniqueness check
+        // and spawning a second orphaned child process.
         {
-            let plugins = self.plugins.lock().await;
+            let mut plugins = self.plugins.lock().await;
             if plugins.contains_key(&name) {
                 return Err(RegistryError::AlreadyExists(name));
             }
-        }
+            // Placeholder: minimal ManagedPlugin in the Starting state.
+            // The real entry (with a live transport) replaces this below.
+            plugins.insert(
+                name.clone(),
+                ManagedPlugin {
+                    config: config.clone(),
+                    from_plugins_d: self.plugins_d.is_some(),
+                    state: PluginState::Starting,
+                    restart_count: 0,
+                    log_buffer: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(
+                        LOG_RING_CAP,
+                    ))),
+                    transport: None,
+                    version: None,
+                },
+            );
+        } // lock released here — spawn can now proceed without holding it
+
         // New plugins always go to plugins.d when available.
         let to_plugins_d = self.plugins_d.is_some();
-        self.init_plugin(config, to_plugins_d).await?;
-        let plugins = self.plugins.lock().await;
-        self.persist_config(&plugins).await;
-        Ok(())
+        match self.init_plugin(config, to_plugins_d).await {
+            Ok(()) => {
+                let plugins = self.plugins.lock().await;
+                self.persist_config(&plugins).await;
+                Ok(())
+            }
+            Err(e) => {
+                // Remove the placeholder so the slot is clean for a future retry.
+                self.plugins.lock().await.remove(&name);
+                Err(e)
+            }
+        }
     }
 
     async fn remove_plugin(&self, name: &str) -> Result<(), RegistryError> {

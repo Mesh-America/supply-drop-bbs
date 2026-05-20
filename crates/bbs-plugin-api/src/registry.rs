@@ -61,10 +61,11 @@ pub enum PluginState {
     Stopped,
     /// The plugin is being started — the spawn is in progress.
     ///
-    /// This is a transitional state set under the mutex *before* the lock is
-    /// released for the spawn attempt.  A concurrent `set_enabled(true)` call
-    /// that sees this state will bail out rather than spawning a second
-    /// orphaned child process.
+    /// This is a transient placeholder inserted into the registry under the
+    /// mutex *before* the spawn attempt begins.  A concurrent `set_enabled(true)`
+    /// call that sees this state will bail out, and a concurrent `add_plugin`
+    /// call will return [`RegistryError::AlreadyExists`], rather than racing
+    /// past the uniqueness check and spawning a second orphaned child process.
     Starting,
     /// The process exited unexpectedly.
     Crashed {
