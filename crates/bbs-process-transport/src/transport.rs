@@ -224,7 +224,9 @@ impl Plugin for ProcessTransport {
         }
 
         let (mut child, tx) = Self::spawn_child(&self.config)?;
-        self.stdin_tx.set(tx.clone()).ok();
+        self.stdin_tx
+            .set(tx.clone())
+            .map_err(|_| PluginError::StartFailed("already started".into()))?;
 
         let stdout = child.stdout.take().expect("stdout piped");
         let stderr = child.stderr.take().expect("stderr piped");
