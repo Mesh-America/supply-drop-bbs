@@ -24,6 +24,22 @@ use tracing::{debug, info, warn};
 
 use crate::ipc::{HostMsg, PluginMsg};
 
+// -- Exit event ----------------------------------------------------------------
+
+/// Signals sent from the process-watcher task to the manager's exit-handling loop.
+///
+/// The channel always exists (regardless of `restart_on_crash`) so the manager
+/// can learn about *any* process exit and keep `PluginState` accurate.
+#[derive(Debug)]
+pub(crate) enum ExitEvent {
+    /// The process exited with a non-zero code and `restart_on_crash` is true.
+    /// The manager should restart the plugin.
+    Crash,
+    /// The process exited cleanly (code 0) **or** `restart_on_crash` is false.
+    /// The manager should transition the plugin state to `Stopped`.
+    Stopped,
+}
+
 // ── Session state ─────────────────────────────────────────────────────────────
 
 struct SessionEntry {
@@ -64,11 +80,11 @@ pub struct ProcessTransport {
     /// Version string reported by the plugin in its `ready` message.
     plugin_version: Arc<std::sync::Mutex<Option<String>>>,
     shutdown_tx: watch::Sender<bool>,
-    /// Fires `()` when the child exits with a non-zero code (crash).
-    /// Only populated when `config.restart_on_crash` is true.
-    crash_tx: Option<mpsc::Sender<()>>,
-    /// Taken once by the manager to wire up the auto-restart loop.
-    crash_rx: std::sync::Mutex<Option<mpsc::Receiver<()>>>,
+    /// Fires an [`ExitEvent`] whenever the child process exits.
+    /// Always populated so both crash and clean exits are reported to the manager.
+    exit_tx: mpsc::Sender<ExitEvent>,
+    /// Taken once by the manager to wire up the exit-handling loop.
+    exit_rx: std::sync::Mutex<Option<mpsc::Receiver<ExitEvent>>>,
 }
 
 impl ProcessTransport {
@@ -76,12 +92,7 @@ impl ProcessTransport {
         // Leak the name string once to get a &'static str.
         // This is a deliberate one-time allocation per plugin name.
         let transport_name: &'static str = Box::leak(config.name.clone().into_boxed_str());
-        let (crash_tx, crash_rx) = if config.restart_on_crash {
-            let (tx, rx) = mpsc::channel(4);
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
+        let (exit_tx, exit_rx) = mpsc::channel(4);
         Self {
             transport_name,
             config,
@@ -91,17 +102,17 @@ impl ProcessTransport {
             payload_limit: Arc::new(AtomicUsize::new(0)),
             plugin_version: Arc::new(std::sync::Mutex::new(None)),
             shutdown_tx: watch::channel(false).0,
-            crash_tx,
-            crash_rx: std::sync::Mutex::new(crash_rx),
+            exit_tx,
+            exit_rx: std::sync::Mutex::new(Some(exit_rx)),
         }
     }
 
-    /// Take the crash receiver so the manager can drive the auto-restart loop.
+    /// Take the exit receiver so the manager can drive the exit-handling loop.
     ///
-    /// Returns `None` when `restart_on_crash` is false or when already taken.
+    /// Returns `None` when already taken.
     /// Must be called before [`Plugin::start`].
-    pub(crate) fn take_crash_receiver(&self) -> Option<mpsc::Receiver<()>> {
-        self.crash_rx.lock().expect("crash_rx poisoned").take()
+    pub(crate) fn take_exit_receiver(&self) -> Option<mpsc::Receiver<ExitEvent>> {
+        self.exit_rx.lock().expect("exit_rx poisoned").take()
     }
 
     /// Version string reported by the plugin in its `ready` message.
@@ -262,10 +273,14 @@ impl Plugin for ProcessTransport {
             }
         });
 
-        // Process watcher task — detects crashes and notifies the manager.
+        // Process watcher task — detects exit and notifies the manager.
+        //
+        // Always fires an ExitEvent so the manager can update PluginState:
+        //   - non-zero exit + restart_on_crash=true  -> ExitEvent::Crash
+        //   - all other exits (clean or no-restart)  -> ExitEvent::Stopped
         let plugin_name3 = self.config.name.clone();
         let restart = self.config.restart_on_crash;
-        let crash_tx = self.crash_tx.clone();
+        let exit_tx = self.exit_tx.clone();
         tokio::spawn(async move {
             match child.wait().await {
                 Ok(status) => {
@@ -274,15 +289,18 @@ impl Plugin for ProcessTransport {
                             plugin = %plugin_name3,
                             "process exited with {status} — notifying manager for restart"
                         );
-                        // Signal the crash-restart loop in ProcessPluginManager.
-                        if let Some(tx) = crash_tx {
-                            let _ = tx.send(()).await;
-                        }
+                        let _ = exit_tx.send(ExitEvent::Crash).await;
                     } else {
                         info!(plugin = %plugin_name3, "process exited with {status}");
+                        let _ = exit_tx.send(ExitEvent::Stopped).await;
                     }
                 }
-                Err(e) => warn!(plugin = %plugin_name3, "wait() error: {e}"),
+                Err(e) => {
+                    warn!(plugin = %plugin_name3, "wait() error: {e}");
+                    // Treat a wait error as a clean stop so the manager does not
+                    // leave the plugin stuck in Running state forever.
+                    let _ = exit_tx.send(ExitEvent::Stopped).await;
+                }
             }
         });
 
