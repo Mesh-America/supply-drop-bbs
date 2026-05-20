@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(not(unix))]
 use tracing::warn;
 #[cfg(unix)]
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 // Unix-only: command/response types needed by the session implementation.
 #[cfg(unix)]
@@ -362,9 +362,22 @@ async fn accept_loop(
                         ));
                     }
                     Err(e) => {
-                        // Transient accept errors (e.g. EMFILE) — log and
-                        // continue; the loop will recover on the next accept.
-                        warn!("cli: accept error: {e}");
+                        // Classify the error: transient errors are safe to
+                        // retry immediately; permanent errors will never
+                        // resolve, so break to avoid a 100% CPU spin.
+                        match e.kind() {
+                            std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::Interrupted => {
+                                // Transient — the next accept will likely succeed.
+                                continue;
+                            }
+                            _ => {
+                                // Permanent (EMFILE, EBADF, EINVAL, …) — log at
+                                // error level and exit the loop cleanly.
+                                error!("cli: fatal accept error, stopping listener: {e}");
+                                break;
+                            }
+                        }
                     }
                 }
             }
