@@ -17,7 +17,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 
-use crate::transport::ProcessTransport;
+use crate::transport::{ExitEvent, ProcessTransport};
 
 const LOG_RING_CAP: usize = 500;
 const LOG_TAIL: usize = 50;
@@ -236,18 +236,17 @@ impl ProcessPluginManager {
 
         let transport = ProcessTransport::new(config.clone(), Arc::clone(&self.host));
 
-        // Wire up crash-restart BEFORE start() so there is no window where
-        // a very-fast crash could go unnoticed.
-        if config.restart_on_crash {
-            if let Some(crash_rx) = transport.take_crash_receiver() {
-                tokio::spawn(crash_restart_loop(
-                    name.clone(),
-                    crash_rx,
-                    config.restart_delay_secs,
-                    Arc::clone(&self.plugins),
-                    Arc::clone(&self.host),
-                ));
-            }
+        // Wire up the exit-handling loop BEFORE start() so there is no window
+        // where a very-fast exit could go unnoticed.
+        if let Some(exit_rx) = transport.take_exit_receiver() {
+            tokio::spawn(plugin_exit_loop(
+                name.clone(),
+                exit_rx,
+                config.restart_on_crash,
+                config.restart_delay_secs,
+                Arc::clone(&self.plugins),
+                Arc::clone(&self.host),
+            ));
         }
 
         transport
@@ -514,66 +513,103 @@ impl PluginRegistryApi for ProcessPluginManager {
     }
 }
 
-// ── Crash restart loop ────────────────────────────────────────────────────────
+// ── Plugin exit loop ───────────────────────────────────────────────────────
 
-/// Spawned once per plugin that has `restart_on_crash = true`.
+/// Spawned once per plugin that has been started.
 ///
-/// Receives a crash signal from `ProcessTransport`'s watcher task, waits the
-/// configured delay, respawns the process, and updates the manager's state.
-/// When the new process is running its own crash channel replaces `rx` so the
-/// loop continues watching the new child.  The loop exits when:
+/// Receives an [`ExitEvent`] from `ProcessTransport`'s watcher task and acts:
 ///
-/// - The sender is dropped (plugin was removed or disabled)
-/// - A respawn attempt fails (state is set to `Crashed`)
-async fn crash_restart_loop(
+/// - [`ExitEvent::Crash`]: waits the configured delay, respawns the process,
+///   and updates state.  The loop then watches the new child via its fresh
+///   receiver.  The loop exits when:
+///   - The sender is dropped (plugin was removed or disabled)
+///   - A respawn attempt fails (state is set to `Crashed`)
+///
+/// - [`ExitEvent::Stopped`]: updates state to `PluginState::Stopped` and
+///   exits.  The plugin exited cleanly or with `restart_on_crash = false`.
+async fn plugin_exit_loop(
     name: String,
-    mut rx: mpsc::Receiver<()>,
+    mut rx: mpsc::Receiver<ExitEvent>,
+    restart_on_crash: bool,
     delay_secs: u64,
     plugins: Arc<Mutex<HashMap<String, ManagedPlugin>>>,
     host: Arc<dyn Host>,
 ) {
-    while rx.recv().await.is_some() {
-        warn!(plugin = %name, delay_secs, "crashed — restarting");
-        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
-
-        let (config, _log_buffer) = {
-            let map = plugins.lock().await;
-            let Some(m) = map.get(&name) else { return };
-            (m.config.clone(), Arc::clone(&m.log_buffer))
-        };
-
-        let new_transport = ProcessTransport::new(config, Arc::clone(&host));
-        // Take the crash receiver for the new process before it starts.
-        let new_rx = new_transport.take_crash_receiver();
-
-        match new_transport.start().await {
-            Ok(()) => {
-                {
-                    let mut map = plugins.lock().await;
-                    if let Some(m) = map.get_mut(&name) {
-                        m.transport = Some(new_transport);
-                        m.state = PluginState::Running;
-                        m.restart_count += 1;
-                    }
-                }
-                info!(plugin = %name, "restarted after crash");
-                // Switch to watching the new process.
-                match new_rx {
-                    Some(new_rx) => rx = new_rx,
-                    None => break, // restart_on_crash was false on new config — stop looping
-                }
-            }
-            Err(e) => {
-                warn!(plugin = %name, error = %e, "restart failed");
+    while let Some(event) = rx.recv().await {
+        match event {
+            ExitEvent::Stopped => {
+                // Clean exit or restart_on_crash=false — mark as Stopped.
+                info!(plugin = %name, "process stopped; updating state to Stopped");
                 let mut map = plugins.lock().await;
                 if let Some(m) = map.get_mut(&name) {
-                    m.transport = None;
-                    m.state = PluginState::Crashed {
-                        reason: e.to_string(),
-                    };
+                    // Only update if still Running — don't clobber Disabled or
+                    // a state already set by an explicit stop/restart call.
+                    if m.state == PluginState::Running {
+                        m.state = PluginState::Stopped;
+                        m.transport = None;
+                    }
                 }
                 break;
             }
-        }
+
+            ExitEvent::Crash => {
+                // restart_on_crash=true and non-zero exit.
+                if !restart_on_crash {
+                    // Defensive: this variant should only arrive when
+                    // restart_on_crash is true, but guard anyway.
+                    let mut map = plugins.lock().await;
+                    if let Some(m) = map.get_mut(&name) {
+                        if m.state == PluginState::Running {
+                            m.state = PluginState::Stopped;
+                            m.transport = None;
+                        }
+                    }
+                    break;
+                }
+
+                warn!(plugin = %name, delay_secs, "crashed — restarting");
+                tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+
+                let (config, _log_buffer) = {
+                    let map = plugins.lock().await;
+                    let Some(m) = map.get(&name) else { return };
+                    (m.config.clone(), Arc::clone(&m.log_buffer))
+                };
+
+                let new_transport = ProcessTransport::new(config, Arc::clone(&host));
+                // Take the crash receiver for the new process before it starts.
+                let new_rx = new_transport.take_exit_receiver();
+
+                match new_transport.start().await {
+                    Ok(()) => {
+                        {
+                            let mut map = plugins.lock().await;
+                            if let Some(m) = map.get_mut(&name) {
+                                m.transport = Some(new_transport);
+                                m.state = PluginState::Running;
+                                m.restart_count += 1;
+                            }
+                        }
+                        info!(plugin = %name, "restarted after crash");
+                        // Switch to watching the new process.
+                        match new_rx {
+                            Some(new_rx) => rx = new_rx,
+                            None => break,
+                        }
+                    }
+                    Err(e) => {
+                        warn!(plugin = %name, error = %e, "restart failed");
+                        let mut map = plugins.lock().await;
+                        if let Some(m) = map.get_mut(&name) {
+                            m.transport = None;
+                            m.state = PluginState::Crashed {
+                                reason: e.to_string(),
+                            };
+                        }
+                        break;
+                    }
+                }
+            } // end ExitEvent::Crash
+        } // end match event
     }
 }
