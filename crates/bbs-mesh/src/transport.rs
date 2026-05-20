@@ -49,7 +49,7 @@ use meshcore_companion::{
 /// = 16 bytes of overhead.  Total frame must not exceed `MAX_FRAME_SIZE`.
 const MAX_REPLY_BYTES: usize = MAX_FRAME_SIZE - 16;
 use tokio::sync::{mpsc, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     command::{format_response, parse_command, render_notification},
@@ -675,7 +675,11 @@ async fn dispatch_message(
     flood_after_send: bool,
 ) {
     // ── Get or create a session for this node ─────────────────────────────────
-    let (session, is_new) = get_or_create_session(sender_prefix, host, state).await;
+    let Some((session, is_new)) = get_or_create_session(sender_prefix, host, state).await else {
+        // Session creation failed; the error was already logged inside
+        // get_or_create_session.  Skip this message â the event loop continues.
+        return;
+    };
 
     if is_new {
         debug!(?session, prefix = ?sender_prefix, "mesh: new session minted");
@@ -931,10 +935,10 @@ async fn get_or_create_session(
     prefix: [u8; 6],
     host: &Arc<dyn Host>,
     state: &Arc<Mutex<SessionState>>,
-) -> (SessionId, bool) {
+) -> Option<(SessionId, bool)> {
     // Fast path: session already exists.
     if let Some(sid) = state.lock().expect("state mutex poisoned").lookup(&prefix) {
-        return (sid, false);
+        return Some((sid, false));
     }
 
     // Slow path: mint a new session from the host.
@@ -945,10 +949,18 @@ async fn get_or_create_session(
             warn!("mesh: host.create_session failed: {e}");
             // Re-check state in case another concurrent message beat us here.
             if let Some(sid) = state.lock().expect("state mutex poisoned").lookup(&prefix) {
-                return (sid, false);
+                return Some((sid, false));
             }
-            // Fallback: can't proceed — caller will produce an error response.
-            panic!("mesh: host.create_session failed and no fallback: {e}");
+            // We cannot proceed without a session, but we must NOT panic here.
+            // This function is called from a detached tokio::spawn event-loop
+            // task; a panic would kill the task permanently and silently, causing
+            // the BBS to stop responding to all mesh nodes with no visible error.
+            // Instead, log the failure and return None so the caller can skip
+            // this message and keep the event loop alive for future messages.
+            error!(
+                "mesh: host.create_session failed and no fallback: {e}                  skipping this message to keep the event loop alive"
+            );
+            return None;
         }
     };
 
@@ -957,5 +969,5 @@ async fn get_or_create_session(
         .expect("state mutex poisoned")
         .get_or_insert(prefix, new_id);
 
-    (sid, is_new)
+    Some((sid, is_new))
 }
