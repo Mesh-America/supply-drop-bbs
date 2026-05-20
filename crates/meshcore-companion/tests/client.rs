@@ -152,9 +152,54 @@ async fn handshake_emits_connected() {
         .expect("channel closed");
 
     match event {
-        ClientEvent::Connected { self_info } => assert_eq!(self_info.node_name, "TestRadio"),
+        ClientEvent::Connected { self_info } => {
+            assert_eq!(self_info.unwrap().node_name, "TestRadio")
+        }
         other => panic!("expected Connected, got {other:?}"),
     }
+}
+
+/// When the device returns `ERR_CODE_UNSUPPORTED_CMD` for `CMD_APP_START`
+/// (MeshCore ≥ 1.15 behaviour on Heltec V4.2), the client should still emit
+/// `Connected { self_info: None }` and enter the event loop rather than
+/// retrying forever.  See GitHub issue #2.
+#[tokio::test]
+async fn unsupported_app_start_emits_connected_without_self_info() {
+    let (mut client, mut bridge) = loopback().await;
+
+    // Consume the AppStart the client sends.
+    let _app_start = bridge.recv_n(5).await;
+
+    // Reply with ERR_CODE_UNSUPPORTED_CMD (error_code = 1).
+    let err_frame = radio_frame(&[RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD]);
+    bridge.send(&err_frame).await;
+
+    // Client must emit Connected with self_info = None (not loop forever).
+    let ev = tokio::time::timeout(Duration::from_secs(2), client.recv())
+        .await
+        .expect("timed out waiting for Connected")
+        .expect("client channel closed");
+
+    match ev {
+        ClientEvent::Connected { self_info } => {
+            assert!(
+                self_info.is_none(),
+                "self_info should be None for firmware that rejects AppStart"
+            );
+        }
+        other => panic!("expected Connected{{self_info: None}}, got {other:?}"),
+    }
+
+    // The client must stay in the event loop — subsequent frames are forwarded.
+    bridge.send(&ok_frame()).await;
+    let ev2 = tokio::time::timeout(Duration::from_secs(2), client.recv())
+        .await
+        .expect("timed out waiting for Frame")
+        .expect("channel closed");
+    assert!(
+        matches!(ev2, ClientEvent::Frame(InboundFrame::Ok)),
+        "expected Frame(Ok) after handshake-less connect, got {ev2:?}"
+    );
 }
 
 /// The first bytes the client sends are a well-formed AppStart frame.

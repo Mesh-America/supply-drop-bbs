@@ -61,7 +61,7 @@ use tokio_serial::SerialPortBuilderExt;
 use tracing::{debug, info, warn};
 
 use crate::{
-    constants::{FRAME_OUTBOUND_PREFIX, MAX_PAYLOAD_SIZE},
+    constants::{ERR_CODE_UNSUPPORTED_CMD, FRAME_OUTBOUND_PREFIX, MAX_PAYLOAD_SIZE},
     decode_inbound, encode_outbound,
     error::FrameDecodeError,
     frame::{InboundFrame, OutboundFrame},
@@ -131,11 +131,15 @@ pub struct SerialConfig {
 /// [`InboundFrame::Unknown`] inside [`ClientEvent::Frame`].
 #[derive(Debug)]
 pub enum ClientEvent {
-    /// The connection is up and the AppStart handshake succeeded.
+    /// The connection is up and the AppStart handshake succeeded (or the
+    /// device indicated it does not support `CMD_APP_START`).
     ///
-    /// Carries the [`SelfInfo`] returned by the device, which includes node
-    /// identity, radio parameters, and GPS coordinates.
-    Connected { self_info: SelfInfo },
+    /// `self_info` is `Some` when the device responded to `CMD_APP_START`
+    /// with a valid `SelfInfo` frame.  It is `None` when the device returned
+    /// `ERR_CODE_UNSUPPORTED_CMD` for `CMD_APP_START`; in that case node
+    /// identity and radio parameters are unavailable until the device pushes
+    /// an advert.
+    Connected { self_info: Option<SelfInfo> },
 
     /// The connection was lost or the handshake failed.
     ///
@@ -176,7 +180,8 @@ pub struct SendError(pub OutboundFrame);
 ///     while let Some(event) = client.recv().await {
 ///         match event {
 ///             ClientEvent::Connected { self_info } => {
-///                 println!("connected: {}", self_info.node_name);
+///                 let name = self_info.as_ref().map(|i| i.node_name.as_str()).unwrap_or("unknown");
+///                 println!("connected: {name}");
 ///                 client.send(OutboundFrame::GetBattAndStorage).await.ok();
 ///             }
 ///             ClientEvent::Frame(frame) => println!("{frame:?}"),
@@ -408,6 +413,10 @@ enum SessionOutcome {
 ///
 /// Works for any `AsyncRead`/`AsyncWrite` pair.  Returns when the session
 /// ends for any reason.
+///
+/// If the device responds to `CMD_APP_START` with `ERR_CODE_UNSUPPORTED_CMD`
+/// the handshake is considered successful with no `SelfInfo`;
+/// [`ClientEvent::Connected`] carries `None`.
 async fn run_session<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -425,9 +434,20 @@ where
         return SessionOutcome::IoError(e, false);
     }
 
-    let self_info = match read_frame(reader).await {
+    let self_info: Option<SelfInfo> = match read_frame(reader).await {
         Err(e) => return SessionOutcome::IoError(e, false),
-        Ok(InboundFrame::SelfInfo(info)) => info,
+        Ok(InboundFrame::SelfInfo(info)) => Some(info),
+        // Some devices return UNSUPPORTED_CMD for CMD_APP_START.  Rather than
+        // looping forever, treat this as a handshake-less connection and
+        // proceed to the event loop without SelfInfo.  See GitHub issue #2.
+        Ok(InboundFrame::Err { error_code }) if error_code == ERR_CODE_UNSUPPORTED_CMD => {
+            warn!(
+                "companion: device returned UNSUPPORTED_CMD for CMD_APP_START \
+                 — proceeding without SelfInfo; \
+                 node identity will be unavailable until the first advert is received"
+            );
+            None
+        }
         Ok(other) => {
             warn!("companion: expected SelfInfo after AppStart, got {other:?}");
             return SessionOutcome::IoError(
@@ -440,7 +460,9 @@ where
         }
     };
 
-    info!(node = %self_info.node_name, "companion: handshake complete");
+    if let Some(ref info) = self_info {
+        info!(node = %info.node_name, "companion: handshake complete");
+    }
     if event_tx
         .send(ClientEvent::Connected { self_info })
         .await

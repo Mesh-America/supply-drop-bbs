@@ -482,43 +482,58 @@ async fn event_loop(
                         break;
                     }
                     Some(ClientEvent::Connected { self_info }) => {
-                        info!(
-                            node = %self_info.node_name,
-                            freq_khz = self_info.frequency_khz,
-                            "mesh: radio bridge connected — draining stale queue"
-                        );
-                        // Register the BBS node in the advert bus so it appears in
-                        // the web UI immediately (using whatever GPS the radio reports).
-                        host.advert_bus().upsert(
-                            self_info.pubkey,
-                            self_info.node_name.clone(),
-                            self_info.adv_type,
-                            self_info.latitude,
-                            self_info.longitude,
-                        );
                         // Drain any messages that queued while we were offline so
-                        // they don't corrupt in-progress workflows.
+                        // they don't corrupt in-progress workflows.  Always done
+                        // regardless of whether SelfInfo is available.
                         draining.store(true, Ordering::Relaxed);
                         let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
-                        // Record our own pubkey so the NewAdvert handler can
-                        // detect self-advert echoes and preserve configured GPS.
-                        state.lock().expect("state mutex poisoned").self_pubkey =
-                            Some(self_info.pubkey);
-                        // Push GPS coordinates to the radio if configured, and refresh
-                        // the advert bus entry so the web UI shows the config GPS.
-                        if let Some((lat, lon)) = host.node_location() {
-                            let lat_1e6 = (lat * 1_000_000.0) as i32;
-                            let lon_1e6 = (lon * 1_000_000.0) as i32;
-                            info!(lat_1e6, lon_1e6, "mesh: setting radio location");
-                            let _ = cmd_tx
-                                .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
-                                .await;
+
+                        if let Some(info) = self_info {
+                            info!(
+                                node = %info.node_name,
+                                freq_khz = info.frequency_khz,
+                                "mesh: radio bridge connected — draining stale queue"
+                            );
+                            // Register the BBS node in the advert bus so it appears in
+                            // the web UI immediately (using whatever GPS the radio reports).
                             host.advert_bus().upsert(
-                                self_info.pubkey,
-                                self_info.node_name.clone(),
-                                self_info.adv_type,
-                                lat_1e6,
-                                lon_1e6,
+                                info.pubkey,
+                                info.node_name.clone(),
+                                info.adv_type,
+                                info.latitude,
+                                info.longitude,
+                            );
+                            // Record our own pubkey so the NewAdvert handler can
+                            // detect self-advert echoes and preserve configured GPS.
+                            state.lock().expect("state mutex poisoned").self_pubkey =
+                                Some(info.pubkey);
+                            // Push GPS coordinates to the radio if configured, and
+                            // refresh the advert bus entry so the web UI shows
+                            // the config GPS.
+                            if let Some((lat, lon)) = host.node_location() {
+                                let lat_1e6 = (lat * 1_000_000.0) as i32;
+                                let lon_1e6 = (lon * 1_000_000.0) as i32;
+                                info!(lat_1e6, lon_1e6, "mesh: setting radio location");
+                                let _ = cmd_tx
+                                    .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
+                                    .await;
+                                host.advert_bus().upsert(
+                                    info.pubkey,
+                                    info.node_name.clone(),
+                                    info.adv_type,
+                                    lat_1e6,
+                                    lon_1e6,
+                                );
+                            }
+                        } else {
+                            // Device did not return SelfInfo (CMD_APP_START
+                            // was unsupported) — node identity and radio
+                            // params are unavailable until the device pushes
+                            // an advert.
+                            info!(
+                                "mesh: radio bridge connected (no SelfInfo — \
+                                 CMD_APP_START unsupported by device) \
+                                 — draining stale queue"
                             );
                         }
                     }
