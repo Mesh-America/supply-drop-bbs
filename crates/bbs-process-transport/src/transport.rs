@@ -209,6 +209,17 @@ fn truncate_to_limit(text: String, limit: usize) -> String {
         return text;
     }
     let suffix = "…";
+    if limit < suffix.len() {
+        // Limit is so small there's no room for even the ellipsis —
+        // hard-truncate at a valid UTF-8 boundary.
+        let safe = text
+            .char_indices()
+            .take_while(|(i, c)| i + c.len_utf8() <= limit)
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        return text[..safe].to_owned();
+    }
     let cut = limit.saturating_sub(suffix.len());
     // Cut at a char boundary.
     let safe_cut = text
@@ -573,13 +584,34 @@ mod tests {
     }
 
     #[test]
-    fn limit_smaller_than_ellipsis_produces_just_ellipsis() {
-        // If the limit is so small there's no room for any content, we still
-        // get a valid (though possibly short) string ending in "…".
-        let result = truncate_to_limit("hello world".to_owned(), 1);
-        assert!(
-            std::str::from_utf8(result.as_bytes()).is_ok(),
-            "not valid UTF-8"
-        );
+    fn limit_smaller_than_ellipsis_respects_limit() {
+        // When the limit is smaller than the ellipsis byte length (3), the
+        // result must be hard-truncated and must not exceed the limit.
+        for limit in 1..3_usize {
+            let result = truncate_to_limit("hello world".to_owned(), limit);
+            assert!(
+                result.len() <= limit,
+                "limit={limit}: result length {} exceeds limit",
+                result.len()
+            );
+            assert!(
+                std::str::from_utf8(result.as_bytes()).is_ok(),
+                "limit={limit}: result is not valid UTF-8"
+            );
+        }
+    }
+
+    #[test]
+    fn limit_smaller_than_ellipsis_multibyte() {
+        // Ensure that with a multibyte-only string and limit < 3 we don't
+        // produce a partial codepoint (each '©' is 2 bytes).
+        let result = truncate_to_limit("©©©©".to_owned(), 1);
+        // limit=1, but every char is 2 bytes, so the result must be empty.
+        assert_eq!(result, "");
+        assert!(result.len() <= 1);
+
+        let result = truncate_to_limit("©©©©".to_owned(), 2);
+        assert!(result.len() <= 2);
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
     }
 }
