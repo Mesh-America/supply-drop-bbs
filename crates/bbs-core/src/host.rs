@@ -416,7 +416,27 @@ impl Host for BbsHost {
             Command::SetGuestRoom { name } => self.handle_set_guest_room(session, name).await,
 
             Command::Unknown { .. } => {
-                Ok(Response::Text("Unknown command. Type H for help.".into()))
+                // Provide a more helpful nudge when the session is not yet
+                // authenticated.  A user who types freeform text like "Hi"
+                // as their very first message after a BBS restart should be
+                // guided to register/login rather than seeing "Unknown command."
+                let is_authed = {
+                    let sessions = self.sessions.read().await;
+                    sessions
+                        .get(&session)
+                        .map(|r| r.username.is_some())
+                        .unwrap_or(false)
+                };
+                if is_authed {
+                    Ok(Response::Text("Unknown command. Type H for help.".into()))
+                } else {
+                    Ok(Response::Text(
+                        "Not recognized. Type 'register <username>' to create an account\n\
+                         or 'login <username>' if you already have one.\n\
+                         Type H for a list of commands."
+                            .into(),
+                    ))
+                }
             }
             _ => Ok(Response::Error("Command not yet supported.".into())),
         }
@@ -1994,12 +2014,51 @@ impl BbsHost {
                         return self.handle_change_to_room(session, target_id).await;
                     }
                 }
-                // Fall back: treat as room name via the normal change-room path
+                // Fall back: treat as room name via the normal change-room path.
+                //
+                // Guard against out-of-order mesh delivery: if the user typed a
+                // BBS command (e.g. "N") immediately after "K" and the command
+                // arrived while awaiting_reply was still true, it would land
+                // here as a room-selection reply.  Single-letter or short
+                // alphabetic inputs that look like known command keywords are
+                // almost never intended as room names; cancel the room-selection
+                // workflow and tell the user to re-send their command.
+                let is_cmd_keyword = matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "n" | "f"
+                        | "r"
+                        | "g"
+                        | "k"
+                        | "m"
+                        | "i"
+                        | "e"
+                        | "d"
+                        | "q"
+                        | "w"
+                        | "s"
+                        | "h"
+                        | "?"
+                        | "profile"
+                        | "passwd"
+                        | "pending"
+                        | "whoami"
+                        | ".ff"
+                        | ".c"
+                        | ".dr"
+                        | ".er"
+                );
                 {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.workflow = Workflow::None;
                     }
+                }
+                if is_cmd_keyword {
+                    return Ok(Response::Text(format!(
+                        "Room selection cancelled (received '{}' while waiting for room number).\n\
+                         Re-send your command, or type K to list rooms again.",
+                        trimmed.to_uppercase()
+                    )));
                 }
                 self.handle_change_room(session, trimmed).await
             }
@@ -2732,11 +2791,64 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
-        let after = self
+        let raw_after = self
             .db
             .get_last_read(user_id, room_id)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        // If get_last_read returns None, it could mean either:
+        //   (a) the user has never visited this room, or
+        //   (b) the read pointer was reset to NULL by ON DELETE SET NULL when
+        //       the exact message the user last read was deleted.
+        //
+        // Case (b) would incorrectly flood the user with all historical
+        // messages on the next N.  Detect it by checking for an existing
+        // user_room_state row and, if found, repair the pointer to the newest
+        // message currently in the room so no old messages appear as "new".
+        let after = if raw_after.is_none() {
+            let has_state = self
+                .db
+                .has_read_state(user_id, room_id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+            if has_state {
+                // Pointer was reset by a delete. Catch the cursor up to the
+                // newest existing message so subsequent reads start fresh.
+                let newest = if room_id == MAIL_ROOM_ID {
+                    // For the mail room use the latest DM involving this user.
+                    self.db
+                        .list_direct(&username, None, 1)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?
+                        .messages
+                        .into_iter()
+                        .next()
+                } else {
+                    self.db
+                        .list_recent_in_room(room_id, 1)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?
+                        .into_iter()
+                        .next()
+                };
+                if let Some(msg) = newest {
+                    self.db
+                        .mark_read(user_id, room_id, msg.id)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?;
+                    // Return early — the cursor is now at the latest message;
+                    // nothing is "new" from the user's perspective.
+                    return Ok(Response::Text(format!("No new messages in {}.", room.name)));
+                }
+                // Room is empty after the deletion.
+                return Ok(Response::Text(format!("No new messages in {}.", room.name)));
+            }
+            None // Truly never visited — show from beginning.
+        } else {
+            raw_after
+        };
 
         let page = if room_id == MAIL_ROOM_ID {
             self.db
@@ -5328,5 +5440,261 @@ mod tests {
                 "verified user should land in Lobby after login"
             );
         }
+    }
+
+    // ── Test helper: register + login in one call ─────────────────────────────
+
+    /// Register `username` with `password` and complete the login flow.
+    /// The session is left authenticated on return.
+    async fn register_and_login(
+        host: &BbsHost,
+        sid: SessionId,
+        username: &Username,
+        password: &str,
+    ) {
+        // Step 1: initiate registration.
+        host.process_command(
+            sid,
+            Command::Register {
+                username: username.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 2: skip optional display name.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 3: enter password.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: password.into(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 4: confirm password — should log in.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: password.into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::LoggedIn { .. }),
+            "register_and_login: expected LoggedIn, got {resp:?}"
+        );
+    }
+
+    // ── Bug-01: pre-auth Unknown command gives helpful guidance ───────────────
+
+    /// Pre-auth sessions should get a register/login nudge for unrecognised
+    /// input, not the generic "Unknown command. Type H for help."
+    #[tokio::test]
+    async fn unknown_command_pre_auth_suggests_register_or_login() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
+        let resp = host
+            .process_command(sid, Command::Unknown { raw: "Hi".into() })
+            .await
+            .unwrap();
+
+        let Response::Text(text) = resp else {
+            panic!("expected Text, got {resp:?}");
+        };
+        assert!(
+            text.contains("register") || text.contains("login"),
+            "pre-auth unknown-command response should mention register/login, got: {text:?}"
+        );
+    }
+
+    /// Authenticated sessions still get "Unknown command. Type H for help."
+    #[tokio::test]
+    async fn unknown_command_post_auth_returns_generic_message() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::Unknown {
+                    raw: "gibberish".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let Response::Text(text) = resp else {
+            panic!("expected Text, got {resp:?}");
+        };
+        assert!(
+            text.to_lowercase().contains("unknown command"),
+            "authenticated unknown-command should say 'Unknown command', got: {text:?}"
+        );
+    }
+
+    // ── Bug-02: stale unread counter after pointer reset ──────────────────────
+
+    /// After the pointed-to message is deleted (ON DELETE SET NULL resets the
+    /// read pointer), `unread_count` must return 0 — not re-count every old
+    /// message as if they were all new.
+    #[tokio::test]
+    async fn unread_count_zero_after_read_pointer_reset_by_delete() {
+        use crate::db::MessageStore as _;
+        use crate::ids::RoomId;
+
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Get alice's user_id from the host's DB.
+        let user_id = UserStore::get_by_username(&host.db, &uname)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        // Post a message to the Lobby, then read it so the pointer advances.
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("hello world".into()),
+            },
+        )
+        .await
+        .unwrap();
+        // Confirm the draft.
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        // N: read the message and advance the pointer.
+        host.process_command(sid, Command::ReadNew).await.unwrap();
+
+        let lobby = RoomId::new(1);
+        let before = host.db.unread_count(user_id, lobby).await.unwrap();
+        assert_eq!(before, 0, "should be 0 after reading");
+
+        // Simulate an admin deleting the exact message the pointer lands on.
+        let last_read = host.db.get_last_read(user_id, lobby).await.unwrap();
+        assert!(last_read.is_some(), "pointer must be set after N");
+        let msg_id = last_read.unwrap();
+        MessageStore::delete(&host.db, msg_id).await.unwrap();
+
+        // The pointer is now NULL (or rescued to a previous message by delete()).
+        // Either way, unread_count must stay 0 — no stale "N new" counters.
+        let after = host.db.unread_count(user_id, lobby).await.unwrap();
+        assert_eq!(
+            after, 0,
+            "unread_count must be 0 after the pointed-to message is deleted"
+        );
+    }
+
+    /// After pointer reset, pressing N should return "No new messages" rather
+    /// than flooding the user with all historical messages.
+    #[tokio::test]
+    async fn read_new_no_messages_after_pointer_reset_by_delete() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Post and read a message.
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("message one".into()),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::ReadNew).await.unwrap();
+
+        // Find and delete the pointed-to message.
+        use crate::db::MessageStore as _;
+        use crate::ids::RoomId;
+        let lobby = RoomId::new(1);
+        let user_id = UserStore::get_by_username(&host.db, &uname)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let msg_id = host
+            .db
+            .get_last_read(user_id, lobby)
+            .await
+            .unwrap()
+            .unwrap();
+        MessageStore::delete(&host.db, msg_id).await.unwrap();
+
+        // Pressing N again should say "no new messages", not re-show old ones.
+        let resp = host.process_command(sid, Command::ReadNew).await.unwrap();
+        let text = match &resp {
+            Response::Text(t) => t.as_str(),
+            Response::MultiText(parts) => parts.first().map(|s| s.as_str()).unwrap_or(""),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.to_lowercase().contains("no new messages"),
+            "N after pointer reset should say 'no new messages', got: {text:?}"
+        );
+    }
+
+    // ── Bug-03: Workflow::Rooms cancels cleanly for command keywords ──────────
+
+    /// When a single-letter command keyword (e.g. "N") arrives as a workflow
+    /// reply during room selection, the session should cancel cleanly with a
+    /// helpful message rather than reporting "Room 'N' not found".
+    #[tokio::test]
+    async fn rooms_workflow_cancels_for_command_keywords() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Enter room-selection workflow.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(resp, Response::Prompt { .. }),
+            "K should enter Workflow::Rooms and return Prompt"
+        );
+
+        // "N" arrives as a WorkflowReply (simulating out-of-order mesh delivery).
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "N".into() })
+            .await
+            .unwrap();
+
+        let text = match resp {
+            Response::Text(t) => t,
+            Response::Error(e) => e,
+            other => panic!("expected Text or Error, got {other:?}"),
+        };
+        // Should mention "cancelled" rather than "Room 'N' not found".
+        assert!(
+            text.to_lowercase().contains("cancel"),
+            "Workflow::Rooms should cancel for command keywords, got: {text:?}"
+        );
+        // Workflow should be cleared — next N should work as ReadNew.
+        let resp2 = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert!(
+            !matches!(resp2, Response::Error(_)),
+            "ReadNew after cancelled room-selection should not error, got {resp2:?}"
+        );
     }
 }

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT COUNT(*) FROM room_messages rm\n            JOIN messages m ON m.id = rm.message_id\n            LEFT JOIN user_room_state urs\n              ON urs.user_id = ? AND urs.room_id = rm.room_id\n            WHERE rm.room_id = ?\n              AND (\n                urs.user_id IS NULL\n                OR (urs.last_read_message_id IS NOT NULL\n                    AND m.id > urs.last_read_message_id)\n              )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "COUNT(*)",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1499d105204493d9230786f15abd1291248a852221b7774e3d1d606a9cf09d87"
+}
