@@ -48,7 +48,10 @@ use bbs_plugin_api::{event::Notification, identity::Username, Command, Response}
 /// - `None` — the message should be silently dropped (prefix configured,
 ///   message doesn't start with it, and no workflow is active).
 pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> Option<Command> {
-    let text = text.trim();
+    // Trim standard whitespace and null bytes.  Some MeshCore firmware
+    // null-terminates its text payloads; without this, "N\0" would not match
+    // the "n" keyword and would produce Command::Unknown instead of ReadNew.
+    let text = text.trim().trim_matches('\0');
 
     // ── Cancel / stop always break out of any workflow ───────────────────────
     if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {

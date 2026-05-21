@@ -1994,12 +1994,51 @@ impl BbsHost {
                         return self.handle_change_to_room(session, target_id).await;
                     }
                 }
-                // Fall back: treat as room name via the normal change-room path
+                // Fall back: treat as room name via the normal change-room path.
+                //
+                // Guard against out-of-order mesh delivery: if the user typed a
+                // BBS command (e.g. "N") immediately after "K" and the command
+                // arrived while awaiting_reply was still true, it would land
+                // here as a room-selection reply.  Single-letter or short
+                // alphabetic inputs that look like known command keywords are
+                // almost never intended as room names; cancel the room-selection
+                // workflow and tell the user to re-send their command.
+                let is_cmd_keyword = matches!(
+                    trimmed.to_ascii_lowercase().as_str(),
+                    "n" | "f"
+                        | "r"
+                        | "g"
+                        | "k"
+                        | "m"
+                        | "i"
+                        | "e"
+                        | "d"
+                        | "q"
+                        | "w"
+                        | "s"
+                        | "h"
+                        | "?"
+                        | "profile"
+                        | "passwd"
+                        | "pending"
+                        | "whoami"
+                        | ".ff"
+                        | ".c"
+                        | ".dr"
+                        | ".er"
+                );
                 {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.workflow = Workflow::None;
                     }
+                }
+                if is_cmd_keyword {
+                    return Ok(Response::Text(format!(
+                        "Room selection cancelled (received '{}' while waiting for room number).\n\
+                         Re-send your command, or type K to list rooms again.",
+                        trimmed.to_uppercase()
+                    )));
                 }
                 self.handle_change_room(session, trimmed).await
             }
@@ -5328,5 +5367,101 @@ mod tests {
                 "verified user should land in Lobby after login"
             );
         }
+    }
+
+    // ── Test helper: register + login in one call ─────────────────────────────
+
+    /// Register `username` with `password` and complete the login flow.
+    /// The session is left authenticated on return.
+    async fn register_and_login(
+        host: &BbsHost,
+        sid: SessionId,
+        username: &Username,
+        password: &str,
+    ) {
+        // Step 1: initiate registration.
+        host.process_command(
+            sid,
+            Command::Register {
+                username: username.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 2: skip optional display name.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 3: enter password.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: password.into(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 4: confirm password — should log in.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: password.into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::LoggedIn { .. }),
+            "register_and_login: expected LoggedIn, got {resp:?}"
+        );
+    }
+
+    // ── Bug-03: Workflow::Rooms cancels cleanly for command keywords ──────────
+
+    /// When a single-letter command keyword (e.g. "N") arrives as a workflow
+    /// reply during room selection, the session should cancel cleanly with a
+    /// helpful message rather than reporting "Room 'N' not found".
+    #[tokio::test]
+    async fn rooms_workflow_cancels_for_command_keywords() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Enter room-selection workflow.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(resp, Response::Prompt { .. }),
+            "K should enter Workflow::Rooms and return Prompt"
+        );
+
+        // "N" arrives as a WorkflowReply (simulating out-of-order mesh delivery).
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "N".into() })
+            .await
+            .unwrap();
+
+        let text = match resp {
+            Response::Text(t) => t,
+            Response::Error(e) => e,
+            other => panic!("expected Text or Error, got {other:?}"),
+        };
+        // Should mention "cancelled" rather than "Room 'N' not found".
+        assert!(
+            text.to_lowercase().contains("cancel"),
+            "Workflow::Rooms should cancel for command keywords, got: {text:?}"
+        );
+        // Workflow should be cleared — next N should work as ReadNew.
+        let resp2 = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert!(
+            !matches!(resp2, Response::Error(_)),
+            "ReadNew after cancelled room-selection should not error, got {resp2:?}"
+        );
     }
 }
