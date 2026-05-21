@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            UPDATE user_room_state\n            SET last_read_message_id = (\n                SELECT MAX(rm2.message_id)\n                FROM room_messages rm2\n                JOIN room_messages rm1 ON rm1.room_id = rm2.room_id\n                WHERE rm1.message_id = ?\n                  AND rm2.message_id < ?\n            )\n            WHERE last_read_message_id = ?\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "c388bf0ba4a31b8e2e2336c9e0263654ccad275710b540728173529a863d6915"
+}
