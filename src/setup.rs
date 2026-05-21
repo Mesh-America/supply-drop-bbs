@@ -35,6 +35,7 @@ struct Existing {
     mesh_connection_type: String,
     mesh_serial_port: Option<String>,
     mesh_baud_rate: u32,
+    mesh_addr: Option<String>,
     // Meshtastic
     meshtastic_enabled: bool,
     meshtastic_connection_type: String,
@@ -109,6 +110,10 @@ fn load_existing(out_path: &Path) -> Existing {
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
         .unwrap_or(115_200);
+    let mesh_addr = mesh
+        .and_then(|m| m.get("addr"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
 
     // Meshtastic existing values
     let meshtastic_enabled = meshtastic
@@ -164,6 +169,7 @@ fn load_existing(out_path: &Path) -> Existing {
         mesh_connection_type,
         mesh_serial_port,
         mesh_baud_rate,
+        mesh_addr,
         meshtastic_enabled,
         meshtastic_connection_type,
         meshtastic_serial_port,
@@ -351,6 +357,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
     let mesh_conn_type;
     let mesh_serial_port;
     let mesh_baud_rate;
+    let mesh_addr: Option<String>;
     let mut hat_params: Option<HatParams> = None;
 
     if use_mesh {
@@ -359,9 +366,12 @@ pub fn run_wizard(config_out: Option<&Path>) {
         let conn_items = &[
             "USB / serial  (Heltec V3, T-Beam, RAK4631 — plug in via USB)",
             "Pi HAT        (ZebraHat, Waveshare, PiMesh, FemtoFox — SPI on GPIO)",
+            "TCP           (connect to a running pymc_core, default port 5000)",
         ];
         let conn_default = if ex.mesh_connection_type == "hat" {
             1
+        } else if ex.mesh_connection_type == "tcp" {
+            2
         } else {
             0
         };
@@ -372,18 +382,36 @@ pub fn run_wizard(config_out: Option<&Path>) {
             conn_default,
         );
 
-        let (ct, sp, br) = match conn_choice {
-            0 => configure_serial(&theme, ex.mesh_serial_port.as_deref(), ex.mesh_baud_rate),
-            _ => ("hat", None, None),
+        let (ct, sp, br, ma) = match conn_choice {
+            0 => {
+                let (ct, sp, br) =
+                    configure_serial(&theme, ex.mesh_serial_port.as_deref(), ex.mesh_baud_rate);
+                (ct, sp, br, None)
+            }
+            1 => ("hat", None, None, None),
+            _ => {
+                let addr: String = Input::with_theme(&theme)
+                    .with_prompt("pymc_core address")
+                    .default(
+                        ex.mesh_addr
+                            .clone()
+                            .unwrap_or_else(|| "127.0.0.1:5000".to_owned()),
+                    )
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+                ("tcp", None, None, Some(addr))
+            }
         };
 
         mesh_conn_type = ct;
         mesh_serial_port = sp;
         mesh_baud_rate = br;
+        mesh_addr = ma;
     } else {
         mesh_conn_type = "serial";
         mesh_serial_port = None;
         mesh_baud_rate = None;
+        mesh_addr = None;
     }
 
     // ── Meshtastic connection ─────────────────────────────────────────────────
@@ -603,6 +631,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         mesh_connection_type: mesh_conn_type,
         mesh_serial_port: mesh_serial_port.as_deref(),
         mesh_baud_rate,
+        mesh_addr: mesh_addr.as_deref(),
         use_meshtastic,
         meshtastic_connection_type: meshtastic_conn_type,
         meshtastic_serial_port: meshtastic_serial_port.as_deref(),
@@ -1366,6 +1395,7 @@ struct TomlParams<'a> {
     mesh_connection_type: &'a str,
     mesh_serial_port: Option<&'a str>,
     mesh_baud_rate: Option<u32>,
+    mesh_addr: Option<&'a str>,
     // Meshtastic
     use_meshtastic: bool,
     meshtastic_connection_type: &'a str,
@@ -1428,7 +1458,13 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                     }
                 }
             }
-            "hat" | "tcp" => {}
+            "tcp" => {
+                if let Some(addr) = p.mesh_addr {
+                    if addr != "127.0.0.1:5000" {
+                        writeln!(s, "addr = {}", toml_str(addr)).unwrap();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1583,6 +1619,13 @@ fn print_next_steps(
     meshtastic_conn_type: &str,
     web_bind: Option<&str>,
 ) {
+    if use_mesh && mesh_conn_type == "tcp" {
+        println!("MeshCore TCP mode: Supply Drop BBS will connect to pymc_core at");
+        println!("the configured address. Make sure pymc_core is running before");
+        println!("starting the BBS.");
+        println!();
+    }
+
     let needs_dialout = cfg!(target_os = "linux")
         && ((use_mesh && mesh_conn_type == "serial")
             || (use_meshtastic && matches!(meshtastic_conn_type, "serial" | "hat")));
