@@ -35,7 +35,7 @@ use bbs_plugin_api::{
     identity::SessionId,
     plugin::Plugin,
     transport::TransportEngine,
-    Host, PermissionLevel, Response,
+    Command, Host, PermissionLevel, Response,
 };
 use meshcore_companion::{
     client::{ClientConfig, ClientEvent, CompanionClient, SerialConfig},
@@ -837,7 +837,20 @@ async fn dispatch_message(
                     warn!(?fresh_sid, "mesh: node_restore on refresh error: {e}");
                 }
             }
-            match host.process_command(fresh_sid, cmd).await {
+            // The original command was parsed with the stale transport state
+            // (which may have had `awaiting_reply = true`).  If it became a
+            // WorkflowReply but the fresh session has no active workflow, re-parse
+            // with awaiting_reply = false so the user's intent is honoured.
+            //
+            // Example: user had K's room list open; BBS session expired; user
+            // sends "N" → parsed as WorkflowReply.  After eviction the fresh
+            // session has Workflow::None, so we re-parse "N" as Command::ReadNew.
+            let retry_cmd = if matches!(cmd, Command::WorkflowReply { .. }) {
+                parse_command(text, command_prefix, false).unwrap_or_else(|| cmd.clone())
+            } else {
+                cmd.clone()
+            };
+            match host.process_command(fresh_sid, retry_cmd).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(?fresh_sid, "mesh: error after session refresh: {e}");
