@@ -34,6 +34,19 @@ features:
     details: New transports and behaviors are Rust crates gated behind Cargo features. If you don't compile it in, it isn't there.
 ---
 
+## See it in action
+
+<div style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;border-radius:8px;margin-bottom:2rem;">
+  <iframe
+    src="https://www.youtube.com/embed/BqlD2JiaF4Q"
+    title="Supply Drop BBS demo"
+    frameborder="0"
+    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+    allowfullscreen
+    style="position:absolute;top:0;left:0;width:100%;height:100%;"
+  ></iframe>
+</div>
+
 ## Quick install
 
 **Debian / Ubuntu / Raspberry Pi OS** — auto-detects your architecture:
