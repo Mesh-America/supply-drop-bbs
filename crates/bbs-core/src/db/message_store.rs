@@ -130,6 +130,12 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<(), StoreError>;
 
     /// Count unread messages in a room for a user.
+    ///
+    /// Returns 0 when the user has never visited the room **and** there are
+    /// no messages, and also when the read pointer was reset to `NULL` by
+    /// `ON DELETE SET NULL` (the `user_room_state` row exists but the pointer
+    /// is `NULL`).  The latter prevents stale "N new" counters after a sysop
+    /// deletes the exact message a user last read.
     async fn unread_count(&self, user_id: UserId, room_id: RoomId) -> Result<u64, StoreError>;
 
     /// Count unread direct messages involving `username`.
@@ -145,12 +151,24 @@ pub trait MessageStore: Send + Sync {
     ) -> Result<u64, StoreError>;
 
     /// Return the user's last-read message ID in a room, or `None`
-    /// if they have never visited it.
+    /// if they have never visited it **or** if the pointer was reset by
+    /// `ON DELETE SET NULL`.
+    ///
+    /// Use [`has_read_state`](Self::has_read_state) to distinguish the two
+    /// `None` cases when the difference matters.
     async fn get_last_read(
         &self,
         user_id: UserId,
         room_id: RoomId,
     ) -> Result<Option<MessageId>, StoreError>;
+
+    /// Return `true` if a `user_room_state` row exists for `(user_id, room_id)`.
+    ///
+    /// Distinguishes "never visited this room" (`get_last_read` returns `None`
+    /// *and* `has_read_state` returns `false`) from "visited but read-pointer
+    /// was reset by a message deletion" (`get_last_read` returns `None` *and*
+    /// `has_read_state` returns `true`).
+    async fn has_read_state(&self, user_id: UserId, room_id: RoomId) -> Result<bool, StoreError>;
 
     /// Return the `limit` most recent messages in a room, newest first.
     async fn list_recent_in_room(
@@ -370,6 +388,34 @@ impl MessageStore for Database {
 
     async fn delete(&self, id: MessageId) -> Result<bool, StoreError> {
         let mid = id.as_i64();
+
+        // Before deleting, rescue any read pointers that land on this message.
+        // Move them to the highest message_id in the same room that is strictly
+        // less than `id`.  If no earlier message exists (this was the first),
+        // the subquery returns NULL and the FK's ON DELETE SET NULL fires; the
+        // `unread_count` query treats NULL-with-existing-row as "all caught up".
+        //
+        // Only room messages are in `room_messages`; for DMs the subquery
+        // returns NULL (a no-op since ON DELETE SET NULL handles it anyway).
+        sqlx::query!(
+            r#"
+            UPDATE user_room_state
+            SET last_read_message_id = (
+                SELECT MAX(rm2.message_id)
+                FROM room_messages rm2
+                JOIN room_messages rm1 ON rm1.room_id = rm2.room_id
+                WHERE rm1.message_id = ?
+                  AND rm2.message_id < ?
+            )
+            WHERE last_read_message_id = ?
+            "#,
+            mid,
+            mid,
+            mid
+        )
+        .execute(&self.write_pool)
+        .await?;
+
         let rows = sqlx::query!("DELETE FROM messages WHERE id = ?", mid)
             .execute(&self.write_pool)
             .await?
@@ -410,6 +456,12 @@ impl MessageStore for Database {
         let uid = user_id.as_i64();
         let rid = room_id.as_i64();
 
+        // Distinguish three cases:
+        //   urs.user_id IS NULL  — no state row: user never visited → all messages unread.
+        //   urs.last_read_message_id IS NULL (row exists) — pointer was reset by an
+        //       ON DELETE SET NULL when the pointed-to message was deleted.  Treat as
+        //       "all caught up" (0 new) to prevent stale counters after admin deletes.
+        //   m.id > urs.last_read_message_id — normal case: messages newer than pointer.
         let count: i64 = sqlx::query_scalar!(
             r#"
             SELECT COUNT(*) FROM room_messages rm
@@ -417,8 +469,11 @@ impl MessageStore for Database {
             LEFT JOIN user_room_state urs
               ON urs.user_id = ? AND urs.room_id = rm.room_id
             WHERE rm.room_id = ?
-              AND (urs.last_read_message_id IS NULL
-                   OR m.id > urs.last_read_message_id)
+              AND (
+                urs.user_id IS NULL
+                OR (urs.last_read_message_id IS NOT NULL
+                    AND m.id > urs.last_read_message_id)
+              )
             "#,
             uid,
             rid
@@ -439,14 +494,19 @@ impl MessageStore for Database {
         let uid = user_id.as_i64();
         let rid = room_id.as_i64();
 
+        // Same NULL-pointer semantics as unread_count: a NULL pointer with an
+        // existing state row means the pointer was reset; treat as "caught up".
         let count: i64 = sqlx::query_scalar!(
             r#"
             SELECT COUNT(*) FROM messages m
             LEFT JOIN user_room_state urs ON urs.user_id = ? AND urs.room_id = ?
             WHERE (m.sender = ? OR m.recipient = ?)
               AND m.recipient IS NOT NULL
-              AND (urs.last_read_message_id IS NULL
-                   OR m.id > urs.last_read_message_id)
+              AND (
+                urs.user_id IS NULL
+                OR (urs.last_read_message_id IS NOT NULL
+                    AND m.id > urs.last_read_message_id)
+              )
             "#,
             uid,
             rid,
@@ -477,6 +537,21 @@ impl MessageStore for Database {
         .await?;
 
         Ok(row.flatten().map(MessageId::new))
+    }
+
+    async fn has_read_state(&self, user_id: UserId, room_id: RoomId) -> Result<bool, StoreError> {
+        let uid = user_id.as_i64();
+        let rid = room_id.as_i64();
+
+        let count: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) FROM user_room_state WHERE user_id = ? AND room_id = ?"#,
+            uid,
+            rid
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+
+        Ok(count > 0)
     }
 
     async fn list_recent_in_room(
