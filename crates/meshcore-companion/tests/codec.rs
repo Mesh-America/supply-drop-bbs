@@ -498,12 +498,14 @@ fn encode_get_contacts() {
 
 #[test]
 fn encode_send_txt_msg_layout() {
-    // Confirm 4 reserved bytes at positions 2-5 (after txt_type and attempt).
-    // Wire payload: [CMD][txt_type][attempt][0x00×4][prefix×6][text…]
+    // Confirm timestamp bytes at positions 2-5 (after txt_type and attempt).
+    // Wire payload: [CMD][txt_type][attempt][timestamp×4][prefix×6][text…]
     let prefix = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+    let ts: u32 = 0x1234_5678;
     let wire_bytes = encode_outbound(&OutboundFrame::SendTxtMsg {
         txt_type: TXT_TYPE_PLAIN,
         attempt: 1,
+        timestamp: ts,
         pubkey_prefix: prefix,
         text: "hi".to_owned(),
     });
@@ -511,8 +513,8 @@ fn encode_send_txt_msg_layout() {
     assert_eq!(payload[0], CMD_SEND_TXT_MSG);
     assert_eq!(payload[1], TXT_TYPE_PLAIN); // txt_type
     assert_eq!(payload[2], 1u8); // attempt
-    assert_eq!(&payload[3..7], &[0u8; 4]); // 4 reserved bytes
-    assert_eq!(&payload[7..13], &prefix); // pubkey_prefix at data[6:12] (relative to CMD byte = index 0)
+    assert_eq!(&payload[3..7], &ts.to_le_bytes()); // timestamp (little-endian)
+    assert_eq!(&payload[7..13], &prefix); // pubkey_prefix
     assert_eq!(&payload[13..15], b"hi");
 }
 
