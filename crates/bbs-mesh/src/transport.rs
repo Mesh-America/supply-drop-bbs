@@ -27,6 +27,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use bbs_plugin_api::{
@@ -45,7 +46,7 @@ use meshcore_companion::{
 
 /// Maximum bytes of plain text that fit in one `SendTxtMsg` companion frame.
 ///
-/// Wire layout: `[prefix:1][len:2][CMD:1][txt_type:1][attempt:1][reserved:4][prefix:6][text:N]`
+/// Wire layout: `[prefix:1][len:2][CMD:1][txt_type:1][attempt:1][timestamp:4][prefix:6][text:N]`
 /// = 16 bytes of overhead.  Total frame must not exceed `MAX_FRAME_SIZE`.
 const MAX_REPLY_BYTES: usize = MAX_FRAME_SIZE - 16;
 use tokio::sync::{mpsc, watch};
@@ -56,6 +57,16 @@ use crate::{
     config::{ConnectionType, MeshConfig},
     session::SessionState,
 };
+
+/// Current Unix time in seconds, truncated to u32 (the wire format's field width).
+/// Returns 0 if the system clock is before the epoch, which should never happen
+/// on a configured host.
+pub fn now_unix_secs() -> u32 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
+}
 
 // ── MeshTransport ─────────────────────────────────────────────────────────────
 
@@ -335,6 +346,7 @@ impl TransportEngine for MeshTransport {
             .send(OutboundFrame::SendTxtMsg {
                 txt_type: TXT_TYPE_PLAIN,
                 attempt: 0,
+                timestamp: now_unix_secs(),
                 pubkey_prefix,
                 text,
             })
@@ -397,6 +409,7 @@ async fn push_domain_notification(
                         .send(OutboundFrame::SendTxtMsg {
                             txt_type: TXT_TYPE_PLAIN,
                             attempt: 0,
+                            timestamp: now_unix_secs(),
                             pubkey_prefix: prefix,
                             text: "Your account has been validated. \
                                    You now have full access. Type 'H'."
@@ -434,6 +447,7 @@ async fn push_domain_notification(
                         .send(OutboundFrame::SendTxtMsg {
                             txt_type: TXT_TYPE_PLAIN,
                             attempt: 0,
+                            timestamp: now_unix_secs(),
                             pubkey_prefix: prefix,
                             text: format!(
                                 "New registration: {} — type PENDING to review.",
@@ -727,6 +741,7 @@ async fn dispatch_message(
                 .send(OutboundFrame::SendTxtMsg {
                     txt_type: TXT_TYPE_PLAIN,
                     attempt: 0,
+                    timestamp: now_unix_secs(),
                     pubkey_prefix: sender_prefix,
                     text: greeting,
                 })
@@ -923,6 +938,7 @@ async fn dispatch_message(
             .send(OutboundFrame::SendTxtMsg {
                 txt_type: TXT_TYPE_PLAIN,
                 attempt: 0,
+                timestamp: now_unix_secs(),
                 pubkey_prefix: sender_prefix,
                 text: reply_text,
             })
