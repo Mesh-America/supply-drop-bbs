@@ -2752,11 +2752,64 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
-        let after = self
+        let raw_after = self
             .db
             .get_last_read(user_id, room_id)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        // If get_last_read returns None, it could mean either:
+        //   (a) the user has never visited this room, or
+        //   (b) the read pointer was reset to NULL by ON DELETE SET NULL when
+        //       the exact message the user last read was deleted.
+        //
+        // Case (b) would incorrectly flood the user with all historical
+        // messages on the next N.  Detect it by checking for an existing
+        // user_room_state row and, if found, repair the pointer to the newest
+        // message currently in the room so no old messages appear as "new".
+        let after = if raw_after.is_none() {
+            let has_state = self
+                .db
+                .has_read_state(user_id, room_id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+            if has_state {
+                // Pointer was reset by a delete. Catch the cursor up to the
+                // newest existing message so subsequent reads start fresh.
+                let newest = if room_id == MAIL_ROOM_ID {
+                    // For the mail room use the latest DM involving this user.
+                    self.db
+                        .list_direct(&username, None, 1)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?
+                        .messages
+                        .into_iter()
+                        .next()
+                } else {
+                    self.db
+                        .list_recent_in_room(room_id, 1)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?
+                        .into_iter()
+                        .next()
+                };
+                if let Some(msg) = newest {
+                    self.db
+                        .mark_read(user_id, room_id, msg.id)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?;
+                    // Return early — the cursor is now at the latest message;
+                    // nothing is "new" from the user's perspective.
+                    return Ok(Response::Text(format!("No new messages in {}.", room.name)));
+                }
+                // Room is empty after the deletion.
+                return Ok(Response::Text(format!("No new messages in {}.", room.name)));
+            }
+            None // Truly never visited — show from beginning.
+        } else {
+            raw_after
+        };
 
         let page = if room_id == MAIL_ROOM_ID {
             self.db
@@ -5450,6 +5503,116 @@ mod tests {
         assert!(
             text.to_lowercase().contains("unknown command"),
             "authenticated unknown-command should say 'Unknown command', got: {text:?}"
+        );
+    }
+
+    // ── Bug-02: stale unread counter after pointer reset ──────────────────────
+
+    /// After the pointed-to message is deleted (ON DELETE SET NULL resets the
+    /// read pointer), `unread_count` must return 0 — not re-count every old
+    /// message as if they were all new.
+    #[tokio::test]
+    async fn unread_count_zero_after_read_pointer_reset_by_delete() {
+        use crate::db::MessageStore as _;
+        use crate::ids::RoomId;
+
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Get alice's user_id from the host's DB.
+        let user_id = UserStore::get_by_username(&host.db, &uname)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        // Post a message to the Lobby, then read it so the pointer advances.
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("hello world".into()),
+            },
+        )
+        .await
+        .unwrap();
+        // Confirm the draft.
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        // N: read the message and advance the pointer.
+        host.process_command(sid, Command::ReadNew).await.unwrap();
+
+        let lobby = RoomId::new(1);
+        let before = host.db.unread_count(user_id, lobby).await.unwrap();
+        assert_eq!(before, 0, "should be 0 after reading");
+
+        // Simulate an admin deleting the exact message the pointer lands on.
+        let last_read = host.db.get_last_read(user_id, lobby).await.unwrap();
+        assert!(last_read.is_some(), "pointer must be set after N");
+        let msg_id = last_read.unwrap();
+        MessageStore::delete(&host.db, msg_id).await.unwrap();
+
+        // The pointer is now NULL (or rescued to a previous message by delete()).
+        // Either way, unread_count must stay 0 — no stale "N new" counters.
+        let after = host.db.unread_count(user_id, lobby).await.unwrap();
+        assert_eq!(
+            after, 0,
+            "unread_count must be 0 after the pointed-to message is deleted"
+        );
+    }
+
+    /// After pointer reset, pressing N should return "No new messages" rather
+    /// than flooding the user with all historical messages.
+    #[tokio::test]
+    async fn read_new_no_messages_after_pointer_reset_by_delete() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Post and read a message.
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("message one".into()),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::ReadNew).await.unwrap();
+
+        // Find and delete the pointed-to message.
+        use crate::db::MessageStore as _;
+        use crate::ids::RoomId;
+        let lobby = RoomId::new(1);
+        let user_id = UserStore::get_by_username(&host.db, &uname)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let msg_id = host
+            .db
+            .get_last_read(user_id, lobby)
+            .await
+            .unwrap()
+            .unwrap();
+        MessageStore::delete(&host.db, msg_id).await.unwrap();
+
+        // Pressing N again should say "no new messages", not re-show old ones.
+        let resp = host.process_command(sid, Command::ReadNew).await.unwrap();
+        let text = match &resp {
+            Response::Text(t) => t.as_str(),
+            Response::MultiText(parts) => parts.first().map(|s| s.as_str()).unwrap_or(""),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.to_lowercase().contains("no new messages"),
+            "N after pointer reset should say 'no new messages', got: {text:?}"
         );
     }
 }
