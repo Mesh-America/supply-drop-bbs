@@ -172,6 +172,7 @@ pub enum OutboundFrame {
     SendTxtMsg {
         txt_type: u8,
         attempt: u8,
+        timestamp: u32,
         pubkey_prefix: [u8; 6],
         text: String,
     },
@@ -592,15 +593,16 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
         OutboundFrame::SendTxtMsg {
             txt_type,
             attempt,
+            timestamp,
             pubkey_prefix,
             text,
         } => {
             // Layout confirmed from frame_server._cmd_send_txt_msg:
-            // data[0]=txt_type, data[1]=attempt, data[2..6]=reserved(4), data[6..12]=prefix, data[12..]=text
+            // data[0]=txt_type, data[1]=attempt, data[2..6]=timestamp(4), data[6..12]=prefix, data[12..]=text
             p.push(CMD_SEND_TXT_MSG);
             p.push(*txt_type);
             p.push(*attempt);
-            p.extend_from_slice(&[0u8; 4]); // reserved
+            p.extend_from_slice(&timestamp.to_le_bytes());
             p.extend_from_slice(pubkey_prefix);
             p.extend_from_slice(text.as_bytes());
         }
