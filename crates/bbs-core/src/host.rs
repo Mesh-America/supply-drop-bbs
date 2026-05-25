@@ -416,7 +416,27 @@ impl Host for BbsHost {
             Command::SetGuestRoom { name } => self.handle_set_guest_room(session, name).await,
 
             Command::Unknown { .. } => {
-                Ok(Response::Text("Unknown command. Type H for help.".into()))
+                // Provide a more helpful nudge when the session is not yet
+                // authenticated.  A user who types freeform text like "Hi"
+                // as their very first message after a BBS restart should be
+                // guided to register/login rather than seeing "Unknown command."
+                let is_authed = {
+                    let sessions = self.sessions.read().await;
+                    sessions
+                        .get(&session)
+                        .map(|r| r.username.is_some())
+                        .unwrap_or(false)
+                };
+                if is_authed {
+                    Ok(Response::Text("Unknown command. Type H for help.".into()))
+                } else {
+                    Ok(Response::Text(
+                        "Not recognized. Type 'register <username>' to create an account\n\
+                         or 'login <username>' if you already have one.\n\
+                         Type H for a list of commands."
+                            .into(),
+                    ))
+                }
             }
             _ => Ok(Response::Error("Command not yet supported.".into())),
         }
@@ -5328,5 +5348,108 @@ mod tests {
                 "verified user should land in Lobby after login"
             );
         }
+    }
+
+    // ── Test helper: register + login in one call ─────────────────────────────
+
+    /// Register `username` with `password` and complete the login flow.
+    /// The session is left authenticated on return.
+    async fn register_and_login(
+        host: &BbsHost,
+        sid: SessionId,
+        username: &Username,
+        password: &str,
+    ) {
+        // Step 1: initiate registration.
+        host.process_command(
+            sid,
+            Command::Register {
+                username: username.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 2: skip optional display name.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 3: enter password.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: password.into(),
+            },
+        )
+        .await
+        .unwrap();
+        // Step 4: confirm password — should log in.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: password.into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::LoggedIn { .. }),
+            "register_and_login: expected LoggedIn, got {resp:?}"
+        );
+    }
+
+    // ── Bug-01: pre-auth Unknown command gives helpful guidance ───────────────
+
+    /// Pre-auth sessions should get a register/login nudge for unrecognised
+    /// input, not the generic "Unknown command. Type H for help."
+    #[tokio::test]
+    async fn unknown_command_pre_auth_suggests_register_or_login() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
+        let resp = host
+            .process_command(sid, Command::Unknown { raw: "Hi".into() })
+            .await
+            .unwrap();
+
+        let Response::Text(text) = resp else {
+            panic!("expected Text, got {resp:?}");
+        };
+        assert!(
+            text.contains("register") || text.contains("login"),
+            "pre-auth unknown-command response should mention register/login, got: {text:?}"
+        );
+    }
+
+    /// Authenticated sessions still get "Unknown command. Type H for help."
+    #[tokio::test]
+    async fn unknown_command_post_auth_returns_generic_message() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::Unknown {
+                    raw: "gibberish".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let Response::Text(text) = resp else {
+            panic!("expected Text, got {resp:?}");
+        };
+        assert!(
+            text.to_lowercase().contains("unknown command"),
+            "authenticated unknown-command should say 'Unknown command', got: {text:?}"
+        );
     }
 }
