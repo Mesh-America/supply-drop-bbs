@@ -454,6 +454,7 @@ impl Command {
                     raw: text.to_owned(),
                 },
             },
+            "whoami" => Command::Whoami,
             "profile" => Command::EditProfile,
             "passwd" => Command::ChangePassword,
 
