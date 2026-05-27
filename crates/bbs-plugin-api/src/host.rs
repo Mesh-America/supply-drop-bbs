@@ -24,6 +24,22 @@
 
 use std::sync::Arc;
 
+/// Request sent from [`Host`] to the mesh transport's admin channel.
+pub enum MeshKeyRequest {
+    /// Fetch the device's private key hex (64 chars).
+    ExportKey {
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    /// Push a new private key (32 raw bytes) to the device.
+    ImportKey {
+        /// Raw 32-byte private key to install on the device.
+        key: [u8; 32],
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
 use crate::admin::{
     AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports,
     AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo,
@@ -386,6 +402,33 @@ pub trait Host: Send + Sync {
     /// Called by the web admin after saving a `[location]` config change.
     /// The mesh transport reads this on the next reconnect.
     fn set_node_location(&self, _location: Option<(f64, f64)>) {}
+
+    /// Called by the mesh transport when AppStart SelfInfo is received.
+    /// Stores the node's public key hex so it can be displayed in the web UI.
+    fn set_node_pubkey(&self, _pubkey_hex: String) {}
+
+    /// Return the current node public key hex (set by the mesh transport on connect).
+    fn node_pubkey(&self) -> Option<String> {
+        None
+    }
+
+    /// Register the mesh transport's admin command channel.
+    /// Called by MeshTransport on start; the sender is stored so Host methods
+    /// can route key operations through the live transport.
+    fn register_mesh_key_ops(&self, _sender: tokio::sync::mpsc::Sender<MeshKeyRequest>) {}
+
+    /// Export the device's private key as a 64-char hex string.
+    /// Requires the mesh transport to be connected.
+    async fn admin_export_node_key(&self) -> Result<String, HostError> {
+        Err(HostError::NotSupported("admin_export_node_key".into()))
+    }
+
+    /// Import a new private key from a 64-char hex string.
+    /// Requires the mesh transport to be connected.
+    async fn admin_import_node_key(&self, hex: String) -> Result<(), HostError> {
+        let _ = hex;
+        Err(HostError::NotSupported("admin_import_node_key".into()))
+    }
 
     // ── Mesh node credentials ────────────────────────────────────────────────────
     //
