@@ -2098,6 +2098,25 @@ impl BbsHost {
                         return self.handle_change_to_room(session, target_id).await;
                     }
                 }
+                // Allow "C <name>" to navigate directly while the room list is active,
+                // so users don't need to cancel with X first.
+                {
+                    let lower = trimmed.to_ascii_lowercase();
+                    if let Some(rest) = lower.strip_prefix("c ") {
+                        let rest = rest.trim();
+                        if !rest.is_empty() {
+                            // Preserve original casing from the user's input.
+                            let name = trimmed[2..].trim();
+                            {
+                                let mut sessions = self.sessions.write().await;
+                                if let Some(r) = sessions.get_mut(&session) {
+                                    r.workflow = Workflow::None;
+                                }
+                            }
+                            return self.handle_change_room(session, name).await;
+                        }
+                    }
+                }
                 // Fall back: treat as room name via the normal change-room path.
                 //
                 // Guard against out-of-order mesh delivery: if the user typed a
@@ -2109,7 +2128,8 @@ impl BbsHost {
                 // workflow and tell the user to re-send their command.
                 let is_cmd_keyword = matches!(
                     trimmed.to_ascii_lowercase().as_str(),
-                    "n" | "f"
+                    "c" | "n"
+                        | "f"
                         | "r"
                         | "g"
                         | "k"
@@ -5780,5 +5800,110 @@ mod tests {
             !matches!(resp2, Response::Error(_)),
             "ReadNew after cancelled room-selection should not error, got {resp2:?}"
         );
+    }
+
+    // ── Bug-20: "C <name>" navigation during K room-list workflow ─────────────
+
+    /// When the user sends "C Lobby" while in Workflow::Rooms, the BBS should
+    /// cancel the workflow and navigate to the named room — not treat "C Lobby"
+    /// as a literal room name.
+    #[tokio::test]
+    async fn rooms_workflow_c_name_navigates_directly() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Enter room-selection workflow.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(resp, Response::Prompt { .. }),
+            "K should enter Workflow::Rooms and return Prompt"
+        );
+
+        // Verify we are in the Workflow::Rooms state.
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::Rooms { .. }),
+                "workflow should be Workflow::Rooms after K"
+            );
+        }
+
+        // Send "C Lobby" — should cancel the workflow and navigate to Lobby.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "C Lobby".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Response should not be an error about "Room 'C Lobby' not found".
+        if let Response::Error(e) = &resp {
+            panic!("Expected successful navigation with 'C Lobby', got error: {e:?}");
+        }
+
+        // Workflow should be cleared.
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::None),
+                "workflow should be cleared after 'C Lobby'"
+            );
+        }
+
+        // The session should now be in the Lobby room.
+        {
+            let sessions = host.sessions.read().await;
+            assert_eq!(
+                sessions[&sid].current_room, LOBBY_ROOM_ID,
+                "user should be in the Lobby room after 'C Lobby'"
+            );
+        }
+    }
+
+    /// When the user sends bare "C" (no room name) while in Workflow::Rooms, it
+    /// should cancel the workflow with a keyword-cancelled message (not error).
+    #[tokio::test]
+    async fn rooms_workflow_bare_c_cancels_with_keyword_message() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Enter room-selection workflow.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(resp, Response::Prompt { .. }),
+            "K should enter Workflow::Rooms and return Prompt"
+        );
+
+        // Send bare "C" — matches is_cmd_keyword and should cancel cleanly.
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "C".into() })
+            .await
+            .unwrap();
+
+        let text = match resp {
+            Response::Text(t) => t,
+            Response::Error(e) => e,
+            other => panic!("expected Text or Error for bare 'C', got {other:?}"),
+        };
+        assert!(
+            text.to_lowercase().contains("cancel"),
+            "bare 'C' during room workflow should produce a cancellation message, got: {text:?}"
+        );
+
+        // Workflow should be cleared.
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::None),
+                "workflow should be Workflow::None after bare 'C'"
+            );
+        }
     }
 }
