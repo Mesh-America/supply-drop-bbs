@@ -696,7 +696,7 @@ async fn handle_frame(
             // While draining, discard queued messages and request the next one
             // so we flush the entire backlog before serving live traffic.
             if draining.load(Ordering::Relaxed) {
-                info!(
+                debug!(
                     prefix = msg.sender_key_prefix[0],
                     "mesh: discarding stale queued message (draining)"
                 );
@@ -707,14 +707,14 @@ async fn handle_frame(
             // Only handle plain-text messages; CLI data and signed frames are
             // not BBS commands.
             if msg.txt_type != meshcore_companion::constants::TXT_TYPE_PLAIN {
-                info!(
+                debug!(
                     txt_type = msg.txt_type,
                     "mesh: ignoring non-plain-text ContactMsg"
                 );
                 return;
             }
 
-            info!(
+            debug!(
                 prefix = msg.sender_key_prefix[0],
                 txt_type = msg.txt_type,
                 len = msg.text.len(),
@@ -737,7 +737,7 @@ async fn handle_frame(
         // ── Queued message notification ───────────────────────────────────────
         // The bridge has a message waiting; fetch it with SyncNextMessage.
         InboundFrame::MsgWaiting => {
-            info!("mesh: MsgWaiting — fetching next queued message");
+            debug!("mesh: MsgWaiting — fetching next queued message");
             if cmd_tx.send(OutboundFrame::SyncNextMessage).await.is_err() {
                 warn!("mesh: could not enqueue SyncNextMessage — cmd channel closed");
             }
@@ -942,7 +942,7 @@ async fn dispatch_message(
             .set_last_workflow_reply(&sender_prefix, text.to_owned());
     }
 
-    info!(?session, ?cmd, "mesh: dispatching command");
+    debug!(?session, ?cmd, "mesh: dispatching command");
 
     // ── Process through the host ──────────────────────────────────────────────
     // On UnknownSession (e.g. server restarted while the transport retained a
@@ -1070,7 +1070,7 @@ async fn dispatch_message(
             reply_text
         };
 
-        info!(
+        debug!(
             ?session,
             len = reply_text.len(),
             frame = i + 1,
