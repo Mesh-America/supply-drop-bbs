@@ -725,26 +725,35 @@ pub fn run_wizard(config_out: Option<&Path>) {
     let config_chown_ok = {
         const SERVICE_USER: &str = "supply-drop";
         let chown_arg = format!("{SERVICE_USER}:{SERVICE_USER}");
-        // Chown the parent directory so the service can atomically rewrite the file.
-        if let Some(parent) = out_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = std::process::Command::new("chown")
+        // Chown the parent directory so the service can atomically rewrite the
+        // file.  Track whether this succeeds — if it fails, the web admin
+        // still cannot save config even if the file itself was chowned.
+        let dir_ok = match out_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => matches!(
+                std::process::Command::new("chown")
                     .args([chown_arg.as_str(), &parent.to_string_lossy()])
-                    .status();
-            }
-        }
+                    .status(),
+                Ok(s) if s.success()
+            ),
+            // No meaningful parent (e.g. path is just a filename with no
+            // directory component) — nothing to chown, not a failure.
+            _ => true,
+        };
         let file_ok = matches!(
             std::process::Command::new("chown")
                 .args([chown_arg.as_str(), &out_path.to_string_lossy()])
                 .status(),
             Ok(s) if s.success()
         );
-        if file_ok {
+        // Both the directory AND the file must be re-owned for the web admin
+        // to write config.toml atomically.
+        let both_ok = dir_ok && file_ok;
+        if both_ok {
             println!(
                 "  ownership set to {SERVICE_USER}:{SERVICE_USER} (web admin can save config)"
             );
         }
-        file_ok
+        both_ok
     };
     #[cfg(not(target_os = "linux"))]
     let config_chown_ok = true;
