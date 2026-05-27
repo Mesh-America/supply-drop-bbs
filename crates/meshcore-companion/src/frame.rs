@@ -465,8 +465,10 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         RESP_CODE_ADVERT_PATH => Ok(InboundFrame::AdvertPath { raw: body.to_vec() }),
         RESP_CODE_TUNING_PARAMS => Ok(InboundFrame::TuningParams { raw: body.to_vec() }),
         RESP_CODE_CUSTOM_VARS => {
-            let s = std::str::from_utf8(body).map_err(|_| FrameDecodeError::InvalidUtf8)?;
-            Ok(InboundFrame::CustomVars { csv: s.to_owned() })
+            // Lossy conversion: same reasoning as read_cstr — bad bytes become U+FFFD.
+            Ok(InboundFrame::CustomVars {
+                csv: String::from_utf8_lossy(body).into_owned(),
+            })
         }
 
         PUSH_CODE_ADVERT => {
@@ -846,9 +848,11 @@ fn copy32(b: &[u8]) -> [u8; 32] {
 
 fn read_cstr(b: &[u8]) -> Result<String, FrameDecodeError> {
     let end = b.iter().position(|&x| x == 0).unwrap_or(b.len());
-    std::str::from_utf8(&b[..end])
-        .map(|s| s.to_owned())
-        .map_err(|_| FrameDecodeError::InvalidUtf8)
+    // Use lossy UTF-8 so that node/contact names containing non-UTF-8 bytes
+    // (e.g. truncated emoji, Latin-1 characters, or zero-padded fields with
+    // stray high bytes) don't kill the session. Invalid bytes are replaced with
+    // the Unicode replacement character U+FFFD.
+    Ok(String::from_utf8_lossy(&b[..end]).into_owned())
 }
 
 fn parse_contact(body: &[u8]) -> Result<Contact, FrameDecodeError> {

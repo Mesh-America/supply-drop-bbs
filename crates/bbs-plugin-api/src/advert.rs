@@ -108,6 +108,51 @@ impl AdvertBus {
         entry.last_seen_secs = now;
     }
 
+    /// Insert or update a full advertisement with an explicit `last_seen` timestamp.
+    ///
+    /// Use this when the timestamp comes from the device (e.g. the
+    /// `last_advert_timestamp` field in a `RESP_CODE_CONTACT` frame) rather than
+    /// the current wall clock. A `device_last_seen` of `0` falls back to `now`.
+    ///
+    /// Updates all fields for an existing record; preserves `first_seen_secs`.
+    pub fn upsert_with_timestamp(
+        &self,
+        pubkey: [u8; 32],
+        name: String,
+        adv_type: u8,
+        gps_lat: i32,
+        gps_lon: i32,
+        device_last_seen: i64,
+    ) {
+        let now = unix_now();
+        let last_seen = if device_last_seen > 0 {
+            device_last_seen
+        } else {
+            now
+        };
+        let lat = gps_lat as f64 / 1_000_000.0;
+        let lon = gps_lon as f64 / 1_000_000.0;
+        let mut records = self.records.lock().expect("advert bus poisoned");
+        let entry = records.entry(pubkey).or_insert_with(|| AdvertRecord {
+            pubkey_hex: hex_encode(&pubkey),
+            name: String::new(),
+            adv_type: 0,
+            lat: 0.0,
+            lon: 0.0,
+            first_seen_secs: now,
+            last_seen_secs: last_seen,
+        });
+        entry.name = name;
+        entry.adv_type = adv_type;
+        entry.lat = lat;
+        entry.lon = lon;
+        // Only advance last_seen — never move it backwards. A live advert
+        // arriving later will always have a wall-clock time ≥ the stored value.
+        if last_seen > entry.last_seen_secs {
+            entry.last_seen_secs = last_seen;
+        }
+    }
+
     /// Insert or update a short advertisement (pubkey only).
     ///
     /// Updates `last_seen_secs` on an existing record without overwriting
