@@ -382,16 +382,23 @@ fn decode_body_too_short_for_type() {
 }
 
 #[test]
-fn decode_invalid_utf8_errors() {
+fn decode_tolerates_invalid_utf8() {
     // RESP_CODE_CHANNEL_MSG_RECV: [chan_idx][path_len][txt_type][ts×4][invalid utf8]
+    // read_cstr now uses from_utf8_lossy so invalid bytes become U+FFFD rather
+    // than returning an error and killing the session.
     let mut payload = vec![RESP_CODE_CHANNEL_MSG_RECV];
     payload.push(0); // channel_idx
     payload.push(0); // path_len
     payload.push(0); // txt_type
     payload.extend_from_slice(&0u32.to_le_bytes()); // timestamp
-    payload.push(0xFF); // invalid UTF-8 byte
-    let err = decode_inbound(&payload).unwrap_err();
-    assert_eq!(err, FrameDecodeError::InvalidUtf8);
+    payload.push(0xFF); // invalid UTF-8 byte → replaced with U+FFFD
+    let frame = decode_inbound(&payload).unwrap();
+    match frame {
+        InboundFrame::ChannelMsgRecv(msg) => {
+            assert_eq!(msg.text, "\u{FFFD}", "invalid byte should become U+FFFD");
+        }
+        other => panic!("expected ChannelMsgRecv, got {other:?}"),
+    }
 }
 
 // ── decode_inbound — contact struct ──────────────────────────────────────────

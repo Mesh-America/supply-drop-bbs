@@ -760,12 +760,18 @@ async fn handle_frame(
             // Populate the advert bus with full metadata from the device's
             // contact list — these arrive as RESP_CODE_CONTACT frames after
             // CMD_GET_CONTACTS and contain name, type, and location.
-            host.advert_bus().upsert(
+            //
+            // Use upsert_with_timestamp so the "Last Seen" column reflects the
+            // real last-advert time stored on the device rather than the moment
+            // we happened to run GetContacts (which would make every row show
+            // the same timestamp).
+            host.advert_bus().upsert_with_timestamp(
                 contact.pubkey,
                 contact.name.clone(),
                 contact.adv_type,
                 contact.gps_lat,
                 contact.gps_lon,
+                contact.last_advert_timestamp as i64,
             );
             // Record the full pubkey mapping so ResetPath can find the node.
             let prefix: [u8; 6] = contact.pubkey[..6].try_into().expect("pubkey is 32 bytes");
