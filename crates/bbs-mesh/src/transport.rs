@@ -541,15 +541,20 @@ async fn event_loop(
                             }
                         } else {
                             // Device did not return SelfInfo (CMD_APP_START
-                            // was unsupported) — node identity and radio
-                            // params are unavailable until the device pushes
-                            // an advert.
+                            // was unsupported) — node identity is unavailable
+                            // until the device pushes an advert.
                             info!(
                                 "mesh: radio bridge connected (no SelfInfo — \
                                  CMD_APP_START unsupported by device) \
                                  — draining stale queue"
                             );
                         }
+
+                        // Fetch the full contact list so the advert bus is populated
+                        // with names, types, and locations. Without this, nodes already
+                        // in the device's contact table arrive only as short adverts
+                        // (pubkey-only stubs) via PUSH_CODE_ADVERT (0x80).
+                        let _ = cmd_tx.send(OutboundFrame::GetContacts { since: 0 }).await;
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
                         if will_retry {
@@ -681,6 +686,35 @@ async fn handle_frame(
                 .expect("state mutex poisoned")
                 .set_full_pubkey(&prefix, contact.pubkey);
             debug!(name = %contact.name, "mesh: full advert (new contact) received");
+        }
+
+        // ── Contact list sync (response to CMD_GET_CONTACTS) ─────────────────
+        InboundFrame::Contact(contact) => {
+            // Populate the advert bus with full metadata from the device's
+            // contact list — these arrive as RESP_CODE_CONTACT frames after
+            // CMD_GET_CONTACTS and contain name, type, and location.
+            host.advert_bus().upsert(
+                contact.pubkey,
+                contact.name.clone(),
+                contact.adv_type,
+                contact.gps_lat,
+                contact.gps_lon,
+            );
+            // Record the full pubkey mapping so ResetPath can find the node.
+            let prefix: [u8; 6] = contact.pubkey[..6].try_into().expect("pubkey is 32 bytes");
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_full_pubkey(&prefix, contact.pubkey);
+            debug!(name = %contact.name, "mesh: contact list entry → advert bus");
+        }
+        InboundFrame::ContactsStart { count: _ } => {
+            debug!("mesh: contact list sync started");
+        }
+        InboundFrame::EndOfContacts {
+            most_recent_lastmod: _,
+        } => {
+            debug!("mesh: contact list sync complete");
         }
 
         // ── Everything else ───────────────────────────────────────────────────
