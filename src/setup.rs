@@ -48,6 +48,8 @@ struct Existing {
     // pymc-companion (HAT)
     region_idx: usize,
     hat_idx: usize,
+    // USB serial radio preset (index into REGION_PRESETS, None = not configured)
+    mesh_radio_preset: Option<usize>,
     // GPS
     latitude: Option<f64>,
     longitude: Option<f64>,
@@ -162,6 +164,13 @@ fn load_existing(out_path: &Path) -> Existing {
     let yaml_path = companion_yaml_path(out_path);
     let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
 
+    // USB serial radio preset — read from [plugins.mesh.radio].preset
+    let mesh_radio_preset = mesh
+        .and_then(|m| m.get("radio"))
+        .and_then(|r| r.get("preset"))
+        .and_then(|v| v.as_str())
+        .and_then(|name| REGION_PRESETS.iter().position(|r| r.name == name));
+
     Existing {
         bbs_name,
         data_dir,
@@ -179,6 +188,7 @@ fn load_existing(out_path: &Path) -> Existing {
         web_backup_dir,
         region_idx: match_region_preset(&yaml),
         hat_idx: match_hat_preset(&yaml),
+        mesh_radio_preset,
         latitude,
         longitude,
         process_plugins_toml,
@@ -274,6 +284,7 @@ fn match_hat_preset(yaml: &str) -> usize {
     0
 }
 
+use crate::mesh_presets::REGION_PRESETS;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -413,6 +424,47 @@ pub fn run_wizard(config_out: Option<&Path>) {
         mesh_baud_rate = None;
         mesh_addr = None;
     }
+
+    // ── MeshCore radio parameters (serial mode only) ──────────────────────────
+    //
+    // For HAT mode, radio parameters go into pymc-companion.yaml (handled
+    // later by configure_hat). For TCP mode, pymc_core owns the radio config.
+    // Only USB serial devices are configured here.
+
+    let mesh_radio_preset: Option<usize> = if use_mesh && mesh_conn_type == "serial" {
+        section("MeshCore radio parameters");
+
+        println!("Select a region preset to configure the radio.");
+        println!("Skip this step if the device is already on the correct frequency.");
+        println!();
+
+        let configure = Confirm::with_theme(&theme)
+            .with_prompt("Configure radio parameters now?")
+            .default(ex.mesh_radio_preset.is_some())
+            .interact()
+            .unwrap_or_else(|_| cancelled());
+
+        if configure {
+            let region_names: Vec<String> = REGION_PRESETS
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{:<26} ({:.3} MHz)",
+                        r.name,
+                        r.frequency_hz as f64 / 1_000_000.0
+                    )
+                })
+                .collect();
+
+            let default_region = ex.mesh_radio_preset.unwrap_or(14); // USA/Canada
+            let choice = prompt_select(&theme, "Select your region", &region_names, default_region);
+            Some(choice)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // ── Meshtastic connection ─────────────────────────────────────────────────
 
@@ -643,6 +695,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         latitude: gps_lat,
         longitude: gps_lon,
         process_plugins_toml: ex.process_plugins_toml.as_deref(),
+        mesh_radio_preset,
     });
 
     if let Some(parent) = out_path.parent() {
@@ -820,172 +873,6 @@ fn configure_uart_hat(theme: &ColorfulTheme, existing_port: Option<&str>) -> (St
 
     (port, 115_200)
 }
-
-// ── Region presets ────────────────────────────────────────────────────────────
-
-struct RegionPreset {
-    name: &'static str,
-    frequency_hz: u64,
-    bandwidth_hz: u32,
-    spreading_factor: u8,
-    coding_rate: u8,
-    tx_power_dbm: i32,
-}
-
-const REGION_PRESETS: &[RegionPreset] = &[
-    RegionPreset {
-        name: "Australia",
-        frequency_hz: 915_800_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 10,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Australia (Narrow)",
-        frequency_hz: 916_575_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Australia SA, WA, QLD",
-        frequency_hz: 923_125_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 8,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Czech Republic",
-        frequency_hz: 869_432_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "EU 433MHz",
-        frequency_hz: 433_650_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "EU/UK (Long Range)",
-        frequency_hz: 869_525_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "EU/UK (Medium Range)",
-        frequency_hz: 869_525_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 10,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "EU/UK (Narrow)",
-        frequency_hz: 869_618_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 8,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "New Zealand",
-        frequency_hz: 917_375_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "New Zealand (Narrow)",
-        frequency_hz: 917_375_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Portugal 433",
-        frequency_hz: 433_375_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 9,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Portugal 869",
-        frequency_hz: 869_618_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "Switzerland",
-        frequency_hz: 869_618_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 8,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "USA Arizona",
-        frequency_hz: 908_205_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 10,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "USA/Canada",
-        frequency_hz: 910_525_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Vietnam",
-        frequency_hz: 920_250_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Off-Grid 433",
-        frequency_hz: 433_000_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 8,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Off-Grid 869",
-        frequency_hz: 869_000_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 8,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "Off-Grid 918",
-        frequency_hz: 918_000_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 8,
-        tx_power_dbm: 20,
-    },
-];
 
 // ── Pi HAT configuration ──────────────────────────────────────────────────────
 
@@ -1411,6 +1298,8 @@ struct TomlParams<'a> {
     longitude: Option<f64>,
     // Process plugins — preserved verbatim from the previous config
     process_plugins_toml: Option<&'a str>,
+    // USB serial radio preset (index into REGION_PRESETS; None = omit section)
+    mesh_radio_preset: Option<usize>,
 }
 
 fn build_toml(p: &TomlParams<'_>) -> String {
@@ -1466,6 +1355,16 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 }
             }
             _ => {}
+        }
+    }
+
+    // [plugins.mesh.radio] — only for USB serial with a preset chosen
+    if p.use_mesh && p.mesh_connection_type == "serial" {
+        if let Some(idx) = p.mesh_radio_preset {
+            if let Some(preset) = REGION_PRESETS.get(idx) {
+                writeln!(s, "\n[plugins.mesh.radio]").unwrap();
+                writeln!(s, "preset = {}", toml_str(preset.name)).unwrap();
+            }
         }
     }
 
