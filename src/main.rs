@@ -112,6 +112,15 @@ enum Commands {
 
     /// Print a system metrics snapshot (CPU, memory, disk, network) and exit.
     Metrics,
+
+    /// Manage the USB serial MeshCore companion device's node identity.
+    ///
+    /// These commands open the serial port directly to communicate with the device.
+    /// The BBS service must not be running on the same port when you execute them.
+    Node {
+        #[command(subcommand)]
+        action: NodeAction,
+    },
 }
 
 #[derive(Subcommand)]
@@ -254,6 +263,48 @@ enum ConfigAction {
     },
 }
 
+#[derive(Subcommand)]
+#[allow(clippy::enum_variant_names)] // "Key" postfix is intentional — all actions operate on a key
+enum NodeAction {
+    /// Show the companion device's public key (hex).
+    ///
+    /// Connects to the device, performs the AppStart handshake, and prints the
+    /// 32-byte public key from the SelfInfo response.
+    ShowKey {
+        /// Serial port to connect to (e.g. /dev/ttyACM0, COM3).
+        /// Defaults to the port in config.toml [plugins.mesh].
+        #[arg(long)]
+        port: Option<String>,
+        /// Baud rate. Defaults to the value in config.toml or 115200.
+        #[arg(long)]
+        baud: Option<u32>,
+    },
+    /// Export the companion device's private key as hex.
+    ///
+    /// The private key uniquely identifies the node on the mesh.
+    /// Keep it secret and back it up — you will need it to restore the node's
+    /// identity after a firmware flash or to migrate to new hardware.
+    ExportKey {
+        #[arg(long)]
+        port: Option<String>,
+        #[arg(long)]
+        baud: Option<u32>,
+    },
+    /// Import a private key into the companion device.
+    ///
+    /// The key must be exactly 64 hex characters (32 bytes).
+    /// The device's current key is replaced immediately. Back it up first with
+    /// `export-key` if you may need to restore it.
+    ImportKey {
+        /// 64 hex characters (32 bytes).
+        key: String,
+        #[arg(long)]
+        port: Option<String>,
+        #[arg(long)]
+        baud: Option<u32>,
+    },
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -273,6 +324,7 @@ async fn main() {
         #[cfg(feature = "transport-process")]
         Some(Commands::Plugin { action }) => cmd_plugin(config_path.as_deref(), action),
         Some(Commands::Metrics) => cmd_metrics(),
+        Some(Commands::Node { action }) => cmd_node(config_path.as_deref(), action).await,
     }
 }
 
@@ -1596,6 +1648,190 @@ async fn cmd_room(config_path: Option<&std::path::Path>, action: RoomAction) {
                 }
             }
         }
+    }
+}
+
+async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
+    #[cfg(feature = "transport-mesh")]
+    {
+        use meshcore_companion::{
+            client::{ClientEvent, CompanionClient, SerialConfig},
+            constants::APP_TARGET_VER_V3,
+            frame::{InboundFrame, OutboundFrame},
+        };
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        // ── Resolve port / baud from flags or config ──────────────────────
+        let cfg = config::load(config_path).unwrap_or_default();
+        let mesh_cfg = &cfg.plugins.mesh;
+
+        let (port_flag, baud_flag) = match &action {
+            NodeAction::ShowKey { port, baud } => (port.clone(), *baud),
+            NodeAction::ExportKey { port, baud } => (port.clone(), *baud),
+            NodeAction::ImportKey { port, baud, .. } => (port.clone(), *baud),
+        };
+
+        let port = match port_flag.or_else(|| {
+            if mesh_cfg.connection_type == bbs_mesh::config::ConnectionType::Serial {
+                mesh_cfg.serial_port.clone()
+            } else {
+                None
+            }
+        }) {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "error: no serial port specified. Use --port or set [plugins.mesh] \
+                     connection_type = \"serial\" and serial_port in config.toml"
+                );
+                std::process::exit(1);
+            }
+        };
+
+        let baud = baud_flag.unwrap_or(mesh_cfg.baud_rate);
+
+        eprintln!("Connecting to {port} at {baud} baud...");
+
+        // ── Build the command to send after Connected ─────────────────────
+        let cmd_to_send: OutboundFrame = match &action {
+            NodeAction::ShowKey { .. } => {
+                // We only need SelfInfo from the Connected event — no extra command needed.
+                // Send GetBattAndStorage as a no-op to keep the connection alive.
+                OutboundFrame::GetBattAndStorage
+            }
+            NodeAction::ExportKey { .. } => OutboundFrame::ExportPrivateKey,
+            NodeAction::ImportKey { key, .. } => {
+                let hex = key.trim();
+                if hex.len() != 64 {
+                    eprintln!(
+                        "error: key must be exactly 64 hex characters ({} given)",
+                        hex.len()
+                    );
+                    std::process::exit(1);
+                }
+                let mut bytes = [0u8; 32];
+                for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+                    let s = std::str::from_utf8(chunk).unwrap_or("??");
+                    bytes[i] = match u8::from_str_radix(s, 16) {
+                        Ok(b) => b,
+                        Err(_) => {
+                            eprintln!("error: invalid hex character in key at position {}", i * 2);
+                            std::process::exit(1);
+                        }
+                    };
+                }
+                OutboundFrame::ImportPrivateKey { key: bytes }
+            }
+        };
+
+        let serial_cfg = SerialConfig {
+            port,
+            baud_rate: baud,
+            app_target_version: APP_TARGET_VER_V3,
+            // Don't retry on CLI — if the port is unavailable, fail fast.
+            reconnect_delay_initial: Duration::from_secs(60),
+            reconnect_delay_max: Duration::from_secs(60),
+        };
+
+        let mut client = CompanionClient::connect_serial(serial_cfg);
+
+        // ── Wait up to 15 s for the whole operation ───────────────────────
+        let result = timeout(Duration::from_secs(15), async {
+            let mut connected = false;
+
+            while let Some(event) = client.recv().await {
+                match event {
+                    ClientEvent::Connected { self_info } => {
+                        connected = true;
+                        if let Some(ref info) = self_info {
+                            let pk_hex: String =
+                                info.pubkey.iter().map(|b| format!("{b:02x}")).collect();
+                            eprintln!("Connected: {} ({})", info.node_name, pk_hex);
+                        } else {
+                            eprintln!("Connected (no SelfInfo)");
+                        }
+
+                        // For show-key we're done once we have SelfInfo.
+                        if let NodeAction::ShowKey { .. } = &action {
+                            match self_info {
+                                Some(info) => {
+                                    let hex: String =
+                                        info.pubkey.iter().map(|b| format!("{b:02x}")).collect();
+                                    println!("{hex}");
+                                    return Ok::<(), String>(());
+                                }
+                                None => {
+                                    return Err(
+                                        "device did not return SelfInfo — public key unavailable"
+                                            .to_owned(),
+                                    );
+                                }
+                            }
+                        }
+
+                        // For export/import, send the command now.
+                        if let Err(e) = client.send(cmd_to_send.clone()).await {
+                            return Err(format!("send failed: {e}"));
+                        }
+                    }
+                    ClientEvent::Frame(frame) => match frame {
+                        InboundFrame::PrivateKey { ref key } => {
+                            if let NodeAction::ExportKey { .. } = &action {
+                                let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                                println!("{hex}");
+                                return Ok(());
+                            }
+                        }
+                        InboundFrame::Ok => {
+                            if let NodeAction::ImportKey { .. } = &action {
+                                eprintln!("Key imported successfully.");
+                                return Ok(());
+                            }
+                        }
+                        InboundFrame::Err { error_code } => {
+                            return Err(format!("device returned error code {error_code}"));
+                        }
+                        _ => {} // ignore other frames
+                    },
+                    ClientEvent::Disconnected { will_retry: false } => {
+                        if !connected {
+                            return Err("connection failed".to_owned());
+                        }
+                        return Err("disconnected before operation completed".to_owned());
+                    }
+                    ClientEvent::Disconnected { will_retry: true } => {
+                        if !connected {
+                            return Err("connection failed".to_owned());
+                        }
+                    }
+                }
+            }
+            Err("connection closed unexpectedly".to_owned())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+            Err(_) => {
+                eprintln!("error: timed out waiting for device response (15s)");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "transport-mesh"))]
+    {
+        let _ = (config_path, action);
+        eprintln!(
+            "error: the `node` subcommand requires the `transport-mesh` feature. \
+             Rebuild with --features transport-mesh."
+        );
+        std::process::exit(1);
     }
 }
 
