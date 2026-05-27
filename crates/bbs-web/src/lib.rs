@@ -1553,6 +1553,17 @@ async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // ── Config read / write ───────────────────────────────────────────────────────
 
+/// One entry in the `presets` list returned by `GET /api/v1/radio-config`.
+#[derive(Debug, Clone, Serialize)]
+struct RadioPresetDetail {
+    name: &'static str,
+    frequency_hz: u64,
+    bandwidth_hz: u32,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power_dbm: i32,
+}
+
 /// Response body for `GET /api/v1/radio-config`.
 #[derive(Debug, Serialize)]
 struct RadioConfigResponse {
@@ -1562,8 +1573,12 @@ struct RadioConfigResponse {
     spreading_factor: Option<u8>,
     coding_rate: Option<u8>,
     tx_power_dbm: Option<i32>,
-    /// All available preset names, for populating the UI dropdown.
-    presets: Vec<&'static str>,
+    /// MeshCore connection type: `"serial"`, `"tcp"`, or `"hat"`.
+    connection_type: Option<String>,
+    /// Serial port path (only set when `connection_type` is `"serial"`).
+    serial_port: Option<String>,
+    /// Full preset details for populating the UI dropdown and auto-filling fields.
+    presets: Vec<RadioPresetDetail>,
 }
 
 /// Patch body for `PATCH /api/v1/radio-config`.
@@ -1698,26 +1713,161 @@ fn system_timezone() -> String {
 
 /// Preset names mirrored from `src/mesh_presets.rs`.
 /// Duplicated here because `bbs-web` does not depend on the main binary.
-const RADIO_PRESET_NAMES: &[&str] = &[
-    "Australia",
-    "Australia (Narrow)",
-    "Australia SA, WA, QLD",
-    "Czech Republic",
-    "EU 433MHz",
-    "EU/UK (Long Range)",
-    "EU/UK (Medium Range)",
-    "EU/UK (Narrow)",
-    "New Zealand",
-    "New Zealand (Narrow)",
-    "Portugal 433",
-    "Portugal 869",
-    "Switzerland",
-    "USA Arizona",
-    "USA/Canada",
-    "Vietnam",
-    "Off-Grid 433",
-    "Off-Grid 869",
-    "Off-Grid 918",
+/// Full preset data mirrored from `src/mesh_presets.rs`.
+/// Duplicated here because `bbs-web` does not depend on the main binary.
+const RADIO_PRESETS: &[RadioPresetDetail] = &[
+    RadioPresetDetail {
+        name: "Australia",
+        frequency_hz: 915_800_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Australia (Narrow)",
+        frequency_hz: 916_575_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Australia SA, WA, QLD",
+        frequency_hz: 923_125_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Czech Republic",
+        frequency_hz: 869_432_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "EU 433MHz",
+        frequency_hz: 433_650_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "EU/UK (Long Range)",
+        frequency_hz: 869_525_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "EU/UK (Medium Range)",
+        frequency_hz: 869_525_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "EU/UK (Narrow)",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "New Zealand",
+        frequency_hz: 917_375_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "New Zealand (Narrow)",
+        frequency_hz: 917_375_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Portugal 433",
+        frequency_hz: 433_375_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 9,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Portugal 869",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "Switzerland",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "USA Arizona",
+        frequency_hz: 908_205_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "USA/Canada",
+        frequency_hz: 910_525_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Vietnam",
+        frequency_hz: 920_250_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Off-Grid 433",
+        frequency_hz: 433_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Off-Grid 869",
+        frequency_hz: 869_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "Off-Grid 918",
+        frequency_hz: 918_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 20,
+    },
 ];
 
 fn read_config_toml(path: &str) -> Result<toml::Value, String> {
@@ -2209,6 +2359,9 @@ async fn api_get_radio_config(
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
     };
 
+    let connection_type = toml_plugin_str(&val, "mesh", "connection_type");
+    let serial_port = toml_plugin_str(&val, "mesh", "serial_port");
+
     Json(RadioConfigResponse {
         preset: toml_radio_str(&val, "preset"),
         frequency_hz: toml_radio_u64(&val, "frequency_hz"),
@@ -2216,7 +2369,9 @@ async fn api_get_radio_config(
         spreading_factor: toml_radio_u32(&val, "spreading_factor").map(|v| v as u8),
         coding_rate: toml_radio_u32(&val, "coding_rate").map(|v| v as u8),
         tx_power_dbm: toml_radio_i32(&val, "tx_power_dbm"),
-        presets: RADIO_PRESET_NAMES.to_vec(),
+        connection_type,
+        serial_port,
+        presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
 }
@@ -2343,7 +2498,9 @@ async fn api_patch_radio_config(
         spreading_factor: toml_radio_u32(&val, "spreading_factor").map(|v| v as u8),
         coding_rate: toml_radio_u32(&val, "coding_rate").map(|v| v as u8),
         tx_power_dbm: toml_radio_i32(&val, "tx_power_dbm"),
-        presets: RADIO_PRESET_NAMES.to_vec(),
+        connection_type: toml_plugin_str(&val, "mesh", "connection_type"),
+        serial_port: toml_plugin_str(&val, "mesh", "serial_port"),
+        presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
 }
