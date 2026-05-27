@@ -421,11 +421,90 @@ async function saveRadioConfig() {
   }
 }
 
+// ── Node identity ─────────────────────────────────────────────────────────────
+
+interface NodeIdentityData {
+  pubkey: string | null
+}
+
+const nodeIdentity = ref<NodeIdentityData | null>(null)
+const nodeIdentityLoading = ref(false)
+const nodeIdentityError = ref<string | null>(null)
+
+// Export state
+const exportedKey = ref<string | null>(null)
+const exportKeyLoading = ref(false)
+const exportKeyError = ref<string | null>(null)
+const exportKeyVisible = ref(false)
+
+// Import state
+const importKeyInput = ref('')
+const importKeyLoading = ref(false)
+const importKeyOk = ref<string | null>(null)
+const importKeyError = ref<string | null>(null)
+const showImportForm = ref(false)
+
+async function loadNodeIdentity() {
+  nodeIdentityLoading.value = true
+  nodeIdentityError.value = null
+  try {
+    const r = await api.get<NodeIdentityData>('/api/v1/node-identity')
+    nodeIdentity.value = r
+  } catch (e: any) {
+    nodeIdentityError.value = e?.message ?? 'failed to load node identity'
+  } finally {
+    nodeIdentityLoading.value = false
+  }
+}
+
+async function exportNodeKey() {
+  exportKeyLoading.value = true
+  exportKeyError.value = null
+  exportedKey.value = null
+  try {
+    const r = await api.post<{ key: string }>('/api/v1/node-identity/export-key', {})
+    exportedKey.value = r.key
+    exportKeyVisible.value = false
+  } catch (e: any) {
+    exportKeyError.value = e?.message ?? 'failed to export key'
+  } finally {
+    exportKeyLoading.value = false
+  }
+}
+
+async function importNodeKey() {
+  importKeyOk.value = null
+  importKeyError.value = null
+  const hex = importKeyInput.value.trim()
+  if (hex.length !== 64 || !/^[0-9a-fA-F]+$/.test(hex)) {
+    importKeyError.value = 'Private key must be exactly 64 hex characters (32 bytes).'
+    return
+  }
+  importKeyLoading.value = true
+  try {
+    await api.post('/api/v1/node-identity/import-key', { key: hex })
+    importKeyOk.value = 'Private key imported successfully. The node\'s public key will update on the next connection.'
+    importKeyInput.value = ''
+    showImportForm.value = false
+    // Reload identity so pubkey refreshes.
+    await loadNodeIdentity()
+  } catch (e: any) {
+    importKeyError.value = e?.message ?? 'failed to import key'
+  } finally {
+    importKeyLoading.value = false
+  }
+}
+
+function copyToClipboard(text: string) {
+  navigator.clipboard.writeText(text).catch(() => {})
+}
+
 onMounted(() => {
   load()
   loadRooms()
   loadAccessPolicy()
   loadRadioConfig()
+  loadNodeIdentity()
 })
 </script>
 
@@ -749,6 +828,83 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
+      <!-- Node identity -->
+      <section class="card">
+        <h2>Node identity</h2>
+        <p class="hint">
+          The companion device's identity keypair. The public key identifies your
+          node on the mesh. Export the private key for backup before a firmware
+          flash; import it to restore your identity on a new device.
+          <strong>Keep the private key secret.</strong>
+        </p>
+
+        <div v-if="nodeIdentityError" class="notice error-notice">{{ nodeIdentityError }}</div>
+
+        <div class="field">
+          <label>Public key</label>
+          <div class="key-display">
+            <code v-if="nodeIdentity?.pubkey" class="key-hex">{{ nodeIdentity.pubkey }}</code>
+            <span v-else-if="nodeIdentityLoading" class="muted">loading…</span>
+            <span v-else class="muted">not connected — start the mesh transport to read the device key</span>
+            <button
+              v-if="nodeIdentity?.pubkey"
+              type="button"
+              class="icon-btn"
+              title="Copy public key"
+              @click="copyToClipboard(nodeIdentity!.pubkey!)"
+            >⎘</button>
+          </div>
+        </div>
+
+        <!-- Export -->
+        <div class="field">
+          <label>Private key</label>
+          <div v-if="exportedKey" class="key-display">
+            <code v-if="exportKeyVisible" class="key-hex">{{ exportedKey }}</code>
+            <span v-else class="muted key-hex">••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••</span>
+            <button type="button" class="icon-btn" :title="exportKeyVisible ? 'Hide' : 'Reveal'" @click="exportKeyVisible = !exportKeyVisible">
+              {{ exportKeyVisible ? '🙈' : '👁' }}
+            </button>
+            <button v-if="exportKeyVisible" type="button" class="icon-btn" title="Copy private key" @click="copyToClipboard(exportedKey!)">⎘</button>
+          </div>
+          <div v-if="exportKeyError" class="notice error-notice" style="margin-top: 0.4rem">{{ exportKeyError }}</div>
+          <div class="actions" style="padding-top: 0.4rem">
+            <button type="button" class="secondary" :disabled="exportKeyLoading" @click="exportNodeKey">
+              {{ exportKeyLoading ? 'exporting…' : 'export private key' }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Import -->
+        <div class="field">
+          <div class="actions" style="padding-top: 0">
+            <button type="button" class="secondary" @click="showImportForm = !showImportForm">
+              {{ showImportForm ? 'cancel import' : 'import private key' }}
+            </button>
+          </div>
+          <div v-if="showImportForm" style="margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.5rem">
+            <div class="notice warn-notice" style="font-size: 0.85em">
+              ⚠ Importing a private key replaces the current keypair. Back up the current key first.
+            </div>
+            <input
+              v-model="importKeyInput"
+              type="password"
+              placeholder="paste 64-char hex private key"
+              style="max-width: 480px; font-family: monospace"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <div v-if="importKeyError" class="notice error-notice">{{ importKeyError }}</div>
+            <div v-if="importKeyOk" class="notice ok-notice">{{ importKeyOk }}</div>
+            <div class="actions" style="padding-top: 0">
+              <button type="button" :disabled="importKeyLoading || !importKeyInput.trim()" @click="importNodeKey">
+                {{ importKeyLoading ? 'importing…' : 'confirm import' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <!-- Service restart -->
       <section class="card">
         <h2>Service</h2>
@@ -854,4 +1010,26 @@ p { margin: 0; }
 .field-row .field { flex: 1; min-width: 160px; }
 
 .actions { display: flex; align-items: center; gap: 1rem; padding-top: 0.4rem; }
+
+.key-display {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.key-hex {
+  font-family: monospace;
+  font-size: 0.82em;
+  word-break: break-all;
+  color: var(--fg);
+}
+.icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1em;
+  padding: 0.1rem 0.3rem;
+  color: var(--muted);
+}
+.icon-btn:hover { color: var(--fg); }
 </style>

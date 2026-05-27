@@ -210,6 +210,10 @@ impl Plugin for MeshTransport {
         let ttl_days = self.node_credential_ttl_days;
         let flood_after_send = self.flood_after_send;
 
+        // Admin channel: web UI → event loop for key operations.
+        let (key_tx, key_rx) = tokio::sync::mpsc::channel::<bbs_plugin_api::MeshKeyRequest>(4);
+        self.host.register_mesh_key_ops(key_tx);
+
         // Watch for advert-send requests from the web UI.
         let mut advert_send_rx = host.advert_bus().subscribe_send();
         let advert_cmd_tx = self.cmd_tx.clone();
@@ -293,6 +297,7 @@ impl Plugin for MeshTransport {
             ttl_days,
             draining,
             flood_after_send,
+            key_rx,
         ));
 
         info!("mesh transport started");
@@ -471,6 +476,16 @@ async fn push_domain_notification(
     }
 }
 
+/// Pending one-shot key operation in the event loop.
+enum PendingKeyOp {
+    Export {
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    Import {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
 /// Background task: receive [`ClientEvent`]s and dispatch them.
 ///
 /// Runs until the shutdown watch fires or the companion client channel closes.
@@ -486,7 +501,11 @@ async fn event_loop(
     node_credential_ttl_days: u32,
     draining: Arc<AtomicBool>,
     flood_after_send: bool,
+    mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
 ) {
+    // Pending one-shot key operation. At most one at a time.
+    let mut pending_key_op: Option<PendingKeyOp> = None;
+
     loop {
         tokio::select! {
             event = client.recv() => {
@@ -521,6 +540,9 @@ async fn event_loop(
                             // detect self-advert echoes and preserve configured GPS.
                             state.lock().expect("state mutex poisoned").self_pubkey =
                                 Some(info.pubkey);
+                            // Publish pubkey to Host so the web UI can display it.
+                            let pubkey_hex: String = info.pubkey.iter().map(|b| format!("{b:02x}")).collect();
+                            host.set_node_pubkey(pubkey_hex);
                             // Push GPS coordinates to the radio if configured, and
                             // refresh the advert bus entry so the web UI shows
                             // the config GPS.
@@ -565,7 +587,52 @@ async fn event_loop(
                         }
                     }
                     Some(ClientEvent::Frame(frame)) => {
-                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining, flood_after_send).await;
+                        use meshcore_companion::frame::InboundFrame;
+                        // Intercept key op responses before general frame dispatch.
+                        let consumed = match &frame {
+                            InboundFrame::PrivateKey { key } => {
+                                if let Some(PendingKeyOp::Export { reply }) = pending_key_op.take() {
+                                    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                                    let _ = reply.send(Ok(hex));
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            InboundFrame::Ok => {
+                                if let Some(PendingKeyOp::Import { reply }) = pending_key_op.take() {
+                                    let _ = reply.send(Ok(()));
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        };
+                        if !consumed {
+                            handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining, flood_after_send).await;
+                        }
+                    }
+                }
+            }
+            Some(req) = key_rx.recv() => {
+                use bbs_plugin_api::MeshKeyRequest;
+                match req {
+                    MeshKeyRequest::ExportKey { reply } => {
+                        if pending_key_op.is_some() {
+                            let _ = reply.send(Err("another key operation is already in progress".into()));
+                        } else {
+                            let _ = cmd_tx.send(OutboundFrame::ExportPrivateKey).await;
+                            pending_key_op = Some(PendingKeyOp::Export { reply });
+                        }
+                    }
+                    MeshKeyRequest::ImportKey { key, reply } => {
+                        if pending_key_op.is_some() {
+                            let _ = reply.send(Err("another key operation is already in progress".into()));
+                        } else {
+                            let _ = cmd_tx.send(OutboundFrame::ImportPrivateKey { key }).await;
+                            pending_key_op = Some(PendingKeyOp::Import { reply });
+                        }
                     }
                 }
             }

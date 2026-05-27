@@ -557,6 +557,9 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/radio-config",
             get(api_get_radio_config).patch(api_patch_radio_config),
         )
+        .route("/node-identity", get(api_get_node_identity))
+        .route("/node-identity/export-key", post(api_export_node_key))
+        .route("/node-identity/import-key", post(api_import_node_key))
         .route("/restart", post(api_restart))
         .route("/logs", get(api_logs))
         .route("/sse/logs", get(api_sse_logs))
@@ -2343,6 +2346,64 @@ async fn api_patch_radio_config(
         presets: RADIO_PRESET_NAMES.to_vec(),
     })
     .into_response()
+}
+
+// ── Node identity ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct NodeIdentityResponse {
+    /// Current node public key hex (64 chars), or null if not yet connected.
+    pubkey: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportKeyBody {
+    /// 64-char hex private key.
+    key: String,
+}
+
+async fn api_get_node_identity(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    Json(NodeIdentityResponse {
+        pubkey: state.host.node_pubkey(),
+    })
+    .into_response()
+}
+
+async fn api_export_node_key(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_export_node_key().await {
+        Ok(hex) => Json(serde_json::json!({ "key": hex })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_import_node_key(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(body): Json<ImportKeyBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_import_node_key(body.key).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json_error(&format!("{e}")))).into_response(),
+    }
 }
 
 // ── HTTP log poll ─────────────────────────────────────────────────────────────
