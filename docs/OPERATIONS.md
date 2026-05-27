@@ -184,6 +184,9 @@ sudo useradd --system --no-create-home --shell /sbin/nologin \
   --home-dir /var/lib/supply-drop-bbs supply-drop 2>/dev/null || true
 sudo mkdir -p /var/lib/supply-drop-bbs /etc/supply-drop-bbs
 sudo chown supply-drop:supply-drop /var/lib/supply-drop-bbs
+# Config dir ownership is set automatically by 'sudo supply-drop-bbs setup'.
+# If you create config.toml manually, fix ownership so the web admin can save changes:
+sudo chown supply-drop:supply-drop /etc/supply-drop-bbs /etc/supply-drop-bbs/config.toml
 sudo curl -fsSL \
   "https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/${TAG}/supply-drop-bbs.service" \
   -o /lib/systemd/system/supply-drop-bbs.service
@@ -810,6 +813,36 @@ ss -ltnp | grep supply-drop-bbs
 ```
 
 Check `[plugins.web] bind` and `external_origin` in config.
+
+### Web admin Settings page shows "Config file is not writable by the server process"
+
+This warning appears when the `supply-drop` service user does not have write
+permission on `config.toml` (or its parent directory). The Settings page needs
+write access to save configuration changes.
+
+**Fix for new installs — run setup as root:**
+
+```sh
+sudo supply-drop-bbs setup --config /etc/supply-drop-bbs/config.toml
+```
+
+When run as root, the setup wizard automatically sets the owner of `config.toml`
+and its parent directory to `supply-drop:supply-drop` and prints:
+
+```
+  ownership set to supply-drop:supply-drop (web admin can save config)
+```
+
+**Fix for existing installs — chown manually:**
+
+```sh
+sudo chown supply-drop:supply-drop \
+  /etc/supply-drop-bbs \
+  /etc/supply-drop-bbs/config.toml
+```
+
+No restart is required — the Settings page will work immediately after ownership
+is corrected.
 
 ## Where to get help
 
