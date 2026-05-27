@@ -276,6 +276,21 @@ pub enum OutboundFrame {
         /// Transmit power in dBm (e.g. `20` for 100 mW).
         power_dbm: i8,
     },
+    /// Export the companion device's private key.
+    ///
+    /// The device responds with [`InboundFrame::PrivateKey`].
+    /// Wire format: `[CMD_EXPORT_PRIVATE_KEY]` (no body).
+    ExportPrivateKey,
+    /// Import a 32-byte private key into the companion device.
+    ///
+    /// The device responds with [`InboundFrame::Ok`] on success or
+    /// [`InboundFrame::Err`] on failure. This replaces the device's current
+    /// keypair — back up the old key with [`OutboundFrame::ExportPrivateKey`] first.
+    ///
+    /// Wire format: `[CMD_IMPORT_PRIVATE_KEY][key:32]`
+    ImportPrivateKey {
+        key: [u8; 32],
+    },
     /// Escape hatch for commands not yet modelled above.
     Raw {
         code: u8,
@@ -793,6 +808,13 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
             // Wire: [CMD][power:i8]
             p.push(CMD_SET_RADIO_TX_POWER);
             p.push(*power_dbm as u8);
+        }
+        OutboundFrame::ExportPrivateKey => {
+            p.push(CMD_EXPORT_PRIVATE_KEY);
+        }
+        OutboundFrame::ImportPrivateKey { key } => {
+            p.push(CMD_IMPORT_PRIVATE_KEY);
+            p.extend_from_slice(key);
         }
         OutboundFrame::Raw { code, body } => {
             p.push(*code);

@@ -664,6 +664,28 @@ fn encode_set_radio_tx_power_negative() {
     assert_eq!(payload[1] as i8, power_dbm, "negative dBm preserved");
 }
 
+// ── ExportPrivateKey / ImportPrivateKey ──────────────────────────────────────
+
+#[test]
+fn encode_export_private_key_layout() {
+    let bytes = encode_outbound(&OutboundFrame::ExportPrivateKey);
+    // Header: 0x3C + u16-LE payload length (1 byte for the CMD byte)
+    assert_eq!(bytes[0], FRAME_INBOUND_PREFIX);
+    assert_eq!(u16::from_le_bytes([bytes[1], bytes[2]]), 1);
+    assert_eq!(bytes[3], CMD_EXPORT_PRIVATE_KEY);
+    assert_eq!(bytes.len(), 4);
+}
+
+#[test]
+fn encode_import_private_key_layout() {
+    let key = [0xABu8; 32];
+    let bytes = encode_outbound(&OutboundFrame::ImportPrivateKey { key });
+    assert_eq!(bytes[0], FRAME_INBOUND_PREFIX);
+    assert_eq!(u16::from_le_bytes([bytes[1], bytes[2]]), 33); // 1 CMD + 32 key
+    assert_eq!(bytes[3], CMD_IMPORT_PRIVATE_KEY);
+    assert_eq!(&bytes[4..], &[0xABu8; 32]);
+}
+
 // ── wrap_payload overflow guard ───────────────────────────────────────────────
 
 /// `encode_outbound` (via `wrap_payload`) must panic with a clear message when
