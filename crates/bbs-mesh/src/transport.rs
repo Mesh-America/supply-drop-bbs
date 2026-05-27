@@ -814,6 +814,59 @@ async fn handle_frame(
             debug!("mesh: contact list sync complete");
         }
 
+        // ── Outbound message send result ──────────────────────────────────────
+        // RESP_CODE_SENT (0x06) is the device's reply to CMD_SEND_TXT_MSG.
+        // Log a warning if the device could not route the message so operators
+        // can diagnose delivery failures without digging through device logs.
+        InboundFrame::Sent(result) => {
+            if !result.is_flood && result.expected_ack == 0 {
+                // MSG_SEND_FAILED — device could not route the message.
+                // Common causes: no path to the destination, contact not in
+                // the device's table, or the destination is out of range.
+                warn!(
+                    "mesh: device could not send message (MSG_SEND_FAILED) — \
+                     message was not delivered; \
+                     check that the destination node is in the radio's contact \
+                     table and that a path exists"
+                );
+            } else {
+                debug!(
+                    is_flood = result.is_flood,
+                    expected_ack = result.expected_ack,
+                    timeout_ms = result.timeout_ms,
+                    "mesh: message accepted by device"
+                );
+            }
+        }
+
+        // ── Device error frames ───────────────────────────────────────────────
+        // InboundFrame::Err that was not consumed by the key-op handler above
+        // (i.e., there is no pending key operation — this error is a response
+        // to a regular command such as CMD_SYNC_NEXT_MESSAGE).
+        //
+        // If this arrives while we are draining the stale-message queue it
+        // most likely means CMD_SYNC_NEXT_MESSAGE is not supported by this
+        // firmware build.  Without this handler the draining flag would stay
+        // true forever, causing every subsequent ContactMsgRecv to be silently
+        // discarded — the BBS would appear alive but no user messages would
+        // ever be processed.
+        InboundFrame::Err { error_code } if draining.load(Ordering::Relaxed) => {
+            warn!(
+                error_code,
+                "mesh: device error during message-queue drain — \
+                 CMD_SYNC_NEXT_MESSAGE may be unsupported by this firmware; \
+                 clearing drain flag and resuming normal message processing"
+            );
+            draining.store(false, Ordering::Relaxed);
+        }
+
+        InboundFrame::Err { error_code } => {
+            debug!(
+                error_code,
+                "mesh: unhandled device error frame (no pending key op, not draining)"
+            );
+        }
+
         // ── Everything else ───────────────────────────────────────────────────
         other => {
             debug!("mesh: ignoring frame {other:?}");
