@@ -581,7 +581,14 @@ async fn cmd_run(cli: &Cli) {
     let cli_transport = init_cli_plugin(&cfg.plugins.cli, Arc::clone(&host)).await;
 
     #[cfg(feature = "transport-mesh")]
-    let mesh_transport = init_mesh_plugin(&cfg.plugins.mesh, Arc::clone(&host)).await;
+    let mesh_cfg = {
+        let mut c = cfg.plugins.mesh.clone();
+        c.welcome_message = cfg.bbs.welcome_msg.clone();
+        c
+    };
+
+    #[cfg(feature = "transport-mesh")]
+    let mesh_transport = init_mesh_plugin(&mesh_cfg, Arc::clone(&host)).await;
 
     #[cfg(feature = "transport-meshtastic")]
     let meshtastic_transport =
