@@ -91,11 +91,12 @@ Run the interactive first-run setup wizard. Detects your radio device, asks conf
 
 The wizard asks:
 
-1. Radio connection type - USB serial or Pi HAT
-2. Serial port *(USB only)* - auto-detected; you confirm or enter manually
-3. BBS name - shown to users on connect
-4. Data directory - defaults to `/var/lib/supply-drop-bbs`
-5. Web admin UI - whether to enable it, bind address, and password
+1. Radio connection type — USB serial or Pi HAT
+2. Serial port *(USB only)* — auto-detected; you confirm or enter manually
+3. Radio parameters *(USB serial only)* — choose a named region preset or enter custom values (frequency, bandwidth, spreading factor, coding rate, TX power); stored in `[plugins.mesh.radio]` and applied to the device; can be re-applied later with `node set-radio`
+4. BBS name — shown to users on connect
+5. Data directory — defaults to `/var/lib/supply-drop-bbs`
+6. Web admin UI — whether to enable it, bind address, and backup directory
 
 After the wizard completes, restart the service to apply:
 
@@ -313,6 +314,64 @@ supply-drop-bbs node import-key ab12cd34ef56...
 **Exit codes:** `0` on success; `1` if the key is invalid, the port cannot be opened, or the device does not confirm the import.
 
 > **Web admin:** The same operation is available in the Settings page → **Node identity** → click the ✏️ icon next to the public key.
+
+---
+
+### `node set-radio`
+
+```
+supply-drop-bbs node set-radio [OPTIONS]
+```
+
+Push radio parameters (frequency, bandwidth, spreading factor, coding rate, TX
+power) to the companion device over USB serial. The device persists these
+settings in its own flash; you only need to run this command when you want to
+change them.
+
+The BBS service must **not** be running on the same serial port when you run
+this command.
+
+| Flag | Description |
+|------|-------------|
+| `--preset <NAME>` | Named region preset (e.g. `"USA/Canada"`). Overrides `config.toml` preset. |
+| `--frequency-hz <N>` | Carrier frequency in Hz. Overrides preset. |
+| `--bandwidth-hz <N>` | Channel bandwidth in Hz. Overrides preset. |
+| `--spreading-factor <N>` | LoRa spreading factor 7–12. Overrides preset. |
+| `--coding-rate <N>` | Coding rate denominator 5–8. Overrides preset. |
+| `--tx-power-dbm <N>` | Transmit power in dBm. Overrides preset. |
+| `--save` | Write the resolved parameters back to `config.toml`. |
+| `--list-presets` | Print all available preset names and exit (does not open the port). |
+| `--port <PATH>` | Serial port (e.g. `/dev/ttyACM0`, `COM3`). Defaults to the port in `config.toml`. |
+| `--baud <N>` | Baud rate. Defaults to `config.toml` value or `115200`. |
+
+**Examples:**
+
+```sh
+# List available region presets
+supply-drop-bbs node set-radio --list-presets
+
+# Apply the preset stored in config.toml (no flags needed)
+supply-drop-bbs node set-radio \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Apply a specific preset and save it to config.toml
+supply-drop-bbs node set-radio --preset "USA/Canada" --save \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Apply fully custom parameters without using a preset
+supply-drop-bbs node set-radio \
+  --frequency-hz 910525000 --bandwidth-hz 62500 \
+  --spreading-factor 7 --coding-rate 5 --tx-power-dbm 20 \
+  --save --config /etc/supply-drop-bbs/config.toml
+```
+
+**Exit codes:** `0` on success; `1` if a parameter is out of range, the port
+cannot be opened, or the device does not confirm the command.
+
+> **Config reference:** Radio parameters are stored in
+> [`[plugins.mesh.radio]`](CONFIG.md#radio-parameter-configuration-pluginsmeshradio)
+> in `config.toml`. Saving them there allows `node set-radio` (with no flags)
+> to re-apply the same settings after a firmware flash.
 
 ---
 

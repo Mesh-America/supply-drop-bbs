@@ -310,6 +310,127 @@ your wiring differs from the standard layout):
 | `waveshare`   | 21 | 18    | 20   | 16  | TXEN=13, RXEN=12             |
 | `uconsole`    | -1 | 25    | 24   | 26  | bus_id=1, hardware CS        |
 
+### Radio parameter configuration (`[plugins.mesh.radio]`)
+
+Stores the LoRa parameters that will be pushed to the companion device when you
+run `supply-drop-bbs node set-radio`. **Not applied automatically on every
+connect** — the device persists radio settings in its own flash after they are
+applied once.
+
+Either specify a named `preset` (which fills all five parameters at once) or
+supply individual fields. Individual fields take precedence over the preset; you
+can mix them to override a single value while keeping the rest of the preset.
+
+| Key                | Type    | Default  | Required | Description                                                  |
+|--------------------|---------|----------|----------|--------------------------------------------------------------|
+| `preset`           | string  | (unset)  | no       | Named region preset. Run `node set-radio --list-presets` to see all names. |
+| `frequency_hz`     | integer | (unset)  | no       | Carrier frequency in Hz. Overrides the preset value when set. Example: `910_525_000` for 910.525 MHz. |
+| `bandwidth_hz`     | integer | (unset)  | no       | Channel bandwidth in Hz. Overrides the preset value. Example: `62_500` for 62.5 kHz. |
+| `spreading_factor` | integer | (unset)  | no       | LoRa spreading factor, `7`–`12`. Higher values = longer range, lower data rate. |
+| `coding_rate`      | integer | (unset)  | no       | LoRa coding rate denominator, `5`–`8` (representing 4/5 through 4/8). |
+| `tx_power_dbm`     | integer | (unset)  | no       | Transmit power in dBm. Overrides the preset value.           |
+
+#### Available presets
+
+Run `supply-drop-bbs node set-radio --list-presets` for the current list. At the
+time of writing the built-in presets are:
+
+| Preset name           | Frequency    | Bandwidth | SF | CR | TX power |
+|-----------------------|--------------|-----------|----|----|----------|
+| `Australia`           | 915.800 MHz  | 250 kHz   | 10 | 5  | 20 dBm   |
+| `Australia (Narrow)`  | 916.575 MHz  | 62.5 kHz  | 7  | 5  | 20 dBm   |
+| `Australia SA, WA, QLD` | 923.125 MHz | 62.5 kHz | 8  | 5  | 20 dBm   |
+| `Czech Republic`      | 869.432 MHz  | 62.5 kHz  | 7  | 5  | 14 dBm   |
+| `EU 433MHz`           | 433.650 MHz  | 250 kHz   | 11 | 5  | 20 dBm   |
+| `EU/UK (Long Range)`  | 869.525 MHz  | 250 kHz   | 11 | 5  | 14 dBm   |
+| `EU/UK (Medium Range)`| 869.525 MHz  | 250 kHz   | 10 | 5  | 14 dBm   |
+| `EU/UK (Narrow)`      | 869.618 MHz  | 62.5 kHz  | 8  | 5  | 14 dBm   |
+| `New Zealand`         | 917.375 MHz  | 250 kHz   | 11 | 5  | 20 dBm   |
+| `New Zealand (Narrow)`| 917.375 MHz  | 62.5 kHz  | 7  | 5  | 20 dBm   |
+| `Portugal 433`        | 433.375 MHz  | 62.5 kHz  | 9  | 5  | 20 dBm   |
+| `Portugal 869`        | 869.618 MHz  | 62.5 kHz  | 7  | 5  | 14 dBm   |
+| `Switzerland`         | 869.618 MHz  | 62.5 kHz  | 8  | 5  | 14 dBm   |
+| `USA Arizona`         | 908.205 MHz  | 62.5 kHz  | 10 | 5  | 20 dBm   |
+| `USA/Canada`          | 910.525 MHz  | 62.5 kHz  | 7  | 5  | 20 dBm   |
+| `Vietnam`             | 920.250 MHz  | 250 kHz   | 11 | 5  | 20 dBm   |
+| `Off-Grid 433`        | 433.000 MHz  | 250 kHz   | 11 | 8  | 20 dBm   |
+| `Off-Grid 869`        | 869.000 MHz  | 250 kHz   | 11 | 8  | 14 dBm   |
+| `Off-Grid 918`        | 918.000 MHz  | 250 kHz   | 11 | 8  | 20 dBm   |
+
+#### Examples
+
+**Using a preset (recommended for most deployments):**
+
+```toml
+[plugins.mesh.radio]
+preset = "USA/Canada"
+```
+
+**Custom parameters (all fields required when no preset is given):**
+
+```toml
+[plugins.mesh.radio]
+frequency_hz     = 910_525_000
+bandwidth_hz     = 62_500
+spreading_factor = 7
+coding_rate      = 5
+tx_power_dbm     = 20
+```
+
+**Preset with one override (increase TX power beyond the preset default):**
+
+```toml
+[plugins.mesh.radio]
+preset       = "EU/UK (Long Range)"
+tx_power_dbm = 17
+```
+
+#### Applying radio parameters
+
+Saving a `[plugins.mesh.radio]` section **does not push the settings to the
+device**. The device persists its own radio parameters in flash; the config
+section is just a record of the intended configuration. To apply or re-apply:
+
+```sh
+# BBS must not be running — it holds the serial port open.
+sudo systemctl stop supply-drop-bbs
+
+# Apply using the preset stored in config.toml:
+supply-drop-bbs node set-radio \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Apply a one-off preset without changing config.toml:
+supply-drop-bbs node set-radio --preset "EU/UK (Narrow)"
+
+# Apply fully custom parameters and save them to config.toml:
+supply-drop-bbs node set-radio \
+  --frequency-hz 910525000 --bandwidth-hz 62500 \
+  --spreading-factor 7 --coding-rate 5 --tx-power-dbm 20 \
+  --save --config /etc/supply-drop-bbs/config.toml
+
+sudo systemctl start supply-drop-bbs
+```
+
+The setup wizard (`supply-drop-bbs setup`) also offers radio configuration and
+writes the chosen settings to both `config.toml` and the device in one step.
+
+#### Node identity (`[plugins.mesh]` — node key)
+
+The BBS's mesh identity is a 32-byte Ed25519 key pair stored on the companion
+device. The public key is what other MeshCore nodes use to address messages to
+your BBS.
+
+| Operation | How |
+|-----------|-----|
+| **View public key** | `supply-drop-bbs node show-key` or web admin **Settings** → Node identity |
+| **Back up private key** | `supply-drop-bbs node export-key` (keep the output secret) |
+| **Restore / migrate private key** | `supply-drop-bbs node import-key <64-hex-chars>` or web admin **Settings** → Node identity → ✏️ |
+
+The BBS service must **not** be running when using these commands — it holds
+the serial port open.
+
+See the [CLI Reference](CLI.md#node-show-key) for full flag documentation.
+
 ## `[plugins.meshtastic]` - Meshtastic transport (only if `transport-meshtastic` feature enabled)
 
 Meshtastic is a separate radio protocol from MeshCore. Both can run simultaneously
