@@ -210,6 +210,10 @@ impl Plugin for MeshTransport {
         let ttl_days = self.node_credential_ttl_days;
         let flood_after_send = self.flood_after_send;
 
+        // Admin channel: web UI → event loop for key operations.
+        let (key_tx, key_rx) = tokio::sync::mpsc::channel::<bbs_plugin_api::MeshKeyRequest>(4);
+        self.host.register_mesh_key_ops(key_tx);
+
         // Watch for advert-send requests from the web UI.
         let mut advert_send_rx = host.advert_bus().subscribe_send();
         let advert_cmd_tx = self.cmd_tx.clone();
@@ -293,6 +297,7 @@ impl Plugin for MeshTransport {
             ttl_days,
             draining,
             flood_after_send,
+            key_rx,
         ));
 
         info!("mesh transport started");
@@ -471,6 +476,16 @@ async fn push_domain_notification(
     }
 }
 
+/// Pending one-shot key operation in the event loop.
+enum PendingKeyOp {
+    Export {
+        reply: tokio::sync::oneshot::Sender<Result<String, String>>,
+    },
+    Import {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
 /// Background task: receive [`ClientEvent`]s and dispatch them.
 ///
 /// Runs until the shutdown watch fires or the companion client channel closes.
@@ -486,7 +501,11 @@ async fn event_loop(
     node_credential_ttl_days: u32,
     draining: Arc<AtomicBool>,
     flood_after_send: bool,
+    mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
 ) {
+    // Pending one-shot key operation. At most one at a time.
+    let mut pending_key_op: Option<PendingKeyOp> = None;
+
     loop {
         tokio::select! {
             event = client.recv() => {
@@ -521,6 +540,9 @@ async fn event_loop(
                             // detect self-advert echoes and preserve configured GPS.
                             state.lock().expect("state mutex poisoned").self_pubkey =
                                 Some(info.pubkey);
+                            // Publish pubkey to Host so the web UI can display it.
+                            let pubkey_hex: String = info.pubkey.iter().map(|b| format!("{b:02x}")).collect();
+                            host.set_node_pubkey(pubkey_hex);
                             // Push GPS coordinates to the radio if configured, and
                             // refresh the advert bus entry so the web UI shows
                             // the config GPS.
@@ -557,6 +579,16 @@ async fn event_loop(
                         let _ = cmd_tx.send(OutboundFrame::GetContacts { since: 0 }).await;
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
+                        // If a key operation is in flight, fail it immediately so
+                        // the caller's oneshot receiver is not left hanging
+                        // indefinitely waiting for a reply that will never come.
+                        if let Some(op) = pending_key_op.take() {
+                            let err = "device disconnected".to_owned();
+                            match op {
+                                PendingKeyOp::Export { reply } => { let _ = reply.send(Err(err)); }
+                                PendingKeyOp::Import { reply } => { let _ = reply.send(Err(err)); }
+                            }
+                        }
                         if will_retry {
                             info!("mesh: radio bridge disconnected, will retry");
                         } else {
@@ -565,7 +597,66 @@ async fn event_loop(
                         }
                     }
                     Some(ClientEvent::Frame(frame)) => {
-                        handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining, flood_after_send).await;
+                        use meshcore_companion::frame::InboundFrame;
+                        // Intercept key op responses before general frame dispatch.
+                        let consumed = match &frame {
+                            InboundFrame::PrivateKey { key } => {
+                                if let Some(PendingKeyOp::Export { reply }) = pending_key_op.take() {
+                                    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                                    let _ = reply.send(Ok(hex));
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            InboundFrame::Ok => {
+                                if let Some(PendingKeyOp::Import { reply }) = pending_key_op.take() {
+                                    let _ = reply.send(Ok(()));
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            // Device returned an error frame while a key op was in
+                            // flight — propagate it so the caller doesn't hang.
+                            InboundFrame::Err { error_code } => {
+                                if let Some(op) = pending_key_op.take() {
+                                    let msg = format!("device error (code {error_code:#04x})");
+                                    match op {
+                                        PendingKeyOp::Export { reply } => { let _ = reply.send(Err(msg)); }
+                                        PendingKeyOp::Import { reply } => { let _ = reply.send(Err(msg)); }
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            _ => false,
+                        };
+                        if !consumed {
+                            handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining, flood_after_send).await;
+                        }
+                    }
+                }
+            }
+            Some(req) = key_rx.recv() => {
+                use bbs_plugin_api::MeshKeyRequest;
+                match req {
+                    MeshKeyRequest::ExportKey { reply } => {
+                        if pending_key_op.is_some() {
+                            let _ = reply.send(Err("another key operation is already in progress".into()));
+                        } else {
+                            let _ = cmd_tx.send(OutboundFrame::ExportPrivateKey).await;
+                            pending_key_op = Some(PendingKeyOp::Export { reply });
+                        }
+                    }
+                    MeshKeyRequest::ImportKey { key, reply } => {
+                        if pending_key_op.is_some() {
+                            let _ = reply.send(Err("another key operation is already in progress".into()));
+                        } else {
+                            let _ = cmd_tx.send(OutboundFrame::ImportPrivateKey { key }).await;
+                            pending_key_op = Some(PendingKeyOp::Import { reply });
+                        }
                     }
                 }
             }
@@ -605,7 +696,7 @@ async fn handle_frame(
             // While draining, discard queued messages and request the next one
             // so we flush the entire backlog before serving live traffic.
             if draining.load(Ordering::Relaxed) {
-                info!(
+                debug!(
                     prefix = msg.sender_key_prefix[0],
                     "mesh: discarding stale queued message (draining)"
                 );
@@ -616,14 +707,14 @@ async fn handle_frame(
             // Only handle plain-text messages; CLI data and signed frames are
             // not BBS commands.
             if msg.txt_type != meshcore_companion::constants::TXT_TYPE_PLAIN {
-                info!(
+                debug!(
                     txt_type = msg.txt_type,
                     "mesh: ignoring non-plain-text ContactMsg"
                 );
                 return;
             }
 
-            info!(
+            debug!(
                 prefix = msg.sender_key_prefix[0],
                 txt_type = msg.txt_type,
                 len = msg.text.len(),
@@ -646,7 +737,7 @@ async fn handle_frame(
         // ── Queued message notification ───────────────────────────────────────
         // The bridge has a message waiting; fetch it with SyncNextMessage.
         InboundFrame::MsgWaiting => {
-            info!("mesh: MsgWaiting — fetching next queued message");
+            debug!("mesh: MsgWaiting — fetching next queued message");
             if cmd_tx.send(OutboundFrame::SyncNextMessage).await.is_err() {
                 warn!("mesh: could not enqueue SyncNextMessage — cmd channel closed");
             }
@@ -693,12 +784,18 @@ async fn handle_frame(
             // Populate the advert bus with full metadata from the device's
             // contact list — these arrive as RESP_CODE_CONTACT frames after
             // CMD_GET_CONTACTS and contain name, type, and location.
-            host.advert_bus().upsert(
+            //
+            // Use upsert_with_timestamp so the "Last Seen" column reflects the
+            // real last-advert time stored on the device rather than the moment
+            // we happened to run GetContacts (which would make every row show
+            // the same timestamp).
+            host.advert_bus().upsert_with_timestamp(
                 contact.pubkey,
                 contact.name.clone(),
                 contact.adv_type,
                 contact.gps_lat,
                 contact.gps_lon,
+                contact.last_advert_timestamp as i64,
             );
             // Record the full pubkey mapping so ResetPath can find the node.
             let prefix: [u8; 6] = contact.pubkey[..6].try_into().expect("pubkey is 32 bytes");
@@ -845,7 +942,7 @@ async fn dispatch_message(
             .set_last_workflow_reply(&sender_prefix, text.to_owned());
     }
 
-    info!(?session, ?cmd, "mesh: dispatching command");
+    debug!(?session, ?cmd, "mesh: dispatching command");
 
     // ── Process through the host ──────────────────────────────────────────────
     // On UnknownSession (e.g. server restarted while the transport retained a
@@ -973,7 +1070,7 @@ async fn dispatch_message(
             reply_text
         };
 
-        info!(
+        debug!(
             ?session,
             len = reply_text.len(),
             frame = i + 1,

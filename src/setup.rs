@@ -48,6 +48,8 @@ struct Existing {
     // pymc-companion (HAT)
     region_idx: usize,
     hat_idx: usize,
+    // USB serial radio config (None = not configured)
+    mesh_radio: Option<RadioChoice>,
     // GPS
     latitude: Option<f64>,
     longitude: Option<f64>,
@@ -162,6 +164,64 @@ fn load_existing(out_path: &Path) -> Existing {
     let yaml_path = companion_yaml_path(out_path);
     let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
 
+    // USB serial radio config — reconstruct from [plugins.mesh.radio]
+    let mesh_radio: Option<RadioChoice> = {
+        let radio = mesh.and_then(|m| m.get("radio"));
+        if let Some(radio) = radio {
+            // First try to match a named preset.
+            let by_preset = radio
+                .get("preset")
+                .and_then(|v| v.as_str())
+                .and_then(|name| REGION_PRESETS.iter().position(|r| r.name == name))
+                .map(RadioChoice::Preset);
+            if by_preset.is_some() {
+                by_preset
+            } else {
+                // Fall back to reading the individual fields (custom config).
+                let freq = radio
+                    .get("frequency_hz")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v as u64);
+                let bw = radio
+                    .get("bandwidth_hz")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v as u32);
+                let sf = radio
+                    .get("spreading_factor")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v as u8);
+                let cr = radio
+                    .get("coding_rate")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v as u8);
+                let tp = radio
+                    .get("tx_power_dbm")
+                    .and_then(|v| v.as_integer())
+                    .map(|v| v as i32);
+                if let (
+                    Some(frequency_hz),
+                    Some(bandwidth_hz),
+                    Some(spreading_factor),
+                    Some(coding_rate),
+                    Some(tx_power_dbm),
+                ) = (freq, bw, sf, cr, tp)
+                {
+                    Some(RadioChoice::Custom {
+                        frequency_hz,
+                        bandwidth_hz,
+                        spreading_factor,
+                        coding_rate,
+                        tx_power_dbm,
+                    })
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     Existing {
         bbs_name,
         data_dir,
@@ -179,6 +239,7 @@ fn load_existing(out_path: &Path) -> Existing {
         web_backup_dir,
         region_idx: match_region_preset(&yaml),
         hat_idx: match_hat_preset(&yaml),
+        mesh_radio,
         latitude,
         longitude,
         process_plugins_toml,
@@ -274,7 +335,23 @@ fn match_hat_preset(yaml: &str) -> usize {
     0
 }
 
+use crate::mesh_presets::REGION_PRESETS;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, MultiSelect, Select};
+
+/// What the operator chose in the "MeshCore radio parameters" step.
+#[derive(Clone)]
+enum RadioChoice {
+    /// A named preset from REGION_PRESETS.
+    Preset(usize),
+    /// Custom values entered field-by-field.
+    Custom {
+        frequency_hz: u64,
+        bandwidth_hz: u32,
+        spreading_factor: u8,
+        coding_rate: u8,
+        tx_power_dbm: i32,
+    },
+}
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
@@ -413,6 +490,144 @@ pub fn run_wizard(config_out: Option<&Path>) {
         mesh_baud_rate = None;
         mesh_addr = None;
     }
+
+    // ── MeshCore radio parameters (serial mode only) ──────────────────────────
+    //
+    // For HAT mode, radio parameters go into pymc-companion.yaml (handled
+    // later by configure_hat). For TCP mode, pymc_core owns the radio config.
+    // Only USB serial devices are configured here.
+
+    let mesh_radio: Option<RadioChoice> = if use_mesh && mesh_conn_type == "serial" {
+        section("MeshCore radio parameters");
+
+        println!("Select a region preset to configure the radio, or choose Custom to");
+        println!("enter individual LoRa parameters. Skip if the device is already");
+        println!("on the correct frequency.");
+        println!();
+
+        let configure = Confirm::with_theme(&theme)
+            .with_prompt("Configure radio parameters now?")
+            .default(ex.mesh_radio.is_some())
+            .interact()
+            .unwrap_or_else(|_| cancelled());
+
+        if configure {
+            // Build the menu: all presets + "Custom…" at the end.
+            let mut region_names: Vec<String> = REGION_PRESETS
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{:<26} ({:.3} MHz)",
+                        r.name,
+                        r.frequency_hz as f64 / 1_000_000.0
+                    )
+                })
+                .collect();
+            region_names.push("Custom…".to_owned());
+            let custom_idx = region_names.len() - 1;
+
+            // Default selection: match existing choice, or USA/Canada (index 14).
+            let default_region = match &ex.mesh_radio {
+                Some(RadioChoice::Preset(i)) => *i,
+                Some(RadioChoice::Custom { .. }) => custom_idx,
+                None => 14, // USA/Canada
+            };
+            let choice = prompt_select(&theme, "Select your region", &region_names, default_region);
+
+            if choice == custom_idx {
+                // Recover previous custom values (if any) for defaults.
+                let (prev_freq, prev_bw, prev_sf, prev_cr, prev_tp) =
+                    if let Some(RadioChoice::Custom {
+                        frequency_hz,
+                        bandwidth_hz,
+                        spreading_factor,
+                        coding_rate,
+                        tx_power_dbm,
+                    }) = &ex.mesh_radio
+                    {
+                        (
+                            *frequency_hz,
+                            *bandwidth_hz,
+                            *spreading_factor,
+                            *coding_rate,
+                            *tx_power_dbm,
+                        )
+                    } else {
+                        // Sensible defaults (USA/Canada values)
+                        let usa = &REGION_PRESETS[14];
+                        (
+                            usa.frequency_hz,
+                            usa.bandwidth_hz,
+                            usa.spreading_factor,
+                            usa.coding_rate,
+                            usa.tx_power_dbm,
+                        )
+                    };
+
+                println!();
+                println!("Enter each LoRa parameter. Press Enter to accept the default.");
+                println!();
+
+                let frequency_hz: u64 = Input::with_theme(&theme)
+                    .with_prompt("Carrier frequency (Hz)")
+                    .default(prev_freq)
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                let bandwidth_hz: u32 = Input::with_theme(&theme)
+                    .with_prompt("Channel bandwidth (Hz)  [e.g. 250000, 125000, 62500]")
+                    .default(prev_bw)
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                let spreading_factor: u8 = Input::with_theme(&theme)
+                    .with_prompt("Spreading factor        [7–12]")
+                    .default(prev_sf)
+                    .validate_with(|v: &u8| {
+                        if (7..=12).contains(v) {
+                            Ok(())
+                        } else {
+                            Err("Spreading factor must be 7–12")
+                        }
+                    })
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                let coding_rate: u8 = Input::with_theme(&theme)
+                    .with_prompt("Coding rate             [5–8]  (5 = 4/5, 8 = 4/8)")
+                    .default(prev_cr)
+                    .validate_with(|v: &u8| {
+                        if (5..=8).contains(v) {
+                            Ok(())
+                        } else {
+                            Err("Coding rate must be 5–8")
+                        }
+                    })
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                let tx_power_dbm: i32 = Input::with_theme(&theme)
+                    .with_prompt("TX power (dBm)          [e.g. 20]")
+                    .default(prev_tp)
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                Some(RadioChoice::Custom {
+                    frequency_hz,
+                    bandwidth_hz,
+                    spreading_factor,
+                    coding_rate,
+                    tx_power_dbm,
+                })
+            } else {
+                Some(RadioChoice::Preset(choice))
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // ── Meshtastic connection ─────────────────────────────────────────────────
 
@@ -643,6 +858,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         latitude: gps_lat,
         longitude: gps_lon,
         process_plugins_toml: ex.process_plugins_toml.as_deref(),
+        mesh_radio: mesh_radio.as_ref(),
     });
 
     if let Some(parent) = out_path.parent() {
@@ -820,172 +1036,6 @@ fn configure_uart_hat(theme: &ColorfulTheme, existing_port: Option<&str>) -> (St
 
     (port, 115_200)
 }
-
-// ── Region presets ────────────────────────────────────────────────────────────
-
-struct RegionPreset {
-    name: &'static str,
-    frequency_hz: u64,
-    bandwidth_hz: u32,
-    spreading_factor: u8,
-    coding_rate: u8,
-    tx_power_dbm: i32,
-}
-
-const REGION_PRESETS: &[RegionPreset] = &[
-    RegionPreset {
-        name: "Australia",
-        frequency_hz: 915_800_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 10,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Australia (Narrow)",
-        frequency_hz: 916_575_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Australia SA, WA, QLD",
-        frequency_hz: 923_125_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 8,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Czech Republic",
-        frequency_hz: 869_432_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "EU 433MHz",
-        frequency_hz: 433_650_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "EU/UK (Long Range)",
-        frequency_hz: 869_525_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "EU/UK (Medium Range)",
-        frequency_hz: 869_525_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 10,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "EU/UK (Narrow)",
-        frequency_hz: 869_618_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 8,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "New Zealand",
-        frequency_hz: 917_375_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "New Zealand (Narrow)",
-        frequency_hz: 917_375_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Portugal 433",
-        frequency_hz: 433_375_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 9,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Portugal 869",
-        frequency_hz: 869_618_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "Switzerland",
-        frequency_hz: 869_618_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 8,
-        coding_rate: 5,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "USA Arizona",
-        frequency_hz: 908_205_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 10,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "USA/Canada",
-        frequency_hz: 910_525_000,
-        bandwidth_hz: 62_500,
-        spreading_factor: 7,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Vietnam",
-        frequency_hz: 920_250_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 5,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Off-Grid 433",
-        frequency_hz: 433_000_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 8,
-        tx_power_dbm: 20,
-    },
-    RegionPreset {
-        name: "Off-Grid 869",
-        frequency_hz: 869_000_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 8,
-        tx_power_dbm: 14,
-    },
-    RegionPreset {
-        name: "Off-Grid 918",
-        frequency_hz: 918_000_000,
-        bandwidth_hz: 250_000,
-        spreading_factor: 11,
-        coding_rate: 8,
-        tx_power_dbm: 20,
-    },
-];
 
 // ── Pi HAT configuration ──────────────────────────────────────────────────────
 
@@ -1411,6 +1461,8 @@ struct TomlParams<'a> {
     longitude: Option<f64>,
     // Process plugins — preserved verbatim from the previous config
     process_plugins_toml: Option<&'a str>,
+    // USB serial radio config (None = omit section)
+    mesh_radio: Option<&'a RadioChoice>,
 }
 
 fn build_toml(p: &TomlParams<'_>) -> String {
@@ -1466,6 +1518,38 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 }
             }
             _ => {}
+        }
+    }
+
+    // [plugins.mesh.radio] — only for USB serial with a radio config chosen
+    if p.use_mesh && p.mesh_connection_type == "serial" {
+        match p.mesh_radio {
+            Some(RadioChoice::Preset(idx)) => {
+                if let Some(preset) = REGION_PRESETS.get(*idx) {
+                    writeln!(s, "\n[plugins.mesh.radio]").unwrap();
+                    writeln!(s, "preset           = {}", toml_str(preset.name)).unwrap();
+                    writeln!(s, "frequency_hz     = {}", preset.frequency_hz).unwrap();
+                    writeln!(s, "bandwidth_hz     = {}", preset.bandwidth_hz).unwrap();
+                    writeln!(s, "spreading_factor = {}", preset.spreading_factor).unwrap();
+                    writeln!(s, "coding_rate      = {}", preset.coding_rate).unwrap();
+                    writeln!(s, "tx_power_dbm     = {}", preset.tx_power_dbm).unwrap();
+                }
+            }
+            Some(RadioChoice::Custom {
+                frequency_hz,
+                bandwidth_hz,
+                spreading_factor,
+                coding_rate,
+                tx_power_dbm,
+            }) => {
+                writeln!(s, "\n[plugins.mesh.radio]").unwrap();
+                writeln!(s, "frequency_hz     = {frequency_hz}").unwrap();
+                writeln!(s, "bandwidth_hz     = {bandwidth_hz}").unwrap();
+                writeln!(s, "spreading_factor = {spreading_factor}").unwrap();
+                writeln!(s, "coding_rate      = {coding_rate}").unwrap();
+                writeln!(s, "tx_power_dbm     = {tx_power_dbm}").unwrap();
+            }
+            None => {}
         }
     }
 
@@ -1645,6 +1729,23 @@ fn print_next_steps(
                 println!();
             }
         }
+    }
+
+    // Node key hint (MeshCore serial only — not applicable for TCP / HAT / Meshtastic)
+    if use_mesh && mesh_conn_type == "serial" {
+        println!("MeshCore node key:");
+        println!();
+        println!("  To see the current node key (public key):");
+        println!("    supply-drop-bbs node show-key");
+        println!();
+        println!("  To back up the private key before a firmware flash:");
+        println!("    supply-drop-bbs node export-key");
+        println!();
+        println!("  To restore or migrate to a new 64-char hex key:");
+        println!("    supply-drop-bbs node import-key <64-char-hex>");
+        println!();
+        println!("  The BBS service must not be running when using these commands.");
+        println!();
     }
 
     if cfg!(target_os = "linux") {

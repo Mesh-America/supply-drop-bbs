@@ -382,16 +382,23 @@ fn decode_body_too_short_for_type() {
 }
 
 #[test]
-fn decode_invalid_utf8_errors() {
+fn decode_tolerates_invalid_utf8() {
     // RESP_CODE_CHANNEL_MSG_RECV: [chan_idx][path_len][txt_type][ts×4][invalid utf8]
+    // read_cstr now uses from_utf8_lossy so invalid bytes become U+FFFD rather
+    // than returning an error and killing the session.
     let mut payload = vec![RESP_CODE_CHANNEL_MSG_RECV];
     payload.push(0); // channel_idx
     payload.push(0); // path_len
     payload.push(0); // txt_type
     payload.extend_from_slice(&0u32.to_le_bytes()); // timestamp
-    payload.push(0xFF); // invalid UTF-8 byte
-    let err = decode_inbound(&payload).unwrap_err();
-    assert_eq!(err, FrameDecodeError::InvalidUtf8);
+    payload.push(0xFF); // invalid UTF-8 byte → replaced with U+FFFD
+    let frame = decode_inbound(&payload).unwrap();
+    match frame {
+        InboundFrame::ChannelMsgRecv(msg) => {
+            assert_eq!(msg.text, "\u{FFFD}", "invalid byte should become U+FFFD");
+        }
+        other => panic!("expected ChannelMsgRecv, got {other:?}"),
+    }
 }
 
 // ── decode_inbound — contact struct ──────────────────────────────────────────
@@ -662,6 +669,28 @@ fn encode_set_radio_tx_power_negative() {
     let wire_bytes = encode_outbound(&OutboundFrame::SetRadioTxPower { power_dbm });
     let payload = &wire_bytes[3..];
     assert_eq!(payload[1] as i8, power_dbm, "negative dBm preserved");
+}
+
+// ── ExportPrivateKey / ImportPrivateKey ──────────────────────────────────────
+
+#[test]
+fn encode_export_private_key_layout() {
+    let bytes = encode_outbound(&OutboundFrame::ExportPrivateKey);
+    // Header: 0x3C + u16-LE payload length (1 byte for the CMD byte)
+    assert_eq!(bytes[0], FRAME_INBOUND_PREFIX);
+    assert_eq!(u16::from_le_bytes([bytes[1], bytes[2]]), 1);
+    assert_eq!(bytes[3], CMD_EXPORT_PRIVATE_KEY);
+    assert_eq!(bytes.len(), 4);
+}
+
+#[test]
+fn encode_import_private_key_layout() {
+    let key = [0xABu8; 32];
+    let bytes = encode_outbound(&OutboundFrame::ImportPrivateKey { key });
+    assert_eq!(bytes[0], FRAME_INBOUND_PREFIX);
+    assert_eq!(u16::from_le_bytes([bytes[1], bytes[2]]), 33); // 1 CMD + 32 key
+    assert_eq!(bytes[3], CMD_IMPORT_PRIVATE_KEY);
+    assert_eq!(&bytes[4..], &[0xABu8; 32]);
 }
 
 // ── wrap_payload overflow guard ───────────────────────────────────────────────

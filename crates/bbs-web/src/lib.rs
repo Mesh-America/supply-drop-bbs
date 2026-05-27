@@ -34,6 +34,8 @@
 //! │  │  PATCH /api/v1/config              (auth)       │    │
 //! │  │  GET  /api/v1/access-policy        (auth)       │    │
 //! │  │  PATCH /api/v1/access-policy       (auth)       │    │
+//! │  │  GET  /api/v1/radio-config         (auth)       │    │
+//! │  │  PATCH /api/v1/radio-config        (auth)       │    │
 //! │  │  GET  /api/v1/errors               (auth)       │    │
 //! │  │  GET  /api/v1/metrics              (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
@@ -551,6 +553,13 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/access-policy",
             get(api_get_access_policy).patch(api_patch_access_policy),
         )
+        .route(
+            "/radio-config",
+            get(api_get_radio_config).patch(api_patch_radio_config),
+        )
+        .route("/node-identity", get(api_get_node_identity))
+        .route("/node-identity/export-key", post(api_export_node_key))
+        .route("/node-identity/import-key", post(api_import_node_key))
         .route("/restart", post(api_restart))
         .route("/logs", get(api_logs))
         .route("/sse/logs", get(api_sse_logs))
@@ -1544,6 +1553,52 @@ async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // ── Config read / write ───────────────────────────────────────────────────────
 
+/// One entry in the `presets` list returned by `GET /api/v1/radio-config`.
+#[derive(Debug, Clone, Serialize)]
+struct RadioPresetDetail {
+    name: &'static str,
+    frequency_hz: u64,
+    bandwidth_hz: u32,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power_dbm: i32,
+}
+
+/// Response body for `GET /api/v1/radio-config`.
+#[derive(Debug, Serialize)]
+struct RadioConfigResponse {
+    preset: Option<String>,
+    frequency_hz: Option<u64>,
+    bandwidth_hz: Option<u32>,
+    spreading_factor: Option<u8>,
+    coding_rate: Option<u8>,
+    tx_power_dbm: Option<i32>,
+    /// MeshCore connection type: `"serial"`, `"tcp"`, or `"hat"`.
+    connection_type: Option<String>,
+    /// Serial port path (only set when `connection_type` is `"serial"`).
+    serial_port: Option<String>,
+    /// Full preset details for populating the UI dropdown and auto-filling fields.
+    presets: Vec<RadioPresetDetail>,
+}
+
+/// Patch body for `PATCH /api/v1/radio-config`.
+/// `None` means "leave unchanged"; for optional fields, JSON `null` clears the value.
+#[derive(Debug, Deserialize)]
+struct RadioConfigPatch {
+    /// Named preset. JSON null clears it; a string sets it.
+    preset: Option<serde_json::Value>,
+    /// Carrier frequency in Hz. JSON null clears it.
+    frequency_hz: Option<serde_json::Value>,
+    /// Channel bandwidth in Hz. JSON null clears it.
+    bandwidth_hz: Option<serde_json::Value>,
+    /// LoRa spreading factor (7–12). JSON null clears it.
+    spreading_factor: Option<serde_json::Value>,
+    /// Coding rate denominator (5–8). JSON null clears it.
+    coding_rate: Option<serde_json::Value>,
+    /// TX power in dBm. JSON null clears it.
+    tx_power_dbm: Option<serde_json::Value>,
+}
+
 /// Editable subset of the BBS configuration, returned by GET /api/v1/config.
 ///
 /// Only fields that are safe to change via the web UI are included.
@@ -1656,6 +1711,165 @@ fn system_timezone() -> String {
     "UTC".to_owned()
 }
 
+/// Preset names mirrored from `src/mesh_presets.rs`.
+/// Duplicated here because `bbs-web` does not depend on the main binary.
+/// Full preset data mirrored from `src/mesh_presets.rs`.
+/// Duplicated here because `bbs-web` does not depend on the main binary.
+const RADIO_PRESETS: &[RadioPresetDetail] = &[
+    RadioPresetDetail {
+        name: "Australia",
+        frequency_hz: 915_800_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Australia (Narrow)",
+        frequency_hz: 916_575_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Australia SA, WA, QLD",
+        frequency_hz: 923_125_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Czech Republic",
+        frequency_hz: 869_432_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "EU 433MHz",
+        frequency_hz: 433_650_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "EU/UK (Long Range)",
+        frequency_hz: 869_525_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "EU/UK (Medium Range)",
+        frequency_hz: 869_525_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "EU/UK (Narrow)",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "New Zealand",
+        frequency_hz: 917_375_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "New Zealand (Narrow)",
+        frequency_hz: 917_375_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Portugal 433",
+        frequency_hz: 433_375_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 9,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Portugal 869",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "Switzerland",
+        frequency_hz: 869_618_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 8,
+        coding_rate: 5,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "USA Arizona",
+        frequency_hz: 908_205_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 10,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "USA/Canada",
+        frequency_hz: 910_525_000,
+        bandwidth_hz: 62_500,
+        spreading_factor: 7,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Vietnam",
+        frequency_hz: 920_250_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 5,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Off-Grid 433",
+        frequency_hz: 433_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 20,
+    },
+    RadioPresetDetail {
+        name: "Off-Grid 869",
+        frequency_hz: 869_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 14,
+    },
+    RadioPresetDetail {
+        name: "Off-Grid 918",
+        frequency_hz: 918_000_000,
+        bandwidth_hz: 250_000,
+        spreading_factor: 11,
+        coding_rate: 8,
+        tx_power_dbm: 20,
+    },
+];
+
 fn read_config_toml(path: &str) -> Result<toml::Value, String> {
     let raw =
         std::fs::read_to_string(path).map_err(|e| format!("could not read config file: {e}"))?;
@@ -1681,6 +1895,73 @@ fn toml_u64_field(val: &toml::Value, section: &str, key: &str) -> Option<u64> {
 
 fn toml_f64_field(val: &toml::Value, section: &str, key: &str) -> Option<f64> {
     val.get(section)?.get(key)?.as_float()
+}
+
+fn toml_radio_str(val: &toml::Value, key: &str) -> Option<String> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("radio")?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn toml_radio_u64(val: &toml::Value, key: &str) -> Option<u64> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("radio")?
+        .get(key)?
+        .as_integer()
+        .map(|i| i as u64)
+}
+
+fn toml_radio_u32(val: &toml::Value, key: &str) -> Option<u32> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("radio")?
+        .get(key)?
+        .as_integer()
+        .map(|i| i as u32)
+}
+
+fn toml_radio_i32(val: &toml::Value, key: &str) -> Option<i32> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("radio")?
+        .get(key)?
+        .as_integer()
+        .map(|i| i as i32)
+}
+
+/// Set a scalar key in `[plugins.mesh.radio]`, creating the table path as needed.
+fn doc_set_radio_field(doc: &mut toml_edit::DocumentMut, key: &str, val: toml_edit::Value) {
+    // Ensure [plugins] exists as a table
+    if doc.get("plugins").is_none() {
+        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let plugins = doc["plugins"].as_table_mut().unwrap();
+    if plugins.get("mesh").is_none() {
+        plugins.insert("mesh", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let mesh = plugins.get_mut("mesh").unwrap().as_table_mut().unwrap();
+    if mesh.get("radio").is_none() {
+        mesh.insert("radio", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let radio = mesh.get_mut("radio").unwrap().as_table_mut().unwrap();
+    radio.insert(key, toml_edit::Item::Value(val));
+}
+
+/// Remove a key from `[plugins.mesh.radio]` if the table path exists.
+fn doc_remove_radio_field(doc: &mut toml_edit::DocumentMut, key: &str) {
+    if let Some(plugins) = doc.get_mut("plugins") {
+        if let Some(mesh) = plugins.as_table_mut().and_then(|t| t.get_mut("mesh")) {
+            if let Some(radio) = mesh.as_table_mut().and_then(|t| t.get_mut("radio")) {
+                if let Some(t) = radio.as_table_mut() {
+                    t.remove(key);
+                }
+            }
+        }
+    }
 }
 
 /// Remove a key from a section in a [`toml_edit::DocumentMut`], if it exists.
@@ -2047,6 +2328,247 @@ async fn api_patch_access_policy(
             Json(json_error(&format!("{e}"))),
         )
             .into_response(),
+    }
+}
+
+// ── Radio config ──────────────────────────────────────────────────────────────
+
+async fn api_get_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    let path = match &state.config.config_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error(
+                    "config_path not set in [plugins.web] — cannot read config",
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let val = match read_config_toml(&path) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
+    };
+
+    let connection_type = toml_plugin_str(&val, "mesh", "connection_type");
+    let serial_port = toml_plugin_str(&val, "mesh", "serial_port");
+
+    Json(RadioConfigResponse {
+        preset: toml_radio_str(&val, "preset"),
+        frequency_hz: toml_radio_u64(&val, "frequency_hz"),
+        bandwidth_hz: toml_radio_u32(&val, "bandwidth_hz"),
+        spreading_factor: toml_radio_u32(&val, "spreading_factor").map(|v| v as u8),
+        coding_rate: toml_radio_u32(&val, "coding_rate").map(|v| v as u8),
+        tx_power_dbm: toml_radio_i32(&val, "tx_power_dbm"),
+        connection_type,
+        serial_port,
+        presets: RADIO_PRESETS.to_vec(),
+    })
+    .into_response()
+}
+
+async fn api_patch_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(patch): Json<RadioConfigPatch>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    let path = match &state.config.config_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error(
+                    "config_path not set in [plugins.web] — cannot write config",
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not read config file: {e}"))),
+            )
+                .into_response()
+        }
+    };
+    let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not parse config file: {e}"))),
+            )
+                .into_response()
+        }
+    };
+
+    // Apply patches — null clears the key; a value sets it.
+    if let Some(v) = patch.preset {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "preset");
+        } else if let Some(s) = v.as_str() {
+            doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s));
+        }
+    }
+    if let Some(v) = patch.frequency_hz {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "frequency_hz");
+        } else if let Some(n) = v.as_u64() {
+            doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64));
+        }
+    }
+    if let Some(v) = patch.bandwidth_hz {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "bandwidth_hz");
+        } else if let Some(n) = v.as_u64() {
+            doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64));
+        }
+    }
+    if let Some(v) = patch.spreading_factor {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "spreading_factor");
+        } else if let Some(n) = v.as_u64() {
+            doc_set_radio_field(
+                &mut doc,
+                "spreading_factor",
+                toml_edit::Value::from(n as i64),
+            );
+        }
+    }
+    if let Some(v) = patch.coding_rate {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "coding_rate");
+        } else if let Some(n) = v.as_u64() {
+            doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64));
+        }
+    }
+    if let Some(v) = patch.tx_power_dbm {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "tx_power_dbm");
+        } else if let Some(n) = v.as_i64() {
+            doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n));
+        }
+    }
+
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("could not write config file: {e}"))),
+        )
+            .into_response();
+    }
+
+    // Audit log — best-effort.
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", user.username),
+            "radio_config_change",
+            None,
+            None,
+        )
+        .await;
+
+    // Return updated config.
+    let val = match read_config_toml(&path) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
+    };
+    Json(RadioConfigResponse {
+        preset: toml_radio_str(&val, "preset"),
+        frequency_hz: toml_radio_u64(&val, "frequency_hz"),
+        bandwidth_hz: toml_radio_u32(&val, "bandwidth_hz"),
+        spreading_factor: toml_radio_u32(&val, "spreading_factor").map(|v| v as u8),
+        coding_rate: toml_radio_u32(&val, "coding_rate").map(|v| v as u8),
+        tx_power_dbm: toml_radio_i32(&val, "tx_power_dbm"),
+        connection_type: toml_plugin_str(&val, "mesh", "connection_type"),
+        serial_port: toml_plugin_str(&val, "mesh", "serial_port"),
+        presets: RADIO_PRESETS.to_vec(),
+    })
+    .into_response()
+}
+
+// ── Node identity ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+struct NodeIdentityResponse {
+    /// Current node public key hex (64 chars), or null if not yet connected.
+    pubkey: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ImportKeyBody {
+    /// 64-char hex private key.
+    key: String,
+}
+
+async fn api_get_node_identity(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    Json(NodeIdentityResponse {
+        pubkey: state.host.node_pubkey(),
+    })
+    .into_response()
+}
+
+async fn api_export_node_key(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_export_node_key().await {
+        Ok(hex) => Json(serde_json::json!({ "key": hex })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_import_node_key(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(body): Json<ImportKeyBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_import_node_key(body.key).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => {
+            // PreconditionFailed = bad key from the client (400).
+            // Internal / NotSupported = transport unavailable or server fault (503/500).
+            let status = match &e {
+                HostError::PreconditionFailed(_) => StatusCode::BAD_REQUEST,
+                HostError::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json_error(&format!("{e}")))).into_response()
+        }
     }
 }
 

@@ -212,6 +212,12 @@ pub struct BbsHost {
     /// Absolute path to `config.toml`, used by in-BBS commands that persist
     /// policy changes to disk.  `None` in tests and minimal CLI runs.
     config_path: Option<PathBuf>,
+    /// Current node public key hex — set by the mesh transport on AppStart.
+    node_pubkey: std::sync::RwLock<Option<String>>,
+    /// Sending half of the mesh key-ops admin channel.
+    /// None when the mesh transport has not registered itself.
+    mesh_key_tx:
+        std::sync::RwLock<Option<tokio::sync::mpsc::Sender<bbs_plugin_api::MeshKeyRequest>>>,
 }
 
 impl BbsHost {
@@ -247,6 +253,8 @@ impl BbsHost {
             access_policy: RwLock::new(policy),
             guest_room_id: std::sync::RwLock::new(None),
             config_path,
+            node_pubkey: std::sync::RwLock::new(None),
+            mesh_key_tx: std::sync::RwLock::new(None),
         }
     }
 
@@ -500,6 +508,82 @@ impl Host for BbsHost {
 
     fn set_node_location(&self, location: Option<(f64, f64)>) {
         *self.location.write().unwrap() = location;
+    }
+
+    fn set_node_pubkey(&self, pubkey_hex: String) {
+        *self.node_pubkey.write().expect("node_pubkey poisoned") = Some(pubkey_hex);
+    }
+
+    fn node_pubkey(&self) -> Option<String> {
+        self.node_pubkey
+            .read()
+            .expect("node_pubkey poisoned")
+            .clone()
+    }
+
+    fn register_mesh_key_ops(
+        &self,
+        sender: tokio::sync::mpsc::Sender<bbs_plugin_api::MeshKeyRequest>,
+    ) {
+        *self.mesh_key_tx.write().expect("mesh_key_tx poisoned") = Some(sender);
+    }
+
+    async fn admin_export_node_key(&self) -> Result<String, bbs_plugin_api::HostError> {
+        let tx = self
+            .mesh_key_tx
+            .read()
+            .expect("mesh_key_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("mesh transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshKeyRequest::ExportKey { reply: reply_tx })
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("mesh transport disconnected".into())
+            })?;
+        reply_rx
+            .await
+            .map_err(|_| bbs_plugin_api::HostError::Internal("key op cancelled".into()))?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
+    async fn admin_import_node_key(&self, hex: String) -> Result<(), bbs_plugin_api::HostError> {
+        // Validate + decode hex -> 32 bytes.
+        if hex.len() != 64 {
+            return Err(bbs_plugin_api::HostError::PreconditionFailed(
+                "private key must be exactly 64 hex characters (32 bytes)".into(),
+            ));
+        }
+        let mut key = [0u8; 32];
+        for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+            let s = std::str::from_utf8(chunk).map_err(|_| {
+                bbs_plugin_api::HostError::PreconditionFailed("invalid hex in private key".into())
+            })?;
+            key[i] = u8::from_str_radix(s, 16).map_err(|_| {
+                bbs_plugin_api::HostError::PreconditionFailed("invalid hex in private key".into())
+            })?;
+        }
+        let tx = self
+            .mesh_key_tx
+            .read()
+            .expect("mesh_key_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("mesh transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshKeyRequest::ImportKey {
+            key,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| bbs_plugin_api::HostError::Internal("mesh transport disconnected".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| bbs_plugin_api::HostError::Internal("key op cancelled".into()))?
+            .map_err(bbs_plugin_api::HostError::Internal)
     }
 
     // ── Admin / web-UI operations ─────────────────────────────────────────────

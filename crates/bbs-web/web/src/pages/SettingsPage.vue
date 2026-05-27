@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, watch, onMounted } from 'vue'
 import { api, ApiError } from '../api/client'
 
 interface ConfigData {
@@ -338,10 +338,213 @@ async function saveAccessPolicy() {
   }
 }
 
+interface RadioPresetDetail {
+  name: string
+  frequency_hz: number
+  bandwidth_hz: number
+  spreading_factor: number
+  coding_rate: number
+  tx_power_dbm: number
+}
+
+interface RadioConfigData {
+  preset: string | null
+  frequency_hz: number | null
+  bandwidth_hz: number | null
+  spreading_factor: number | null
+  coding_rate: number | null
+  tx_power_dbm: number | null
+  connection_type: string | null
+  serial_port: string | null
+  presets: RadioPresetDetail[]
+}
+
+const radioConfig = ref<RadioConfigData | null>(null)
+const radioPresets = ref<RadioPresetDetail[]>([])
+const radioLoading = ref(false)
+const radioError = ref<string | null>(null)
+const radioSaving = ref(false)
+const radioSaveOk = ref<string | null>(null)
+const radioSaveError = ref<string | null>(null)
+
+// Working copy — always show all fields; preset just fills them in
+const radioPreset = ref<string>('')  // '' means no preset selected
+const radioFrequencyHz = ref<string>('')
+const radioBandwidthHz = ref<string>('')
+const radioSpreadingFactor = ref<string>('')
+const radioCodingRate = ref<string>('')
+const radioTxPowerDbm = ref<string>('')
+
+function applyPreset(name: string) {
+  const p = radioPresets.value.find(p => p.name === name)
+  if (!p) return
+  radioFrequencyHz.value     = String(p.frequency_hz)
+  radioBandwidthHz.value     = String(p.bandwidth_hz)
+  radioSpreadingFactor.value = String(p.spreading_factor)
+  radioCodingRate.value      = String(p.coding_rate)
+  radioTxPowerDbm.value      = String(p.tx_power_dbm)
+}
+
+watch(radioPreset, (name) => {
+  if (name) applyPreset(name)
+})
+
+async function loadRadioConfig() {
+  radioLoading.value = true
+  radioError.value = null
+  try {
+    const r = await api.get<RadioConfigData>('/api/v1/radio-config')
+    radioConfig.value = r
+    radioPresets.value = r.presets
+    radioPreset.value = r.preset ?? ''
+    // Prefer stored individual values; if none, fall back to preset values
+    if (r.frequency_hz != null || r.bandwidth_hz != null || r.spreading_factor != null ||
+        r.coding_rate != null || r.tx_power_dbm != null) {
+      radioFrequencyHz.value     = r.frequency_hz     != null ? String(r.frequency_hz)     : ''
+      radioBandwidthHz.value     = r.bandwidth_hz     != null ? String(r.bandwidth_hz)     : ''
+      radioSpreadingFactor.value = r.spreading_factor != null ? String(r.spreading_factor) : ''
+      radioCodingRate.value      = r.coding_rate      != null ? String(r.coding_rate)      : ''
+      radioTxPowerDbm.value      = r.tx_power_dbm     != null ? String(r.tx_power_dbm)     : ''
+    } else if (r.preset) {
+      applyPreset(r.preset)
+    }
+  } catch (e: any) {
+    radioError.value = e?.message ?? 'failed to load radio config'
+  } finally {
+    radioLoading.value = false
+  }
+}
+
+async function saveRadioConfig() {
+  radioSaving.value    = true
+  radioSaveOk.value    = null
+  radioSaveError.value = null
+  try {
+    const patch: Record<string, unknown> = {
+      preset:           radioPreset.value || null,
+      frequency_hz:     radioFrequencyHz.value     ? parseInt(radioFrequencyHz.value, 10)     : null,
+      bandwidth_hz:     radioBandwidthHz.value     ? parseInt(radioBandwidthHz.value, 10)     : null,
+      spreading_factor: radioSpreadingFactor.value ? parseInt(radioSpreadingFactor.value, 10) : null,
+      coding_rate:      radioCodingRate.value      ? parseInt(radioCodingRate.value, 10)      : null,
+      tx_power_dbm:     radioTxPowerDbm.value      ? parseInt(radioTxPowerDbm.value, 10)      : null,
+    }
+    const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
+    radioConfig.value = updated
+    radioSaveOk.value = 'Radio config saved. Apply to device with: sudo supply-drop-bbs node set-radio'
+  } catch (e: any) {
+    radioSaveError.value = e?.message ?? 'failed to save radio config'
+  } finally {
+    radioSaving.value = false
+  }
+}
+
+// ── Node identity ─────────────────────────────────────────────────────────────
+
+interface NodeIdentityData {
+  pubkey: string | null
+}
+
+const nodeIdentity = ref<NodeIdentityData | null>(null)
+const nodeIdentityLoading = ref(false)
+const nodeIdentityError = ref<string | null>(null)
+
+// Export state
+const exportedKey = ref<string | null>(null)
+const exportKeyLoading = ref(false)
+const exportKeyError = ref<string | null>(null)
+const exportKeyVisible = ref(false)
+
+// Inline node-key edit state (replaces the old separate import form)
+const editingNodeKey = ref(false)
+const nodeKeyInput = ref('')
+const nodeKeyLoading = ref(false)
+const nodeKeyOk = ref<string | null>(null)
+const nodeKeyError = ref<string | null>(null)
+
+function startEditNodeKey() {
+  nodeKeyInput.value = ''
+  nodeKeyOk.value = null
+  nodeKeyError.value = null
+  editingNodeKey.value = true
+}
+
+function cancelEditNodeKey() {
+  editingNodeKey.value = false
+  nodeKeyInput.value = ''
+  nodeKeyOk.value = null
+  nodeKeyError.value = null
+}
+
+function validateHex64(value: string): string | null {
+  const h = value.trim()
+  if (h.length !== 64) return `Must be exactly 64 hex characters (${h.length} given).`
+  if (!/^[0-9a-fA-F]+$/.test(h)) return 'Contains invalid characters — only 0-9 and a-f are allowed.'
+  return null
+}
+
+const nodeKeyInputError = computed(() => {
+  if (!nodeKeyInput.value.trim()) return null
+  return validateHex64(nodeKeyInput.value)
+})
+
+async function loadNodeIdentity() {
+  nodeIdentityLoading.value = true
+  nodeIdentityError.value = null
+  try {
+    const r = await api.get<NodeIdentityData>('/api/v1/node-identity')
+    nodeIdentity.value = r
+  } catch (e: any) {
+    nodeIdentityError.value = e?.message ?? 'failed to load node identity'
+  } finally {
+    nodeIdentityLoading.value = false
+  }
+}
+
+async function exportNodeKey() {
+  exportKeyLoading.value = true
+  exportKeyError.value = null
+  exportedKey.value = null
+  try {
+    const r = await api.post<{ key: string }>('/api/v1/node-identity/export-key', {})
+    exportedKey.value = r.key
+    exportKeyVisible.value = false
+  } catch (e: any) {
+    exportKeyError.value = e?.message ?? 'failed to export key'
+  } finally {
+    exportKeyLoading.value = false
+  }
+}
+
+async function saveNodeKey() {
+  nodeKeyOk.value = null
+  nodeKeyError.value = null
+  const err = validateHex64(nodeKeyInput.value)
+  if (err) { nodeKeyError.value = err; return }
+  const hex = nodeKeyInput.value.trim()
+  nodeKeyLoading.value = true
+  try {
+    await api.post('/api/v1/node-identity/import-key', { key: hex })
+    nodeKeyOk.value = 'Node key saved. The public key will update on the next mesh connection.'
+    nodeKeyInput.value = ''
+    editingNodeKey.value = false
+    await loadNodeIdentity()
+  } catch (e: any) {
+    nodeKeyError.value = e?.message ?? 'failed to save node key'
+  } finally {
+    nodeKeyLoading.value = false
+  }
+}
+
+function copyToClipboard(text: string) {
+  navigator.clipboard.writeText(text).catch(() => {})
+}
+
 onMounted(() => {
   load()
   loadRooms()
   loadAccessPolicy()
+  loadRadioConfig()
+  loadNodeIdentity()
 })
 </script>
 
@@ -596,6 +799,163 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
+      <!-- MeshCore Radio -->
+      <section class="card">
+        <h2>MeshCore radio</h2>
+        <p class="hint">
+          LoRa parameters for the MeshCore companion device
+          <span v-if="radioConfig?.connection_type === 'serial' && radioConfig?.serial_port">
+            (<code>{{ radioConfig.serial_port }}</code>)
+          </span>
+          <span v-else-if="radioConfig?.connection_type === 'hat'">
+            (Pi HAT via pymc-companion)
+          </span>
+          <span v-else-if="radioConfig?.connection_type === 'tcp'">
+            (TCP — pymc-companion)
+          </span>.
+          Saved to <code>[plugins.mesh.radio]</code> in config.toml.
+          Settings are <strong>not</strong> applied automatically — after saving, run:
+          <code>sudo supply-drop-bbs node set-radio</code>
+        </p>
+        <p class="hint" style="margin-top: 0.3rem">
+          Using Meshtastic? Radio parameters are configured in the Meshtastic app — they are not managed here.
+        </p>
+
+        <div v-if="radioError" class="notice error-notice">{{ radioError }}</div>
+        <div v-if="radioSaveOk" class="notice ok-notice">{{ radioSaveOk }}</div>
+        <div v-if="radioSaveError" class="notice error-notice">{{ radioSaveError }}</div>
+
+        <div class="field">
+          <label>Region preset</label>
+          <select v-model="radioPreset" :disabled="radioLoading" style="max-width: 320px">
+            <option value="">(select a preset to fill values below)</option>
+            <option v-for="p in radioPresets" :key="p.name" :value="p.name">{{ p.name }}</option>
+          </select>
+          <p class="hint">Selecting a preset fills in the parameters below. You can then adjust individual values.</p>
+        </div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>Frequency (Hz)</label>
+            <input v-model="radioFrequencyHz" type="number" min="1" placeholder="e.g. 910525000" :disabled="radioLoading" />
+            <p class="hint">e.g. 910525000 for 910.525 MHz</p>
+          </div>
+          <div class="field">
+            <label>Bandwidth (Hz)</label>
+            <input v-model="radioBandwidthHz" type="number" min="1" placeholder="e.g. 62500" :disabled="radioLoading" />
+            <p class="hint">e.g. 62500 for 62.5 kHz</p>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Spreading factor (7–12)</label>
+            <input v-model="radioSpreadingFactor" type="number" min="7" max="12" :disabled="radioLoading" />
+          </div>
+          <div class="field">
+            <label>Coding rate (5–8)</label>
+            <input v-model="radioCodingRate" type="number" min="5" max="8" :disabled="radioLoading" />
+            <p class="hint">Denominator: 5 = 4/5, 8 = 4/8</p>
+          </div>
+          <div class="field">
+            <label>TX power (dBm)</label>
+            <input v-model="radioTxPowerDbm" type="number" min="-10" max="30" :disabled="radioLoading" />
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="button" :disabled="radioSaving || radioLoading || !writable" @click="saveRadioConfig">
+            {{ radioSaving ? 'saving…' : 'save radio config' }}
+          </button>
+          <span v-if="!writable" class="hint">config file is not writable</span>
+        </div>
+      </section>
+
+      <!-- Node identity -->
+      <section class="card">
+        <h2>Node identity</h2>
+        <p class="hint">
+          The MeshCore companion device's identity keypair. The public key identifies
+          your node on the mesh network and is shared with other stations to contact you.
+          Use <strong>Set node key</strong> to paste a known 64-character hex key (e.g. when
+          migrating to new hardware). Export the private key for backup before a firmware
+          flash. <strong>Keep the private key secret.</strong>
+        </p>
+
+        <div v-if="nodeIdentityError" class="notice error-notice">{{ nodeIdentityError }}</div>
+
+        <!-- Public key display + inline edit -->
+        <div class="field">
+          <label>Public key</label>
+          <div v-if="!editingNodeKey" class="key-display">
+            <code v-if="nodeIdentity?.pubkey" class="key-hex">{{ nodeIdentity.pubkey }}</code>
+            <span v-else-if="nodeIdentityLoading" class="muted">loading…</span>
+            <span v-else class="muted">not connected — start the mesh transport to read the device key</span>
+            <button
+              v-if="nodeIdentity?.pubkey"
+              type="button"
+              class="icon-btn"
+              title="Copy public key"
+              @click="copyToClipboard(nodeIdentity!.pubkey!)"
+            >⎘</button>
+            <button
+              type="button"
+              class="icon-btn"
+              title="Set node key"
+              style="margin-left: 0.25rem"
+              @click="startEditNodeKey"
+            >✏️</button>
+          </div>
+
+          <!-- Inline edit form -->
+          <div v-if="editingNodeKey" style="display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.25rem">
+            <div class="notice warn-notice" style="font-size: 0.85em">
+              ⚠ Setting a new node key replaces the device's current identity on the mesh.
+              Back up the current private key first if you may need to restore it.
+            </div>
+            <input
+              v-model="nodeKeyInput"
+              type="text"
+              placeholder="paste 64-character hex node key"
+              style="max-width: 480px; font-family: monospace; font-size: 0.85em"
+              autocomplete="off"
+              spellcheck="false"
+              autofocus
+            />
+            <div v-if="nodeKeyInputError" class="notice error-notice" style="font-size: 0.85em">{{ nodeKeyInputError }}</div>
+            <div v-if="nodeKeyError" class="notice error-notice">{{ nodeKeyError }}</div>
+            <div class="actions" style="padding-top: 0">
+              <button
+                type="button"
+                :disabled="nodeKeyLoading || !nodeKeyInput.trim() || !!nodeKeyInputError"
+                @click="saveNodeKey"
+              >{{ nodeKeyLoading ? 'saving…' : 'set node key' }}</button>
+              <button type="button" class="secondary" :disabled="nodeKeyLoading" @click="cancelEditNodeKey">cancel</button>
+            </div>
+          </div>
+
+          <div v-if="nodeKeyOk" class="notice ok-notice" style="margin-top: 0.5rem">{{ nodeKeyOk }}</div>
+        </div>
+
+        <!-- Export private key -->
+        <div class="field">
+          <label>Private key backup</label>
+          <div v-if="exportedKey" class="key-display">
+            <code v-if="exportKeyVisible" class="key-hex">{{ exportedKey }}</code>
+            <span v-else class="muted key-hex">••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••</span>
+            <button type="button" class="icon-btn" :title="exportKeyVisible ? 'Hide' : 'Reveal'" @click="exportKeyVisible = !exportKeyVisible">
+              {{ exportKeyVisible ? '🙈' : '👁' }}
+            </button>
+            <button v-if="exportKeyVisible" type="button" class="icon-btn" title="Copy private key" @click="copyToClipboard(exportedKey!)">⎘</button>
+          </div>
+          <div v-if="exportKeyError" class="notice error-notice" style="margin-top: 0.4rem">{{ exportKeyError }}</div>
+          <div class="actions" style="padding-top: 0.4rem">
+            <button type="button" class="secondary" :disabled="exportKeyLoading" @click="exportNodeKey">
+              {{ exportKeyLoading ? 'exporting…' : 'export private key' }}
+            </button>
+          </div>
+        </div>
+      </section>
+
       <!-- Service restart -->
       <section class="card">
         <h2>Service</h2>
@@ -701,4 +1061,26 @@ p { margin: 0; }
 .field-row .field { flex: 1; min-width: 160px; }
 
 .actions { display: flex; align-items: center; gap: 1rem; padding-top: 0.4rem; }
+
+.key-display {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+}
+.key-hex {
+  font-family: monospace;
+  font-size: 0.82em;
+  word-break: break-all;
+  color: var(--fg);
+}
+.icon-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 1em;
+  padding: 0.1rem 0.3rem;
+  color: var(--muted);
+}
+.icon-btn:hover { color: var(--fg); }
 </style>

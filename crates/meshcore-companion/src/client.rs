@@ -521,7 +521,7 @@ where
             result = read_frame(reader) => {
                 match result {
                     Ok(frame) => {
-                        debug!("companion: rx {frame:?}");
+                        trace!("companion: rx {frame:?}");
                         if event_tx.send(ClientEvent::Frame(frame)).await.is_err() {
                             return SessionOutcome::Shutdown;
                         }
@@ -533,7 +533,7 @@ where
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(frame) => {
-                        debug!("companion: tx {frame:?}");
+                        trace!("companion: tx {frame:?}");
                         let wire = encode_outbound(&frame);
                         if let Err(e) = writer.write_all(&wire).await {
                             return SessionOutcome::IoError(e, false);
