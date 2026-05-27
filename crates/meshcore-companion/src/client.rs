@@ -55,10 +55,10 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
     sync::mpsc,
-    time::sleep,
+    time::{sleep, timeout},
 };
 use tokio_serial::SerialPortBuilderExt;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::{
     constants::{ERR_CODE_UNSUPPORTED_CMD, FRAME_OUTBOUND_PREFIX, MAX_PAYLOAD_SIZE},
@@ -378,6 +378,17 @@ async fn attempt_serial_session(
     };
     info!(port = %config.port, baud = config.baud_rate, "companion/serial: port opened");
 
+    // Give the nRF52840 firmware time to complete setup() before we send
+    // AppStart.  The Linux cdc-acm driver sends SET_CONTROL_LINE_STATE(DTR=1)
+    // automatically on port open (acm_port_activate), so no explicit DTR
+    // assertion is needed.  What *is* needed is this delay: radio init,
+    // filesystem mount, and mesh init together take ~1-2 seconds, and if we
+    // send AppStart before setup() finishes the frame sits in the TinyUSB FIFO
+    // safely — but it is processed correctly only once serial_interface.begin()
+    // and startInterface() have been called.  2 s matches the delay used by the
+    // Meshtastic serial transport for the same class of devices.
+    sleep(Duration::from_secs(2)).await;
+
     let (mut reader, mut writer) = tokio::io::split(stream);
     match run_session(
         &mut reader,
@@ -430,11 +441,43 @@ where
 {
     // ── AppStart handshake ────────────────────────────────────────────────────
     let handshake = encode_outbound(&OutboundFrame::AppStart { app_target_version });
+    trace!(
+        "companion: tx AppStart ({} bytes): {:02X?}",
+        handshake.len(),
+        handshake
+    );
     if let Err(e) = writer.write_all(&handshake).await {
         return SessionOutcome::IoError(e, false);
     }
+    // Flush to ensure the frame reaches the device before we start reading.
+    // USB CDC drivers may batch small writes; an explicit flush forces immediate
+    // transmission, which matters for devices that won't respond until they
+    // receive the full AppStart frame.
+    if let Err(e) = writer.flush().await {
+        warn!("companion: flush after AppStart failed: {e}");
+    }
 
-    let self_info: Option<SelfInfo> = match read_frame(reader).await {
+    // Wait up to 10 seconds for the SelfInfo handshake response.
+    // If the device is silent we log a clear error and fall into the reconnect
+    // loop rather than blocking the task forever.
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+    let frame_result = match timeout(HANDSHAKE_TIMEOUT, read_frame(reader)).await {
+        Ok(r) => r,
+        Err(_) => {
+            warn!(
+                "companion: handshake timeout ({HANDSHAKE_TIMEOUT:?}) — \
+                 device did not respond to AppStart; \
+                 check connection type, baud rate, and that the device is \
+                 running the MeshCore USB companion firmware"
+            );
+            return SessionOutcome::IoError(
+                io::Error::new(io::ErrorKind::TimedOut, "AppStart handshake timeout"),
+                false,
+            );
+        }
+    };
+
+    let self_info: Option<SelfInfo> = match frame_result {
         Err(e) => return SessionOutcome::IoError(e, false),
         Ok(InboundFrame::SelfInfo(info)) => Some(info),
         // Some devices return UNSUPPORTED_CMD for CMD_APP_START.  Rather than
@@ -506,24 +549,34 @@ where
 
 /// Read one complete frame from `reader`.
 ///
-/// Reads the 3-byte header (prefix + LE u16 length), validates the prefix,
-/// reads the payload, then decodes.  Returns `io::Error` on any failure so
-/// the caller can treat all session errors uniformly.
+/// Scans the byte stream for the device→host prefix (`0x3E`, `>`), skipping
+/// any bytes that don't match.  This tolerates startup banners or stray bytes
+/// that some companion devices emit before the companion-frame protocol is
+/// ready.  Once the prefix is found, reads the 2-byte LE payload length, then
+/// the payload, then decodes.
+///
+/// Returns `io::Error` on any I/O failure or payload decode error.
 async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<InboundFrame> {
-    let mut header = [0u8; 3];
-    reader.read_exact(&mut header).await?;
-
-    if header[0] != FRAME_OUTBOUND_PREFIX {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!(
-                "companion: bad frame prefix 0x{:02X} (expected 0x{FRAME_OUTBOUND_PREFIX:02X})",
-                header[0]
-            ),
-        ));
+    // Scan for the outbound-frame prefix, skipping any non-matching bytes.
+    // This handles startup banners, CRLF noise, or any bytes the device sends
+    // before entering companion-frame mode.
+    loop {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).await?;
+        if byte[0] == FRAME_OUTBOUND_PREFIX {
+            break;
+        }
+        // Log at trace so routine operation is quiet but debug builds show the noise.
+        trace!(
+            "companion: skipping non-prefix byte 0x{:02X} (expected 0x{FRAME_OUTBOUND_PREFIX:02X})",
+            byte[0]
+        );
     }
 
-    let payload_len = u16::from_le_bytes([header[1], header[2]]) as usize;
+    let mut len_bytes = [0u8; 2];
+    reader.read_exact(&mut len_bytes).await?;
+    let payload_len = u16::from_le_bytes(len_bytes) as usize;
+
     if payload_len > MAX_PAYLOAD_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -535,6 +588,12 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<InboundF
 
     let mut payload = vec![0u8; payload_len];
     reader.read_exact(&mut payload).await?;
+
+    trace!(
+        "companion: rx {} bytes payload: {:02X?}",
+        payload_len,
+        payload
+    );
 
     decode_inbound(&payload)
         .map_err(|e: FrameDecodeError| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))

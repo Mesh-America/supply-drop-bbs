@@ -253,6 +253,29 @@ pub enum OutboundFrame {
     SetPathHashMode {
         mode: u8,
     },
+    /// Configure the radio parameters (frequency, bandwidth, spreading factor, coding rate).
+    ///
+    /// Send immediately after the AppStart handshake for USB serial companion devices
+    /// that have no persisted radio configuration (e.g. freshly-flashed Heltec T114).
+    ///
+    /// Wire format: `[CMD_SET_RADIO_PARAMS][freq:u32-LE][bw:u32-LE][sf:u8][cr:u8]`
+    SetRadioParams {
+        /// Carrier frequency in Hz (e.g. `910_525_000` for USA/Canada 915 MHz band).
+        frequency_hz: u32,
+        /// Bandwidth in Hz (e.g. `62_500` for 62.5 kHz).
+        bandwidth_hz: u32,
+        /// LoRa spreading factor (7–12).
+        spreading_factor: u8,
+        /// LoRa coding rate denominator (5–8, representing 4/5 through 4/8).
+        coding_rate: u8,
+    },
+    /// Set the radio transmit power.
+    ///
+    /// Wire format: `[CMD_SET_RADIO_TX_POWER][power:i8]`
+    SetRadioTxPower {
+        /// Transmit power in dBm (e.g. `20` for 100 mW).
+        power_dbm: i8,
+    },
     /// Escape hatch for commands not yet modelled above.
     Raw {
         code: u8,
@@ -576,8 +599,14 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
     let mut p: Vec<u8> = Vec::new();
     match frame {
         OutboundFrame::AppStart { app_target_version } => {
+            // MeshCore firmware requires a minimum 8-byte payload for CMD_APP_START.
+            // Layout: [CMD][reserved×7] — positions 1–7 are reserved/ignored by the
+            // device, but the frame is silently dropped if len < 8.  We place the
+            // app_target_version byte at position 1 (a convention from earlier protocol
+            // versions); the remaining 6 bytes are zeroed.
             p.push(CMD_APP_START);
             p.push(*app_target_version);
+            p.extend_from_slice(&[0u8; 6]); // pad to minimum 8-byte payload
         }
         OutboundFrame::DeviceQuery { app_target_version } => {
             p.push(CMD_DEVICE_QUERY);
@@ -736,6 +765,34 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
             p.push(CMD_SET_PATH_HASH_MODE);
             p.push(0); // subtype byte must be 0
             p.push(*mode);
+        }
+        OutboundFrame::SetRadioParams {
+            frequency_hz,
+            bandwidth_hz,
+            spreading_factor,
+            coding_rate,
+        } => {
+            // Wire: [CMD][freq_khz:u32-LE 4B][bw_hz:u32-LE 4B][sf:u8][cr:u8]
+            //
+            // IMPORTANT: frequency is encoded in kHz on the wire, matching how
+            // the device reports it in CMD_APP_START → RESP_CODE_SELF_INFO
+            // (field `frequency_khz`).  The `OutboundFrame` field is named
+            // `frequency_hz` for human clarity; we divide by 1000 here.
+            //
+            // This matches the pymc_core CompanionFrameServer comment:
+            //   "Frequency in kHz (match firmware self-info; client sends same encoding)"
+            // and the validation range (100_000–2_500_000 kHz = 100 MHz–2.5 GHz).
+            let freq_khz = frequency_hz / 1000;
+            p.push(CMD_SET_RADIO_PARAMS);
+            p.extend_from_slice(&freq_khz.to_le_bytes());
+            p.extend_from_slice(&bandwidth_hz.to_le_bytes());
+            p.push(*spreading_factor);
+            p.push(*coding_rate);
+        }
+        OutboundFrame::SetRadioTxPower { power_dbm } => {
+            // Wire: [CMD][power:i8]
+            p.push(CMD_SET_RADIO_TX_POWER);
+            p.push(*power_dbm as u8);
         }
         OutboundFrame::Raw { code, body } => {
             p.push(*code);

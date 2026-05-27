@@ -4,9 +4,11 @@
 //! no real `pymc_core` process or external network is needed.  The test
 //! controls the "server" side manually via [`TcpBridge`].
 //!
-//! AppStart is always 5 wire bytes: `[0x3C][0x02][0x00][CMD_APP_START][version]`.
-//! Tests that consume the AppStart always read exactly 5 bytes to avoid
-//! leaving the version byte in the TCP buffer and corrupting subsequent reads.
+//! AppStart is always 11 wire bytes:
+//! `[0x3C][0x08][0x00][CMD_APP_START][version][0x00 × 6]` (payload padded to 8
+//! bytes per the MeshCore firmware minimum).  Tests that consume the AppStart
+//! always read exactly 11 bytes to avoid leaving stale bytes in the TCP buffer
+//! and corrupting subsequent reads.
 
 use std::time::Duration;
 
@@ -113,8 +115,8 @@ async fn loopback() -> (CompanionClient, TcpBridge) {
 /// Complete the AppStart handshake on a fresh loopback pair and wait for the
 /// `Connected` event.  Returns the `TcpBridge` so the test can continue.
 async fn complete_handshake(client: &mut CompanionClient, bridge: &mut TcpBridge, name: &str) {
-    // AppStart = 5 bytes: [prefix][len_lo=2][len_hi=0][CMD_APP_START][version]
-    let _app_start = bridge.recv_n(5).await;
+    // AppStart = 11 bytes: [prefix][len_lo=8][len_hi=0][CMD_APP_START][version][0×6]
+    let _app_start = bridge.recv_n(11).await;
     bridge.send(&self_info_frame(name)).await;
     let ev = tokio::time::timeout(Duration::from_secs(2), client.recv())
         .await
@@ -133,10 +135,15 @@ async fn complete_handshake(client: &mut CompanionClient, bridge: &mut TcpBridge
 async fn handshake_emits_connected() {
     let (mut client, mut bridge) = loopback().await;
 
-    let app_start = bridge.recv_n(5).await;
+    let app_start = bridge.recv_n(11).await;
     assert_eq!(
         app_start[0], FRAME_INBOUND_PREFIX,
         "AppStart must use inbound prefix"
+    );
+    assert_eq!(
+        u16::from_le_bytes([app_start[1], app_start[2]]),
+        8,
+        "AppStart payload length must be 8"
     );
     assert_eq!(app_start[3], CMD_APP_START, "byte[3] must be CMD_APP_START");
     assert_eq!(
@@ -167,8 +174,8 @@ async fn handshake_emits_connected() {
 async fn unsupported_app_start_emits_connected_without_self_info() {
     let (mut client, mut bridge) = loopback().await;
 
-    // Consume the AppStart the client sends.
-    let _app_start = bridge.recv_n(5).await;
+    // Consume the AppStart the client sends (11 bytes: prefix + 2-byte len + 8-byte payload).
+    let _app_start = bridge.recv_n(11).await;
 
     // Reply with ERR_CODE_UNSUPPORTED_CMD (error_code = 1).
     let err_frame = radio_frame(&[RESP_CODE_ERR, ERR_CODE_UNSUPPORTED_CMD]);
@@ -207,16 +214,21 @@ async fn unsupported_app_start_emits_connected_without_self_info() {
 async fn first_bytes_are_app_start() {
     let (_client, mut bridge) = loopback().await;
 
-    // [prefix][len_lo=2][len_hi=0][CMD_APP_START][APP_TARGET_VER_V3]
-    let wire = bridge.recv_n(5).await;
+    // [prefix][len_lo=8][len_hi=0][CMD_APP_START][APP_TARGET_VER_V3][0×6 padding]
+    let wire = bridge.recv_n(11).await;
     assert_eq!(wire[0], FRAME_INBOUND_PREFIX);
     assert_eq!(
         u16::from_le_bytes([wire[1], wire[2]]),
-        2,
-        "payload length must be 2"
+        8,
+        "payload length must be 8 (firmware minimum)"
     );
     assert_eq!(wire[3], CMD_APP_START);
     assert_eq!(wire[4], APP_TARGET_VER_V3);
+    assert_eq!(
+        &wire[5..11],
+        &[0u8; 6],
+        "trailing padding bytes must be zero"
+    );
 }
 
 /// Frames arriving after the handshake are forwarded as `Frame` events.
@@ -284,7 +296,7 @@ async fn reconnects_after_disconnect() {
 
     // ── First connection ──────────────────────────────────────────────────
     let (mut s1, _) = listener.accept().await.unwrap();
-    let mut buf = vec![0u8; 5];
+    let mut buf = vec![0u8; 11]; // AppStart = prefix(1) + len(2) + payload(8)
     tokio::io::AsyncReadExt::read_exact(&mut s1, &mut buf)
         .await
         .unwrap();
@@ -311,7 +323,7 @@ async fn reconnects_after_disconnect() {
 
     // ── Second connection (automatic reconnect) ───────────────────────────
     let (mut s2, _) = listener.accept().await.unwrap();
-    let mut buf2 = vec![0u8; 5];
+    let mut buf2 = vec![0u8; 11]; // AppStart = prefix(1) + len(2) + payload(8)
     tokio::io::AsyncReadExt::read_exact(&mut s2, &mut buf2)
         .await
         .unwrap();
@@ -342,7 +354,7 @@ async fn drop_client_closes_connection() {
     let mut client = CompanionClient::connect(config);
 
     let (mut srv, _) = listener.accept().await.unwrap();
-    let mut buf = vec![0u8; 5];
+    let mut buf = vec![0u8; 11]; // AppStart = prefix(1) + len(2) + payload(8)
     tokio::io::AsyncReadExt::read_exact(&mut srv, &mut buf)
         .await
         .unwrap();
