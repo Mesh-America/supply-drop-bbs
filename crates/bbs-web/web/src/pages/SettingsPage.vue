@@ -454,12 +454,38 @@ const exportKeyLoading = ref(false)
 const exportKeyError = ref<string | null>(null)
 const exportKeyVisible = ref(false)
 
-// Import state
-const importKeyInput = ref('')
-const importKeyLoading = ref(false)
-const importKeyOk = ref<string | null>(null)
-const importKeyError = ref<string | null>(null)
-const showImportForm = ref(false)
+// Inline node-key edit state (replaces the old separate import form)
+const editingNodeKey = ref(false)
+const nodeKeyInput = ref('')
+const nodeKeyLoading = ref(false)
+const nodeKeyOk = ref<string | null>(null)
+const nodeKeyError = ref<string | null>(null)
+
+function startEditNodeKey() {
+  nodeKeyInput.value = ''
+  nodeKeyOk.value = null
+  nodeKeyError.value = null
+  editingNodeKey.value = true
+}
+
+function cancelEditNodeKey() {
+  editingNodeKey.value = false
+  nodeKeyInput.value = ''
+  nodeKeyOk.value = null
+  nodeKeyError.value = null
+}
+
+function validateHex64(value: string): string | null {
+  const h = value.trim()
+  if (h.length !== 64) return `Must be exactly 64 hex characters (${h.length} given).`
+  if (!/^[0-9a-fA-F]+$/.test(h)) return 'Contains invalid characters — only 0-9 and a-f are allowed.'
+  return null
+}
+
+const nodeKeyInputError = computed(() => {
+  if (!nodeKeyInput.value.trim()) return null
+  return validateHex64(nodeKeyInput.value)
+})
 
 async function loadNodeIdentity() {
   nodeIdentityLoading.value = true
@@ -489,26 +515,23 @@ async function exportNodeKey() {
   }
 }
 
-async function importNodeKey() {
-  importKeyOk.value = null
-  importKeyError.value = null
-  const hex = importKeyInput.value.trim()
-  if (hex.length !== 64 || !/^[0-9a-fA-F]+$/.test(hex)) {
-    importKeyError.value = 'Private key must be exactly 64 hex characters (32 bytes).'
-    return
-  }
-  importKeyLoading.value = true
+async function saveNodeKey() {
+  nodeKeyOk.value = null
+  nodeKeyError.value = null
+  const err = validateHex64(nodeKeyInput.value)
+  if (err) { nodeKeyError.value = err; return }
+  const hex = nodeKeyInput.value.trim()
+  nodeKeyLoading.value = true
   try {
     await api.post('/api/v1/node-identity/import-key', { key: hex })
-    importKeyOk.value = 'Private key imported successfully. The node\'s public key will update on the next connection.'
-    importKeyInput.value = ''
-    showImportForm.value = false
-    // Reload identity so pubkey refreshes.
+    nodeKeyOk.value = 'Node key saved. The public key will update on the next mesh connection.'
+    nodeKeyInput.value = ''
+    editingNodeKey.value = false
     await loadNodeIdentity()
   } catch (e: any) {
-    importKeyError.value = e?.message ?? 'failed to import key'
+    nodeKeyError.value = e?.message ?? 'failed to save node key'
   } finally {
-    importKeyLoading.value = false
+    nodeKeyLoading.value = false
   }
 }
 
@@ -851,17 +874,19 @@ chmod g+w {{ configFile }}</pre>
       <section class="card">
         <h2>Node identity</h2>
         <p class="hint">
-          The companion device's identity keypair. The public key identifies your
-          node on the mesh. Export the private key for backup before a firmware
-          flash; import it to restore your identity on a new device.
-          <strong>Keep the private key secret.</strong>
+          The MeshCore companion device's identity keypair. The public key identifies
+          your node on the mesh network and is shared with other stations to contact you.
+          Use <strong>Set node key</strong> to paste a known 64-character hex key (e.g. when
+          migrating to new hardware). Export the private key for backup before a firmware
+          flash. <strong>Keep the private key secret.</strong>
         </p>
 
         <div v-if="nodeIdentityError" class="notice error-notice">{{ nodeIdentityError }}</div>
 
+        <!-- Public key display + inline edit -->
         <div class="field">
           <label>Public key</label>
-          <div class="key-display">
+          <div v-if="!editingNodeKey" class="key-display">
             <code v-if="nodeIdentity?.pubkey" class="key-hex">{{ nodeIdentity.pubkey }}</code>
             <span v-else-if="nodeIdentityLoading" class="muted">loading…</span>
             <span v-else class="muted">not connected — start the mesh transport to read the device key</span>
@@ -872,12 +897,48 @@ chmod g+w {{ configFile }}</pre>
               title="Copy public key"
               @click="copyToClipboard(nodeIdentity!.pubkey!)"
             >⎘</button>
+            <button
+              type="button"
+              class="icon-btn"
+              title="Set node key"
+              style="margin-left: 0.25rem"
+              @click="startEditNodeKey"
+            >✏️</button>
           </div>
+
+          <!-- Inline edit form -->
+          <div v-if="editingNodeKey" style="display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.25rem">
+            <div class="notice warn-notice" style="font-size: 0.85em">
+              ⚠ Setting a new node key replaces the device's current identity on the mesh.
+              Back up the current private key first if you may need to restore it.
+            </div>
+            <input
+              v-model="nodeKeyInput"
+              type="text"
+              placeholder="paste 64-character hex node key"
+              style="max-width: 480px; font-family: monospace; font-size: 0.85em"
+              autocomplete="off"
+              spellcheck="false"
+              autofocus
+            />
+            <div v-if="nodeKeyInputError" class="notice error-notice" style="font-size: 0.85em">{{ nodeKeyInputError }}</div>
+            <div v-if="nodeKeyError" class="notice error-notice">{{ nodeKeyError }}</div>
+            <div class="actions" style="padding-top: 0">
+              <button
+                type="button"
+                :disabled="nodeKeyLoading || !nodeKeyInput.trim() || !!nodeKeyInputError"
+                @click="saveNodeKey"
+              >{{ nodeKeyLoading ? 'saving…' : 'set node key' }}</button>
+              <button type="button" class="secondary" :disabled="nodeKeyLoading" @click="cancelEditNodeKey">cancel</button>
+            </div>
+          </div>
+
+          <div v-if="nodeKeyOk" class="notice ok-notice" style="margin-top: 0.5rem">{{ nodeKeyOk }}</div>
         </div>
 
-        <!-- Export -->
+        <!-- Export private key -->
         <div class="field">
-          <label>Private key</label>
+          <label>Private key backup</label>
           <div v-if="exportedKey" class="key-display">
             <code v-if="exportKeyVisible" class="key-hex">{{ exportedKey }}</code>
             <span v-else class="muted key-hex">••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••••</span>
@@ -891,35 +952,6 @@ chmod g+w {{ configFile }}</pre>
             <button type="button" class="secondary" :disabled="exportKeyLoading" @click="exportNodeKey">
               {{ exportKeyLoading ? 'exporting…' : 'export private key' }}
             </button>
-          </div>
-        </div>
-
-        <!-- Import -->
-        <div class="field">
-          <div class="actions" style="padding-top: 0">
-            <button type="button" class="secondary" @click="showImportForm = !showImportForm">
-              {{ showImportForm ? 'cancel import' : 'import private key' }}
-            </button>
-          </div>
-          <div v-if="showImportForm" style="margin-top: 0.6rem; display: flex; flex-direction: column; gap: 0.5rem">
-            <div class="notice warn-notice" style="font-size: 0.85em">
-              ⚠ Importing a private key replaces the current keypair. Back up the current key first.
-            </div>
-            <input
-              v-model="importKeyInput"
-              type="password"
-              placeholder="paste 64-char hex private key"
-              style="max-width: 480px; font-family: monospace"
-              autocomplete="off"
-              spellcheck="false"
-            />
-            <div v-if="importKeyError" class="notice error-notice">{{ importKeyError }}</div>
-            <div v-if="importKeyOk" class="notice ok-notice">{{ importKeyOk }}</div>
-            <div class="actions" style="padding-top: 0">
-              <button type="button" :disabled="importKeyLoading || !importKeyInput.trim()" @click="importNodeKey">
-                {{ importKeyLoading ? 'importing…' : 'confirm import' }}
-              </button>
-            </div>
           </div>
         </div>
       </section>

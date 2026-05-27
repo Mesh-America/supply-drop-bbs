@@ -1546,6 +1546,23 @@ fn print_next_steps(
         }
     }
 
+    // Node key hint (MeshCore serial only — not applicable for TCP / HAT / Meshtastic)
+    if use_mesh && mesh_conn_type == "serial" {
+        println!("MeshCore node key:");
+        println!();
+        println!("  To see the current node key (public key):");
+        println!("    supply-drop-bbs node show-key");
+        println!();
+        println!("  To back up the private key before a firmware flash:");
+        println!("    supply-drop-bbs node export-key");
+        println!();
+        println!("  To restore or migrate to a new 64-char hex key:");
+        println!("    supply-drop-bbs node import-key <64-char-hex>");
+        println!();
+        println!("  The BBS service must not be running when using these commands.");
+        println!();
+    }
+
     if cfg!(target_os = "linux") {
         println!("To run Supply Drop BBS as a systemd service:");
         println!();
