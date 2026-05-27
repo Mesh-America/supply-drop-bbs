@@ -212,6 +212,8 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
+        "whoami" => Some(Command::Whoami),
+
         "profile" => Some(Command::EditProfile),
 
         "passwd" => Some(Command::ChangePassword),
@@ -404,9 +406,13 @@ mod tests {
     }
 
     #[test]
-    fn logout_and_whoami_are_unknown_on_mesh() {
+    fn logout_is_unknown_on_mesh() {
         assert!(matches!(cmd("logout"), Some(Command::Unknown { .. })));
-        assert!(matches!(cmd("whoami"), Some(Command::Unknown { .. })));
+    }
+
+    #[test]
+    fn whoami_is_parsed_on_mesh() {
+        assert!(matches!(cmd("whoami"), Some(Command::Whoami)));
     }
 
     #[test]
