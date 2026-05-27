@@ -47,6 +47,51 @@ pub enum ConnectionType {
     Serial,
 }
 
+/// Radio parameter configuration stored in `[plugins.mesh.radio]`.
+///
+/// These values are **not** pushed to the device automatically on connect.
+/// Apply them explicitly via `supply-drop-bbs node set-radio` or during
+/// the setup wizard. Once applied the device (T114, Heltec V3, etc.)
+/// persists the settings in its own flash.
+///
+/// Either specify a named `preset` (which sets all parameters at once) or
+/// supply individual fields. Individual fields take precedence over the preset.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RadioConfig {
+    /// Named region preset (e.g. `"USA/Canada"`).
+    ///
+    /// Run `supply-drop-bbs node set-radio --list-presets` to see all names.
+    #[serde(default)]
+    pub preset: Option<String>,
+
+    /// Carrier frequency in Hz (e.g. `910_525_000` for 910.525 MHz).
+    ///
+    /// Overrides the preset value when set.
+    #[serde(default)]
+    pub frequency_hz: Option<u64>,
+
+    /// Channel bandwidth in Hz (e.g. `62_500` for 62.5 kHz).
+    ///
+    /// Overrides the preset value when set.
+    #[serde(default)]
+    pub bandwidth_hz: Option<u32>,
+
+    /// LoRa spreading factor (7–12). Overrides the preset value when set.
+    #[serde(default)]
+    pub spreading_factor: Option<u8>,
+
+    /// LoRa coding rate denominator (5–8, representing 4/5 through 4/8).
+    ///
+    /// Overrides the preset value when set.
+    #[serde(default)]
+    pub coding_rate: Option<u8>,
+
+    /// Transmit power in dBm. Overrides the preset value when set.
+    #[serde(default)]
+    pub tx_power_dbm: Option<i32>,
+}
+
 /// Configuration for [`MeshTransport`](crate::MeshTransport).
 ///
 /// # Minimal TOML examples
@@ -156,6 +201,20 @@ pub struct MeshConfig {
     /// behaviour.  Defaults to `true`.
     #[serde(default = "default_flood_after_send")]
     pub flood_after_send: bool,
+
+    /// Radio parameter configuration.
+    ///
+    /// Stored here for reference and applied on demand via
+    /// `supply-drop-bbs node set-radio`.  **Not** pushed automatically on
+    /// every connect — the device persists radio settings in its own flash.
+    ///
+    /// Example:
+    /// ```toml
+    /// [plugins.mesh.radio]
+    /// preset = "USA/Canada"
+    /// ```
+    #[serde(default)]
+    pub radio: Option<RadioConfig>,
 }
 
 impl MeshConfig {
@@ -185,6 +244,7 @@ impl Default for MeshConfig {
             reconnect_delay_max_ms: default_reconnect_max_ms(),
             node_credential_ttl_days: default_node_credential_ttl_days(),
             flood_after_send: default_flood_after_send(),
+            radio: None,
         }
     }
 }

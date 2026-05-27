@@ -11,6 +11,7 @@
 #![allow(missing_docs)]
 
 mod config;
+mod mesh_presets;
 mod setup;
 
 use std::{path::PathBuf, sync::Arc};
@@ -302,6 +303,56 @@ enum NodeAction {
         port: Option<String>,
         #[arg(long)]
         baud: Option<u32>,
+    },
+
+    /// Apply radio configuration to the companion device.
+    ///
+    /// Reads parameters from `[plugins.mesh.radio]` in config.toml, with
+    /// optional per-flag overrides. The device persists the settings in its
+    /// own flash — they survive power cycles and reconnects without the BBS
+    /// re-sending them.
+    ///
+    /// The BBS service must not be running on the same port when you run this.
+    ///
+    /// Examples:
+    ///
+    ///   # Apply preset from config.toml and save any flag overrides back
+    ///   supply-drop-bbs node set-radio
+    ///
+    ///   # Apply a specific preset and save it to config.toml
+    ///   supply-drop-bbs node set-radio --preset "USA/Canada" --save
+    ///
+    ///   # List available presets
+    ///   supply-drop-bbs node set-radio --list-presets
+    SetRadio {
+        #[arg(long)]
+        port: Option<String>,
+        #[arg(long)]
+        baud: Option<u32>,
+        /// Named region preset (e.g. "USA/Canada"). Overrides config.toml preset.
+        #[arg(long)]
+        preset: Option<String>,
+        /// Carrier frequency in Hz. Overrides preset.
+        #[arg(long)]
+        frequency_hz: Option<u64>,
+        /// Channel bandwidth in Hz. Overrides preset.
+        #[arg(long)]
+        bandwidth_hz: Option<u32>,
+        /// Spreading factor 7–12. Overrides preset.
+        #[arg(long)]
+        spreading_factor: Option<u8>,
+        /// Coding rate 5–8. Overrides preset.
+        #[arg(long)]
+        coding_rate: Option<u8>,
+        /// TX power in dBm. Overrides preset.
+        #[arg(long)]
+        tx_power_dbm: Option<i32>,
+        /// Also save the resolved settings to config.toml.
+        #[arg(long)]
+        save: bool,
+        /// Print all available region preset names and exit.
+        #[arg(long)]
+        list_presets: bool,
     },
 }
 
@@ -1651,6 +1702,151 @@ async fn cmd_room(config_path: Option<&std::path::Path>, action: RoomAction) {
     }
 }
 
+// ── Radio helpers ─────────────────────────────────────────────────────────────
+
+#[cfg(feature = "transport-mesh")]
+struct ResolvedRadio {
+    frequency_hz: u32,
+    bandwidth_hz: u32,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power_dbm: i32,
+}
+
+/// Resolve final radio parameters by layering: preset → config fields → CLI flags.
+#[cfg(feature = "transport-mesh")]
+fn resolve_radio(
+    cfg_radio: Option<&bbs_mesh::config::RadioConfig>,
+    preset_override: Option<&str>,
+    freq_override: Option<u64>,
+    bw_override: Option<u32>,
+    sf_override: Option<u8>,
+    cr_override: Option<u8>,
+    pwr_override: Option<i32>,
+) -> Result<ResolvedRadio, String> {
+    let mut freq: Option<u32> = None;
+    let mut bw: Option<u32> = None;
+    let mut sf: Option<u8> = None;
+    let mut cr: Option<u8> = None;
+    let mut pwr: Option<i32> = None;
+
+    // 1. Named preset (CLI flag > config.toml preset).
+    let preset_name = preset_override.or_else(|| cfg_radio.and_then(|r| r.preset.as_deref()));
+    if let Some(name) = preset_name {
+        let p = mesh_presets::REGION_PRESETS
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| {
+                format!(
+                    "unknown preset '{name}' — run \
+                     'supply-drop-bbs node set-radio --list-presets' to see valid names"
+                )
+            })?;
+        freq = Some(p.frequency_hz as u32);
+        bw = Some(p.bandwidth_hz);
+        sf = Some(p.spreading_factor);
+        cr = Some(p.coding_rate);
+        pwr = Some(p.tx_power_dbm);
+    }
+
+    // 2. Individual config.toml fields overlay preset.
+    if let Some(r) = cfg_radio {
+        if let Some(v) = r.frequency_hz {
+            freq = Some(v as u32);
+        }
+        if let Some(v) = r.bandwidth_hz {
+            bw = Some(v);
+        }
+        if let Some(v) = r.spreading_factor {
+            sf = Some(v);
+        }
+        if let Some(v) = r.coding_rate {
+            cr = Some(v);
+        }
+        if let Some(v) = r.tx_power_dbm {
+            pwr = Some(v);
+        }
+    }
+
+    // 3. CLI flag overrides take highest precedence.
+    if let Some(v) = freq_override {
+        freq = Some(v as u32);
+    }
+    if let Some(v) = bw_override {
+        bw = Some(v);
+    }
+    if let Some(v) = sf_override {
+        sf = Some(v);
+    }
+    if let Some(v) = cr_override {
+        cr = Some(v);
+    }
+    if let Some(v) = pwr_override {
+        pwr = Some(v);
+    }
+
+    Ok(ResolvedRadio {
+        frequency_hz: freq
+            .ok_or("frequency_hz not set — specify a preset or frequency_hz in config")?,
+        bandwidth_hz: bw.ok_or("bandwidth_hz not set")?,
+        spreading_factor: sf.ok_or("spreading_factor not set")?,
+        coding_rate: cr.ok_or("coding_rate not set")?,
+        tx_power_dbm: pwr.ok_or("tx_power_dbm not set")?,
+    })
+}
+
+/// Write radio settings back to config.toml under `[plugins.mesh.radio]`.
+#[cfg(feature = "transport-mesh")]
+fn save_radio_config(config_path: Option<&std::path::Path>, r: &ResolvedRadio) {
+    #[cfg(feature = "transport-process")]
+    let path_opt = config::resolve_config_path(config_path);
+    #[cfg(not(feature = "transport-process"))]
+    let path_opt = {
+        let explicit = config_path.map(|p| p.to_path_buf());
+        explicit.or_else(|| {
+            [
+                std::path::PathBuf::from("config.toml"),
+                std::path::PathBuf::from("/etc/supply-drop-bbs/config.toml"),
+            ]
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+        })
+    };
+
+    let path = match path_opt {
+        Some(p) => p,
+        None => {
+            eprintln!("warning: --save: no config file found, skipping write");
+            return;
+        }
+    };
+
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = content.parse().unwrap_or_default();
+
+    // Ensure [plugins] and [plugins.mesh] exist.
+    if doc.get("plugins").is_none() {
+        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    if doc["plugins"].get("mesh").is_none() {
+        doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    // Write [plugins.mesh.radio] fields.
+    doc["plugins"]["mesh"]["radio"]["frequency_hz"] = toml_edit::value(r.frequency_hz as i64);
+    doc["plugins"]["mesh"]["radio"]["bandwidth_hz"] = toml_edit::value(r.bandwidth_hz as i64);
+    doc["plugins"]["mesh"]["radio"]["spreading_factor"] =
+        toml_edit::value(r.spreading_factor as i64);
+    doc["plugins"]["mesh"]["radio"]["coding_rate"] = toml_edit::value(r.coding_rate as i64);
+    doc["plugins"]["mesh"]["radio"]["tx_power_dbm"] = toml_edit::value(r.tx_power_dbm as i64);
+
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+        eprintln!("warning: --save: could not write {}: {e}", path.display());
+    } else {
+        eprintln!("Saved radio config to {}.", path.display());
+    }
+}
+
 async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
     #[cfg(feature = "transport-mesh")]
     {
@@ -1666,10 +1862,32 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
         let cfg = config::load(config_path).unwrap_or_default();
         let mesh_cfg = &cfg.plugins.mesh;
 
+        // --list-presets is handled before we even open the port.
+        if let NodeAction::SetRadio {
+            list_presets: true, ..
+        } = &action
+        {
+            println!("{:<28} FREQUENCY   BANDWIDTH  SF  CR  PWR", "PRESET NAME");
+            println!("{}", "-".repeat(72));
+            for p in mesh_presets::REGION_PRESETS {
+                println!(
+                    "{:<28} {:>10.3} MHz  {:>6} kHz  {:>2}  {:>2}  {:>3} dBm",
+                    p.name,
+                    p.frequency_hz as f64 / 1_000_000.0,
+                    p.bandwidth_hz / 1_000,
+                    p.spreading_factor,
+                    p.coding_rate,
+                    p.tx_power_dbm,
+                );
+            }
+            return;
+        }
+
         let (port_flag, baud_flag) = match &action {
             NodeAction::ShowKey { port, baud } => (port.clone(), *baud),
             NodeAction::ExportKey { port, baud } => (port.clone(), *baud),
             NodeAction::ImportKey { port, baud, .. } => (port.clone(), *baud),
+            NodeAction::SetRadio { port, baud, .. } => (port.clone(), *baud),
         };
 
         let port = match port_flag.or_else(|| {
@@ -1692,6 +1910,57 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
         let baud = baud_flag.unwrap_or(mesh_cfg.baud_rate);
 
         eprintln!("Connecting to {port} at {baud} baud...");
+
+        // ── Resolve radio params for set-radio ────────────────────────────
+        // Do this before connecting so we can fail fast on bad config.
+        let resolved_radio: Option<ResolvedRadio> = if let NodeAction::SetRadio {
+            preset,
+            frequency_hz,
+            bandwidth_hz,
+            spreading_factor,
+            coding_rate,
+            tx_power_dbm,
+            save,
+            ..
+        } = &action
+        {
+            match resolve_radio(
+                cfg.plugins.mesh.radio.as_ref(),
+                preset.as_deref(),
+                *frequency_hz,
+                *bandwidth_hz,
+                *spreading_factor,
+                *coding_rate,
+                *tx_power_dbm,
+            ) {
+                Ok(r) => {
+                    eprintln!(
+                        "Radio: {:.3} MHz  BW={} kHz  SF={}  CR={}  PWR={} dBm",
+                        r.frequency_hz as f64 / 1_000_000.0,
+                        r.bandwidth_hz / 1_000,
+                        r.spreading_factor,
+                        r.coding_rate,
+                        r.tx_power_dbm,
+                    );
+                    if *save {
+                        save_radio_config(config_path, &r);
+                    }
+                    Some(r)
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    eprintln!(
+                        "Tip: add a [plugins.mesh.radio] section to config.toml, or use --preset."
+                    );
+                    eprintln!(
+                        "     Run 'supply-drop-bbs node set-radio --list-presets' for preset names."
+                    );
+                    std::process::exit(1);
+                }
+            }
+        } else {
+            None
+        };
 
         // ── Build the command to send after Connected ─────────────────────
         let cmd_to_send: OutboundFrame = match &action {
@@ -1723,6 +1992,11 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
                 }
                 OutboundFrame::ImportPrivateKey { key: bytes }
             }
+            NodeAction::SetRadio { .. } => {
+                // First frame sent in the event loop after the radio params frame.
+                // Placeholder — the actual send is handled specially below.
+                OutboundFrame::GetBattAndStorage
+            }
         };
 
         let serial_cfg = SerialConfig {
@@ -1739,6 +2013,9 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
         // ── Wait up to 15 s for the whole operation ───────────────────────
         let result = timeout(Duration::from_secs(15), async {
             let mut connected = false;
+            // For set-radio: track how many Ok responses we've received
+            // (one for SetRadioParams, one for SetRadioTxPower).
+            let mut radio_ok_count: u8 = 0;
 
             while let Some(event) = client.recv().await {
                 match event {
@@ -1770,6 +2047,22 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
                             }
                         }
 
+                        // For set-radio, send SetRadioParams first.
+                        if let NodeAction::SetRadio { .. } = &action {
+                            if let Some(ref r) = resolved_radio {
+                                let frame = OutboundFrame::SetRadioParams {
+                                    frequency_hz: r.frequency_hz,
+                                    bandwidth_hz: r.bandwidth_hz,
+                                    spreading_factor: r.spreading_factor,
+                                    coding_rate: r.coding_rate,
+                                };
+                                if let Err(e) = client.send(frame).await {
+                                    return Err(format!("send SetRadioParams failed: {e}"));
+                                }
+                            }
+                            continue;
+                        }
+
                         // For export/import, send the command now.
                         if let Err(e) = client.send(cmd_to_send.clone()).await {
                             return Err(format!("send failed: {e}"));
@@ -1787,6 +2080,26 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
                             if let NodeAction::ImportKey { .. } = &action {
                                 eprintln!("Key imported successfully.");
                                 return Ok(());
+                            }
+                            if let NodeAction::SetRadio { .. } = &action {
+                                radio_ok_count += 1;
+                                if radio_ok_count == 1 {
+                                    // SetRadioParams acknowledged — now send SetRadioTxPower.
+                                    if let Some(ref r) = resolved_radio {
+                                        let frame = OutboundFrame::SetRadioTxPower {
+                                            power_dbm: r.tx_power_dbm as i8,
+                                        };
+                                        if let Err(e) = client.send(frame).await {
+                                            return Err(format!(
+                                                "send SetRadioTxPower failed: {e}"
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    // Both commands acknowledged — done.
+                                    eprintln!("Radio configured successfully.");
+                                    return Ok(());
+                                }
                             }
                         }
                         InboundFrame::Err { error_code } => {
