@@ -457,12 +457,39 @@ where
         warn!("companion: flush after AppStart failed: {e}");
     }
 
-    // Wait up to 10 seconds for the SelfInfo handshake response.
-    // If the device is silent we log a clear error and fall into the reconnect
-    // loop rather than blocking the task forever.
+    // Wait up to 10 seconds for SelfInfo, discarding any unsolicited push
+    // frames (LogRxData, Advert, etc.) that arrive before the device processes
+    // AppStart.  Active nodes relay mesh traffic continuously, so several
+    // frames may arrive before SelfInfo is queued in the firmware's TX buffer.
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-    let frame_result = match timeout(HANDSHAKE_TIMEOUT, read_frame(reader)).await {
-        Ok(r) => r,
+    let self_info: Option<SelfInfo> = match timeout(HANDSHAKE_TIMEOUT, async {
+        loop {
+            match read_frame(reader).await {
+                Err(e) => return Err(e),
+                Ok(InboundFrame::SelfInfo(info)) => return Ok(Some(info)),
+                // Some devices return UNSUPPORTED_CMD for CMD_APP_START.  Treat
+                // this as a handshake-less connection and proceed without SelfInfo.
+                Ok(InboundFrame::Err { error_code }) if error_code == ERR_CODE_UNSUPPORTED_CMD => {
+                    warn!(
+                        "companion: device returned UNSUPPORTED_CMD for CMD_APP_START \
+                         — proceeding without SelfInfo; \
+                         node identity will be unavailable until the first advert is received"
+                    );
+                    return Ok(None);
+                }
+                // Any other frame (LogRxData, Advert, PathUpdated, …) arrived
+                // before SelfInfo — the device is busy relaying mesh traffic.
+                // Discard and keep waiting.
+                Ok(other) => {
+                    trace!("companion: discarding pre-handshake frame: {other:?}");
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(info)) => info,
+        Ok(Err(e)) => return SessionOutcome::IoError(e, false),
         Err(_) => {
             warn!(
                 "companion: handshake timeout ({HANDSHAKE_TIMEOUT:?}) — \
@@ -472,32 +499,6 @@ where
             );
             return SessionOutcome::IoError(
                 io::Error::new(io::ErrorKind::TimedOut, "AppStart handshake timeout"),
-                false,
-            );
-        }
-    };
-
-    let self_info: Option<SelfInfo> = match frame_result {
-        Err(e) => return SessionOutcome::IoError(e, false),
-        Ok(InboundFrame::SelfInfo(info)) => Some(info),
-        // Some devices return UNSUPPORTED_CMD for CMD_APP_START.  Rather than
-        // looping forever, treat this as a handshake-less connection and
-        // proceed to the event loop without SelfInfo.  See GitHub issue #2.
-        Ok(InboundFrame::Err { error_code }) if error_code == ERR_CODE_UNSUPPORTED_CMD => {
-            warn!(
-                "companion: device returned UNSUPPORTED_CMD for CMD_APP_START \
-                 — proceeding without SelfInfo; \
-                 node identity will be unavailable until the first advert is received"
-            );
-            None
-        }
-        Ok(other) => {
-            warn!("companion: expected SelfInfo after AppStart, got {other:?}");
-            return SessionOutcome::IoError(
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "no SelfInfo after AppStart handshake",
-                ),
                 false,
             );
         }
