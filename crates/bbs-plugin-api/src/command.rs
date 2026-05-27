@@ -128,10 +128,14 @@ pub enum Command {
     // ── Message posting / deletion ────────────────────────────────────
     /// Compose a message. (E)
     ///
-    /// `body`: when `Some`, the message is posted immediately without a
-    /// prompt/reply round-trip — useful on low-reliability links like LoRa
-    /// where the prompt frame may be lost. `None` starts the two-step
-    /// workflow (prompt → body → post).
+    /// Both paths require a lone `.` to confirm before the message is posted:
+    ///
+    /// - `body` is `Some`: the inline text is staged as a draft
+    ///   (`AwaitingConfirmation`) and the user must reply with `.` to send.
+    ///   This makes sends idempotent on lossy links — if "Message posted." is
+    ///   not received the user sends `.` again without creating a duplicate.
+    /// - `body` is `None`: the host prompts for the body, then transitions to
+    ///   `AwaitingConfirmation` where `.` finalises the post.
     ///
     /// For Mail DMs the format is `E @recipient message text`; for the
     /// current room it is `E message text`.
