@@ -45,7 +45,7 @@ struct Existing {
     web_enabled: bool,
     web_bind: String,
     web_backup_dir: Option<String>,
-    // pymc-companion
+    // pymc-companion (HAT)
     region_idx: usize,
     hat_idx: usize,
     // GPS
@@ -158,7 +158,7 @@ fn load_existing(out_path: &Path) -> Existing {
         .and_then(|l| l.get("longitude"))
         .and_then(|v| v.as_float());
 
-    // pymc-companion
+    // pymc-companion (HAT)
     let yaml_path = companion_yaml_path(out_path);
     let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
 

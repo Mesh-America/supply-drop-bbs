@@ -6,9 +6,10 @@
 //!
 //! # Bridge protocol reminder
 //!
-//! The companion client sends AppStart (5 bytes) and expects SelfInfo back
-//! before entering the event loop.  The test bridge must complete this
-//! handshake before sending any other frames.
+//! The companion client sends AppStart (11 bytes: prefix + 2-byte len + 8-byte
+//! payload padded to firmware minimum) and expects SelfInfo back before
+//! entering the event loop.  The test bridge must read all 11 bytes before
+//! sending SelfInfo to avoid leaving stale bytes in the TCP buffer.
 
 use std::{sync::Arc, time::Duration};
 
@@ -83,7 +84,9 @@ impl Bridge {
     }
 
     async fn complete_handshake(&mut self, name: &str) {
-        let app_start = self.recv_n(5).await;
+        // AppStart = 11 bytes: prefix(1) + len(2) + CMD_APP_START(1) + version(1) + zeros(6)
+        // Must read all 11 to avoid leaving stale bytes that corrupt read_command().
+        let app_start = self.recv_n(11).await;
         assert_eq!(app_start[3], CMD_APP_START, "expected CMD_APP_START");
         self.send(&self_info_frame(name)).await;
         // Transport immediately drains the queue on connect: read the
@@ -96,6 +99,13 @@ impl Bridge {
         );
         let no_more = radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]);
         self.send(&no_more).await;
+        // Transport sends CMD_GET_CONTACTS immediately after connect to populate
+        // the advert bus. Read and discard it — the mock bridge sends no contacts.
+        let get_contacts = self.read_command().await;
+        assert_eq!(
+            get_contacts[0], CMD_GET_CONTACTS,
+            "expected CMD_GET_CONTACTS after drain"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 

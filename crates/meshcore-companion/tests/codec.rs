@@ -467,13 +467,23 @@ fn encode_app_start() {
     let wire_bytes = encode_outbound(&OutboundFrame::AppStart {
         app_target_version: APP_TARGET_VER_V3,
     });
-    // [FRAME_INBOUND_PREFIX][len_lo][len_hi][CMD_APP_START][APP_TARGET_VER_V3]
+    // Wire: [FRAME_INBOUND_PREFIX][len_lo][len_hi][CMD_APP_START][APP_TARGET_VER_V3][0×6]
+    // Payload is padded to 8 bytes minimum as required by the MeshCore companion firmware.
     assert_eq!(wire_bytes[0], FRAME_INBOUND_PREFIX);
     let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
     let payload = &wire_bytes[3..3 + len];
     assert_eq!(payload[0], CMD_APP_START);
     assert_eq!(payload[1], APP_TARGET_VER_V3);
-    assert_eq!(len, 2);
+    // Remaining bytes are zero padding.
+    assert_eq!(
+        &payload[2..],
+        &[0u8; 6],
+        "AppStart must be padded to 8-byte minimum payload"
+    );
+    assert_eq!(
+        len, 8,
+        "AppStart payload must be 8 bytes (firmware minimum)"
+    );
 }
 
 #[test]
@@ -595,6 +605,63 @@ fn strip_then_decode_curr_time() {
     let stripped = strip_frame_header(&raw).unwrap();
     let frame = decode_inbound(stripped).unwrap();
     assert_eq!(frame, InboundFrame::CurrTime { unix_time: t });
+}
+
+// ── SetRadioParams / SetRadioTxPower ─────────────────────────────────────────
+
+#[test]
+fn encode_set_radio_params_layout() {
+    // USA/Canada preset: 910_525_000 Hz, 62_500 Hz BW, SF7, CR5
+    //
+    // NOTE: the companion-frame protocol encodes frequency in kHz on the wire
+    // (matching how RESP_CODE_SELF_INFO reports it).  Our frame type stores Hz
+    // for human clarity and divides by 1000 during encoding.
+    let freq_hz: u32 = 910_525_000;
+    let freq_khz: u32 = freq_hz / 1000; // 910_525 kHz
+    let bw: u32 = 62_500;
+    let sf: u8 = 7;
+    let cr: u8 = 5;
+
+    let wire_bytes = encode_outbound(&OutboundFrame::SetRadioParams {
+        frequency_hz: freq_hz,
+        bandwidth_hz: bw,
+        spreading_factor: sf,
+        coding_rate: cr,
+    });
+
+    // Wire: [prefix:1][len:2][CMD_SET_RADIO_PARAMS][freq_khz:4-LE][bw_hz:4-LE][sf:1][cr:1]
+    let payload = &wire_bytes[3..]; // skip 3-byte header
+    assert_eq!(payload[0], CMD_SET_RADIO_PARAMS, "command byte");
+    assert_eq!(
+        &payload[1..5],
+        &freq_khz.to_le_bytes(),
+        "frequency in kHz LE"
+    );
+    assert_eq!(&payload[5..9], &bw.to_le_bytes(), "bandwidth_hz LE");
+    assert_eq!(payload[9], sf, "spreading_factor");
+    assert_eq!(payload[10], cr, "coding_rate");
+    assert_eq!(payload.len(), 11, "total payload length");
+}
+
+#[test]
+fn encode_set_radio_tx_power_layout() {
+    let power_dbm: i8 = 20;
+    let wire_bytes = encode_outbound(&OutboundFrame::SetRadioTxPower { power_dbm });
+
+    // Wire: [prefix:1][len:2][CMD_SET_RADIO_TX_POWER][power:1]
+    let payload = &wire_bytes[3..];
+    assert_eq!(payload[0], CMD_SET_RADIO_TX_POWER, "command byte");
+    assert_eq!(payload[1], power_dbm as u8, "power byte");
+    assert_eq!(payload.len(), 2, "total payload length");
+}
+
+#[test]
+fn encode_set_radio_tx_power_negative() {
+    // Negative dBm values must round-trip correctly through i8→u8→i8.
+    let power_dbm: i8 = -10;
+    let wire_bytes = encode_outbound(&OutboundFrame::SetRadioTxPower { power_dbm });
+    let payload = &wire_bytes[3..];
+    assert_eq!(payload[1] as i8, power_dbm, "negative dBm preserved");
 }
 
 // ── wrap_payload overflow guard ───────────────────────────────────────────────
