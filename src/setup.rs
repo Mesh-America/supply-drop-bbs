@@ -717,6 +717,38 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     println!("\nConfig written to {}.", out_path.display());
 
+    // On Linux, set ownership of the config file (and its parent directory)
+    // so the BBS service process can update config.toml from the web admin.
+    // Succeeds when setup is run as root (e.g. sudo supply-drop-bbs setup).
+    // If it fails, a manual command is printed in the next-steps section.
+    #[cfg(target_os = "linux")]
+    let config_chown_ok = {
+        const SERVICE_USER: &str = "supply-drop-bbs";
+        let chown_arg = format!("{SERVICE_USER}:{SERVICE_USER}");
+        // Chown the parent directory so the service can atomically rewrite the file.
+        if let Some(parent) = out_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = std::process::Command::new("chown")
+                    .args([chown_arg.as_str(), &parent.to_string_lossy()])
+                    .status();
+            }
+        }
+        let file_ok = matches!(
+            std::process::Command::new("chown")
+                .args([chown_arg.as_str(), &out_path.to_string_lossy()])
+                .status(),
+            Ok(s) if s.success()
+        );
+        if file_ok {
+            println!(
+                "  ownership set to {SERVICE_USER}:{SERVICE_USER} (web admin can save config)"
+            );
+        }
+        file_ok
+    };
+    #[cfg(not(target_os = "linux"))]
+    let config_chown_ok = true;
+
     if let Some(ref dir) = web_backup_dir {
         if !dir.is_empty() {
             match fs::create_dir_all(dir) {
@@ -767,6 +799,8 @@ pub fn run_wizard(config_out: Option<&Path>) {
         use_meshtastic,
         meshtastic_conn_type,
         web_bind.as_deref(),
+        &out_path,
+        config_chown_ok,
     );
 }
 
@@ -1510,6 +1544,7 @@ fn list_serial_ports() -> Vec<PortInfo> {
 
 // ── Next steps ────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn print_next_steps(
     use_mesh: bool,
     mesh_conn_type: &str,
@@ -1517,6 +1552,8 @@ fn print_next_steps(
     use_meshtastic: bool,
     meshtastic_conn_type: &str,
     web_bind: Option<&str>,
+    config_path: &std::path::Path,
+    config_chown_ok: bool,
 ) {
     if use_mesh && mesh_conn_type == "tcp" {
         println!("MeshCore TCP mode: Supply Drop BBS will connect to pymc_core at");
@@ -1553,6 +1590,28 @@ fn print_next_steps(
         println!("  sudo systemctl daemon-reload");
         println!("  sudo systemctl enable --now supply-drop-bbs");
         println!();
+
+        // If ownership was not set during setup (not run as root, or the
+        // service user didn't exist yet), remind the operator to do it
+        // manually so the web admin can save config changes.
+        if !config_chown_ok {
+            println!("After the service user is created, allow the BBS to update config.toml:");
+            println!();
+            println!(
+                "  sudo chown supply-drop-bbs:supply-drop-bbs {}",
+                config_path.display()
+            );
+            if let Some(parent) = config_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    println!(
+                        "  sudo chown supply-drop-bbs:supply-drop-bbs {}",
+                        parent.display()
+                    );
+                }
+            }
+            println!();
+        }
+
         println!("Or run it directly in the foreground:");
         println!();
         println!("  supply-drop-bbs run");
