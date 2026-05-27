@@ -534,6 +534,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/native-plugins", get(api_list_native_plugins))
         .route("/native-plugins/:name", patch(api_update_native_plugin))
         .route("/adverts", get(api_adverts))
+        .route("/adverts", delete(api_adverts_clear))
         .route("/adverts/send", post(api_adverts_send))
         .route("/sessions", get(api_list_sessions))
         .route("/sessions/:id", delete(api_kill_session))
@@ -949,6 +950,16 @@ async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         })
         .collect();
     Json(out)
+}
+
+/// `DELETE /api/v1/adverts` — flush all in-memory advert records.
+///
+/// Useful after correcting device clocks or clearing stale contacts.
+/// The bus repopulates automatically as adverts arrive or on the next
+/// BBS reconnect (which triggers a fresh `GetContacts` scan).
+async fn api_adverts_clear(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    state.host.advert_bus().clear();
+    axum::http::StatusCode::NO_CONTENT
 }
 
 fn adv_type_name(t: u8) -> &'static str {

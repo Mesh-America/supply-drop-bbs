@@ -24,6 +24,7 @@ let timer: number | undefined
 const flood = ref(true)
 const sending = ref(false)
 const sendStatus = ref<{ kind: 'ok' | 'error'; message: string } | null>(null)
+const clearing = ref(false)
 
 async function load() {
   try {
@@ -54,6 +55,17 @@ async function sendAdvert() {
     sendStatus.value = { kind: 'error', message: msg }
   } finally {
     sending.value = false
+  }
+}
+
+async function clearAdverts() {
+  if (!confirm('Clear all advert records from memory? The list will repopulate as nodes are heard.')) return
+  clearing.value = true
+  try {
+    await api.del('/api/v1/adverts')
+    await load()
+  } finally {
+    clearing.value = false
   }
 }
 
@@ -119,6 +131,14 @@ const columns = [
             ? 'rebroadcast hop-by-hop — more reach, more airtime'
             : 'neighbours only — single hop' }}
         </span>
+        <button
+          class="btn-danger"
+          @click="clearAdverts"
+          :disabled="clearing || !auth.isSysop"
+          :title="!auth.isSysop ? 'sysop required' : 'Clear all advert records from memory'"
+        >
+          {{ clearing ? 'clearing…' : 'clear list' }}
+        </button>
       </div>
       <p v-if="sendStatus" class="status-line small" :class="sendStatus.kind">
         {{ sendStatus.message }}
@@ -178,6 +198,7 @@ h1 { margin: 0; }
 .status-line { margin: 0; padding: 0.25rem 0.5rem; border-radius: 3px; }
 .status-line.ok    { color: #2a8a2a; border: 1px solid #2a8a2a; background: rgba(42,138,42,0.08); }
 .status-line.error { color: var(--error); border: 1px solid var(--error); background: rgba(200,60,60,0.08); }
+.btn-danger { color: var(--error); border-color: var(--error); }
 
 .type-summary { margin: 0; display: flex; flex-wrap: wrap; gap: 0.4rem; }
 
