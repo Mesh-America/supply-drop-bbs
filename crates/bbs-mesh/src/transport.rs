@@ -579,6 +579,16 @@ async fn event_loop(
                         let _ = cmd_tx.send(OutboundFrame::GetContacts { since: 0 }).await;
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
+                        // If a key operation is in flight, fail it immediately so
+                        // the caller's oneshot receiver is not left hanging
+                        // indefinitely waiting for a reply that will never come.
+                        if let Some(op) = pending_key_op.take() {
+                            let err = "device disconnected".to_owned();
+                            match op {
+                                PendingKeyOp::Export { reply } => { let _ = reply.send(Err(err)); }
+                                PendingKeyOp::Import { reply } => { let _ = reply.send(Err(err)); }
+                            }
+                        }
                         if will_retry {
                             info!("mesh: radio bridge disconnected, will retry");
                         } else {
@@ -602,6 +612,20 @@ async fn event_loop(
                             InboundFrame::Ok => {
                                 if let Some(PendingKeyOp::Import { reply }) = pending_key_op.take() {
                                     let _ = reply.send(Ok(()));
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            // Device returned an error frame while a key op was in
+                            // flight — propagate it so the caller doesn't hang.
+                            InboundFrame::Err { error_code } => {
+                                if let Some(op) = pending_key_op.take() {
+                                    let msg = format!("device error (code {error_code:#04x})");
+                                    match op {
+                                        PendingKeyOp::Export { reply } => { let _ = reply.send(Err(msg)); }
+                                        PendingKeyOp::Import { reply } => { let _ = reply.send(Err(msg)); }
+                                    }
                                     true
                                 } else {
                                     false

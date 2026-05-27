@@ -2559,7 +2559,16 @@ async fn api_import_node_key(
     }
     match state.host.admin_import_node_key(body.key).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json_error(&format!("{e}")))).into_response(),
+        Err(e) => {
+            // PreconditionFailed = bad key from the client (400).
+            // Internal / NotSupported = transport unavailable or server fault (503/500).
+            let status = match &e {
+                HostError::PreconditionFailed(_) => StatusCode::BAD_REQUEST,
+                HostError::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json_error(&format!("{e}")))).into_response()
+        }
     }
 }
 
