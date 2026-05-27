@@ -34,6 +34,8 @@
 //! │  │  PATCH /api/v1/config              (auth)       │    │
 //! │  │  GET  /api/v1/access-policy        (auth)       │    │
 //! │  │  PATCH /api/v1/access-policy       (auth)       │    │
+//! │  │  GET  /api/v1/radio-config         (auth)       │    │
+//! │  │  PATCH /api/v1/radio-config        (auth)       │    │
 //! │  │  GET  /api/v1/errors               (auth)       │    │
 //! │  │  GET  /api/v1/metrics              (auth)       │    │
 //! │  │  GET  /api/v1/sse/logs             (auth)       │    │
@@ -550,6 +552,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/access-policy",
             get(api_get_access_policy).patch(api_patch_access_policy),
+        )
+        .route(
+            "/radio-config",
+            get(api_get_radio_config).patch(api_patch_radio_config),
         )
         .route("/restart", post(api_restart))
         .route("/logs", get(api_logs))
@@ -1544,6 +1550,37 @@ async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 // ── Config read / write ───────────────────────────────────────────────────────
 
+/// Response body for `GET /api/v1/radio-config`.
+#[derive(Debug, Serialize)]
+struct RadioConfigResponse {
+    preset: Option<String>,
+    frequency_hz: Option<u64>,
+    bandwidth_hz: Option<u32>,
+    spreading_factor: Option<u8>,
+    coding_rate: Option<u8>,
+    tx_power_dbm: Option<i32>,
+    /// All available preset names, for populating the UI dropdown.
+    presets: Vec<&'static str>,
+}
+
+/// Patch body for `PATCH /api/v1/radio-config`.
+/// `None` means "leave unchanged"; for optional fields, JSON `null` clears the value.
+#[derive(Debug, Deserialize)]
+struct RadioConfigPatch {
+    /// Named preset. JSON null clears it; a string sets it.
+    preset: Option<serde_json::Value>,
+    /// Carrier frequency in Hz. JSON null clears it.
+    frequency_hz: Option<serde_json::Value>,
+    /// Channel bandwidth in Hz. JSON null clears it.
+    bandwidth_hz: Option<serde_json::Value>,
+    /// LoRa spreading factor (7–12). JSON null clears it.
+    spreading_factor: Option<serde_json::Value>,
+    /// Coding rate denominator (5–8). JSON null clears it.
+    coding_rate: Option<serde_json::Value>,
+    /// TX power in dBm. JSON null clears it.
+    tx_power_dbm: Option<serde_json::Value>,
+}
+
 /// Editable subset of the BBS configuration, returned by GET /api/v1/config.
 ///
 /// Only fields that are safe to change via the web UI are included.
@@ -1656,6 +1693,30 @@ fn system_timezone() -> String {
     "UTC".to_owned()
 }
 
+/// Preset names mirrored from `src/mesh_presets.rs`.
+/// Duplicated here because `bbs-web` does not depend on the main binary.
+const RADIO_PRESET_NAMES: &[&str] = &[
+    "Australia",
+    "Australia (Narrow)",
+    "Australia SA, WA, QLD",
+    "Czech Republic",
+    "EU 433MHz",
+    "EU/UK (Long Range)",
+    "EU/UK (Medium Range)",
+    "EU/UK (Narrow)",
+    "New Zealand",
+    "New Zealand (Narrow)",
+    "Portugal 433",
+    "Portugal 869",
+    "Switzerland",
+    "USA Arizona",
+    "USA/Canada",
+    "Vietnam",
+    "Off-Grid 433",
+    "Off-Grid 869",
+    "Off-Grid 918",
+];
+
 fn read_config_toml(path: &str) -> Result<toml::Value, String> {
     let raw =
         std::fs::read_to_string(path).map_err(|e| format!("could not read config file: {e}"))?;
@@ -1681,6 +1742,73 @@ fn toml_u64_field(val: &toml::Value, section: &str, key: &str) -> Option<u64> {
 
 fn toml_f64_field(val: &toml::Value, section: &str, key: &str) -> Option<f64> {
     val.get(section)?.get(key)?.as_float()
+}
+
+fn toml_radio_str(val: &toml::Value, key: &str) -> Option<String> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("radio")?
+        .get(key)?
+        .as_str()
+        .map(str::to_owned)
+}
+
+fn toml_radio_u64(val: &toml::Value, key: &str) -> Option<u64> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("radio")?
+        .get(key)?
+        .as_integer()
+        .map(|i| i as u64)
+}
+
+fn toml_radio_u32(val: &toml::Value, key: &str) -> Option<u32> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("radio")?
+        .get(key)?
+        .as_integer()
+        .map(|i| i as u32)
+}
+
+fn toml_radio_i32(val: &toml::Value, key: &str) -> Option<i32> {
+    val.get("plugins")?
+        .get("mesh")?
+        .get("radio")?
+        .get(key)?
+        .as_integer()
+        .map(|i| i as i32)
+}
+
+/// Set a scalar key in `[plugins.mesh.radio]`, creating the table path as needed.
+fn doc_set_radio_field(doc: &mut toml_edit::DocumentMut, key: &str, val: toml_edit::Value) {
+    // Ensure [plugins] exists as a table
+    if doc.get("plugins").is_none() {
+        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let plugins = doc["plugins"].as_table_mut().unwrap();
+    if plugins.get("mesh").is_none() {
+        plugins.insert("mesh", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let mesh = plugins.get_mut("mesh").unwrap().as_table_mut().unwrap();
+    if mesh.get("radio").is_none() {
+        mesh.insert("radio", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let radio = mesh.get_mut("radio").unwrap().as_table_mut().unwrap();
+    radio.insert(key, toml_edit::Item::Value(val));
+}
+
+/// Remove a key from `[plugins.mesh.radio]` if the table path exists.
+fn doc_remove_radio_field(doc: &mut toml_edit::DocumentMut, key: &str) {
+    if let Some(plugins) = doc.get_mut("plugins") {
+        if let Some(mesh) = plugins.as_table_mut().and_then(|t| t.get_mut("mesh")) {
+            if let Some(radio) = mesh.as_table_mut().and_then(|t| t.get_mut("radio")) {
+                if let Some(t) = radio.as_table_mut() {
+                    t.remove(key);
+                }
+            }
+        }
+    }
 }
 
 /// Remove a key from a section in a [`toml_edit::DocumentMut`], if it exists.
@@ -2048,6 +2176,173 @@ async fn api_patch_access_policy(
         )
             .into_response(),
     }
+}
+
+// ── Radio config ──────────────────────────────────────────────────────────────
+
+async fn api_get_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    let path = match &state.config.config_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error(
+                    "config_path not set in [plugins.web] — cannot read config",
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let val = match read_config_toml(&path) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
+    };
+
+    Json(RadioConfigResponse {
+        preset: toml_radio_str(&val, "preset"),
+        frequency_hz: toml_radio_u64(&val, "frequency_hz"),
+        bandwidth_hz: toml_radio_u32(&val, "bandwidth_hz"),
+        spreading_factor: toml_radio_u32(&val, "spreading_factor").map(|v| v as u8),
+        coding_rate: toml_radio_u32(&val, "coding_rate").map(|v| v as u8),
+        tx_power_dbm: toml_radio_i32(&val, "tx_power_dbm"),
+        presets: RADIO_PRESET_NAMES.to_vec(),
+    })
+    .into_response()
+}
+
+async fn api_patch_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(patch): Json<RadioConfigPatch>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    let path = match &state.config.config_path {
+        Some(p) if !p.is_empty() => p.clone(),
+        _ => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json_error(
+                    "config_path not set in [plugins.web] — cannot write config",
+                )),
+            )
+                .into_response()
+        }
+    };
+
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not read config file: {e}"))),
+            )
+                .into_response()
+        }
+    };
+    let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("could not parse config file: {e}"))),
+            )
+                .into_response()
+        }
+    };
+
+    // Apply patches — null clears the key; a value sets it.
+    if let Some(v) = patch.preset {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "preset");
+        } else if let Some(s) = v.as_str() {
+            doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s));
+        }
+    }
+    if let Some(v) = patch.frequency_hz {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "frequency_hz");
+        } else if let Some(n) = v.as_u64() {
+            doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64));
+        }
+    }
+    if let Some(v) = patch.bandwidth_hz {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "bandwidth_hz");
+        } else if let Some(n) = v.as_u64() {
+            doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64));
+        }
+    }
+    if let Some(v) = patch.spreading_factor {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "spreading_factor");
+        } else if let Some(n) = v.as_u64() {
+            doc_set_radio_field(
+                &mut doc,
+                "spreading_factor",
+                toml_edit::Value::from(n as i64),
+            );
+        }
+    }
+    if let Some(v) = patch.coding_rate {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "coding_rate");
+        } else if let Some(n) = v.as_u64() {
+            doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64));
+        }
+    }
+    if let Some(v) = patch.tx_power_dbm {
+        if v.is_null() {
+            doc_remove_radio_field(&mut doc, "tx_power_dbm");
+        } else if let Some(n) = v.as_i64() {
+            doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n));
+        }
+    }
+
+    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("could not write config file: {e}"))),
+        )
+            .into_response();
+    }
+
+    // Audit log — best-effort.
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", user.username),
+            "radio_config_change",
+            None,
+            None,
+        )
+        .await;
+
+    // Return updated config.
+    let val = match read_config_toml(&path) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
+    };
+    Json(RadioConfigResponse {
+        preset: toml_radio_str(&val, "preset"),
+        frequency_hz: toml_radio_u64(&val, "frequency_hz"),
+        bandwidth_hz: toml_radio_u32(&val, "bandwidth_hz"),
+        spreading_factor: toml_radio_u32(&val, "spreading_factor").map(|v| v as u8),
+        coding_rate: toml_radio_u32(&val, "coding_rate").map(|v| v as u8),
+        tx_power_dbm: toml_radio_i32(&val, "tx_power_dbm"),
+        presets: RADIO_PRESET_NAMES.to_vec(),
+    })
+    .into_response()
 }
 
 // ── HTTP log poll ─────────────────────────────────────────────────────────────
