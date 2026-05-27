@@ -954,8 +954,8 @@ async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 fn adv_type_name(t: u8) -> &'static str {
     match t {
         1 => "chat",
-        2 => "room",
-        3 => "repeater",
+        2 => "repeater",
+        3 => "room",
         4 => "sensor",
         _ => "unknown",
     }
