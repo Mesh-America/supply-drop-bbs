@@ -723,7 +723,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // If it fails, a manual command is printed in the next-steps section.
     #[cfg(target_os = "linux")]
     let config_chown_ok = {
-        const SERVICE_USER: &str = "supply-drop-bbs";
+        const SERVICE_USER: &str = "supply-drop";
         let chown_arg = format!("{SERVICE_USER}:{SERVICE_USER}");
         // Chown the parent directory so the service can atomically rewrite the file.
         if let Some(parent) = out_path.parent() {
@@ -1598,15 +1598,12 @@ fn print_next_steps(
             println!("After the service user is created, allow the BBS to update config.toml:");
             println!();
             println!(
-                "  sudo chown supply-drop-bbs:supply-drop-bbs {}",
+                "  sudo chown supply-drop:supply-drop {}",
                 config_path.display()
             );
             if let Some(parent) = config_path.parent() {
                 if !parent.as_os_str().is_empty() {
-                    println!(
-                        "  sudo chown supply-drop-bbs:supply-drop-bbs {}",
-                        parent.display()
-                    );
+                    println!("  sudo chown supply-drop:supply-drop {}", parent.display());
                 }
             }
             println!();

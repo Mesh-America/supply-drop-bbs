@@ -87,21 +87,32 @@ SUPPLY_DROP__LOGGING__LEVEL=trace supply-drop-bbs run
 supply-drop-bbs setup [OPTIONS]
 ```
 
-Run the interactive first-run setup wizard. Detects your radio device, asks configuration questions, and writes a `config.toml`. Safe to run on an existing installation - answers are pre-populated from the current config.
+Run the interactive first-run setup wizard. Detects your radio device, asks configuration questions, and writes a `config.toml`. Safe to run on an existing installation — answers are pre-populated from the current config.
 
 The wizard asks:
 
-1. Radio connection type - USB serial or Pi HAT
-2. Serial port *(USB only)* - auto-detected; you confirm or enter manually
-3. BBS name - shown to users on connect
-4. Data directory - defaults to `/var/lib/supply-drop-bbs`
-5. Web admin UI - whether to enable it, bind address, and password
+1. Radio connection type — USB serial or Pi HAT
+2. Serial port *(USB only)* — auto-detected; you confirm or enter manually
+3. Radio region preset *(USB serial only)* — stored in `[plugins.mesh.radio]`; can be applied later with `node set-radio`
+4. BBS name — shown to users on connect
+5. Data directory — defaults to `/var/lib/supply-drop-bbs`
+6. Web admin UI — whether to enable it, bind address, and backup directory
 
 After the wizard completes, restart the service to apply:
 
 ```sh
 sudo systemctl restart supply-drop-bbs
 ```
+
+**Run as root for automatic ownership fix**
+
+When run as `root` (e.g. `sudo supply-drop-bbs setup`), the wizard automatically sets the owner of `config.toml` and its parent directory to the `supply-drop` service user:
+
+```
+  ownership set to supply-drop:supply-drop (web admin can save config)
+```
+
+This is required for the web admin **Settings** page to be able to save configuration changes. If the wizard is not run as root, or the `supply-drop` user does not exist yet, the next-steps output will print the manual commands to run after the service user is created.
 
 **Example:**
 
