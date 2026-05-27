@@ -338,10 +338,94 @@ async function saveAccessPolicy() {
   }
 }
 
+interface RadioConfigData {
+  preset: string | null
+  frequency_hz: number | null
+  bandwidth_hz: number | null
+  spreading_factor: number | null
+  coding_rate: number | null
+  tx_power_dbm: number | null
+  presets: string[]
+}
+
+const radioConfig = ref<RadioConfigData | null>(null)
+const radioPresets = ref<string[]>([])
+const radioLoading = ref(false)
+const radioError = ref<string | null>(null)
+const radioSaving = ref(false)
+const radioSaveOk = ref<string | null>(null)
+const radioSaveError = ref<string | null>(null)
+
+// Working copy
+const radioPreset = ref<string>('')          // '' means none/cleared
+const radioCustomEnabled = ref(false)        // whether to show/save individual overrides
+const radioFrequencyHz = ref<string>('')
+const radioBandwidthHz = ref<string>('')
+const radioSpreadingFactor = ref<string>('')
+const radioCodingRate = ref<string>('')
+const radioTxPowerDbm = ref<string>('')
+
+async function loadRadioConfig() {
+  radioLoading.value = true
+  radioError.value = null
+  try {
+    const r = await api.get<RadioConfigData>('/api/v1/radio-config')
+    radioConfig.value = r
+    radioPresets.value = r.presets
+    radioPreset.value = r.preset ?? ''
+    const hasCustom = r.frequency_hz != null || r.bandwidth_hz != null ||
+                      r.spreading_factor != null || r.coding_rate != null ||
+                      r.tx_power_dbm != null
+    radioCustomEnabled.value = hasCustom
+    radioFrequencyHz.value     = r.frequency_hz     != null ? String(r.frequency_hz)     : ''
+    radioBandwidthHz.value     = r.bandwidth_hz     != null ? String(r.bandwidth_hz)     : ''
+    radioSpreadingFactor.value = r.spreading_factor != null ? String(r.spreading_factor) : ''
+    radioCodingRate.value      = r.coding_rate      != null ? String(r.coding_rate)      : ''
+    radioTxPowerDbm.value      = r.tx_power_dbm     != null ? String(r.tx_power_dbm)     : ''
+  } catch (e: any) {
+    radioError.value = e?.message ?? 'failed to load radio config'
+  } finally {
+    radioLoading.value = false
+  }
+}
+
+async function saveRadioConfig() {
+  radioSaving.value   = true
+  radioSaveOk.value   = null
+  radioSaveError.value = null
+  try {
+    const patch: Record<string, unknown> = {
+      preset: radioPreset.value || null,
+    }
+    if (radioCustomEnabled.value) {
+      patch.frequency_hz     = radioFrequencyHz.value     ? parseInt(radioFrequencyHz.value, 10)     : null
+      patch.bandwidth_hz     = radioBandwidthHz.value     ? parseInt(radioBandwidthHz.value, 10)     : null
+      patch.spreading_factor = radioSpreadingFactor.value ? parseInt(radioSpreadingFactor.value, 10) : null
+      patch.coding_rate      = radioCodingRate.value      ? parseInt(radioCodingRate.value, 10)      : null
+      patch.tx_power_dbm     = radioTxPowerDbm.value      ? parseInt(radioTxPowerDbm.value, 10)      : null
+    } else {
+      // Clear all individual fields
+      patch.frequency_hz = null
+      patch.bandwidth_hz = null
+      patch.spreading_factor = null
+      patch.coding_rate = null
+      patch.tx_power_dbm = null
+    }
+    const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
+    radioConfig.value = updated
+    radioSaveOk.value = 'Radio config saved to config.toml. Restart the service or run `supply-drop-bbs node set-radio` to apply to device.'
+  } catch (e: any) {
+    radioSaveError.value = e?.message ?? 'failed to save radio config'
+  } finally {
+    radioSaving.value = false
+  }
+}
+
 onMounted(() => {
   load()
   loadRooms()
   loadAccessPolicy()
+  loadRadioConfig()
 })
 </script>
 
@@ -593,6 +677,75 @@ chmod g+w {{ configFile }}</pre>
           >
             {{ accessPolicySaving ? 'saving…' : 'save access policy' }}
           </button>
+        </div>
+      </section>
+
+      <!-- Radio -->
+      <section class="card">
+        <h2>Radio</h2>
+        <p class="hint">
+          Saved to <code>[plugins.mesh.radio]</code> in config.toml.
+          Settings stored here are <strong>not</strong> pushed to the device automatically.
+          After saving, apply them with:
+          <code>sudo supply-drop-bbs node set-radio</code>
+          (or restart the service, which applies them on reconnect when using USB serial).
+        </p>
+
+        <div v-if="radioError" class="notice error-notice">{{ radioError }}</div>
+        <div v-if="radioSaveOk" class="notice ok-notice">{{ radioSaveOk }}</div>
+        <div v-if="radioSaveError" class="notice error-notice">{{ radioSaveError }}</div>
+
+        <div class="field">
+          <label>Region preset</label>
+          <select v-model="radioPreset" :disabled="radioLoading" style="max-width: 320px">
+            <option value="">(none — use custom parameters below)</option>
+            <option v-for="p in radioPresets" :key="p" :value="p">{{ p }}</option>
+          </select>
+          <p class="hint">Selects a predefined set of LoRa parameters for your region.</p>
+        </div>
+
+        <div class="field checkbox-field">
+          <label>
+            <input type="checkbox" v-model="radioCustomEnabled" :disabled="radioLoading" />
+            Override individual radio parameters
+          </label>
+          <p class="hint">
+            Override specific values from the preset, or set all parameters manually when no preset is selected.
+          </p>
+        </div>
+
+        <div v-if="radioCustomEnabled" class="field-row">
+          <div class="field">
+            <label>Frequency (Hz)</label>
+            <input v-model="radioFrequencyHz" type="number" min="1" placeholder="e.g. 910525000" :disabled="radioLoading" />
+            <p class="hint">e.g. 910525000 for 910.525 MHz</p>
+          </div>
+          <div class="field">
+            <label>Bandwidth (Hz)</label>
+            <input v-model="radioBandwidthHz" type="number" min="1" placeholder="e.g. 62500" :disabled="radioLoading" />
+          </div>
+        </div>
+        <div v-if="radioCustomEnabled" class="field-row">
+          <div class="field">
+            <label>Spreading factor (7–12)</label>
+            <input v-model="radioSpreadingFactor" type="number" min="7" max="12" :disabled="radioLoading" />
+          </div>
+          <div class="field">
+            <label>Coding rate (5–8)</label>
+            <input v-model="radioCodingRate" type="number" min="5" max="8" :disabled="radioLoading" />
+            <p class="hint">Denominator: 5 = 4/5, 8 = 4/8</p>
+          </div>
+          <div class="field">
+            <label>TX power (dBm)</label>
+            <input v-model="radioTxPowerDbm" type="number" min="-10" max="30" :disabled="radioLoading" />
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="button" :disabled="radioSaving || radioLoading || !writable" @click="saveRadioConfig">
+            {{ radioSaving ? 'saving…' : 'save radio config' }}
+          </button>
+          <span v-if="!writable" class="hint">config file is not writable</span>
         </div>
       </section>
 
