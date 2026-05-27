@@ -583,7 +583,8 @@ async fn cmd_run(cli: &Cli) {
     #[cfg(feature = "transport-mesh")]
     let mesh_cfg = {
         let mut c = cfg.plugins.mesh.clone();
-        c.welcome_message = cfg.bbs.welcome_msg.clone();
+        // Substitute {name} placeholder before wiring into mesh transport.
+        c.welcome_message = cfg.bbs.welcome_msg.replace("{name}", &cfg.bbs.name);
         c
     };
 
