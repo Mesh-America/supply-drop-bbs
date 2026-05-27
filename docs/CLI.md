@@ -245,6 +245,77 @@ Backup created: backup_20260511_142301.db
 
 ---
 
+### `node show-key`
+
+```
+supply-drop-bbs node show-key [OPTIONS]
+```
+
+Connect to the MeshCore companion device via USB serial, perform the handshake, and print the node's 32-byte **public key** as a 64-character hex string. This is the key other mesh nodes use to contact your BBS.
+
+The BBS service must **not** be running on the same serial port when you run this.
+
+```sh
+supply-drop-bbs node show-key
+# ab12cd34ef56...  (64 hex chars)
+
+supply-drop-bbs node show-key --port /dev/ttyACM0
+```
+
+| Flag | Description |
+|------|-------------|
+| `--port <PATH>` | Serial port (e.g. `/dev/ttyACM0`, `COM3`). Defaults to the port in `config.toml`. |
+| `--baud <N>` | Baud rate. Defaults to `config.toml` value or `115200`. |
+
+---
+
+### `node export-key`
+
+```
+supply-drop-bbs node export-key [OPTIONS]
+```
+
+Export the companion device's 32-byte **private key** as a 64-character hex string. Back up this value before a firmware flash or hardware migration — it is the only way to restore your node's mesh identity.
+
+**Keep the output secret.** Anyone with the private key can impersonate your node.
+
+The BBS service must **not** be running on the same serial port.
+
+```sh
+supply-drop-bbs node export-key
+# 7f3a1b... (64 hex chars — keep secret)
+```
+
+---
+
+### `node import-key`
+
+```
+supply-drop-bbs node import-key <KEY> [OPTIONS]
+```
+
+Import a 64-character hex key into the companion device as its new private key. The device's mesh identity changes immediately. The corresponding public key (shown by `node show-key`) will change to match.
+
+Use this to:
+- Restore a backed-up key after a firmware flash
+- Migrate an identity from one device to another
+- Set a specific node key when deploying pre-provisioned hardware
+
+| Argument | Description |
+|----------|-------------|
+| `<KEY>` | 64 hex characters (32 bytes). Must be valid hexadecimal. |
+
+```sh
+supply-drop-bbs node import-key ab12cd34ef56...
+# key imported — node identity updated
+```
+
+**Exit codes:** `0` on success; `1` if the key is invalid, the port cannot be opened, or the device does not confirm the import.
+
+> **Web admin:** The same operation is available in the Settings page → **Node identity** → click the ✏️ icon next to the public key.
+
+---
+
 ### `user promote`
 
 ```
