@@ -112,7 +112,13 @@ impl AdvertBus {
     ///
     /// Use this when the timestamp comes from the device (e.g. the
     /// `last_advert_timestamp` field in a `RESP_CODE_CONTACT` frame) rather than
-    /// the current wall clock. A `device_last_seen` of `0` falls back to `now`.
+    /// the current wall clock.
+    ///
+    /// `device_last_seen` is validated before use: MeshCore devices without a
+    /// synced RTC report seconds-since-boot (small values → near 1970 epoch)
+    /// and devices with a misconfigured clock can report future values. Any
+    /// value outside `[MIN_PLAUSIBLE_TS, now + CLOCK_FUDGE_SECS]` is treated
+    /// as unreliable and falls back to the current wall-clock time.
     ///
     /// Updates all fields for an existing record; preserves `first_seen_secs`.
     pub fn upsert_with_timestamp(
@@ -125,11 +131,19 @@ impl AdvertBus {
         device_last_seen: i64,
     ) {
         let now = unix_now();
-        let last_seen = if device_last_seen > 0 {
-            device_last_seen
-        } else {
-            now
-        };
+        // Accept only plausible Unix timestamps. Devices without a synced RTC
+        // report seconds-since-boot which are tiny (→ dates near 1970); devices
+        // with a misconfigured clock can exceed the current time by years.
+        // 2020-01-01 UTC is a safe floor — no BBS contact predates MeshCore.
+        // 5-minute ceiling fudge tolerates minor clock skew between devices.
+        const MIN_PLAUSIBLE_TS: i64 = 1_577_836_800; // 2020-01-01 00:00:00 UTC
+        const CLOCK_FUDGE_SECS: i64 = 300; // 5 minutes
+        let last_seen =
+            if device_last_seen >= MIN_PLAUSIBLE_TS && device_last_seen <= now + CLOCK_FUDGE_SECS {
+                device_last_seen
+            } else {
+                now
+            };
         let lat = gps_lat as f64 / 1_000_000.0;
         let lon = gps_lon as f64 / 1_000_000.0;
         let mut records = self.records.lock().expect("advert bus poisoned");
@@ -182,6 +196,14 @@ impl AdvertBus {
         v
     }
 
+    /// Remove all records from the bus.
+    ///
+    /// Useful when a sysop wants to flush stale data without restarting the
+    /// BBS (e.g. after correcting device clocks or clearing old contacts).
+    pub fn clear(&self) {
+        self.records.lock().expect("advert bus poisoned").clear();
+    }
+
     /// Subscribe to send-advert requests from the web UI.
     ///
     /// Delivers `true` for flood mode, `false` for direct-only.
@@ -214,4 +236,85 @@ fn hex_encode(bytes: &[u8]) -> String {
         let _ = write!(acc, "{b:02x}");
         acc
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_key(byte: u8) -> [u8; 32] {
+        [byte; 32]
+    }
+
+    fn now_secs() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64)
+    }
+
+    /// A device timestamp of 0 (unset) falls back to wall-clock time.
+    #[test]
+    fn zero_device_ts_falls_back_to_now() {
+        let bus = AdvertBus::new();
+        bus.upsert_with_timestamp(dummy_key(1), "A".into(), 1, 0, 0, 0);
+        let records = bus.list();
+        let ts = records[0].last_seen_secs;
+        let now = now_secs();
+        assert!(
+            ts >= now - 2 && ts <= now + 2,
+            "ts {ts} should be near now {now}"
+        );
+    }
+
+    /// A boot-relative timestamp (small value — seconds since reboot, near 1970)
+    /// must be rejected and replaced with the current wall-clock time.
+    #[test]
+    fn boot_relative_ts_is_rejected() {
+        let bus = AdvertBus::new();
+        let boot_relative: i64 = 3600; // 1 hour after epoch — clearly 1970
+        bus.upsert_with_timestamp(dummy_key(2), "B".into(), 1, 0, 0, boot_relative);
+        let ts = bus.list()[0].last_seen_secs;
+        let now = now_secs();
+        assert!(
+            ts >= now - 2 && ts <= now + 2,
+            "boot-relative ts {boot_relative} should have been replaced with now ({now}), got {ts}"
+        );
+    }
+
+    /// A far-future timestamp (device with misconfigured clock) is rejected.
+    #[test]
+    fn far_future_ts_is_rejected() {
+        let bus = AdvertBus::new();
+        let far_future: i64 = 2_000_000_000; // ~year 2033 — plausible false positive guard
+                                             // Use a value well past now+fudge to ensure rejection.
+        let very_far_future: i64 = 4_000_000_000; // ~year 2096
+        bus.upsert_with_timestamp(dummy_key(3), "C".into(), 1, 0, 0, very_far_future);
+        let ts = bus.list()[0].last_seen_secs;
+        let now = now_secs();
+        assert!(
+            ts >= now - 2 && ts <= now + 2,
+            "far-future ts {very_far_future} should have been replaced with now ({now}), got {ts}"
+        );
+        let _ = far_future; // suppress unused warning
+    }
+
+    /// A plausible Unix timestamp (recent past) is accepted as-is.
+    #[test]
+    fn plausible_ts_is_accepted() {
+        let bus = AdvertBus::new();
+        let plausible: i64 = 1_700_000_000; // Nov 2023 — clearly reasonable
+        bus.upsert_with_timestamp(dummy_key(4), "D".into(), 1, 0, 0, plausible);
+        let ts = bus.list()[0].last_seen_secs;
+        assert_eq!(ts, plausible, "plausible ts should be stored unchanged");
+    }
+
+    /// `clear()` empties the bus.
+    #[test]
+    fn clear_empties_bus() {
+        let bus = AdvertBus::new();
+        bus.upsert(dummy_key(5), "E".into(), 1, 0, 0);
+        assert_eq!(bus.list().len(), 1);
+        bus.clear();
+        assert_eq!(bus.list().len(), 0);
+    }
 }
