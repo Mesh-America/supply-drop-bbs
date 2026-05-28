@@ -897,16 +897,63 @@ async fn handle_frame(
             }
         }
 
-        // ── Contact table full ────────────────────────────────────────────────
-        // The radio cannot store new contacts.  If autoadd is enabled the
-        // firmware prunes old entries automatically; if not, outbound DMs to
-        // nodes not already in the table will fail silently.
+        // ── Contact table full — proactive eviction ───────────────────────────
+        // The firmware could not store a new contact because the table is at
+        // capacity.  Outbound DMs to nodes not in the table fail silently
+        // because the radio cannot encrypt to an unknown key.
+        //
+        // Response: find the least-recently-seen contact in the advert bus that
+        // does NOT have an active BBS session (we do not want to evict someone
+        // mid-conversation), then send CMD_REMOVE_CONTACT for it.  This frees
+        // one slot so the firmware can store the next new contact it hears.
+        //
+        // Note: after eviction the firmware will NOT automatically retry the
+        // contact that just failed.  The new node needs to send another advert
+        // (MeshCore nodes re-advertise periodically) before it can be added.
         InboundFrame::ContactsFull => {
             warn!(
-                "mesh: radio contact table is full (CONTACTS_FULL) — \
-                 new nodes cannot be stored until old entries are pruned; \
-                 outbound DMs to unknown nodes will fail until space is freed"
+                "mesh: radio contact table is full — \
+                 evicting stalest inactive contact to free a slot"
             );
+            // Build an exclusion list: our own node + all prefixes with active sessions.
+            let (active_prefixes, self_prefix) = {
+                let st = state.lock().expect("state mutex poisoned");
+                let active: Vec<[u8; 6]> = st.by_prefix.keys().copied().collect();
+                let sp = st
+                    .self_pubkey
+                    .map(|pk| pk[..6].try_into().expect("pubkey is 32 bytes"));
+                (active, sp)
+            };
+            let mut exclude = active_prefixes;
+            if let Some(sp) = self_prefix {
+                if !exclude.contains(&sp) {
+                    exclude.push(sp);
+                }
+            }
+            match host.advert_bus().stalest_pubkey_excluding(&exclude) {
+                Some(stale_pubkey) => {
+                    let prefix_hex: String = stale_pubkey[..6]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    warn!(
+                        prefix = %prefix_hex,
+                        "mesh: removing stale contact from radio table to free a slot"
+                    );
+                    let _ = cmd_tx
+                        .send(OutboundFrame::RemoveContact {
+                            pubkey: stale_pubkey,
+                        })
+                        .await;
+                }
+                None => {
+                    warn!(
+                        "mesh: radio table full but no evictable stale contact found \
+                         (all known contacts have active sessions); \
+                         new nodes cannot be added until sessions close"
+                    );
+                }
+            }
         }
 
         // ── Everything else ───────────────────────────────────────────────────
