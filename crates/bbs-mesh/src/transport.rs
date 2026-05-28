@@ -577,6 +577,16 @@ async fn event_loop(
                         // in the device's contact table arrive only as short adverts
                         // (pubkey-only stubs) via PUSH_CODE_ADVERT (0x80).
                         let _ = cmd_tx.send(OutboundFrame::GetContacts { since: 0 }).await;
+
+                        // Query the radio's autoadd config so we can ensure
+                        // auto-pruning is enabled.  When the contact table is full
+                        // and autoadd is active the firmware evicts the oldest entry
+                        // to make room for newly-heard nodes.  Without this, a full
+                        // table (PUSH_CODE_CONTACTS_FULL) prevents new contacts from
+                        // being stored, causing outbound DMs to those nodes to fail.
+                        // The response (InboundFrame::AutoaddConfig) is handled in
+                        // handle_frame, which sets config if it is currently disabled.
+                        let _ = cmd_tx.send(OutboundFrame::GetAutoaddConfig).await;
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
                         // If a key operation is in flight, fail it immediately so
@@ -864,6 +874,38 @@ async fn handle_frame(
             debug!(
                 error_code,
                 "mesh: unhandled device error frame (no pending key op, not draining)"
+            );
+        }
+
+        // ── Autoadd / autoprune config ────────────────────────────────────────
+        // Response to CMD_GET_AUTOADD_CONFIG sent at startup.
+        // When bit 0 is clear the firmware will NOT automatically add newly-heard
+        // nodes to the contact table, and will NOT prune old entries when the
+        // table is full.  Enable it so the table self-manages.
+        InboundFrame::AutoaddConfig { config } => {
+            if config & 1 == 0 {
+                warn!(
+                    config,
+                    "mesh: contact autoadd is disabled on the radio — \
+                     enabling it so stale contacts are pruned when the table is full"
+                );
+                let _ = cmd_tx
+                    .send(OutboundFrame::SetAutoaddConfig { config: config | 1 })
+                    .await;
+            } else {
+                debug!(config, "mesh: contact autoadd already enabled");
+            }
+        }
+
+        // ── Contact table full ────────────────────────────────────────────────
+        // The radio cannot store new contacts.  If autoadd is enabled the
+        // firmware prunes old entries automatically; if not, outbound DMs to
+        // nodes not already in the table will fail silently.
+        InboundFrame::ContactsFull => {
+            warn!(
+                "mesh: radio contact table is full (CONTACTS_FULL) — \
+                 new nodes cannot be stored until old entries are pruned; \
+                 outbound DMs to unknown nodes will fail until space is freed"
             );
         }
 

@@ -111,6 +111,16 @@ impl Bridge {
             get_contacts[0], CMD_GET_CONTACTS,
             "expected CMD_GET_CONTACTS after drain"
         );
+        // Transport queries autoadd config at startup to ensure auto-pruning is
+        // enabled on the radio. Reply with config=1 (already enabled) so the
+        // transport does not emit a follow-up SetAutoaddConfig command.
+        let get_autoadd = self.read_command().await;
+        assert_eq!(
+            get_autoadd[0], CMD_GET_AUTOADD_CONFIG,
+            "expected CMD_GET_AUTOADD_CONFIG after CMD_GET_CONTACTS"
+        );
+        let autoadd_reply = radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 1]);
+        self.send(&autoadd_reply).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -138,6 +148,14 @@ impl Bridge {
         assert_eq!(
             get_contacts[0], CMD_GET_CONTACTS,
             "expected CMD_GET_CONTACTS"
+        );
+        self.send(&err_frame(ERR_CODE_UNSUPPORTED_CMD)).await;
+        // Transport also queries autoadd config. Old firmware may not support
+        // it — return UNSUPPORTED_CMD so the transport ignores it gracefully.
+        let get_autoadd = self.read_command().await;
+        assert_eq!(
+            get_autoadd[0], CMD_GET_AUTOADD_CONFIG,
+            "expected CMD_GET_AUTOADD_CONFIG"
         );
         self.send(&err_frame(ERR_CODE_UNSUPPORTED_CMD)).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -404,6 +422,12 @@ async fn unsupported_app_start_with_successful_drain_processes_messages() {
 
     let get_contacts = bridge.read_command().await;
     assert_eq!(get_contacts[0], CMD_GET_CONTACTS);
+    // Transport queries autoadd config; reply with config=1 (already enabled).
+    let get_autoadd = bridge.read_command().await;
+    assert_eq!(get_autoadd[0], CMD_GET_AUTOADD_CONFIG);
+    bridge
+        .send(&radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 1]))
+        .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Send a message — should be processed.
