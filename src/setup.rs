@@ -360,9 +360,29 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     let theme = ColorfulTheme::default();
 
-    let out_path = config_out
-        .map(|p| p.to_owned())
-        .unwrap_or_else(|| PathBuf::from("config.toml"));
+    let out_path = config_out.map(|p| p.to_owned()).unwrap_or_else(|| {
+        #[cfg(target_os = "linux")]
+        {
+            PathBuf::from("/etc/supply-drop-bbs/config.toml")
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            PathBuf::from("config.toml")
+        }
+    });
+
+    println!("Writing config to: {}", out_path.display());
+
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                eprintln!(
+                    "warning: could not create config directory {}: {e}",
+                    parent.display()
+                );
+            }
+        }
+    }
 
     let ex = load_existing(&out_path);
 
