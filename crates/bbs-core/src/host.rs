@@ -1171,24 +1171,28 @@ impl Host for BbsHost {
 
 impl BbsHost {
     async fn handle_whoami(&self, session: SessionId) -> Result<Response, HostError> {
-        let sessions = self.sessions.read().await;
-        let text = sessions
-            .get(&session)
-            .map(|r| {
-                r.username
-                    .as_ref()
-                    .map(|u| {
-                        format!(
-                            "Logged in as {} ({}). Current room: room:{}",
-                            u.as_str(),
-                            r.level,
-                            r.current_room.as_i64()
-                        )
-                    })
-                    .unwrap_or_else(|| "Not logged in.".into())
-            })
-            .unwrap_or_else(|| "Unknown session.".into());
-        Ok(Response::Text(text))
+        let (username, level, current_room) = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&session) {
+                None => return Ok(Response::Text("Unknown session.".into())),
+                Some(r) => match r.username.as_ref() {
+                    None => return Ok(Response::Text("Not logged in.".into())),
+                    Some(u) => (u.clone(), r.level, r.current_room),
+                },
+            }
+        };
+        let room_name = RoomStore::get_by_id(&self.db, current_room)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| r.name.to_string())
+            .unwrap_or_else(|| format!("room:{}", current_room.as_i64()));
+        Ok(Response::Text(format!(
+            "Logged in as {} ({}). Current room: {}",
+            username.as_str(),
+            level,
+            room_name
+        )))
     }
 
     async fn handle_cancel(&self, session: SessionId) -> Result<Response, HostError> {
@@ -4470,9 +4474,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
 
 const HELP_QUICK_ANON: &str = "\
 REGISTER <user>  create an account\n\
-LOGIN <user>     log in to your account\n\
-Q  quit\n\
-H  help";
+LOGIN <user>     log in to your account";
 
 // 156 bytes — must stay ≤ MAX_REPLY_BYTES (MAX_FRAME_SIZE(172) - 16 bytes overhead).
 const HELP_QUICK_LOGGED_IN: &str = "\
