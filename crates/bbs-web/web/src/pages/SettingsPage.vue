@@ -430,7 +430,7 @@ async function saveRadioConfig() {
     }
     const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
     radioConfig.value = updated
-    radioSaveOk.value = 'Radio config saved. Apply to device with: sudo supply-drop-bbs node set-radio'
+    radioSaveOk.value = 'Radio config saved to config.toml. Run: sudo supply-drop-bbs node set-radio — to push to the device (only needed when parameters change).'
   } catch (e: any) {
     radioSaveError.value = e?.message ?? 'failed to save radio config'
   } finally {
@@ -799,26 +799,19 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
-      <!-- MeshCore Radio -->
-      <section class="card">
+      <!-- MeshCore Radio — USB serial only -->
+      <!-- Pi HAT and TCP connections have their radio managed by pymc-companion;
+           node set-radio speaks directly to the USB serial device and is not
+           applicable to those connection types. -->
+      <section v-if="radioConfig?.connection_type === 'serial'" class="card">
         <h2>MeshCore radio</h2>
         <p class="hint">
-          LoRa parameters for the MeshCore companion device
-          <span v-if="radioConfig?.connection_type === 'serial' && radioConfig?.serial_port">
-            (<code>{{ radioConfig.serial_port }}</code>)
-          </span>
-          <span v-else-if="radioConfig?.connection_type === 'hat'">
-            (Pi HAT via pymc-companion)
-          </span>
-          <span v-else-if="radioConfig?.connection_type === 'tcp'">
-            (TCP — pymc-companion)
-          </span>.
-          Saved to <code>[plugins.mesh.radio]</code> in config.toml.
-          Settings are <strong>not</strong> applied automatically — after saving, run:
-          <code>sudo supply-drop-bbs node set-radio</code>
-        </p>
-        <p class="hint" style="margin-top: 0.3rem">
-          Using Meshtastic? Radio parameters are configured in the Meshtastic app — they are not managed here.
+          LoRa parameters for the USB MeshCore companion device
+          <span v-if="radioConfig.serial_port">(<code>{{ radioConfig.serial_port }}</code>)</span>.
+          Save here to record them in config.toml, then push to the device once with
+          <code>sudo supply-drop-bbs node set-radio</code>.
+          The device stores these settings in its own flash — you only need to run that
+          command when you change the parameters, not on every restart.
         </p>
 
         <div v-if="radioError" class="notice error-notice">{{ radioError }}</div>
