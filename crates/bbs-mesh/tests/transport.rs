@@ -56,6 +56,11 @@ fn self_info_frame(name: &str) -> Vec<u8> {
     radio_frame(&payload)
 }
 
+/// Build an error frame (RESP_CODE_ERR + error_code).
+fn err_frame(error_code: u8) -> Vec<u8> {
+    radio_frame(&[RESP_CODE_ERR, error_code])
+}
+
 fn contact_msg_frame(sender_prefix: [u8; 6], text: &str) -> Vec<u8> {
     let mut payload = vec![RESP_CODE_CONTACT_MSG_RECV];
     payload.extend_from_slice(&sender_prefix);
@@ -106,6 +111,35 @@ impl Bridge {
             get_contacts[0], CMD_GET_CONTACTS,
             "expected CMD_GET_CONTACTS after drain"
         );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    /// Simulate older firmware that returns UNSUPPORTED_CMD for CMD_APP_START
+    /// and also for CMD_SYNC_NEXT_MESSAGE (the drain command).
+    ///
+    /// This exercises the drain-lock fix: without it, the draining flag would
+    /// stay true forever and all subsequent messages would be silently dropped.
+    async fn complete_handshake_unsupported_app_start(&mut self) {
+        let app_start = self.recv_n(11).await;
+        assert_eq!(app_start[3], CMD_APP_START, "expected CMD_APP_START");
+        // Return UNSUPPORTED_CMD instead of SelfInfo.
+        self.send(&err_frame(ERR_CODE_UNSUPPORTED_CMD)).await;
+        // Transport still sends SyncNextMessage for the drain.
+        let drain_cmd = self.read_command().await;
+        assert_eq!(
+            drain_cmd[0], CMD_SYNC_NEXT_MESSAGE,
+            "expected SyncNextMessage drain even without SelfInfo"
+        );
+        // Return UNSUPPORTED_CMD — the fixed code must clear the drain flag.
+        self.send(&err_frame(ERR_CODE_UNSUPPORTED_CMD)).await;
+        // Transport sends CMD_GET_CONTACTS. Return error (unsupported) — that
+        // is also silently tolerable; the advert bus just won't be pre-populated.
+        let get_contacts = self.read_command().await;
+        assert_eq!(
+            get_contacts[0], CMD_GET_CONTACTS,
+            "expected CMD_GET_CONTACTS"
+        );
+        self.send(&err_frame(ERR_CODE_UNSUPPORTED_CMD)).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
@@ -307,6 +341,79 @@ async fn notify_unknown_session_drops() {
         .await
         .unwrap();
     assert!(matches!(outcome, NotifyOutcome::Dropped));
+
+    transport.stop().await.unwrap();
+}
+
+/// When the device returns UNSUPPORTED_CMD for CMD_APP_START *and*
+/// CMD_SYNC_NEXT_MESSAGE, the drain flag must be cleared so subsequent
+/// ContactMsgRecv frames are processed normally.
+///
+/// Regression test for the drain-forever bug: without the fix an
+/// UNSUPPORTED_CMD error during drain falls to the catch-all debug log,
+/// leaving `draining = true` permanently and silently dropping every
+/// message the user sends.
+#[tokio::test]
+async fn unsupported_app_start_and_sync_still_processes_messages() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("pong".to_owned()));
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    // Simulate firmware that rejects CMD_APP_START and CMD_SYNC_NEXT_MESSAGE.
+    bridge.complete_handshake_unsupported_app_start().await;
+
+    // Send a user message — it should reach the host (drain was cleared).
+    let sender = [0x55u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+
+    // The transport should send back a reply (from MockHost).
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+        .await
+        .expect("timed out — drain flag was not cleared; message was silently dropped");
+
+    assert_eq!(
+        cmd_payload[0], CMD_SEND_TXT_MSG,
+        "expected SendTxtMsg reply to user"
+    );
+    let text = std::str::from_utf8(&cmd_payload[13..]).unwrap();
+    assert_eq!(text, "pong");
+
+    transport.stop().await.unwrap();
+}
+
+/// Same as above but after UNSUPPORTED_CMD for AppStart the *drain* command
+/// succeeds (NoMoreMessages). Verifies the normal-but-no-SelfInfo path still
+/// works and messages are dispatched.
+#[tokio::test]
+async fn unsupported_app_start_with_successful_drain_processes_messages() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    // Handshake: AppStart → UNSUPPORTED_CMD, then drain completes normally.
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&err_frame(ERR_CODE_UNSUPPORTED_CMD)).await;
+
+    let drain_cmd = bridge.read_command().await;
+    assert_eq!(drain_cmd[0], CMD_SYNC_NEXT_MESSAGE);
+    bridge
+        .send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]))
+        .await;
+
+    let get_contacts = bridge.read_command().await;
+    assert_eq!(get_contacts[0], CMD_GET_CONTACTS);
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // Send a message — should be processed.
+    let sender = [0x66u8; 6];
+    bridge.send(&contact_msg_frame(sender, "whoami")).await;
+
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+        .await
+        .expect("timed out waiting for reply");
+    assert_eq!(cmd_payload[0], CMD_SEND_TXT_MSG);
 
     transport.stop().await.unwrap();
 }
