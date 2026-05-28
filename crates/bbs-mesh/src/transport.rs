@@ -121,7 +121,7 @@ impl Plugin for MeshTransport {
     type Config = MeshConfig;
 
     fn name(&self) -> &'static str {
-        "mesh"
+        "meshtastic"
     }
 
     fn version(&self) -> &'static str {
@@ -961,7 +961,7 @@ async fn dispatch_message(
                 .lock()
                 .expect("state mutex poisoned")
                 .remove_by_prefix(&sender_prefix);
-            let fresh = match host.create_session("mesh").await {
+            let fresh = match host.create_session("meshtastic").await {
                 Ok(id) => id,
                 Err(e) => {
                     warn!("mesh: session refresh failed: {e}");
@@ -1124,7 +1124,7 @@ async fn get_or_create_session(
     }
 
     // Slow path: mint a new session from the host.
-    let new_id = match host.create_session("mesh").await {
+    let new_id = match host.create_session("meshtastic").await {
         Ok(id) => id,
         Err(e) => {
             // This should not happen in normal operation; log and use a dummy.
