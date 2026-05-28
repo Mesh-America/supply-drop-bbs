@@ -3,10 +3,25 @@ pub const FRAME_OUTBOUND_PREFIX: u8 = 0x3E;
 /// `<` — prefix byte on frames sent from the app to the radio bridge.
 pub const FRAME_INBOUND_PREFIX: u8 = 0x3C;
 
-/// Maximum total frame size (prefix + 2-byte length + payload).
+/// Maximum total frame size for frames we *send* (prefix + 2-byte length + payload).
+///
+/// Used by the transport layer to compute [`MAX_REPLY_BYTES`] so that outgoing
+/// `SendTxtMsg` frames fit within the radio bridge's expected frame size.
+///
+/// [`MAX_REPLY_BYTES`]: bbs_mesh::transport::MAX_REPLY_BYTES
 pub const MAX_FRAME_SIZE: usize = 172;
-/// Maximum payload size (MAX_FRAME_SIZE - 3).
-pub const MAX_PAYLOAD_SIZE: usize = MAX_FRAME_SIZE - 3;
+
+/// Maximum payload size for frames we *receive* from the radio bridge.
+///
+/// This is a sanity guard against a malformed length field causing a
+/// large allocation or memory-limit panic. It is intentionally larger
+/// than `MAX_FRAME_SIZE - 3` because the firmware can send structured
+/// response frames (contact lists, advert records, etc.) whose payload
+/// exceeds the outgoing text-message limit.
+///
+/// Setting this to 256 covers every valid MeshCore companion-protocol
+/// frame while still catching obviously corrupt length values.
+pub const MAX_PAYLOAD_SIZE: usize = 256;
 
 pub const PUB_KEY_SIZE: usize = 32;
 pub const MAX_PATH_SIZE: usize = 64;

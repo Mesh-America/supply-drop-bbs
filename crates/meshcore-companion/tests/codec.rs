@@ -53,11 +53,12 @@ fn strip_header_empty_rejects() {
 
 #[test]
 fn strip_header_payload_too_large() {
-    // Claim 200 bytes (> MAX_PAYLOAD_SIZE = 169).
-    let mut raw = vec![FRAME_OUTBOUND_PREFIX, 200u8, 0u8];
-    raw.extend(vec![0u8; 200]);
+    // Claim 300 bytes (> MAX_PAYLOAD_SIZE = 256). Use little-endian u16.
+    let len: u16 = 300;
+    let mut raw = vec![FRAME_OUTBOUND_PREFIX, (len & 0xFF) as u8, (len >> 8) as u8];
+    raw.extend(vec![0u8; 300]);
     let err = strip_frame_header(&raw).unwrap_err();
-    assert_eq!(err, FrameDecodeError::PayloadTooLarge(200));
+    assert_eq!(err, FrameDecodeError::PayloadTooLarge(300));
 }
 
 // ── decode_inbound — zero-body frames ─────────────────────────────────────────
