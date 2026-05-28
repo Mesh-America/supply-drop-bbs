@@ -28,6 +28,7 @@ admin-web             = ["dep:bbs-web"]
 transport-process     = ["dep:bbs-process-transport"]
 
 [dependencies]
+mimalloc.workspace        = true
 bbs-core.workspace        = true
 bbs-plugin-api.workspace  = true
 bbs-cli              = { workspace = true, optional = true }
@@ -115,6 +116,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 zip         = { version = "2", default-features = false, features = ["deflate"] }
 toml_edit   = { version = "0.22", features = ["serde"] }
 sysinfo     = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }
+mimalloc    = { version = "0.1", default-features = false }
 
 # Workspace-wide lint config. Applied to every member crate via
 # `[lints] workspace = true` in their Cargo.toml. Centralising here
@@ -151,5 +153,8 @@ opt-level = 0
 # This profile is for release-ready artifacts; CI uses it in tag
 # builds. Inherits from release; overrides where stricter.
 [profile.release-min]
-inherits = "release"
-opt-level = "z"               # optimise for size
+inherits      = "release"
+opt-level     = "z"           # optimise for size
+lto           = "fat"         # full LTO for maximum dead-code elimination
+panic         = "abort"       # drop unwind tables (~50–100 KB savings)
+overflow-checks = false       # no debug assertions in min builds
