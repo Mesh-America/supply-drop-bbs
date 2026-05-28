@@ -906,7 +906,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // If it fails, a manual command is printed in the next-steps section.
     #[cfg(target_os = "linux")]
     let config_chown_ok = {
-        const SERVICE_USER: &str = "supply-drop-bbs";
+        const SERVICE_USER: &str = "supply-drop";
         let chown_arg = format!("{SERVICE_USER}:{SERVICE_USER}");
         // Chown the parent directory so the service can atomically rewrite the
         // file.  Track whether this succeeds — if it fails, the web admin
