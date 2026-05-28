@@ -370,8 +370,8 @@ async fn main() {
         Some(Commands::Config { action }) => cmd_config(config_path.as_deref(), action),
         Some(Commands::Migrate) => cmd_migrate(&cli).await,
         Some(Commands::Backup) => cmd_backup(&cli).await,
-        Some(Commands::User { action }) => cmd_user(config_path.as_deref(), action).await,
-        Some(Commands::Room { action }) => cmd_room(config_path.as_deref(), action).await,
+        Some(Commands::User { ref action }) => cmd_user(&cli, action).await,
+        Some(Commands::Room { ref action }) => cmd_room(&cli, action).await,
         #[cfg(feature = "transport-process")]
         Some(Commands::Plugin { action }) => cmd_plugin(config_path.as_deref(), action),
         Some(Commands::Metrics) => cmd_metrics(),
@@ -380,6 +380,64 @@ async fn main() {
 }
 
 // ── Subcommand handlers ───────────────────────────────────────────────────────
+
+// ── Shared helpers ────────────────────────────────────────────────────────────
+
+/// Load and resolve the effective [`config::Config`] for a CLI invocation.
+///
+/// Applies the `--data-dir` flag (and the `SUPPLY_DROP__BBS__DATA_DIR` env var
+/// it is aliased to) on top of the TOML config file so that *every* subcommand
+/// honours the override — not just `run`.
+fn load_config(cli: &Cli) -> config::Config {
+    let mut cfg = match config::load(cli.config.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error loading config: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Some(ref dd) = cli.data_dir {
+        cfg.bbs.data_dir = Some(dd.clone());
+        // Clear derived paths so resolve() re-computes them under the new root.
+        cfg.database.path = None;
+        cfg.logging.file = None;
+        cfg.backup.directory = None;
+        #[cfg(feature = "transport-cli")]
+        {
+            cfg.plugins.cli.socket = None;
+        }
+        cfg = cfg.resolve();
+    }
+    cfg
+}
+
+/// Open the SQLite database at `path`, or print an actionable error and exit.
+///
+/// When the open fails the error message includes a hint about the service
+/// user — the most common cause on a `.deb` install is running a maintenance
+/// command as `root` instead of as the `supply-drop` service account.
+async fn open_database(path: &std::path::Path) -> Database {
+    match Database::open(&path.to_string_lossy()).await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("error opening database: {e}");
+            eprintln!();
+            eprintln!(
+                "  The database may not be accessible from the current user.\n\
+                 \n\
+                   On .deb installs the database is owned by the 'supply-drop'\n\
+                   service account. Try running the command as that user:\n\
+                 \n\
+                     sudo -u supply-drop supply-drop-bbs <subcommand> ...\n\
+                 \n\
+                   Or pass the data directory explicitly:\n\
+                 \n\
+                     sudo supply-drop-bbs --data-dir /var/lib/supply-drop-bbs <subcommand> ..."
+            );
+            std::process::exit(1);
+        }
+    }
+}
 
 /// Host supervisor — the real `run` path.
 ///
@@ -1416,13 +1474,7 @@ fn write_plugins(
 /// as an explicit step for deployment scripts that want a clear "migrations
 /// done" signal before starting the BBS process.
 async fn cmd_migrate(cli: &Cli) {
-    let cfg = match config::load(cli.config.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error loading config: {e}");
-            std::process::exit(1);
-        }
-    };
+    let cfg = load_config(cli);
 
     let db_path = cfg
         .database
@@ -1432,24 +1484,13 @@ async fn cmd_migrate(cli: &Cli) {
 
     println!("Applying migrations to: {}", db_path.display());
 
-    match Database::open(&db_path.to_string_lossy()).await {
-        Ok(_db) => println!("Migrations applied successfully."),
-        Err(e) => {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-    }
+    open_database(db_path).await;
+    println!("Migrations applied successfully.");
 }
 
 /// Trigger an immediate database backup and report the result.
 async fn cmd_backup(cli: &Cli) {
-    let cfg = match config::load(cli.config.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error loading config: {e}");
-            std::process::exit(1);
-        }
-    };
+    let cfg = load_config(cli);
 
     let db_path = cfg
         .database
@@ -1463,13 +1504,7 @@ async fn cmd_backup(cli: &Cli) {
         .as_ref()
         .expect("backup.directory set by resolve()");
 
-    let db = match Database::open(&db_path.to_string_lossy()).await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error opening database: {e}");
-            std::process::exit(1);
-        }
-    };
+    let db = open_database(db_path).await;
 
     let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
 
@@ -1492,14 +1527,8 @@ async fn cmd_backup(cli: &Cli) {
     }
 }
 
-async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
-    let cfg = match config::load(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error loading config: {e}");
-            std::process::exit(1);
-        }
-    };
+async fn cmd_user(cli: &Cli, action: &UserAction) {
+    let cfg = load_config(cli);
 
     let db_path = cfg
         .database
@@ -1507,20 +1536,14 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
         .as_ref()
         .expect("database.path set by resolve()");
 
-    let db = match Database::open(&db_path.to_string_lossy()).await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error opening database: {e}");
-            std::process::exit(1);
-        }
-    };
+    let db = open_database(db_path).await;
 
     let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
 
     match action {
         UserAction::List { pending } => match host.admin_list_users(None, 500, 0).await {
             Ok(users) => {
-                let users: Vec<_> = if pending {
+                let users: Vec<_> = if *pending {
                     users
                         .into_iter()
                         .filter(|u| u.permission_level == 0)
@@ -1531,7 +1554,7 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
                 if users.is_empty() {
                     println!(
                         "{}",
-                        if pending {
+                        if *pending {
                             "No pending users."
                         } else {
                             "No users."
@@ -1571,7 +1594,7 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
         },
 
         UserAction::Verify { username } => {
-            match host.admin_update_user(&username, None, Some(10)).await {
+            match host.admin_update_user(username, None, Some(10)).await {
                 Ok(()) => println!("verified: {username} (promoted to User)"),
                 Err(bbs_plugin_api::HostError::NotFound(_)) => {
                     eprintln!("error: user '{username}' not found");
@@ -1594,10 +1617,10 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
                     std::process::exit(1);
                 });
 
-            let level = if sysop { 100u8 } else { 10u8 };
-            let label = if sysop { "sysop" } else { "user" };
+            let level = if *sysop { 100u8 } else { 10u8 };
+            let label = if *sysop { "sysop" } else { "user" };
 
-            match host.admin_create_user(&username, &password, level).await {
+            match host.admin_create_user(username, &password, level).await {
                 Ok(()) => println!("created {label} account: {username}"),
                 Err(bbs_plugin_api::HostError::PreconditionFailed(msg)) => {
                     eprintln!("error: {msg}");
@@ -1625,7 +1648,7 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
                 std::process::exit(1);
             }
 
-            match host.admin_set_password(&username, &password).await {
+            match host.admin_set_password(username, &password).await {
                 Ok(()) => println!("password reset for {username}"),
                 Err(bbs_plugin_api::HostError::NotFound(_)) => {
                     eprintln!("error: user '{username}' not found");
@@ -1651,7 +1674,7 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
             };
 
             match host
-                .admin_update_user(&username, None, Some(new_level))
+                .admin_update_user(username, None, Some(new_level))
                 .await
             {
                 Ok(()) => println!("{username} promoted to {label} (level {new_level})"),
@@ -1668,14 +1691,8 @@ async fn cmd_user(config_path: Option<&std::path::Path>, action: UserAction) {
     }
 }
 
-async fn cmd_room(config_path: Option<&std::path::Path>, action: RoomAction) {
-    let cfg = match config::load(config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error loading config: {e}");
-            std::process::exit(1);
-        }
-    };
+async fn cmd_room(cli: &Cli, action: &RoomAction) {
+    let cfg = load_config(cli);
 
     let db_path = cfg
         .database
@@ -1683,19 +1700,13 @@ async fn cmd_room(config_path: Option<&std::path::Path>, action: RoomAction) {
         .as_ref()
         .expect("database.path set by resolve()");
 
-    let db = match Database::open(&db_path.to_string_lossy()).await {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("error opening database: {e}");
-            std::process::exit(1);
-        }
-    };
+    let db = open_database(db_path).await;
 
     let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
 
     match action {
         RoomAction::Create { name, description } => {
-            match host.admin_create_room(&name, description.as_deref()).await {
+            match host.admin_create_room(name, description.as_deref()).await {
                 Ok(room) => println!("created room '{}' (id {})", room.name, room.id),
                 Err(bbs_plugin_api::HostError::PreconditionFailed(msg)) => {
                     eprintln!("error: {msg}");
