@@ -1682,44 +1682,30 @@ impl BbsHost {
                     });
                 }
 
-                let sender = {
-                    let sessions = self.sessions.read().await;
-                    sessions
-                        .get(&session)
-                        .and_then(|r| r.username.clone())
-                        .ok_or(HostError::NotAuthenticated)?
-                };
-
-                let now = Timestamp::now();
-                let (msg_id, event_recipient) = if let Some(ref rcpt) = recipient {
-                    let mid = self
-                        .db
-                        .post_direct(&sender, rcpt, body, now)
-                        .await
-                        .map_err(|e| HostError::Storage(format!("post_direct: {e}")))?;
-                    (mid, MessageRecipient::Direct(rcpt.clone()))
-                } else {
-                    let mid = self
-                        .db
-                        .post_to_room(room_id, &sender, body, now)
-                        .await
-                        .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))?;
-                    (mid, MessageRecipient::Room(room_id.as_i64().to_string()))
-                };
-
-                let _ = self.events_tx.send(DomainEvent::MessagePosted {
-                    sender: sender.clone(),
-                    recipient: event_recipient,
-                    message_id: msg_id.as_i64() as u64,
-                });
-
+                // Transition to AwaitingConfirmation instead of posting immediately,
+                // so both E paths (inline and multi-step) require "." to confirm.
+                let body = body.to_string();
                 {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::None;
+                        r.workflow = Workflow::Compose {
+                            room_id,
+                            stage: ComposeStage::AwaitingConfirmation {
+                                recipient: recipient.clone(),
+                                body: body.clone(),
+                            },
+                        };
                     }
                 }
-                Ok(Response::Text("Message posted.".into()))
+                let preview = if let Some(ref rcpt) = recipient {
+                    format!("To {}: {}\nType . to send", rcpt.as_str(), body)
+                } else {
+                    format!("{body}\nType . to send")
+                };
+                Ok(Response::Prompt {
+                    text: preview,
+                    hide_input: false,
+                })
             }
 
             // ── Draft confirmation ────────────────────────────────────────────
@@ -2098,6 +2084,25 @@ impl BbsHost {
                         return self.handle_change_to_room(session, target_id).await;
                     }
                 }
+                // Allow "C <name>" to navigate directly while the room list is active,
+                // so users don't need to cancel with X first.
+                {
+                    let lower = trimmed.to_ascii_lowercase();
+                    if let Some(rest) = lower.strip_prefix("c ") {
+                        let rest = rest.trim();
+                        if !rest.is_empty() {
+                            // Preserve original casing from the user's input.
+                            let name = trimmed[2..].trim();
+                            {
+                                let mut sessions = self.sessions.write().await;
+                                if let Some(r) = sessions.get_mut(&session) {
+                                    r.workflow = Workflow::None;
+                                }
+                            }
+                            return self.handle_change_room(session, name).await;
+                        }
+                    }
+                }
                 // Fall back: treat as room name via the normal change-room path.
                 //
                 // Guard against out-of-order mesh delivery: if the user typed a
@@ -2109,7 +2114,8 @@ impl BbsHost {
                 // workflow and tell the user to re-send their command.
                 let is_cmd_keyword = matches!(
                     trimmed.to_ascii_lowercase().as_str(),
-                    "n" | "f"
+                    "c" | "n"
+                        | "f"
                         | "r"
                         | "g"
                         | "k"
@@ -4904,6 +4910,16 @@ mod tests {
             )
             .await
             .unwrap();
+        // After body input the host should now show a confirmation prompt.
+        assert!(
+            matches!(r, Response::Prompt { .. }),
+            "expected confirmation Prompt after body, got: {r:?}"
+        );
+        // Send "." to confirm and post.
+        let r = host
+            .process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
         assert_eq!(r, Response::Text("Message posted.".into()));
 
         // Read new — should see it (read pointer was at 0 before posting).
@@ -5779,6 +5795,228 @@ mod tests {
         assert!(
             !matches!(resp2, Response::Error(_)),
             "ReadNew after cancelled room-selection should not error, got {resp2:?}"
+        );
+    }
+
+    // ── Bug-20: "C <name>" navigation during K room-list workflow ─────────────
+
+    /// When the user sends "C Lobby" while in Workflow::Rooms, the BBS should
+    /// cancel the workflow and navigate to the named room — not treat "C Lobby"
+    /// as a literal room name.
+    #[tokio::test]
+    async fn rooms_workflow_c_name_navigates_directly() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Enter room-selection workflow.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(resp, Response::Prompt { .. }),
+            "K should enter Workflow::Rooms and return Prompt"
+        );
+
+        // Verify we are in the Workflow::Rooms state.
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::Rooms { .. }),
+                "workflow should be Workflow::Rooms after K"
+            );
+        }
+
+        // Send "C Lobby" — should cancel the workflow and navigate to Lobby.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "C Lobby".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Response should not be an error about "Room 'C Lobby' not found".
+        if let Response::Error(e) = &resp {
+            panic!("Expected successful navigation with 'C Lobby', got error: {e:?}");
+        }
+
+        // Workflow should be cleared.
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::None),
+                "workflow should be cleared after 'C Lobby'"
+            );
+        }
+
+        // The session should now be in the Lobby room.
+        {
+            let sessions = host.sessions.read().await;
+            assert_eq!(
+                sessions[&sid].current_room, LOBBY_ROOM_ID,
+                "user should be in the Lobby room after 'C Lobby'"
+            );
+        }
+    }
+
+    /// When the user sends bare "C" (no room name) while in Workflow::Rooms, it
+    /// should cancel the workflow with a keyword-cancelled message (not error).
+    #[tokio::test]
+    async fn rooms_workflow_bare_c_cancels_with_keyword_message() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Enter room-selection workflow.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(resp, Response::Prompt { .. }),
+            "K should enter Workflow::Rooms and return Prompt"
+        );
+
+        // Send bare "C" — matches is_cmd_keyword and should cancel cleanly.
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "C".into() })
+            .await
+            .unwrap();
+
+        let text = match resp {
+            Response::Text(t) => t,
+            Response::Error(e) => e,
+            other => panic!("expected Text or Error for bare 'C', got {other:?}"),
+        };
+        assert!(
+            text.to_lowercase().contains("cancel"),
+            "bare 'C' during room workflow should produce a cancellation message, got: {text:?}"
+        );
+
+        // Workflow should be cleared.
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::None),
+                "workflow should be Workflow::None after bare 'C'"
+            );
+        }
+    }
+
+    // ── Bug-21: multi-step E command requires dot confirmation ────────────────
+
+    /// `E` (no inline body) → body sent → BBS responds with preview + "Type . to send".
+    /// Sending `.` after → "Message posted."
+    #[tokio::test]
+    async fn e_command_multistep_requires_dot_confirmation() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Step 1: `E` with no body → should prompt for message body.
+        let resp = host
+            .process_command(sid, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Prompt { .. }),
+            "E with no body should return a Prompt for the message body, got: {resp:?}"
+        );
+
+        // Step 2: supply the message body → should transition to AwaitingConfirmation
+        // and show a preview with "Type . to send" (not post immediately).
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "Hello BBS world".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let Response::Prompt { text, .. } = resp else {
+            panic!("after body input, expected Prompt with confirmation, got: {resp:?}");
+        };
+        assert!(
+            text.contains("Type . to send"),
+            "confirmation prompt should contain 'Type . to send', got: {text:?}"
+        );
+        assert!(
+            text.contains("Hello BBS world"),
+            "confirmation prompt should contain the message body, got: {text:?}"
+        );
+
+        // Step 3: send `.` → message should be posted.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: ".".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let Response::Text(text) = resp else {
+            panic!("after dot, expected Text 'Message posted.', got: {resp:?}");
+        };
+        assert!(
+            text.contains("Message posted"),
+            "expected 'Message posted.' after dot confirmation, got: {text:?}"
+        );
+    }
+
+    /// `E` multi-step: sending non-dot reply at confirmation re-shows the preview.
+    #[tokio::test]
+    async fn e_command_multistep_non_dot_reshows_preview() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("bob").unwrap();
+        register_and_login(&host, sid, &uname, "pass5678").await;
+
+        // Initiate compose.
+        host.process_command(sid, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+
+        // Provide body.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: "Test message".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Send something other than "." — should re-show the preview.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "oops wrong".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Prompt { .. }),
+            "non-dot reply at confirmation should re-show Prompt, got: {resp:?}"
+        );
+
+        // Now send "." to actually post.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: ".".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Text(_)),
+            "dot after re-shown preview should post the message, got: {resp:?}"
         );
     }
 }
