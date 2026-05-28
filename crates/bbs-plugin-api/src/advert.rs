@@ -196,6 +196,27 @@ impl AdvertBus {
         v
     }
 
+    /// Return the full 32-byte public key of the least-recently-seen contact
+    /// whose key prefix (first 6 bytes) does not appear in `exclude_prefixes`.
+    ///
+    /// Used by the mesh transport to pick a stale contact for eviction when
+    /// the radio's contact table is full ([`ContactsFull`] push): the caller
+    /// can then send `RemoveContact` for the returned key to free a table slot.
+    ///
+    /// Returns `None` if the bus is empty or all contacts match an excluded
+    /// prefix (e.g. all known contacts have active BBS sessions).
+    pub fn stalest_pubkey_excluding(&self, exclude_prefixes: &[[u8; 6]]) -> Option<[u8; 32]> {
+        let records = self.records.lock().expect("advert bus poisoned");
+        records
+            .iter()
+            .filter(|(pubkey, _)| {
+                let prefix: [u8; 6] = pubkey[..6].try_into().expect("pubkey is 32 bytes");
+                !exclude_prefixes.contains(&prefix)
+            })
+            .min_by_key(|(_, rec)| rec.last_seen_secs)
+            .map(|(pubkey, _)| *pubkey)
+    }
+
     /// Remove all records from the bus.
     ///
     /// Useful when a sysop wants to flush stale data without restarting the
@@ -316,5 +337,47 @@ mod tests {
         assert_eq!(bus.list().len(), 1);
         bus.clear();
         assert_eq!(bus.list().len(), 0);
+    }
+
+    /// `stalest_pubkey_excluding` returns the oldest contact not in the exclusion list.
+    #[test]
+    fn stalest_pubkey_excluding_returns_oldest_non_excluded() {
+        let bus = AdvertBus::new();
+        let old_key = dummy_key(10);
+        let new_key = dummy_key(20);
+        let excluded_key = dummy_key(30);
+
+        // old_key was last seen in Nov 2023.
+        bus.upsert_with_timestamp(old_key, "OldNode".into(), 1, 0, 0, 1_700_000_000);
+        // new_key was last seen in Jan 2025.
+        bus.upsert_with_timestamp(new_key, "NewNode".into(), 1, 0, 0, 1_735_689_600);
+        // excluded_key is even older but excluded.
+        bus.upsert_with_timestamp(excluded_key, "ExcludedNode".into(), 1, 0, 0, 1_500_000_000);
+
+        let excluded_prefix: [u8; 6] = excluded_key[..6].try_into().unwrap();
+        let result = bus.stalest_pubkey_excluding(&[excluded_prefix]);
+
+        assert_eq!(
+            result,
+            Some(old_key),
+            "should return old_key — oldest non-excluded"
+        );
+    }
+
+    /// When all contacts are excluded, `stalest_pubkey_excluding` returns `None`.
+    #[test]
+    fn stalest_pubkey_excluding_all_excluded_returns_none() {
+        let bus = AdvertBus::new();
+        let key = dummy_key(11);
+        bus.upsert(key, "A".into(), 1, 0, 0);
+        let prefix: [u8; 6] = key[..6].try_into().unwrap();
+        assert_eq!(bus.stalest_pubkey_excluding(&[prefix]), None);
+    }
+
+    /// An empty bus returns `None`.
+    #[test]
+    fn stalest_pubkey_excluding_empty_bus_returns_none() {
+        let bus = AdvertBus::new();
+        assert_eq!(bus.stalest_pubkey_excluding(&[]), None);
     }
 }
