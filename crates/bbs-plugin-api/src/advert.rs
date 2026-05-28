@@ -217,6 +217,24 @@ impl AdvertBus {
             .map(|(pubkey, _)| *pubkey)
     }
 
+    /// Look up the human-readable node name for a given 6-byte key prefix.
+    ///
+    /// Returns `None` if the prefix is not in the bus or if its name field is
+    /// empty (i.e. only a short advert has been received so far).
+    pub fn name_by_prefix(&self, prefix: &[u8; 6]) -> Option<String> {
+        let records = self.records.lock().expect("advert bus poisoned");
+        records
+            .iter()
+            .find(|(pubkey, _)| pubkey[..6] == *prefix)
+            .and_then(|(_, r)| {
+                if r.name.is_empty() {
+                    None
+                } else {
+                    Some(r.name.clone())
+                }
+            })
+    }
+
     /// Remove all records from the bus.
     ///
     /// Useful when a sysop wants to flush stale data without restarting the

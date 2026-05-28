@@ -985,9 +985,23 @@ async fn dispatch_message(
 
     if is_new {
         debug!(?session, prefix = ?sender_prefix, "mesh: new session minted");
+    }
 
-        // Attempt auto-login via stored node credential (skip when TTL = 0).
-        let auto_username = if node_credential_ttl_days > 0 {
+    // Determine whether this node already has an authenticated BBS session.
+    // We greet unauthenticated nodes every time they contact us so they always
+    // see the welcome message and know how to register/log in — not just the
+    // very first time.
+    let already_authenticated = !is_new
+        && host
+            .permission_ctx(session)
+            .await
+            .map(|ctx| ctx.username.is_some())
+            .unwrap_or(false);
+
+    if !already_authenticated {
+        // Attempt auto-login via stored node credential (new sessions only;
+        // skip when TTL = 0 or the session already exists).
+        let auto_username = if is_new && node_credential_ttl_days > 0 {
             match host
                 .mesh_node_restore(session, sender_prefix, node_credential_ttl_days)
                 .await
@@ -1002,10 +1016,27 @@ async fn dispatch_message(
             None
         };
 
-        let greeting = if let Some(ref username) = auto_username {
-            format!("Welcome back, {username}! Type 'H' for commands.")
-        } else {
-            welcome_message.to_owned()
+        // Resolve {name} — prefer the auto-login username, fall back to the
+        // node's advertised display name, and finally an empty string so the
+        // placeholder is always removed from the message.
+        let name = auto_username
+            .as_ref()
+            .map(|u| u.as_str().to_owned())
+            .or_else(|| host.advert_bus().name_by_prefix(&sender_prefix))
+            .unwrap_or_default();
+
+        let welcome = welcome_message.replace("{name}", &name);
+
+        // For auto-login: prepend the welcome message and append the
+        // "Welcome back" line so the user gets both context and confirmation.
+        let greeting = match &auto_username {
+            Some(username) if !welcome.is_empty() => {
+                format!("{welcome}\nWelcome back, {username}! Type 'H' for commands.")
+            }
+            Some(username) => {
+                format!("Welcome back, {username}! Type 'H' for commands.")
+            }
+            None => welcome,
         };
 
         let greeting_empty = greeting.is_empty();
