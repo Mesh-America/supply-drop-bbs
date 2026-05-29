@@ -10,6 +10,12 @@
 
 #![allow(missing_docs)]
 
+// Use mimalloc as the global allocator. It reduces heap fragmentation on
+// long-running Pi deployments and is faster than the system allocator for
+// the allocation patterns this crate produces (many small, short-lived strings).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod config;
 mod mesh_presets;
 mod setup;
