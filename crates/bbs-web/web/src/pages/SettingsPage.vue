@@ -430,11 +430,108 @@ async function saveRadioConfig() {
     }
     const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
     radioConfig.value = updated
-    radioSaveOk.value = 'Radio config saved to config.toml. Run: sudo supply-drop-bbs node set-radio — to push to the device (only needed when parameters change).'
+    radioSaveOk.value = 'Radio config saved to config.toml.'
   } catch (e: any) {
     radioSaveError.value = e?.message ?? 'failed to save radio config'
   } finally {
     radioSaving.value = false
+  }
+}
+
+const radioApplying = ref(false)
+const radioApplyOk = ref<string | null>(null)
+const radioApplyError = ref<string | null>(null)
+
+async function applyRadioConfig() {
+  radioApplying.value  = true
+  radioApplyOk.value   = null
+  radioApplyError.value = null
+  try {
+    await api.post('/api/v1/radio-config/apply', {
+      frequency_hz:     radioFrequencyHz.value     ? parseInt(radioFrequencyHz.value, 10)     : 0,
+      bandwidth_hz:     radioBandwidthHz.value     ? parseInt(radioBandwidthHz.value, 10)     : 0,
+      spreading_factor: radioSpreadingFactor.value ? parseInt(radioSpreadingFactor.value, 10) : 0,
+      coding_rate:      radioCodingRate.value      ? parseInt(radioCodingRate.value, 10)      : 0,
+      tx_power_dbm:     radioTxPowerDbm.value      ? parseInt(radioTxPowerDbm.value, 10)      : 0,
+    })
+    radioApplyOk.value = 'Radio parameters applied to device.'
+  } catch (e: any) {
+    radioApplyError.value = e?.message ?? 'failed to apply radio config'
+  } finally {
+    radioApplying.value = false
+  }
+}
+
+// ── Meshtastic radio ──────────────────────────────────────────────────────────
+
+const meshtasticRadioLoading = ref(false)
+const meshtasticRadioSaving = ref(false)
+const meshtasticRadioError = ref<string | null>(null)
+const meshtasticRadioOk = ref<string | null>(null)
+
+const meshtasticUsePreset = ref(false)
+const meshtasticModemPreset = ref(0)
+const meshtasticBandwidth = ref(0)
+const meshtasticSpreadFactor = ref(11)
+const meshtasticCodingRate = ref(8)
+const meshtasticFrequencyOffset = ref(0)
+const meshtasticRegion = ref(0)
+const meshtasticHopLimit = ref(3)
+const meshtasticTxEnabled = ref(true)
+const meshtasticTxPower = ref(17)
+const meshtasticChannelNum = ref(0)
+const meshtasticOverrideFrequency = ref(0)
+
+async function loadMeshtasticRadio() {
+  meshtasticRadioLoading.value = true
+  meshtasticRadioError.value = null
+  meshtasticRadioOk.value = null
+  try {
+    const r = await api.get<any>('/api/v1/meshtastic-radio-config')
+    meshtasticUsePreset.value         = r.use_preset ?? false
+    meshtasticModemPreset.value       = r.modem_preset ?? 0
+    meshtasticBandwidth.value         = r.bandwidth ?? 0
+    meshtasticSpreadFactor.value      = r.spread_factor ?? 11
+    meshtasticCodingRate.value        = r.coding_rate ?? 8
+    meshtasticFrequencyOffset.value   = r.frequency_offset ?? 0
+    meshtasticRegion.value            = r.region ?? 0
+    meshtasticHopLimit.value          = r.hop_limit ?? 3
+    meshtasticTxEnabled.value         = r.tx_enabled ?? true
+    meshtasticTxPower.value           = r.tx_power ?? 17
+    meshtasticChannelNum.value        = r.channel_num ?? 0
+    meshtasticOverrideFrequency.value = r.override_frequency ?? 0
+    meshtasticRadioOk.value = 'Loaded from device.'
+  } catch (e: any) {
+    meshtasticRadioError.value = e?.message ?? 'failed to load meshtastic radio config'
+  } finally {
+    meshtasticRadioLoading.value = false
+  }
+}
+
+async function saveMeshtasticRadio() {
+  meshtasticRadioSaving.value = true
+  meshtasticRadioError.value = null
+  meshtasticRadioOk.value = null
+  try {
+    await api.patch('/api/v1/meshtastic-radio-config', {
+      use_preset:         meshtasticUsePreset.value,
+      modem_preset:       meshtasticModemPreset.value,
+      bandwidth:          meshtasticBandwidth.value,
+      spread_factor:      meshtasticSpreadFactor.value,
+      coding_rate:        meshtasticCodingRate.value,
+      frequency_offset:   meshtasticFrequencyOffset.value,
+      region:             meshtasticRegion.value,
+      hop_limit:          meshtasticHopLimit.value,
+      tx_enabled:         meshtasticTxEnabled.value,
+      tx_power:           meshtasticTxPower.value,
+      channel_num:        meshtasticChannelNum.value,
+      override_frequency: meshtasticOverrideFrequency.value,
+    })
+    meshtasticRadioOk.value = 'Radio config saved to device.'
+  } catch (e: any) {
+    meshtasticRadioError.value = e?.message ?? 'failed to save meshtastic radio config'
+  } finally {
+    meshtasticRadioSaving.value = false
   }
 }
 
@@ -799,24 +896,21 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
-      <!-- MeshCore Radio — USB serial only -->
-      <!-- Pi HAT and TCP connections have their radio managed by pymc-companion;
-           node set-radio speaks directly to the USB serial device and is not
-           applicable to those connection types. -->
-      <section v-if="radioConfig?.connection_type === 'serial'" class="card">
+      <!-- MeshCore Radio — shown for all MeshCore connection types -->
+      <section v-if="radioConfig" class="card">
         <h2>MeshCore radio</h2>
         <p class="hint">
-          LoRa parameters for the USB MeshCore companion device
-          <span v-if="radioConfig.serial_port">(<code>{{ radioConfig.serial_port }}</code>)</span>.
-          Save here to record them in config.toml, then push to the device once with
-          <code>sudo supply-drop-bbs node set-radio</code>.
-          The device stores these settings in its own flash — you only need to run that
-          command when you change the parameters, not on every restart.
+          LoRa parameters for the MeshCore companion device.
+          Save here to record them in config.toml. Use <strong>Apply to device</strong>
+          to push the current values directly to the live companion device over the
+          existing connection.
         </p>
 
         <div v-if="radioError" class="notice error-notice">{{ radioError }}</div>
         <div v-if="radioSaveOk" class="notice ok-notice">{{ radioSaveOk }}</div>
         <div v-if="radioSaveError" class="notice error-notice">{{ radioSaveError }}</div>
+        <div v-if="radioApplyOk" class="notice ok-notice">{{ radioApplyOk }}</div>
+        <div v-if="radioApplyError" class="notice error-notice">{{ radioApplyError }}</div>
 
         <div class="field">
           <label>Region preset</label>
@@ -859,7 +953,80 @@ chmod g+w {{ configFile }}</pre>
           <button type="button" :disabled="radioSaving || radioLoading || !writable" @click="saveRadioConfig">
             {{ radioSaving ? 'saving…' : 'save radio config' }}
           </button>
+          <button type="button" :disabled="radioApplying || radioLoading || !radioConfig" @click="applyRadioConfig">
+            {{ radioApplying ? 'applying…' : 'apply to device' }}
+          </button>
           <span v-if="!writable" class="hint">config file is not writable</span>
+        </div>
+      </section>
+
+      <!-- Meshtastic radio -->
+      <section class="card">
+        <h2>Meshtastic radio</h2>
+        <p class="hint">
+          LoRa radio configuration for the connected Meshtastic device.
+          Use <strong>Load from device</strong> to read the current settings,
+          edit them, then <strong>Save to device</strong> to push them back.
+        </p>
+
+        <div v-if="meshtasticRadioError" class="notice error-notice">{{ meshtasticRadioError }}</div>
+        <div v-if="meshtasticRadioOk" class="notice ok-notice">{{ meshtasticRadioOk }}</div>
+
+        <div class="field-row">
+          <div class="field">
+            <label>Spread factor</label>
+            <input v-model.number="meshtasticSpreadFactor" type="number" min="7" max="12" :disabled="meshtasticRadioLoading" />
+          </div>
+          <div class="field">
+            <label>Bandwidth</label>
+            <input v-model.number="meshtasticBandwidth" type="number" min="0" :disabled="meshtasticRadioLoading" />
+          </div>
+          <div class="field">
+            <label>TX power (dBm)</label>
+            <input v-model.number="meshtasticTxPower" type="number" :disabled="meshtasticRadioLoading" />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Region</label>
+            <input v-model.number="meshtasticRegion" type="number" min="0" :disabled="meshtasticRadioLoading" />
+            <p class="hint">Meshtastic region enum value</p>
+          </div>
+          <div class="field">
+            <label>Hop limit</label>
+            <input v-model.number="meshtasticHopLimit" type="number" min="0" max="7" :disabled="meshtasticRadioLoading" />
+          </div>
+          <div class="field">
+            <label>Modem preset</label>
+            <input v-model.number="meshtasticModemPreset" type="number" min="0" :disabled="meshtasticRadioLoading || meshtasticUsePreset" />
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Override frequency (MHz)</label>
+            <input v-model.number="meshtasticOverrideFrequency" type="number" step="0.001" :disabled="meshtasticRadioLoading" />
+          </div>
+          <div class="field">
+            <label style="display:flex;align-items:center;gap:0.5rem;">
+              <input type="checkbox" v-model="meshtasticUsePreset" :disabled="meshtasticRadioLoading" />
+              Use preset
+            </label>
+          </div>
+          <div class="field">
+            <label style="display:flex;align-items:center;gap:0.5rem;">
+              <input type="checkbox" v-model="meshtasticTxEnabled" :disabled="meshtasticRadioLoading" />
+              TX enabled
+            </label>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="button" :disabled="meshtasticRadioLoading" @click="loadMeshtasticRadio">
+            {{ meshtasticRadioLoading ? 'loading…' : 'load from device' }}
+          </button>
+          <button type="button" :disabled="meshtasticRadioLoading || meshtasticRadioSaving" @click="saveMeshtasticRadio">
+            {{ meshtasticRadioSaving ? 'saving…' : 'save to device' }}
+          </button>
         </div>
       </section>
 

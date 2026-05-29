@@ -558,6 +558,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/radio-config",
             get(api_get_radio_config).patch(api_patch_radio_config),
         )
+        .route("/radio-config/apply", post(api_apply_radio_config))
+        .route(
+            "/meshtastic-radio-config",
+            get(api_get_meshtastic_radio_config).patch(api_patch_meshtastic_radio_config),
+        )
         .route("/node-identity", get(api_get_node_identity))
         .route("/node-identity/export-key", post(api_export_node_key))
         .route("/node-identity/import-key", post(api_import_node_key))
@@ -2514,6 +2519,92 @@ async fn api_patch_radio_config(
         presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
+}
+
+// ── Radio config apply (MeshCore) ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ApplyRadioBody {
+    frequency_hz: u32,
+    bandwidth_hz: u32,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power_dbm: i8,
+}
+
+async fn api_apply_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(body): Json<ApplyRadioBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let params = bbs_plugin_api::MeshRadioParams {
+        frequency_hz: body.frequency_hz,
+        bandwidth_hz: body.bandwidth_hz,
+        spreading_factor: body.spreading_factor,
+        coding_rate: body.coding_rate,
+        tx_power_dbm: body.tx_power_dbm,
+    };
+    match state.host.admin_apply_mesh_radio(params).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => {
+            let status = match &e {
+                HostError::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
+                HostError::NotSupported(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json_error(&format!("{e}")))).into_response()
+        }
+    }
+}
+
+// ── Meshtastic radio config ───────────────────────────────────────────────────
+
+async fn api_get_meshtastic_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_meshtastic_lora().await {
+        Ok(config) => Json(config).into_response(),
+        Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_patch_meshtastic_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(config): Json<bbs_plugin_api::MeshtasticLoRaConfig>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_set_meshtastic_lora(config).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
 }
 
 // ── Node identity ─────────────────────────────────────────────────────────────
