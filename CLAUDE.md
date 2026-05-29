@@ -14,6 +14,22 @@ rustup run 1.88 cargo doc --workspace --no-deps --all-features
 Be certain to update documentation, where relevant.
 
 
+## Branching and pull requests
+
+**Never commit directly to `main`.** All changes must go through a feature branch and a pull request, no matter how small.
+
+Branch naming follows the pattern `<type>/<short-description>`, e.g.:
+- `feat/guest-room-access`
+- `fix/issue-45-root-cli`
+- `perf/binary-size-optimisations`
+- `chore/bump-v0-8-3`
+
+Workflow:
+1. Create a feature branch from `main`
+2. Commit changes to the feature branch
+3. Push the branch and open a PR with `gh pr create --base main --head <branch>`
+4. Never push directly to `main`
+
 ## Commit style
 
 All commits must use [Conventional Commits](https://www.conventionalcommits.org/) format:
