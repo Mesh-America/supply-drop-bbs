@@ -484,6 +484,13 @@ enum PendingKeyOp {
     Import {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    ApplyRadio {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        /// true = waiting for SetRadioParams Ok; false = waiting for SetRadioTxPower Ok
+        waiting_for_params: bool,
+        /// tx_power to send after params Ok arrives
+        tx_power_dbm: i8,
+    },
 }
 
 /// Background task: receive [`ClientEvent`]s and dispatch them.
@@ -597,6 +604,7 @@ async fn event_loop(
                             match op {
                                 PendingKeyOp::Export { reply } => { let _ = reply.send(Err(err)); }
                                 PendingKeyOp::Import { reply } => { let _ = reply.send(Err(err)); }
+                                PendingKeyOp::ApplyRadio { reply, .. } => { let _ = reply.send(Err(err)); }
                             }
                         }
                         if will_retry {
@@ -620,11 +628,30 @@ async fn event_loop(
                                 }
                             }
                             InboundFrame::Ok => {
-                                if let Some(PendingKeyOp::Import { reply }) = pending_key_op.take() {
-                                    let _ = reply.send(Ok(()));
-                                    true
-                                } else {
-                                    false
+                                match pending_key_op.take() {
+                                    Some(PendingKeyOp::Import { reply }) => {
+                                        let _ = reply.send(Ok(()));
+                                        true
+                                    }
+                                    Some(PendingKeyOp::ApplyRadio { reply, waiting_for_params: true, tx_power_dbm }) => {
+                                        // Params acknowledged — now send TX power
+                                        let _ = cmd_tx.send(OutboundFrame::SetRadioTxPower { power_dbm: tx_power_dbm }).await;
+                                        pending_key_op = Some(PendingKeyOp::ApplyRadio {
+                                            reply,
+                                            waiting_for_params: false,
+                                            tx_power_dbm,
+                                        });
+                                        true
+                                    }
+                                    Some(PendingKeyOp::ApplyRadio { reply, waiting_for_params: false, .. }) => {
+                                        // TX power acknowledged — done
+                                        let _ = reply.send(Ok(()));
+                                        true
+                                    }
+                                    other => {
+                                        pending_key_op = other;
+                                        false
+                                    }
                                 }
                             }
                             // Device returned an error frame while a key op was in
@@ -635,6 +662,7 @@ async fn event_loop(
                                     match op {
                                         PendingKeyOp::Export { reply } => { let _ = reply.send(Err(msg)); }
                                         PendingKeyOp::Import { reply } => { let _ = reply.send(Err(msg)); }
+                                        PendingKeyOp::ApplyRadio { reply, .. } => { let _ = reply.send(Err(msg)); }
                                     }
                                     true
                                 } else {
@@ -666,6 +694,23 @@ async fn event_loop(
                         } else {
                             let _ = cmd_tx.send(OutboundFrame::ImportPrivateKey { key }).await;
                             pending_key_op = Some(PendingKeyOp::Import { reply });
+                        }
+                    }
+                    MeshKeyRequest::ApplyRadio { params, reply } => {
+                        if pending_key_op.is_some() {
+                            let _ = reply.send(Err("another device operation is already in progress".into()));
+                        } else {
+                            let _ = cmd_tx.send(OutboundFrame::SetRadioParams {
+                                frequency_hz: params.frequency_hz,
+                                bandwidth_hz: params.bandwidth_hz,
+                                spreading_factor: params.spreading_factor,
+                                coding_rate: params.coding_rate,
+                            }).await;
+                            pending_key_op = Some(PendingKeyOp::ApplyRadio {
+                                reply,
+                                waiting_for_params: true,
+                                tx_power_dbm: params.tx_power_dbm,
+                            });
                         }
                     }
                 }

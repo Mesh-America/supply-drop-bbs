@@ -218,6 +218,11 @@ pub struct BbsHost {
     /// None when the mesh transport has not registered itself.
     mesh_key_tx:
         std::sync::RwLock<Option<tokio::sync::mpsc::Sender<bbs_plugin_api::MeshKeyRequest>>>,
+    /// Sending half of the Meshtastic admin channel.
+    /// None when the Meshtastic transport has not registered itself.
+    meshtastic_admin_tx: std::sync::RwLock<
+        Option<tokio::sync::mpsc::Sender<bbs_plugin_api::MeshtasticAdminRequest>>,
+    >,
 }
 
 impl BbsHost {
@@ -255,6 +260,7 @@ impl BbsHost {
             config_path,
             node_pubkey: std::sync::RwLock::new(None),
             mesh_key_tx: std::sync::RwLock::new(None),
+            meshtastic_admin_tx: std::sync::RwLock::new(None),
         }
     }
 
@@ -583,6 +589,102 @@ impl Host for BbsHost {
         reply_rx
             .await
             .map_err(|_| bbs_plugin_api::HostError::Internal("key op cancelled".into()))?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
+    async fn admin_apply_mesh_radio(
+        &self,
+        params: bbs_plugin_api::MeshRadioParams,
+    ) -> Result<(), bbs_plugin_api::HostError> {
+        let tx = self
+            .mesh_key_tx
+            .read()
+            .expect("mesh_key_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("mesh transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshKeyRequest::ApplyRadio {
+            params,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| bbs_plugin_api::HostError::Internal("mesh transport disconnected".into()))?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| bbs_plugin_api::HostError::Internal("radio apply timed out".into()))?
+            .map_err(|_| bbs_plugin_api::HostError::Internal("radio apply cancelled".into()))?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
+    fn register_meshtastic_admin_ops(
+        &self,
+        sender: tokio::sync::mpsc::Sender<bbs_plugin_api::MeshtasticAdminRequest>,
+    ) {
+        *self
+            .meshtastic_admin_tx
+            .write()
+            .expect("meshtastic_admin_tx poisoned") = Some(sender);
+    }
+
+    async fn admin_get_meshtastic_lora(
+        &self,
+    ) -> Result<bbs_plugin_api::MeshtasticLoRaConfig, bbs_plugin_api::HostError> {
+        let tx = self
+            .meshtastic_admin_tx
+            .read()
+            .expect("meshtastic_admin_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshtasticAdminRequest::GetLoRaConfig { reply: reply_tx })
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport disconnected".into())
+            })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic lora get timed out".into())
+            })?
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic lora get cancelled".into())
+            })?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
+    async fn admin_set_meshtastic_lora(
+        &self,
+        config: bbs_plugin_api::MeshtasticLoRaConfig,
+    ) -> Result<(), bbs_plugin_api::HostError> {
+        let tx = self
+            .meshtastic_admin_tx
+            .read()
+            .expect("meshtastic_admin_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshtasticAdminRequest::SetLoRaConfig {
+            config,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| {
+            bbs_plugin_api::HostError::Internal("meshtastic transport disconnected".into())
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic lora set timed out".into())
+            })?
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic lora set cancelled".into())
+            })?
             .map_err(bbs_plugin_api::HostError::Internal)
     }
 

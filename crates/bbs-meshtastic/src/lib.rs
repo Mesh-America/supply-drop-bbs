@@ -28,11 +28,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
+use bbs_plugin_api::MeshtasticAdminRequest;
+
 use crate::{
     command::{format_response, parse_command, render_notification, truncate_utf8},
     proto::{
-        direct_text_packet, from_radio, mesh_packet, node_key, synthetic_pubkey, Data, MeshPacket,
-        NodeInfo, BROADCAST_ADDR, PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
+        admin_get_lora_config, admin_message, admin_set_lora_config, direct_text_packet,
+        from_radio, mesh_packet, mt_config, node_key, synthetic_pubkey, AdminMessage, Data,
+        LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP,
+        PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
     },
     session::SessionState,
     stream::{ClientEvent, MeshtasticClient, SerialConfig, TcpConfig},
@@ -196,6 +200,10 @@ pub struct MeshtasticTransport {
     hop_limit: u32,
     want_ack: bool,
     packet_counter: Arc<AtomicU32>,
+    /// Admin channel sender — stored so `start()` can register it with the host.
+    admin_tx: mpsc::Sender<MeshtasticAdminRequest>,
+    /// Admin channel receiver — taken by `start()` into the event loop.
+    admin_rx: Mutex<Option<mpsc::Receiver<MeshtasticAdminRequest>>>,
 }
 
 #[async_trait]
@@ -243,6 +251,7 @@ impl Plugin for MeshtasticTransport {
 
         let cmd_tx = client.sender();
         let (shutdown_tx, _) = watch::channel(false);
+        let (admin_tx, admin_rx) = mpsc::channel::<MeshtasticAdminRequest>(4);
 
         Ok(Self {
             host,
@@ -257,6 +266,8 @@ impl Plugin for MeshtasticTransport {
             hop_limit: config.hop_limit,
             want_ack: config.want_ack,
             packet_counter: Arc::new(AtomicU32::new(1)),
+            admin_tx,
+            admin_rx: Mutex::new(Some(admin_rx)),
         })
     }
 
@@ -269,6 +280,19 @@ impl Plugin for MeshtasticTransport {
             .ok_or_else(|| {
                 PluginError::StartFailed("meshtastic transport already started".into())
             })?;
+
+        let admin_rx = self
+            .admin_rx
+            .lock()
+            .expect("admin_rx mutex poisoned")
+            .take()
+            .ok_or_else(|| {
+                PluginError::StartFailed("meshtastic admin channel already taken".into())
+            })?;
+
+        // Register admin channel with the host before spawning the event loop.
+        self.host
+            .register_meshtastic_admin_ops(self.admin_tx.clone());
 
         let host = Arc::clone(&self.host);
         let cmd_tx = self.cmd_tx.clone();
@@ -295,6 +319,7 @@ impl Plugin for MeshtasticTransport {
             hop_limit,
             want_ack,
             packet_counter,
+            admin_rx,
         ));
 
         // Subscribe to advisory domain events, mirroring the MeshCore transport.
@@ -383,6 +408,18 @@ impl TransportEngine for MeshtasticTransport {
 
 // ── Event loop ────────────────────────────────────────────────────────────────
 
+/// Pending admin request in the Meshtastic event loop.
+enum PendingMeshtasticAdmin {
+    GetLora {
+        request_id: u32,
+        reply: tokio::sync::oneshot::Sender<Result<bbs_plugin_api::MeshtasticLoRaConfig, String>>,
+    },
+    SetLora {
+        request_id: u32,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop(
     mut client: MeshtasticClient,
@@ -397,7 +434,10 @@ async fn event_loop(
     hop_limit: u32,
     want_ack: bool,
     packet_counter: Arc<AtomicU32>,
+    mut admin_rx: mpsc::Receiver<MeshtasticAdminRequest>,
 ) {
+    let mut pending_admin: Option<PendingMeshtasticAdmin> = None;
+
     loop {
         tokio::select! {
             event = client.recv() => match event {
@@ -405,6 +445,14 @@ async fn event_loop(
                     info!("meshtastic: connected to radio");
                 }
                 Some(ClientEvent::Disconnected { will_retry }) => {
+                    // Fail any in-flight admin request.
+                    if let Some(op) = pending_admin.take() {
+                        let err = "device disconnected".to_owned();
+                        match op {
+                            PendingMeshtasticAdmin::GetLora { reply, .. } => { let _ = reply.send(Err(err)); }
+                            PendingMeshtasticAdmin::SetLora { reply, .. } => { let _ = reply.send(Err(err)); }
+                        }
+                    }
                     if will_retry {
                         info!("meshtastic: radio disconnected, will retry");
                     } else {
@@ -413,27 +461,159 @@ async fn event_loop(
                     }
                 }
                 Some(ClientEvent::FromRadio(msg)) => {
-                    handle_from_radio(
-                        msg,
-                        &host,
-                        &cmd_tx,
-                        &state,
-                        command_prefix,
-                        &welcome_message,
-                        node_credential_ttl_days,
-                        max_payload_bytes,
-                        hop_limit,
-                        want_ack,
-                        &packet_counter,
-                    ).await;
+                    // Check if this is an admin response packet before general dispatch.
+                    let consumed = try_handle_admin_response(&msg, &mut pending_admin);
+                    if !consumed {
+                        handle_from_radio(
+                            msg,
+                            &host,
+                            &cmd_tx,
+                            &state,
+                            command_prefix,
+                            &welcome_message,
+                            node_credential_ttl_days,
+                            max_payload_bytes,
+                            hop_limit,
+                            want_ack,
+                            &packet_counter,
+                        ).await;
+                    }
                 }
                 None => break,
+            },
+            Some(req) = admin_rx.recv() => {
+                let my_node_num = state.lock().expect("state mutex poisoned").my_node_num;
+                let Some(my_node_num) = my_node_num else {
+                    match req {
+                        MeshtasticAdminRequest::GetLoRaConfig { reply } => {
+                            let _ = reply.send(Err("node num not yet received from radio".into()));
+                        }
+                        MeshtasticAdminRequest::SetLoRaConfig { reply, .. } => {
+                            let _ = reply.send(Err("node num not yet received from radio".into()));
+                        }
+                    }
+                    continue;
+                };
+                if pending_admin.is_some() {
+                    match req {
+                        MeshtasticAdminRequest::GetLoRaConfig { reply } => {
+                            let _ = reply.send(Err("another admin operation is already in progress".into()));
+                        }
+                        MeshtasticAdminRequest::SetLoRaConfig { reply, .. } => {
+                            let _ = reply.send(Err("another admin operation is already in progress".into()));
+                        }
+                    }
+                    continue;
+                }
+                match req {
+                    MeshtasticAdminRequest::GetLoRaConfig { reply } => {
+                        let request_id = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if cmd_tx.send(admin_get_lora_config(my_node_num, request_id)).await.is_err() {
+                            let _ = reply.send(Err("meshtastic client disconnected".into()));
+                        } else {
+                            pending_admin = Some(PendingMeshtasticAdmin::GetLora { request_id, reply });
+                        }
+                    }
+                    MeshtasticAdminRequest::SetLoRaConfig { config, reply } => {
+                        let request_id = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let lora = LoRaConfig {
+                            use_preset: config.use_preset,
+                            modem_preset: config.modem_preset,
+                            bandwidth: config.bandwidth,
+                            spread_factor: config.spread_factor,
+                            coding_rate: config.coding_rate,
+                            frequency_offset: config.frequency_offset,
+                            region: config.region,
+                            hop_limit: config.hop_limit,
+                            tx_enabled: config.tx_enabled,
+                            tx_power: config.tx_power,
+                            channel_num: config.channel_num,
+                            override_frequency: config.override_frequency,
+                        };
+                        if cmd_tx.send(admin_set_lora_config(my_node_num, request_id, lora)).await.is_err() {
+                            let _ = reply.send(Err("meshtastic client disconnected".into()));
+                        } else {
+                            pending_admin = Some(PendingMeshtasticAdmin::SetLora { request_id, reply });
+                        }
+                    }
+                }
             },
             _ = shutdown_rx.changed() => {
                 info!("meshtastic: shutdown signal received");
                 break;
             }
         }
+    }
+}
+
+/// Try to handle an admin-channel response packet.
+/// Returns `true` if the message was consumed (caller should skip general dispatch).
+fn try_handle_admin_response(
+    msg: &proto::FromRadio,
+    pending_admin: &mut Option<PendingMeshtasticAdmin>,
+) -> bool {
+    use prost::Message as _;
+
+    let Some(from_radio::PayloadVariant::Packet(packet)) = &msg.payload_variant else {
+        return false;
+    };
+    let Some(mesh_packet::PayloadVariant::Decoded(data)) = &packet.payload_variant else {
+        return false;
+    };
+    if data.portnum != PORT_ADMIN_APP {
+        return false;
+    }
+
+    match pending_admin.take() {
+        Some(PendingMeshtasticAdmin::GetLora { request_id, reply }) => {
+            if data.reply_id != request_id && data.request_id != request_id {
+                // Not our response — put it back and don't consume.
+                *pending_admin = Some(PendingMeshtasticAdmin::GetLora { request_id, reply });
+                return false;
+            }
+            // Decode AdminMessage to extract GetConfigResponse.
+            match AdminMessage::decode(data.payload.as_slice()) {
+                Ok(AdminMessage {
+                    payload_variant:
+                        Some(admin_message::PayloadVariant::GetConfigResponse(MtConfig {
+                            payload_variant: Some(mt_config::PayloadVariant::Lora(lora)),
+                        })),
+                }) => {
+                    let config = bbs_plugin_api::MeshtasticLoRaConfig {
+                        use_preset: lora.use_preset,
+                        modem_preset: lora.modem_preset,
+                        bandwidth: lora.bandwidth,
+                        spread_factor: lora.spread_factor,
+                        coding_rate: lora.coding_rate,
+                        frequency_offset: lora.frequency_offset,
+                        region: lora.region,
+                        hop_limit: lora.hop_limit,
+                        tx_enabled: lora.tx_enabled,
+                        tx_power: lora.tx_power,
+                        channel_num: lora.channel_num,
+                        override_frequency: lora.override_frequency,
+                    };
+                    let _ = reply.send(Ok(config));
+                }
+                Ok(_) => {
+                    let _ = reply.send(Err("unexpected admin response payload".into()));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("failed to decode admin response: {e}")));
+                }
+            }
+            true
+        }
+        Some(PendingMeshtasticAdmin::SetLora { request_id, reply }) => {
+            if data.reply_id != request_id && data.request_id != request_id {
+                *pending_admin = Some(PendingMeshtasticAdmin::SetLora { request_id, reply });
+                return false;
+            }
+            // Any admin packet with matching reply_id/request_id for SetConfig is the ACK.
+            let _ = reply.send(Ok(()));
+            true
+        }
+        None => false,
     }
 }
 
@@ -542,6 +722,10 @@ async fn handle_packet(
                 from = format_node_id(packet.from),
                 "meshtastic: nodeinfo packet observed"
             );
+            return;
+        }
+        if data.portnum == PORT_ADMIN_APP {
+            // Admin packets are handled by try_handle_admin_response in the event loop.
             return;
         }
     }

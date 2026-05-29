@@ -270,6 +270,143 @@ pub fn synthetic_pubkey(node_num: u32) -> [u8; 32] {
     key
 }
 
+pub const PORT_ADMIN_APP: i32 = 67;
+
+#[derive(Clone, PartialEq, Message)]
+pub struct AdminMessage {
+    #[prost(oneof = "admin_message::PayloadVariant", tags = "6, 11, 13")]
+    pub payload_variant: Option<admin_message::PayloadVariant>,
+}
+
+pub mod admin_message {
+    use super::*;
+    #[derive(Clone, PartialEq, Oneof)]
+    pub enum PayloadVariant {
+        #[prost(message, tag = "6")]
+        GetConfigResponse(super::MtConfig),
+        #[prost(message, tag = "11")]
+        SetConfig(super::MtConfig),
+        #[prost(int32, tag = "13")]
+        GetConfigRequest(i32),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct MtConfig {
+    #[prost(oneof = "mt_config::PayloadVariant", tags = "3")]
+    pub payload_variant: Option<mt_config::PayloadVariant>,
+}
+
+pub mod mt_config {
+    use super::*;
+    #[derive(Clone, PartialEq, Oneof)]
+    pub enum PayloadVariant {
+        #[prost(message, tag = "3")]
+        Lora(super::LoRaConfig),
+    }
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct LoRaConfig {
+    #[prost(bool, tag = "1")]
+    pub use_preset: bool,
+    #[prost(int32, tag = "2")]
+    pub modem_preset: i32,
+    #[prost(uint32, tag = "3")]
+    pub bandwidth: u32,
+    #[prost(uint32, tag = "4")]
+    pub spread_factor: u32,
+    #[prost(uint32, tag = "5")]
+    pub coding_rate: u32,
+    #[prost(float, tag = "6")]
+    pub frequency_offset: f32,
+    #[prost(int32, tag = "7")]
+    pub region: i32,
+    #[prost(uint32, tag = "8")]
+    pub hop_limit: u32,
+    #[prost(bool, tag = "9")]
+    pub tx_enabled: bool,
+    #[prost(int32, tag = "10")]
+    pub tx_power: i32,
+    #[prost(uint32, tag = "11")]
+    pub channel_num: u32,
+    #[prost(float, tag = "14")]
+    pub override_frequency: f32,
+}
+
+/// CONFIG_TYPE_LORA = 5
+pub const CONFIG_TYPE_LORA: i32 = 5;
+
+pub fn admin_get_lora_config(to_node: u32, request_id: u32) -> ToRadio {
+    use prost::Message as _;
+    let admin = AdminMessage {
+        payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
+            CONFIG_TYPE_LORA,
+        )),
+    };
+    ToRadio {
+        payload_variant: Some(to_radio::PayloadVariant::Packet(MeshPacket {
+            from: 0,
+            to: to_node,
+            channel: 0,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+                portnum: PORT_ADMIN_APP,
+                payload: admin.encode_to_vec(),
+                want_response: true,
+                dest: to_node,
+                source: to_node,
+                request_id,
+                reply_id: 0,
+            })),
+            id: request_id,
+            rx_time: 0,
+            rx_snr: 0.0,
+            hop_limit: 0,
+            want_ack: false,
+            priority: PRIORITY_RELIABLE,
+            rx_rssi: 0,
+            via_mqtt: false,
+            hop_start: 0,
+            public_key: Vec::new(),
+        })),
+    }
+}
+
+pub fn admin_set_lora_config(to_node: u32, request_id: u32, config: LoRaConfig) -> ToRadio {
+    use prost::Message as _;
+    let admin = AdminMessage {
+        payload_variant: Some(admin_message::PayloadVariant::SetConfig(MtConfig {
+            payload_variant: Some(mt_config::PayloadVariant::Lora(config)),
+        })),
+    };
+    ToRadio {
+        payload_variant: Some(to_radio::PayloadVariant::Packet(MeshPacket {
+            from: 0,
+            to: to_node,
+            channel: 0,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+                portnum: PORT_ADMIN_APP,
+                payload: admin.encode_to_vec(),
+                want_response: true,
+                dest: to_node,
+                source: to_node,
+                request_id,
+                reply_id: 0,
+            })),
+            id: request_id,
+            rx_time: 0,
+            rx_snr: 0.0,
+            hop_limit: 0,
+            want_ack: false,
+            priority: PRIORITY_RELIABLE,
+            rx_rssi: 0,
+            via_mqtt: false,
+            hop_start: 0,
+            public_key: Vec::new(),
+        })),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

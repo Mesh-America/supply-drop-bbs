@@ -38,11 +38,35 @@ pub enum MeshKeyRequest {
         /// One-shot channel to deliver the result back to the caller.
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Apply LoRa radio parameters to the companion device.
+    ApplyRadio {
+        /// The radio parameters to apply.
+        params: crate::admin::MeshRadioParams,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// Request sent from [`Host`] to the Meshtastic transport's admin channel.
+pub enum MeshtasticAdminRequest {
+    /// Fetch the current LoRa radio config from the device.
+    GetLoRaConfig {
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticLoRaConfig, String>>,
+    },
+    /// Push a new LoRa radio config to the device.
+    SetLoRaConfig {
+        /// The LoRa config to write to the device.
+        config: crate::admin::MeshtasticLoRaConfig,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 use crate::admin::{
     AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports,
-    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo,
+    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, MeshRadioParams,
+    MeshtasticLoRaConfig,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -428,6 +452,34 @@ pub trait Host: Send + Sync {
     async fn admin_import_node_key(&self, hex: String) -> Result<(), HostError> {
         let _ = hex;
         Err(HostError::NotSupported("admin_import_node_key".into()))
+    }
+
+    /// Apply LoRa radio parameters to the MeshCore companion device.
+    /// Requires the mesh transport to be connected.
+    async fn admin_apply_mesh_radio(&self, params: MeshRadioParams) -> Result<(), HostError> {
+        let _ = params;
+        Err(HostError::NotSupported("admin_apply_mesh_radio".into()))
+    }
+
+    /// Register the Meshtastic transport's admin command channel.
+    fn register_meshtastic_admin_ops(
+        &self,
+        _sender: tokio::sync::mpsc::Sender<MeshtasticAdminRequest>,
+    ) {
+    }
+
+    /// Fetch the current LoRa radio config from the Meshtastic device.
+    async fn admin_get_meshtastic_lora(&self) -> Result<MeshtasticLoRaConfig, HostError> {
+        Err(HostError::NotSupported("admin_get_meshtastic_lora".into()))
+    }
+
+    /// Push a new LoRa radio config to the Meshtastic device.
+    async fn admin_set_meshtastic_lora(
+        &self,
+        config: MeshtasticLoRaConfig,
+    ) -> Result<(), HostError> {
+        let _ = config;
+        Err(HostError::NotSupported("admin_set_meshtastic_lora".into()))
     }
 
     // ── Mesh node credentials ────────────────────────────────────────────────────

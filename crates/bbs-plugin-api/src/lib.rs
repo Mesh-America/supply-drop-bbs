@@ -52,13 +52,14 @@ pub mod transport;
 pub use admin::{
     AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity,
     AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStaleRoom,
-    AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups,
+    AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups, MeshRadioParams,
+    MeshtasticLoRaConfig,
 };
 pub use advert::{AdvertBus, AdvertRecord};
 pub use command::{Command, Response};
 pub use error::{HostError, PluginError, TransportError};
 pub use event::{DomainEvent, MessageRecipient, Notification, NotifyOutcome};
-pub use host::{Host, MeshKeyRequest};
+pub use host::{Host, MeshKeyRequest, MeshtasticAdminRequest};
 pub use identity::{SessionId, Username};
 pub use permissions::{PermissionCtx, PermissionLevel};
 pub use plugin::Plugin;

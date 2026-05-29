@@ -210,6 +210,50 @@ pub struct AdminAccessPolicy {
     pub guest_room_id: Option<i64>,
 }
 
+/// Radio parameters applied to a MeshCore companion device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshRadioParams {
+    /// Centre frequency in Hz (e.g. 910_525_000 for 910.525 MHz).
+    pub frequency_hz: u32,
+    /// Channel bandwidth in Hz (e.g. 62_500 for 62.5 kHz).
+    pub bandwidth_hz: u32,
+    /// LoRa spreading factor (7–12).
+    pub spreading_factor: u8,
+    /// Coding rate denominator (5–8, meaning 4/5 through 4/8).
+    pub coding_rate: u8,
+    /// Transmit power in dBm.
+    pub tx_power_dbm: i8,
+}
+
+/// Meshtastic LoRa radio configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshtasticLoRaConfig {
+    /// Whether to use a built-in modem preset instead of custom parameters.
+    pub use_preset: bool,
+    /// Meshtastic modem preset enum value (used when `use_preset` is true).
+    pub modem_preset: i32,
+    /// Channel bandwidth (device-specific units).
+    pub bandwidth: u32,
+    /// LoRa spreading factor (7–12).
+    pub spread_factor: u32,
+    /// Coding rate denominator (5–8).
+    pub coding_rate: u32,
+    /// Frequency offset in MHz.
+    pub frequency_offset: f32,
+    /// Meshtastic region enum value.
+    pub region: i32,
+    /// Maximum number of hops for mesh routing.
+    pub hop_limit: u32,
+    /// Whether the transmitter is enabled.
+    pub tx_enabled: bool,
+    /// Transmit power in dBm.
+    pub tx_power: i32,
+    /// LoRa channel number (0 = use frequency directly).
+    pub channel_num: u32,
+    /// Override frequency in MHz (0 = use region default).
+    pub override_frequency: f32,
+}
+
 /// One entry in the durable audit log.
 ///
 /// Written whenever a privileged action is performed: ban, unban, validate,
