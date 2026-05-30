@@ -57,6 +57,30 @@ pub enum MeshtasticConnectionType {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+/// Radio parameter configuration stored in `[plugins.meshtastic.radio]`.
+///
+/// These values are **not** pushed to the device automatically on connect.
+/// Apply them on demand via the web admin UI (Settings → Meshtastic radio)
+/// or `supply-drop-bbs node set-meshtastic-radio` once that command is added.
+/// Once applied the device persists the settings in its own flash.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MeshtasticRadioConfig {
+    /// Meshtastic region code (e.g. `"US"`, `"EU_868"`, `"ANZ"`).
+    ///
+    /// Sets the legal frequency range for the device.  See the Meshtastic
+    /// documentation for the full list of region codes.
+    #[serde(default)]
+    pub region: Option<String>,
+
+    /// Meshtastic modem preset (e.g. `"LONG_FAST"`, `"MEDIUM_SLOW"`).
+    ///
+    /// Predefined LoRa parameter profiles.  `"LONG_FAST"` is the Meshtastic
+    /// default and works well for most outdoor deployments.
+    #[serde(default)]
+    pub modem_preset: Option<String>,
+}
+
 /// Configuration for the Meshtastic transport (`[plugins.meshtastic]`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -112,6 +136,21 @@ pub struct MeshtasticConfig {
     /// Maximum reconnect delay after repeated failures.
     #[serde(default = "default_reconnect_delay_max_ms")]
     pub reconnect_delay_max_ms: u64,
+
+    /// Radio parameter configuration.
+    ///
+    /// Stored here for reference and applied on demand via the web admin UI
+    /// (Settings → Meshtastic radio).  **Not** pushed automatically on every
+    /// connect — the device persists radio settings in its own flash.
+    ///
+    /// Example:
+    /// ```toml
+    /// [plugins.meshtastic.radio]
+    /// region       = "US"
+    /// modem_preset = "LONG_FAST"
+    /// ```
+    #[serde(default)]
+    pub radio: Option<MeshtasticRadioConfig>,
 }
 
 impl Default for MeshtasticConfig {
@@ -130,6 +169,7 @@ impl Default for MeshtasticConfig {
             want_ack: default_want_ack(),
             reconnect_delay_initial_ms: default_reconnect_delay_initial_ms(),
             reconnect_delay_max_ms: default_reconnect_delay_max_ms(),
+            radio: None,
         }
     }
 }
