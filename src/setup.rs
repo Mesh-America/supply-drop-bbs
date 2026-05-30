@@ -2029,6 +2029,20 @@ fn print_next_steps(
         println!();
     }
 
+    // Meshtastic settings push hint
+    if use_meshtastic {
+        println!("Meshtastic radio and node settings:");
+        println!();
+        println!("  The region, modem preset, and node name were saved to config.toml.");
+        println!("  To push them to the device now (BBS must NOT be running):");
+        println!();
+        println!("    supply-drop-bbs node set-meshtastic-radio");
+        println!("    supply-drop-bbs node set-meshtastic-owner");
+        println!();
+        println!("  Or push them later from Settings in the web admin UI.");
+        println!();
+    }
+
     if cfg!(target_os = "linux") {
         println!("To run Supply Drop BBS as a systemd service:");
         println!();

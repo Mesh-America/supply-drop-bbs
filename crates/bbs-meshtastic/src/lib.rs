@@ -835,6 +835,301 @@ fn hex_encode(bytes: &[u8]) -> String {
         })
 }
 
+// ── CLI helpers — direct device config push ───────────────────────────────────
+
+fn region_str_to_int(name: &str) -> i32 {
+    match name {
+        "US" => 1,
+        "EU_433" => 2,
+        "EU_868" => 3,
+        "CN" => 4,
+        "JP" => 5,
+        "ANZ" => 6,
+        "KR" => 7,
+        "TW" => 8,
+        "RU" => 9,
+        "IN" => 10,
+        "NZ_865" => 11,
+        "TH" => 12,
+        "LORA_24" => 13,
+        "UA_433" => 14,
+        "UA_868" => 15,
+        "MY_433" => 16,
+        "MY_919" => 17,
+        "SG_923" => 18,
+        _ => 0, // UNSET
+    }
+}
+
+fn preset_str_to_int(name: &str) -> i32 {
+    match name {
+        "LONG_FAST" => 0,
+        "LONG_SLOW" => 1,
+        "VERY_LONG_SLOW" => 2,
+        "MEDIUM_SLOW" => 3,
+        "MEDIUM_FAST" => 4,
+        "SHORT_SLOW" => 5,
+        "SHORT_FAST" => 6,
+        "LONG_MODERATE" => 7,
+        "SHORT_TURBO" => 8,
+        "LONG_TURBO" => 9,
+        "LITE_FAST" => 10,
+        "LITE_SLOW" => 11,
+        "NARROW_FAST" => 12,
+        "NARROW_SLOW" => 13,
+        _ => 0, // LONG_FAST
+    }
+}
+
+/// Connect to the Meshtastic device and push the LoRa radio config stored in
+/// `config`.  Returns `Ok(())` on success or an error string.
+///
+/// Resolves the connection parameters in order: flag overrides → config values.
+/// The BBS must **not** be running on the same port when this is called.
+pub async fn apply_radio_from_config(
+    config: &MeshtasticConfig,
+    port_override: Option<String>,
+    baud_override: Option<u32>,
+    addr_override: Option<String>,
+) -> Result<(), String> {
+    use proto::{
+        admin_set_lora_config, from_radio, mesh_packet, want_config, LoRaConfig, PORT_ADMIN_APP,
+    };
+    use std::time::Duration;
+    use stream::ClientEvent;
+    use tokio::time::timeout;
+
+    let radio_cfg = config.radio.as_ref().ok_or_else(|| {
+        "no [plugins.meshtastic.radio] in config.toml — \
+         run 'supply-drop-bbs setup' to configure"
+            .to_owned()
+    })?;
+    let region = region_str_to_int(radio_cfg.region.as_deref().unwrap_or("UNSET"));
+    let preset = preset_str_to_int(radio_cfg.modem_preset.as_deref().unwrap_or("LONG_FAST"));
+    eprintln!(
+        "Pushing radio config: region={} ({}), modem_preset={} ({})",
+        region,
+        radio_cfg.region.as_deref().unwrap_or("UNSET"),
+        preset,
+        radio_cfg.modem_preset.as_deref().unwrap_or("LONG_FAST"),
+    );
+
+    let mut client = make_client(config, port_override, baud_override, addr_override)?;
+
+    timeout(Duration::from_secs(15), async {
+        let cmd_tx = client.sender();
+        let mut my_node_num: Option<u32> = None;
+        let mut sent = false;
+
+        cmd_tx
+            .send(want_config(42))
+            .await
+            .map_err(|_| "send failed".to_owned())?;
+
+        while let Some(event) = client.recv().await {
+            match event {
+                ClientEvent::Connected => {}
+                ClientEvent::Disconnected { .. } => return Err("device disconnected".to_owned()),
+                ClientEvent::FromRadio(msg) => {
+                    if my_node_num.is_none() {
+                        if let Some(from_radio::PayloadVariant::MyInfo(info)) = &msg.payload_variant
+                        {
+                            my_node_num = Some(info.my_node_num);
+                        }
+                    }
+                    if let Some(node_num) = my_node_num {
+                        if !sent {
+                            let lora = LoRaConfig {
+                                use_preset: true,
+                                modem_preset: preset,
+                                region,
+                                ..Default::default()
+                            };
+                            cmd_tx
+                                .send(admin_set_lora_config(node_num, 0x1234_5601, lora, vec![]))
+                                .await
+                                .map_err(|_| "send failed".to_owned())?;
+                            sent = true;
+                        }
+                    }
+                    // Any admin packet after we sent = ACK.
+                    if sent {
+                        if let Some(from_radio::PayloadVariant::Packet(pkt)) = &msg.payload_variant
+                        {
+                            if let Some(mesh_packet::PayloadVariant::Decoded(d)) =
+                                &pkt.payload_variant
+                            {
+                                if d.portnum == PORT_ADMIN_APP {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err("connection closed unexpectedly".to_owned())
+    })
+    .await
+    .map_err(|_| "timed out (15s) — is the device connected and not in use?".to_owned())?
+}
+
+/// Connect to the Meshtastic device and push the node name stored in `config`.
+///
+/// Fetches the existing owner first to preserve the PKC public key, then
+/// merges in `long_name` and `short_name` from config and sends `SetOwner`.
+pub async fn apply_owner_from_config(
+    config: &MeshtasticConfig,
+    port_override: Option<String>,
+    baud_override: Option<u32>,
+    addr_override: Option<String>,
+) -> Result<(), String> {
+    use prost::Message as _;
+    use proto::{
+        admin_get_owner, admin_message, admin_set_owner, from_radio, mesh_packet, want_config,
+        AdminMessage, User, PORT_ADMIN_APP,
+    };
+    use std::time::Duration;
+    use stream::ClientEvent;
+    use tokio::time::timeout;
+
+    if config.long_name.is_none() && config.short_name.is_none() {
+        return Err(
+            "neither long_name nor short_name is set in [plugins.meshtastic] — \
+             run 'supply-drop-bbs setup' or add them manually to config.toml"
+                .to_owned(),
+        );
+    }
+
+    let mut client = make_client(config, port_override, baud_override, addr_override)?;
+
+    timeout(Duration::from_secs(15), async {
+        let cmd_tx = client.sender();
+        let mut my_node_num: Option<u32> = None;
+        let mut existing_owner: Option<User> = None;
+        let mut phase = 0u8; // 0=wait-node-num 1=wait-get-owner-ack 2=wait-set-ack
+
+        cmd_tx
+            .send(want_config(42))
+            .await
+            .map_err(|_| "send failed".to_owned())?;
+
+        while let Some(event) = client.recv().await {
+            match event {
+                ClientEvent::Connected => {}
+                ClientEvent::Disconnected { .. } => return Err("device disconnected".to_owned()),
+                ClientEvent::FromRadio(msg) => {
+                    if my_node_num.is_none() {
+                        if let Some(from_radio::PayloadVariant::MyInfo(info)) = &msg.payload_variant
+                        {
+                            my_node_num = Some(info.my_node_num);
+                            // Fetch existing owner to preserve public key.
+                            cmd_tx
+                                .send(admin_get_owner(info.my_node_num, 0x1234_5601))
+                                .await
+                                .map_err(|_| "send failed".to_owned())?;
+                            phase = 1;
+                        }
+                    }
+                    if let Some(from_radio::PayloadVariant::Packet(pkt)) = &msg.payload_variant {
+                        if let Some(mesh_packet::PayloadVariant::Decoded(d)) = &pkt.payload_variant
+                        {
+                            if d.portnum == PORT_ADMIN_APP {
+                                if phase == 1 {
+                                    if let Ok(adm) = AdminMessage::decode(d.payload.as_slice()) {
+                                        if let Some(
+                                            admin_message::PayloadVariant::GetOwnerResponse(u),
+                                        ) = adm.payload_variant
+                                        {
+                                            existing_owner = Some(u);
+                                        }
+                                    }
+                                    if let Some(owner) = existing_owner.take() {
+                                        let new_user = User {
+                                            id: owner.id,
+                                            long_name: config
+                                                .long_name
+                                                .clone()
+                                                .unwrap_or(owner.long_name),
+                                            short_name: config
+                                                .short_name
+                                                .clone()
+                                                .unwrap_or(owner.short_name),
+                                            public_key: owner.public_key,
+                                        };
+                                        eprintln!(
+                                            "Pushing owner: long_name={:?}, short_name={:?}",
+                                            new_user.long_name, new_user.short_name
+                                        );
+                                        cmd_tx
+                                            .send(admin_set_owner(
+                                                my_node_num.unwrap(),
+                                                0x1234_5602,
+                                                new_user,
+                                                vec![],
+                                            ))
+                                            .await
+                                            .map_err(|_| "send failed".to_owned())?;
+                                        phase = 2;
+                                    }
+                                } else if phase == 2 {
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Err("connection closed unexpectedly".to_owned())
+    })
+    .await
+    .map_err(|_| "timed out (15s) — is the device connected and not in use?".to_owned())?
+}
+
+/// Build a [`MeshtasticClient`] from config + optional CLI overrides.
+fn make_client(
+    config: &MeshtasticConfig,
+    port_override: Option<String>,
+    baud_override: Option<u32>,
+    addr_override: Option<String>,
+) -> Result<stream::MeshtasticClient, String> {
+    use std::time::Duration;
+    use stream::{SerialConfig, TcpConfig};
+
+    match config.connection_type {
+        MeshtasticConnectionType::Serial | MeshtasticConnectionType::Hat => {
+            let port = port_override
+                .or_else(|| config.serial_port.clone())
+                .ok_or_else(|| {
+                    "no serial port — use --port or set serial_port in \
+                     [plugins.meshtastic] in config.toml"
+                        .to_owned()
+                })?;
+            let baud = baud_override.unwrap_or(config.baud_rate);
+            eprintln!("Connecting to {port} at {baud} baud…");
+            Ok(stream::MeshtasticClient::connect_serial(SerialConfig {
+                port,
+                baud_rate: baud,
+                reconnect_delay_initial: Duration::from_secs(1),
+                reconnect_delay_max: Duration::from_secs(1),
+            }))
+        }
+        MeshtasticConnectionType::Tcp => {
+            let addr_str = addr_override.unwrap_or_else(|| config.addr.to_string());
+            let addr: std::net::SocketAddr = addr_str
+                .parse()
+                .map_err(|e| format!("invalid TCP address '{addr_str}': {e}"))?;
+            eprintln!("Connecting to {addr}…");
+            Ok(stream::MeshtasticClient::connect_tcp(TcpConfig {
+                addr,
+                reconnect_delay_initial: Duration::from_secs(1),
+                reconnect_delay_max: Duration::from_secs(1),
+            }))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_from_radio(
     msg: proto::FromRadio,
