@@ -41,6 +41,8 @@ struct Existing {
     meshtastic_connection_type: String,
     meshtastic_serial_port: Option<String>,
     meshtastic_baud_rate: u32,
+    meshtastic_radio_region: Option<String>,
+    meshtastic_radio_preset: Option<String>,
     // Web
     web_enabled: bool,
     web_bind: String,
@@ -136,6 +138,16 @@ fn load_existing(out_path: &Path) -> Existing {
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
         .unwrap_or(115_200);
+    let meshtastic_radio_region = meshtastic
+        .and_then(|m| m.get("radio"))
+        .and_then(|r| r.get("region"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let meshtastic_radio_preset = meshtastic
+        .and_then(|m| m.get("radio"))
+        .and_then(|r| r.get("modem_preset"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
 
     // Web
     let web_enabled = web
@@ -234,6 +246,8 @@ fn load_existing(out_path: &Path) -> Existing {
         meshtastic_connection_type,
         meshtastic_serial_port,
         meshtastic_baud_rate,
+        meshtastic_radio_region,
+        meshtastic_radio_preset,
         web_enabled,
         web_bind,
         web_backup_dir,
@@ -741,6 +755,108 @@ pub fn run_wizard(config_out: Option<&Path>) {
         meshtastic_addr = None;
     }
 
+    // ── Meshtastic radio parameters ───────────────────────────────────────────
+
+    /// (code, display label)
+    const MESHTASTIC_REGIONS: &[(&str, &str)] = &[
+        ("US", "United States"),
+        ("EU_433", "Europe 433 MHz"),
+        ("EU_868", "Europe 868 MHz"),
+        ("ANZ", "Australia / New Zealand"),
+        ("JP", "Japan"),
+        ("CN", "China"),
+        ("KR", "South Korea"),
+        ("TW", "Taiwan"),
+        ("RU", "Russia"),
+        ("IN", "India"),
+        ("NZ_865", "New Zealand 865 MHz"),
+        ("TH", "Thailand"),
+        ("LORA_24", "2.4 GHz LoRa"),
+        ("UA_433", "Ukraine 433 MHz"),
+        ("UA_868", "Ukraine 868 MHz"),
+        ("MY_433", "Malaysia 433 MHz"),
+        ("MY_919", "Malaysia 919 MHz"),
+        ("SG_923", "Singapore 923 MHz"),
+    ];
+
+    /// (code, display label)
+    const MESHTASTIC_PRESETS: &[(&str, &str)] = &[
+        (
+            "LONG_FAST",
+            "Long range, fast      (default — good starting point)",
+        ),
+        ("LONG_MODERATE", "Long range, moderate"),
+        ("MEDIUM_SLOW", "Medium range, slow"),
+        ("MEDIUM_FAST", "Medium range, fast"),
+        ("SHORT_SLOW", "Short range, slow"),
+        ("SHORT_FAST", "Short range, fast"),
+        ("LONG_SLOW", "Long range, slow      (very slow data rate)"),
+        (
+            "MAX_RANGE",
+            "Maximum range         (extremely slow data rate)",
+        ),
+        ("SHORT_TURBO", "Short range, turbo    (high data rate)"),
+    ];
+
+    let (meshtastic_radio_region, meshtastic_radio_preset): (Option<String>, Option<String>) =
+        if use_meshtastic {
+            section("Meshtastic radio parameters");
+
+            println!("Select the region and modem preset for your Meshtastic device.");
+            println!("These are saved to config.toml and can be pushed to the device");
+            println!("at any time via the web admin (Settings → Meshtastic radio).");
+            println!("Skip if the device is already configured correctly.");
+            println!();
+
+            let configure = Confirm::with_theme(&theme)
+                .with_prompt("Configure Meshtastic radio parameters now?")
+                .default(ex.meshtastic_radio_region.is_some())
+                .interact()
+                .unwrap_or_else(|_| cancelled());
+
+            if configure {
+                let region_labels: Vec<String> = MESHTASTIC_REGIONS
+                    .iter()
+                    .map(|(code, name)| format!("{code:<10} {name}"))
+                    .collect();
+                let default_region = ex
+                    .meshtastic_radio_region
+                    .as_deref()
+                    .and_then(|r| MESHTASTIC_REGIONS.iter().position(|(c, _)| *c == r))
+                    .unwrap_or(0); // US
+                let region_choice =
+                    prompt_select(&theme, "Select your region", &region_labels, default_region);
+                let region = MESHTASTIC_REGIONS[region_choice].0.to_owned();
+
+                println!();
+                let preset_labels: Vec<String> = MESHTASTIC_PRESETS
+                    .iter()
+                    .map(|(_, d)| d.to_string())
+                    .collect();
+                let default_preset = ex
+                    .meshtastic_radio_preset
+                    .as_deref()
+                    .and_then(|p| MESHTASTIC_PRESETS.iter().position(|(c, _)| *c == p))
+                    .unwrap_or(0); // LONG_FAST
+                let preset_choice = prompt_select(
+                    &theme,
+                    "Select modem preset",
+                    &preset_labels,
+                    default_preset,
+                );
+                let preset = MESHTASTIC_PRESETS[preset_choice].0.to_owned();
+
+                (Some(region), Some(preset))
+            } else {
+                (
+                    ex.meshtastic_radio_region.clone(),
+                    ex.meshtastic_radio_preset.clone(),
+                )
+            }
+        } else {
+            (None, None)
+        };
+
     // ── Web admin ─────────────────────────────────────────────────────────────
     section("Web admin UI");
 
@@ -877,6 +993,8 @@ pub fn run_wizard(config_out: Option<&Path>) {
         meshtastic_serial_port: meshtastic_serial_port.as_deref(),
         meshtastic_baud_rate,
         meshtastic_addr: meshtastic_addr.as_deref(),
+        meshtastic_radio_region: meshtastic_radio_region.as_deref(),
+        meshtastic_radio_preset: meshtastic_radio_preset.as_deref(),
         web_enabled,
         web_bind: web_bind.as_deref(),
         web_backup_dir: web_backup_dir.as_deref(),
@@ -1520,6 +1638,8 @@ struct TomlParams<'a> {
     meshtastic_serial_port: Option<&'a str>,
     meshtastic_baud_rate: Option<u32>,
     meshtastic_addr: Option<&'a str>,
+    meshtastic_radio_region: Option<&'a str>,
+    meshtastic_radio_preset: Option<&'a str>,
     // Web
     web_enabled: bool,
     web_bind: Option<&'a str>,
@@ -1655,6 +1775,20 @@ fn build_toml(p: &TomlParams<'_>) -> String {
             }
         }
     }
+    // [plugins.meshtastic.radio] — only when Meshtastic is enabled and params chosen
+    #[cfg(feature = "transport-meshtastic")]
+    if p.use_meshtastic
+        && (p.meshtastic_radio_region.is_some() || p.meshtastic_radio_preset.is_some())
+    {
+        writeln!(s, "\n[plugins.meshtastic.radio]").unwrap();
+        if let Some(region) = p.meshtastic_radio_region {
+            writeln!(s, "region       = {}", toml_str(region)).unwrap();
+        }
+        if let Some(preset) = p.meshtastic_radio_preset {
+            writeln!(s, "modem_preset = {}", toml_str(preset)).unwrap();
+        }
+    }
+
     // Suppress unused-variable warnings when feature is off.
     #[cfg(not(feature = "transport-meshtastic"))]
     {
@@ -1664,6 +1798,8 @@ fn build_toml(p: &TomlParams<'_>) -> String {
             p.meshtastic_serial_port,
             p.meshtastic_baud_rate,
             p.meshtastic_addr,
+            p.meshtastic_radio_region,
+            p.meshtastic_radio_preset,
         );
     }
 
