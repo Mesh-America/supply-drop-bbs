@@ -386,6 +386,31 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
     let ex = load_existing(&out_path);
 
+    // ── BBS identity ──────────────────────────────────────────────────────────
+    //
+    // Collected first so it is clear there is exactly one BBS instance.
+    // All radio transports (MeshCore, Meshtastic, …) configured below are
+    // simply different ways to reach the same BBS — they do not have
+    // separate identities.
+    section("BBS identity");
+
+    let bbs_name: String = Input::with_theme(&theme)
+        .with_prompt("BBS name")
+        .default(ex.bbs_name.clone())
+        .interact_text()
+        .unwrap_or_else(|_| cancelled());
+
+    // ── Data storage ──────────────────────────────────────────────────────────
+    section("Data storage");
+
+    let data_dir_str: String = Input::with_theme(&theme)
+        .with_prompt("Data directory")
+        .default(ex.data_dir.clone())
+        .interact_text()
+        .unwrap_or_else(|_| cancelled());
+
+    let data_dir = PathBuf::from(&data_dir_str);
+
     // ── Protocol selection ────────────────────────────────────────────────────
     //
     // Which protocols appear here is determined by compiled-in features:
@@ -715,26 +740,6 @@ pub fn run_wizard(config_out: Option<&Path>) {
         meshtastic_baud_rate = None;
         meshtastic_addr = None;
     }
-
-    // ── BBS identity ──────────────────────────────────────────────────────────
-    section("BBS identity");
-
-    let bbs_name: String = Input::with_theme(&theme)
-        .with_prompt("BBS name")
-        .default(ex.bbs_name.clone())
-        .interact_text()
-        .unwrap_or_else(|_| cancelled());
-
-    // ── Data storage ──────────────────────────────────────────────────────────
-    section("Data storage");
-
-    let data_dir_str: String = Input::with_theme(&theme)
-        .with_prompt("Data directory")
-        .default(ex.data_dir.clone())
-        .interact_text()
-        .unwrap_or_else(|_| cancelled());
-
-    let data_dir = PathBuf::from(&data_dir_str);
 
     // ── Web admin ─────────────────────────────────────────────────────────────
     section("Web admin UI");
