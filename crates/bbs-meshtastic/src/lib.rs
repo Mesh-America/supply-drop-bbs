@@ -33,10 +33,11 @@ use bbs_plugin_api::MeshtasticAdminRequest;
 use crate::{
     command::{format_response, parse_command, render_notification, truncate_utf8},
     proto::{
-        admin_get_lora_config, admin_message, admin_set_lora_config, direct_text_packet,
-        from_radio, mesh_packet, mt_config, node_key, synthetic_pubkey, AdminMessage, Data,
-        LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP,
-        PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
+        admin_get_lora_config, admin_get_owner, admin_get_security_config, admin_message,
+        admin_set_lora_config, admin_set_owner, direct_text_packet, from_radio, mesh_packet,
+        mt_config, node_key, synthetic_pubkey, AdminMessage, Data, LoRaConfig, MeshPacket,
+        MtConfig, NodeInfo, User, BROADCAST_ADDR, PORT_ADMIN_APP, PORT_NODEINFO_APP,
+        PORT_TEXT_MESSAGE_APP,
     },
     session::SessionState,
     stream::{ClientEvent, MeshtasticClient, SerialConfig, TcpConfig},
@@ -155,6 +156,21 @@ pub struct MeshtasticConfig {
     /// ```
     #[serde(default)]
     pub radio: Option<MeshtasticRadioConfig>,
+
+    /// Short node name shown on OLED maps and mesh UIs (≤ 4 chars).
+    ///
+    /// Stored here for reference.  Push to the device via the web admin UI
+    /// (Settings → Meshtastic device → Node name → Save to device) or by
+    /// running `supply-drop-bbs node set-meshtastic-owner` once that CLI
+    /// command is available.
+    #[serde(default)]
+    pub short_name: Option<String>,
+
+    /// Full node display name shown in Meshtastic apps.
+    ///
+    /// Stored alongside `short_name`; applied on demand via the web admin UI.
+    #[serde(default)]
+    pub long_name: Option<String>,
 }
 
 impl Default for MeshtasticConfig {
@@ -174,6 +190,8 @@ impl Default for MeshtasticConfig {
             reconnect_delay_initial_ms: default_reconnect_delay_initial_ms(),
             reconnect_delay_max_ms: default_reconnect_delay_max_ms(),
             radio: None,
+            short_name: None,
+            long_name: None,
         }
     }
 }
@@ -458,6 +476,18 @@ enum PendingMeshtasticAdmin {
         request_id: u32,
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    GetOwner {
+        request_id: u32,
+        reply: tokio::sync::oneshot::Sender<Result<bbs_plugin_api::MeshtasticOwnerInfo, String>>,
+    },
+    SetOwner {
+        request_id: u32,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    GetSecurity {
+        request_id: u32,
+        reply: tokio::sync::oneshot::Sender<Result<bbs_plugin_api::MeshtasticSecurityInfo, String>>,
+    },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -477,6 +507,9 @@ async fn event_loop(
     mut admin_rx: mpsc::Receiver<MeshtasticAdminRequest>,
 ) {
     let mut pending_admin: Option<PendingMeshtasticAdmin> = None;
+    // Session passkey received from the last GET response; echo it back in SET
+    // commands as a replay-attack guard (Meshtastic 2.5+, field 101).
+    let mut last_session_passkey: Vec<u8> = Vec::new();
 
     loop {
         tokio::select! {
@@ -491,6 +524,9 @@ async fn event_loop(
                         match op {
                             PendingMeshtasticAdmin::GetLora { reply, .. } => { let _ = reply.send(Err(err)); }
                             PendingMeshtasticAdmin::SetLora { reply, .. } => { let _ = reply.send(Err(err)); }
+                            PendingMeshtasticAdmin::GetOwner { reply, .. } => { let _ = reply.send(Err(err)); }
+                            PendingMeshtasticAdmin::SetOwner { reply, .. } => { let _ = reply.send(Err(err)); }
+                            PendingMeshtasticAdmin::GetSecurity { reply, .. } => { let _ = reply.send(Err(err)); }
                         }
                     }
                     if will_retry {
@@ -502,7 +538,11 @@ async fn event_loop(
                 }
                 Some(ClientEvent::FromRadio(msg)) => {
                     // Check if this is an admin response packet before general dispatch.
-                    let consumed = try_handle_admin_response(&msg, &mut pending_admin);
+                    let consumed = try_handle_admin_response(
+                        &msg,
+                        &mut pending_admin,
+                        &mut last_session_passkey,
+                    );
                     if !consumed {
                         handle_from_radio(
                             msg,
@@ -516,7 +556,8 @@ async fn event_loop(
                             hop_limit,
                             want_ack,
                             &packet_counter,
-                        ).await;
+                        )
+                        .await;
                     }
                 }
                 None => break,
@@ -524,38 +565,46 @@ async fn event_loop(
             Some(req) = admin_rx.recv() => {
                 let my_node_num = state.lock().expect("state mutex poisoned").my_node_num;
                 let Some(my_node_num) = my_node_num else {
-                    match req {
-                        MeshtasticAdminRequest::GetLoRaConfig { reply } => {
-                            let _ = reply.send(Err("node num not yet received from radio".into()));
-                        }
-                        MeshtasticAdminRequest::SetLoRaConfig { reply, .. } => {
-                            let _ = reply.send(Err("node num not yet received from radio".into()));
+                    // Node number not yet received — reject all admin requests.
+                    fn reject_no_num(req: MeshtasticAdminRequest) {
+                        let e = "node num not yet received from radio".to_owned();
+                        match req {
+                            MeshtasticAdminRequest::GetLoRaConfig { reply } => { let _ = reply.send(Err(e)); }
+                            MeshtasticAdminRequest::SetLoRaConfig { reply, .. } => { let _ = reply.send(Err(e)); }
+                            MeshtasticAdminRequest::GetOwner { reply } => { let _ = reply.send(Err(e)); }
+                            MeshtasticAdminRequest::SetOwner { reply, .. } => { let _ = reply.send(Err(e)); }
+                            MeshtasticAdminRequest::GetSecurity { reply } => { let _ = reply.send(Err(e)); }
                         }
                     }
+                    reject_no_num(req);
                     continue;
                 };
                 if pending_admin.is_some() {
-                    match req {
-                        MeshtasticAdminRequest::GetLoRaConfig { reply } => {
-                            let _ = reply.send(Err("another admin operation is already in progress".into()));
-                        }
-                        MeshtasticAdminRequest::SetLoRaConfig { reply, .. } => {
-                            let _ = reply.send(Err("another admin operation is already in progress".into()));
+                    // Another admin operation is in flight — reject immediately.
+                    fn reject_busy(req: MeshtasticAdminRequest) {
+                        let e = "another admin operation is already in progress".to_owned();
+                        match req {
+                            MeshtasticAdminRequest::GetLoRaConfig { reply } => { let _ = reply.send(Err(e)); }
+                            MeshtasticAdminRequest::SetLoRaConfig { reply, .. } => { let _ = reply.send(Err(e)); }
+                            MeshtasticAdminRequest::GetOwner { reply } => { let _ = reply.send(Err(e)); }
+                            MeshtasticAdminRequest::SetOwner { reply, .. } => { let _ = reply.send(Err(e)); }
+                            MeshtasticAdminRequest::GetSecurity { reply } => { let _ = reply.send(Err(e)); }
                         }
                     }
+                    reject_busy(req);
                     continue;
                 }
                 match req {
                     MeshtasticAdminRequest::GetLoRaConfig { reply } => {
-                        let request_id = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        if cmd_tx.send(admin_get_lora_config(my_node_num, request_id)).await.is_err() {
+                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if cmd_tx.send(admin_get_lora_config(my_node_num, rid)).await.is_err() {
                             let _ = reply.send(Err("meshtastic client disconnected".into()));
                         } else {
-                            pending_admin = Some(PendingMeshtasticAdmin::GetLora { request_id, reply });
+                            pending_admin = Some(PendingMeshtasticAdmin::GetLora { request_id: rid, reply });
                         }
                     }
                     MeshtasticAdminRequest::SetLoRaConfig { config, reply } => {
-                        let request_id = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let lora = LoRaConfig {
                             use_preset: config.use_preset,
                             modem_preset: config.modem_preset,
@@ -570,10 +619,46 @@ async fn event_loop(
                             channel_num: config.channel_num,
                             override_frequency: config.override_frequency,
                         };
-                        if cmd_tx.send(admin_set_lora_config(my_node_num, request_id, lora)).await.is_err() {
+                        let passkey = last_session_passkey.clone();
+                        if cmd_tx.send(admin_set_lora_config(my_node_num, rid, lora, passkey)).await.is_err() {
                             let _ = reply.send(Err("meshtastic client disconnected".into()));
                         } else {
-                            pending_admin = Some(PendingMeshtasticAdmin::SetLora { request_id, reply });
+                            pending_admin = Some(PendingMeshtasticAdmin::SetLora { request_id: rid, reply });
+                        }
+                    }
+                    MeshtasticAdminRequest::GetOwner { reply } => {
+                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if cmd_tx.send(admin_get_owner(my_node_num, rid)).await.is_err() {
+                            let _ = reply.send(Err("meshtastic client disconnected".into()));
+                        } else {
+                            pending_admin = Some(PendingMeshtasticAdmin::GetOwner { request_id: rid, reply });
+                        }
+                    }
+                    MeshtasticAdminRequest::SetOwner { long_name, short_name, reply } => {
+                        // For SetOwner we need the current values to merge — do a
+                        // GetOwner first and then set. For simplicity, send SetOwner
+                        // with only the provided fields; the device keeps others.
+                        // We synthesize a User with empty fields for what we don't change.
+                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let user = User {
+                            id: String::new(),
+                            long_name: long_name.unwrap_or_default(),
+                            short_name: short_name.unwrap_or_default(),
+                            public_key: Vec::new(),
+                        };
+                        let passkey = last_session_passkey.clone();
+                        if cmd_tx.send(admin_set_owner(my_node_num, rid, user, passkey)).await.is_err() {
+                            let _ = reply.send(Err("meshtastic client disconnected".into()));
+                        } else {
+                            pending_admin = Some(PendingMeshtasticAdmin::SetOwner { request_id: rid, reply });
+                        }
+                    }
+                    MeshtasticAdminRequest::GetSecurity { reply } => {
+                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if cmd_tx.send(admin_get_security_config(my_node_num, rid)).await.is_err() {
+                            let _ = reply.send(Err("meshtastic client disconnected".into()));
+                        } else {
+                            pending_admin = Some(PendingMeshtasticAdmin::GetSecurity { request_id: rid, reply });
                         }
                     }
                 }
@@ -587,10 +672,13 @@ async fn event_loop(
 }
 
 /// Try to handle an admin-channel response packet.
+///
 /// Returns `true` if the message was consumed (caller should skip general dispatch).
+/// Updates `session_passkey` with any passkey found in the decoded `AdminMessage`.
 fn try_handle_admin_response(
     msg: &proto::FromRadio,
     pending_admin: &mut Option<PendingMeshtasticAdmin>,
+    session_passkey: &mut Vec<u8>,
 ) -> bool {
     use prost::Message as _;
 
@@ -607,36 +695,41 @@ fn try_handle_admin_response(
     match pending_admin.take() {
         Some(PendingMeshtasticAdmin::GetLora { request_id, reply }) => {
             if data.reply_id != request_id && data.request_id != request_id {
-                // Not our response — put it back and don't consume.
                 *pending_admin = Some(PendingMeshtasticAdmin::GetLora { request_id, reply });
                 return false;
             }
-            // Decode AdminMessage to extract GetConfigResponse.
             match AdminMessage::decode(data.payload.as_slice()) {
-                Ok(AdminMessage {
-                    payload_variant:
+                Ok(msg) => {
+                    // Capture session passkey for subsequent SET commands.
+                    if !msg.session_passkey.is_empty() {
+                        *session_passkey = msg.session_passkey.clone();
+                    }
+                    match msg.payload_variant {
                         Some(admin_message::PayloadVariant::GetConfigResponse(MtConfig {
                             payload_variant: Some(mt_config::PayloadVariant::Lora(lora)),
-                        })),
-                }) => {
-                    let config = bbs_plugin_api::MeshtasticLoRaConfig {
-                        use_preset: lora.use_preset,
-                        modem_preset: lora.modem_preset,
-                        bandwidth: lora.bandwidth,
-                        spread_factor: lora.spread_factor,
-                        coding_rate: lora.coding_rate,
-                        frequency_offset: lora.frequency_offset,
-                        region: lora.region,
-                        hop_limit: lora.hop_limit,
-                        tx_enabled: lora.tx_enabled,
-                        tx_power: lora.tx_power,
-                        channel_num: lora.channel_num,
-                        override_frequency: lora.override_frequency,
-                    };
-                    let _ = reply.send(Ok(config));
-                }
-                Ok(_) => {
-                    let _ = reply.send(Err("unexpected admin response payload".into()));
+                        })) => {
+                            let config = bbs_plugin_api::MeshtasticLoRaConfig {
+                                use_preset: lora.use_preset,
+                                modem_preset: lora.modem_preset,
+                                bandwidth: lora.bandwidth,
+                                spread_factor: lora.spread_factor,
+                                coding_rate: lora.coding_rate,
+                                frequency_offset: lora.frequency_offset,
+                                region: lora.region,
+                                hop_limit: lora.hop_limit,
+                                tx_enabled: lora.tx_enabled,
+                                tx_power: lora.tx_power,
+                                channel_num: lora.channel_num,
+                                override_frequency: lora.override_frequency,
+                            };
+                            let _ = reply.send(Ok(config));
+                        }
+                        _ => {
+                            let _ = reply.send(Err(
+                                "unexpected admin response (expected LoRa config)".into(),
+                            ));
+                        }
+                    }
                 }
                 Err(e) => {
                     let _ = reply.send(Err(format!("failed to decode admin response: {e}")));
@@ -649,12 +742,97 @@ fn try_handle_admin_response(
                 *pending_admin = Some(PendingMeshtasticAdmin::SetLora { request_id, reply });
                 return false;
             }
-            // Any admin packet with matching reply_id/request_id for SetConfig is the ACK.
+            // Any matching admin packet is the ACK for a SET command.
             let _ = reply.send(Ok(()));
+            true
+        }
+        Some(PendingMeshtasticAdmin::GetOwner { request_id, reply }) => {
+            if data.reply_id != request_id && data.request_id != request_id {
+                *pending_admin = Some(PendingMeshtasticAdmin::GetOwner { request_id, reply });
+                return false;
+            }
+            match AdminMessage::decode(data.payload.as_slice()) {
+                Ok(msg) => {
+                    if !msg.session_passkey.is_empty() {
+                        *session_passkey = msg.session_passkey.clone();
+                    }
+                    match msg.payload_variant {
+                        Some(admin_message::PayloadVariant::GetOwnerResponse(user)) => {
+                            let info = bbs_plugin_api::MeshtasticOwnerInfo {
+                                id: user.id,
+                                long_name: user.long_name,
+                                short_name: user.short_name,
+                                public_key_hex: hex_encode(&user.public_key),
+                            };
+                            let _ = reply.send(Ok(info));
+                        }
+                        _ => {
+                            let _ = reply.send(Err(
+                                "unexpected admin response (expected owner info)".into(),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("failed to decode admin response: {e}")));
+                }
+            }
+            true
+        }
+        Some(PendingMeshtasticAdmin::SetOwner { request_id, reply }) => {
+            if data.reply_id != request_id && data.request_id != request_id {
+                *pending_admin = Some(PendingMeshtasticAdmin::SetOwner { request_id, reply });
+                return false;
+            }
+            let _ = reply.send(Ok(()));
+            true
+        }
+        Some(PendingMeshtasticAdmin::GetSecurity { request_id, reply }) => {
+            if data.reply_id != request_id && data.request_id != request_id {
+                *pending_admin = Some(PendingMeshtasticAdmin::GetSecurity { request_id, reply });
+                return false;
+            }
+            match AdminMessage::decode(data.payload.as_slice()) {
+                Ok(msg) => {
+                    if !msg.session_passkey.is_empty() {
+                        *session_passkey = msg.session_passkey.clone();
+                    }
+                    match msg.payload_variant {
+                        Some(admin_message::PayloadVariant::GetConfigResponse(MtConfig {
+                            payload_variant: Some(mt_config::PayloadVariant::Security(sec)),
+                        })) => {
+                            let info = bbs_plugin_api::MeshtasticSecurityInfo {
+                                public_key_hex: hex_encode(&sec.public_key),
+                                admin_channel_enabled: sec.admin_channel_enabled,
+                            };
+                            let _ = reply.send(Ok(info));
+                        }
+                        _ => {
+                            let _ = reply.send(Err(
+                                "unexpected admin response (expected security config)".into(),
+                            ));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(format!("failed to decode admin response: {e}")));
+                }
+            }
             true
         }
         None => false,
     }
+}
+
+/// Hex-encode a byte slice (lowercase, no prefix).
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut s, b| {
+            use std::fmt::Write as _;
+            write!(s, "{b:02x}").unwrap();
+            s
+        })
 }
 
 #[allow(clippy::too_many_arguments)]

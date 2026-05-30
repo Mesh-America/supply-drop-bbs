@@ -688,6 +688,96 @@ impl Host for BbsHost {
             .map_err(bbs_plugin_api::HostError::Internal)
     }
 
+    async fn admin_get_meshtastic_owner(
+        &self,
+    ) -> Result<bbs_plugin_api::MeshtasticOwnerInfo, bbs_plugin_api::HostError> {
+        let tx = self
+            .meshtastic_admin_tx
+            .read()
+            .expect("meshtastic_admin_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshtasticAdminRequest::GetOwner { reply: reply_tx })
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport disconnected".into())
+            })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic owner get timed out".into())
+            })?
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic owner get cancelled".into())
+            })?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
+    async fn admin_set_meshtastic_owner(
+        &self,
+        long_name: Option<String>,
+        short_name: Option<String>,
+    ) -> Result<(), bbs_plugin_api::HostError> {
+        let tx = self
+            .meshtastic_admin_tx
+            .read()
+            .expect("meshtastic_admin_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshtasticAdminRequest::SetOwner {
+            long_name,
+            short_name,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| {
+            bbs_plugin_api::HostError::Internal("meshtastic transport disconnected".into())
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic owner set timed out".into())
+            })?
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic owner set cancelled".into())
+            })?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
+    async fn admin_get_meshtastic_security(
+        &self,
+    ) -> Result<bbs_plugin_api::MeshtasticSecurityInfo, bbs_plugin_api::HostError> {
+        let tx = self
+            .meshtastic_admin_tx
+            .read()
+            .expect("meshtastic_admin_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshtasticAdminRequest::GetSecurity { reply: reply_tx })
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport disconnected".into())
+            })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic security get timed out".into())
+            })?
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic security get cancelled".into())
+            })?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
     // ── Admin / web-UI operations ─────────────────────────────────────────────
 
     async fn admin_verify_credentials(

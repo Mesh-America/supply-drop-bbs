@@ -563,6 +563,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/meshtastic-radio-config",
             get(api_get_meshtastic_radio_config).patch(api_patch_meshtastic_radio_config),
         )
+        .route(
+            "/meshtastic-owner",
+            get(api_get_meshtastic_owner).patch(api_patch_meshtastic_owner),
+        )
+        .route("/meshtastic-security", get(api_get_meshtastic_security))
         .route("/node-identity", get(api_get_node_identity))
         .route("/node-identity/export-key", post(api_export_node_key))
         .route("/node-identity/import-key", post(api_import_node_key))
@@ -2595,6 +2600,87 @@ async fn api_patch_meshtastic_radio_config(
     match state.host.admin_set_meshtastic_lora(config).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+// ── Meshtastic owner / user info ──────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct PatchMeshtasticOwnerBody {
+    long_name: Option<String>,
+    short_name: Option<String>,
+}
+
+async fn api_get_meshtastic_owner(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_meshtastic_owner().await {
+        Ok(info) => Json(info).into_response(),
+        Err(HostError::NotSupported(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_patch_meshtastic_owner(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(body): Json<PatchMeshtasticOwnerBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state
+        .host
+        .admin_set_meshtastic_owner(body.long_name, body.short_name)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(HostError::NotSupported(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+// ── Meshtastic security / PKC info ────────────────────────────────────────────
+
+async fn api_get_meshtastic_security(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_meshtastic_security().await {
+        Ok(info) => Json(info).into_response(),
+        Err(HostError::NotSupported(_)) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json_error("Meshtastic transport not connected")),
         )

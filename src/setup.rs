@@ -43,6 +43,8 @@ struct Existing {
     meshtastic_baud_rate: u32,
     meshtastic_radio_region: Option<String>,
     meshtastic_radio_preset: Option<String>,
+    meshtastic_short_name: Option<String>,
+    meshtastic_long_name: Option<String>,
     // Web
     web_enabled: bool,
     web_bind: String,
@@ -148,6 +150,14 @@ fn load_existing(out_path: &Path) -> Existing {
         .and_then(|r| r.get("modem_preset"))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
+    let meshtastic_short_name = meshtastic
+        .and_then(|m| m.get("short_name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let meshtastic_long_name = meshtastic
+        .and_then(|m| m.get("long_name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
 
     // Web
     let web_enabled = web
@@ -248,6 +258,8 @@ fn load_existing(out_path: &Path) -> Existing {
         meshtastic_baud_rate,
         meshtastic_radio_region,
         meshtastic_radio_preset,
+        meshtastic_short_name,
+        meshtastic_long_name,
         web_enabled,
         web_bind,
         web_backup_dir,
@@ -857,6 +869,56 @@ pub fn run_wizard(config_out: Option<&Path>) {
             (None, None)
         };
 
+    // ── Meshtastic node name ──────────────────────────────────────────────────
+
+    let (meshtastic_short_name, meshtastic_long_name): (Option<String>, Option<String>) =
+        if use_meshtastic {
+            section("Meshtastic node name");
+
+            println!("Set the long name (full display name) and short name (≤ 4 chars,");
+            println!("shown on mesh maps). These are saved to config.toml and can be");
+            println!("pushed to the device via the web admin UI at any time.");
+            println!();
+
+            let configure = Confirm::with_theme(&theme)
+                .with_prompt("Configure Meshtastic node name?")
+                .default(ex.meshtastic_short_name.is_some() || ex.meshtastic_long_name.is_some())
+                .interact()
+                .unwrap_or_else(|_| cancelled());
+
+            if configure {
+                let long: String = Input::with_theme(&theme)
+                    .with_prompt("Long name (full display name)")
+                    .default(ex.meshtastic_long_name.clone().unwrap_or_default())
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                let short: String = Input::with_theme(&theme)
+                    .with_prompt("Short name (≤ 4 chars, shown on maps)")
+                    .default(ex.meshtastic_short_name.clone().unwrap_or_default())
+                    .validate_with(|v: &String| {
+                        if v.chars().count() <= 4 {
+                            Ok(())
+                        } else {
+                            Err("Short name must be 4 characters or fewer")
+                        }
+                    })
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                let ln = if long.is_empty() { None } else { Some(long) };
+                let sn = if short.is_empty() { None } else { Some(short) };
+                (sn, ln)
+            } else {
+                (
+                    ex.meshtastic_short_name.clone(),
+                    ex.meshtastic_long_name.clone(),
+                )
+            }
+        } else {
+            (None, None)
+        };
+
     // ── Web admin ─────────────────────────────────────────────────────────────
     section("Web admin UI");
 
@@ -995,6 +1057,8 @@ pub fn run_wizard(config_out: Option<&Path>) {
         meshtastic_addr: meshtastic_addr.as_deref(),
         meshtastic_radio_region: meshtastic_radio_region.as_deref(),
         meshtastic_radio_preset: meshtastic_radio_preset.as_deref(),
+        meshtastic_short_name: meshtastic_short_name.as_deref(),
+        meshtastic_long_name: meshtastic_long_name.as_deref(),
         web_enabled,
         web_bind: web_bind.as_deref(),
         web_backup_dir: web_backup_dir.as_deref(),
@@ -1640,6 +1704,8 @@ struct TomlParams<'a> {
     meshtastic_addr: Option<&'a str>,
     meshtastic_radio_region: Option<&'a str>,
     meshtastic_radio_preset: Option<&'a str>,
+    meshtastic_short_name: Option<&'a str>,
+    meshtastic_long_name: Option<&'a str>,
     // Web
     web_enabled: bool,
     web_bind: Option<&'a str>,
@@ -1773,6 +1839,12 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 }
                 _ => {}
             }
+            if let Some(sn) = p.meshtastic_short_name {
+                writeln!(s, "short_name = {}", toml_str(sn)).unwrap();
+            }
+            if let Some(ln) = p.meshtastic_long_name {
+                writeln!(s, "long_name  = {}", toml_str(ln)).unwrap();
+            }
         }
     }
     // [plugins.meshtastic.radio] — only when Meshtastic is enabled and params chosen
@@ -1800,6 +1872,8 @@ fn build_toml(p: &TomlParams<'_>) -> String {
             p.meshtastic_addr,
             p.meshtastic_radio_region,
             p.meshtastic_radio_preset,
+            p.meshtastic_short_name,
+            p.meshtastic_long_name,
         );
     }
 
