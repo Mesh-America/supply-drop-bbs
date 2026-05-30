@@ -254,6 +254,33 @@ pub struct MeshtasticLoRaConfig {
     pub override_frequency: f32,
 }
 
+/// Meshtastic node owner / identity info.
+///
+/// Returned by [`crate::host::Host::admin_get_meshtastic_owner`].
+/// The public key is hex-encoded (64 lower-case hex chars for 32 bytes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshtasticOwnerInfo {
+    /// Unique node ID string, e.g. `"!aabbccdd"`.
+    pub id: String,
+    /// Full display name.
+    pub long_name: String,
+    /// Short display name (≤ 4 chars on hardware).
+    pub short_name: String,
+    /// Curve25519 public key, hex-encoded (64 chars = 32 bytes).
+    pub public_key_hex: String,
+}
+
+/// Meshtastic security / PKC configuration.
+///
+/// Returned by [`crate::host::Host::admin_get_meshtastic_security`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshtasticSecurityInfo {
+    /// Node's Curve25519 public key, hex-encoded (64 chars).
+    pub public_key_hex: String,
+    /// Whether the legacy insecure admin channel is enabled.
+    pub admin_channel_enabled: bool,
+}
+
 /// One entry in the durable audit log.
 ///
 /// Written whenever a privileged action is performed: ban, unban, validate,

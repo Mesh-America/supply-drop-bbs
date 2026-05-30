@@ -462,6 +462,46 @@ async function applyRadioConfig() {
   }
 }
 
+// ── Meshtastic region / modem preset constants ────────────────────────────────
+
+const MESHTASTIC_REGIONS = [
+  { value: 0,  label: 'UNSET — not configured' },
+  { value: 1,  label: 'US — United States (902–928 MHz)' },
+  { value: 2,  label: 'EU_433 — Europe 433 MHz' },
+  { value: 3,  label: 'EU_868 — Europe 868 MHz' },
+  { value: 4,  label: 'CN — China 470–510 MHz' },
+  { value: 5,  label: 'JP — Japan 920–923 MHz' },
+  { value: 6,  label: 'ANZ — Australia/New Zealand 915–928 MHz' },
+  { value: 7,  label: 'KR — South Korea 920–923 MHz' },
+  { value: 8,  label: 'TW — Taiwan 920–925 MHz' },
+  { value: 9,  label: 'RU — Russia 868 MHz' },
+  { value: 10, label: 'IN — India 865–867 MHz' },
+  { value: 11, label: 'NZ_865 — New Zealand 865 MHz' },
+  { value: 12, label: 'TH — Thailand 920–925 MHz' },
+  { value: 13, label: 'LORA_24 — 2.4 GHz (SX128x)' },
+  { value: 14, label: 'UA_433 — Ukraine 433 MHz' },
+  { value: 15, label: 'UA_868 — Ukraine 868 MHz' },
+  { value: 16, label: 'MY_433 — Malaysia 433 MHz' },
+  { value: 17, label: 'MY_919 — Malaysia 919 MHz' },
+  { value: 18, label: 'SG_923 — Singapore 923 MHz' },
+]
+
+const MESHTASTIC_PRESETS = [
+  { value: 0, label: 'LONG_FAST — long range, fast (default)' },
+  { value: 1, label: 'LONG_SLOW — long range, slow (deprecated in 2.7)' },
+  { value: 3, label: 'MEDIUM_SLOW — medium range, slow' },
+  { value: 4, label: 'MEDIUM_FAST — medium range, fast' },
+  { value: 5, label: 'SHORT_SLOW — short range, slow' },
+  { value: 6, label: 'SHORT_FAST — short range, fast' },
+  { value: 7, label: 'LONG_MODERATE — long range, moderate (125 kHz)' },
+  { value: 8, label: 'SHORT_TURBO — fastest (500 kHz, not legal everywhere)' },
+  { value: 9, label: 'LONG_TURBO — long range, 500 kHz' },
+  { value: 10, label: 'LITE_FAST — EU_866 compliant, ~MEDIUM_FAST range' },
+  { value: 11, label: 'LITE_SLOW — EU_866 compliant, ~LONG_FAST range' },
+  { value: 12, label: 'NARROW_FAST — EU_868 62.5 kHz, ~SHORT_SLOW range' },
+  { value: 13, label: 'NARROW_SLOW — EU_868 62.5 kHz, ~LONG_FAST range' },
+]
+
 // ── Meshtastic radio ──────────────────────────────────────────────────────────
 
 const meshtasticRadioLoading = ref(false)
@@ -532,6 +572,80 @@ async function saveMeshtasticRadio() {
     meshtasticRadioError.value = e?.message ?? 'failed to save meshtastic radio config'
   } finally {
     meshtasticRadioSaving.value = false
+  }
+}
+
+// ── Meshtastic device (owner + security) ─────────────────────────────────────
+
+interface MeshtasticOwnerData {
+  id: string
+  long_name: string
+  short_name: string
+  public_key_hex: string
+}
+
+interface MeshtasticSecurityData {
+  public_key_hex: string
+  admin_channel_enabled: boolean
+}
+
+const meshtasticOwnerLoading = ref(false)
+const meshtasticOwnerSaving = ref(false)
+const meshtasticOwnerError = ref<string | null>(null)
+const meshtasticOwnerOk = ref<string | null>(null)
+const meshtasticOwner = ref<MeshtasticOwnerData | null>(null)
+const meshtasticLongName = ref('')
+const meshtasticShortName = ref('')
+
+const meshtasticSecurityLoading = ref(false)
+const meshtasticSecurityError = ref<string | null>(null)
+const meshtasticSecurity = ref<MeshtasticSecurityData | null>(null)
+
+async function loadMeshtasticOwner() {
+  meshtasticOwnerLoading.value = true
+  meshtasticOwnerError.value = null
+  meshtasticOwnerOk.value = null
+  try {
+    const r = await api.get<MeshtasticOwnerData>('/api/v1/meshtastic-owner')
+    meshtasticOwner.value = r
+    meshtasticLongName.value = r.long_name
+    meshtasticShortName.value = r.short_name
+    meshtasticOwnerOk.value = 'Loaded from device.'
+  } catch (e: any) {
+    meshtasticOwnerError.value = e?.message ?? 'failed to load device owner info'
+  } finally {
+    meshtasticOwnerLoading.value = false
+  }
+}
+
+async function saveMeshtasticOwner() {
+  meshtasticOwnerSaving.value = true
+  meshtasticOwnerError.value = null
+  meshtasticOwnerOk.value = null
+  try {
+    await api.patch('/api/v1/meshtastic-owner', {
+      long_name: meshtasticLongName.value || null,
+      short_name: meshtasticShortName.value || null,
+    })
+    meshtasticOwnerOk.value = 'Device owner info updated.'
+    await loadMeshtasticOwner()
+  } catch (e: any) {
+    meshtasticOwnerError.value = e?.message ?? 'failed to save device owner info'
+  } finally {
+    meshtasticOwnerSaving.value = false
+  }
+}
+
+async function loadMeshtasticSecurity() {
+  meshtasticSecurityLoading.value = true
+  meshtasticSecurityError.value = null
+  try {
+    const r = await api.get<MeshtasticSecurityData>('/api/v1/meshtastic-security')
+    meshtasticSecurity.value = r
+  } catch (e: any) {
+    meshtasticSecurityError.value = e?.message ?? 'failed to load security config'
+  } finally {
+    meshtasticSecurityLoading.value = false
   }
 }
 
@@ -972,14 +1086,35 @@ chmod g+w {{ configFile }}</pre>
         <div v-if="meshtasticRadioError" class="notice error-notice">{{ meshtasticRadioError }}</div>
         <div v-if="meshtasticRadioOk" class="notice ok-notice">{{ meshtasticRadioOk }}</div>
 
+        <!-- Region and modem preset — dropdowns -->
+        <div class="field-row">
+          <div class="field">
+            <label>Region</label>
+            <select v-model.number="meshtasticRegion" :disabled="meshtasticRadioLoading">
+              <option v-for="r in MESHTASTIC_REGIONS" :key="r.value" :value="r.value">
+                {{ r.label }}
+              </option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Modem preset</label>
+            <select v-model.number="meshtasticModemPreset" :disabled="meshtasticRadioLoading || !meshtasticUsePreset">
+              <option v-for="p in MESHTASTIC_PRESETS" :key="p.value" :value="p.value">
+                {{ p.label }}
+              </option>
+            </select>
+            <p class="hint">Only used when "Use preset" is enabled.</p>
+          </div>
+        </div>
+        <!-- Custom LoRa parameters — visible when not using preset -->
         <div class="field-row">
           <div class="field">
             <label>Spread factor</label>
-            <input v-model.number="meshtasticSpreadFactor" type="number" min="7" max="12" :disabled="meshtasticRadioLoading" />
+            <input v-model.number="meshtasticSpreadFactor" type="number" min="7" max="12" :disabled="meshtasticRadioLoading || meshtasticUsePreset" />
           </div>
           <div class="field">
-            <label>Bandwidth</label>
-            <input v-model.number="meshtasticBandwidth" type="number" min="0" :disabled="meshtasticRadioLoading" />
+            <label>Bandwidth (kHz units)</label>
+            <input v-model.number="meshtasticBandwidth" type="number" min="0" :disabled="meshtasticRadioLoading || meshtasticUsePreset" />
           </div>
           <div class="field">
             <label>TX power (dBm)</label>
@@ -988,31 +1123,18 @@ chmod g+w {{ configFile }}</pre>
         </div>
         <div class="field-row">
           <div class="field">
-            <label>Region</label>
-            <input v-model.number="meshtasticRegion" type="number" min="0" :disabled="meshtasticRadioLoading" />
-            <p class="hint">Meshtastic region enum value</p>
-          </div>
-          <div class="field">
             <label>Hop limit</label>
             <input v-model.number="meshtasticHopLimit" type="number" min="0" max="7" :disabled="meshtasticRadioLoading" />
           </div>
           <div class="field">
-            <label>Modem preset</label>
-            <input v-model.number="meshtasticModemPreset" type="number" min="0" :disabled="meshtasticRadioLoading || meshtasticUsePreset" />
-          </div>
-        </div>
-        <div class="field-row">
-          <div class="field">
             <label>Override frequency (MHz)</label>
             <input v-model.number="meshtasticOverrideFrequency" type="number" step="0.001" :disabled="meshtasticRadioLoading" />
           </div>
-          <div class="field">
+          <div class="field" style="display:flex;flex-direction:column;gap:0.5rem;justify-content:flex-end;">
             <label style="display:flex;align-items:center;gap:0.5rem;">
               <input type="checkbox" v-model="meshtasticUsePreset" :disabled="meshtasticRadioLoading" />
               Use preset
             </label>
-          </div>
-          <div class="field">
             <label style="display:flex;align-items:center;gap:0.5rem;">
               <input type="checkbox" v-model="meshtasticTxEnabled" :disabled="meshtasticRadioLoading" />
               TX enabled
@@ -1030,15 +1152,89 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
+      <!-- Meshtastic device — owner info and PKC key -->
+      <section class="card">
+        <h2>Meshtastic device <span class="badge">Meshtastic</span></h2>
+        <p class="hint">
+          Node identity and PKC (public-key cryptography) settings for the connected
+          Meshtastic radio. The public key is derived from the device's private key and is
+          broadcast on the mesh so other nodes can send you encrypted direct messages.
+        </p>
+
+        <!-- Owner / node name -->
+        <h3 style="margin: 1rem 0 0.5rem">Node name</h3>
+        <div v-if="meshtasticOwnerError" class="notice error-notice">{{ meshtasticOwnerError }}</div>
+        <div v-if="meshtasticOwnerOk" class="notice ok-notice">{{ meshtasticOwnerOk }}</div>
+
+        <div v-if="meshtasticOwner" class="field-row">
+          <div class="field">
+            <label>Node ID</label>
+            <code style="display:block;padding:0.3rem 0;">{{ meshtasticOwner.id }}</code>
+          </div>
+          <div class="field">
+            <label>Long name</label>
+            <input v-model="meshtasticLongName" type="text" maxlength="39" :disabled="meshtasticOwnerLoading" />
+          </div>
+          <div class="field">
+            <label>Short name <span class="hint" style="display:inline">(≤ 4 chars)</span></label>
+            <input v-model="meshtasticShortName" type="text" maxlength="4" :disabled="meshtasticOwnerLoading" />
+          </div>
+        </div>
+        <div v-else class="muted" style="margin:0.5rem 0;">
+          {{ meshtasticOwnerLoading ? 'Loading…' : 'Not loaded — click "Load from device" to read.' }}
+        </div>
+
+        <div class="actions" style="margin-top:0.75rem;">
+          <button type="button" :disabled="meshtasticOwnerLoading" @click="loadMeshtasticOwner">
+            {{ meshtasticOwnerLoading ? 'loading…' : 'load from device' }}
+          </button>
+          <button type="button" :disabled="meshtasticOwnerLoading || meshtasticOwnerSaving || !meshtasticOwner" @click="saveMeshtasticOwner">
+            {{ meshtasticOwnerSaving ? 'saving…' : 'save to device' }}
+          </button>
+        </div>
+
+        <!-- PKC public key -->
+        <h3 style="margin: 1.5rem 0 0.5rem">Public key (PKC)</h3>
+        <div v-if="meshtasticSecurityError" class="notice error-notice">{{ meshtasticSecurityError }}</div>
+
+        <div v-if="meshtasticSecurity" class="field">
+          <label>Public key (Curve25519, hex)</label>
+          <div class="key-display">
+            <code class="key-hex">{{ meshtasticSecurity.public_key_hex || '(not set)' }}</code>
+            <button
+              v-if="meshtasticSecurity.public_key_hex"
+              type="button"
+              class="icon-btn"
+              title="Copy public key"
+              @click="copyToClipboard(meshtasticSecurity.public_key_hex)"
+            >⎘</button>
+          </div>
+          <p class="hint" style="margin-top:0.3rem;">
+            Admin channel: <strong>{{ meshtasticSecurity.admin_channel_enabled ? 'enabled' : 'disabled' }}</strong>.
+            To manage the private key or admin keys, use the Meshtastic app or meshtasticd CLI.
+          </p>
+        </div>
+        <div v-else class="muted" style="margin:0.5rem 0;">
+          {{ meshtasticSecurityLoading ? 'Loading…' : 'Not loaded — click "Load security config" to read.' }}
+        </div>
+
+        <div class="actions" style="margin-top:0.75rem;">
+          <button type="button" :disabled="meshtasticSecurityLoading" @click="loadMeshtasticSecurity">
+            {{ meshtasticSecurityLoading ? 'loading…' : 'load security config' }}
+          </button>
+        </div>
+      </section>
+
       <!-- Node identity -->
       <section class="card">
-        <h2>Node identity</h2>
+        <h2>Node identity <span class="badge">MeshCore</span></h2>
         <p class="hint">
-          The MeshCore companion device's identity keypair. The public key identifies
-          your node on the mesh network and is shared with other stations to contact you.
-          Use <strong>Set node key</strong> to paste a known 64-character hex key (e.g. when
-          migrating to new hardware). Export the private key for backup before a firmware
-          flash. <strong>Keep the private key secret.</strong>
+          The <strong>MeshCore</strong> companion device's identity keypair. The public key
+          identifies your node on the MeshCore mesh network and is shared with other stations
+          to contact you. Use <strong>Set node key</strong> to paste a known 64-character hex
+          key (e.g. when migrating to new hardware). Export the private key for backup before a
+          firmware flash. <strong>Keep the private key secret.</strong>
+          For Meshtastic PKC keys, see the <em>Meshtastic device</em> section below.
         </p>
 
         <div v-if="nodeIdentityError" class="notice error-notice">{{ nodeIdentityError }}</div>

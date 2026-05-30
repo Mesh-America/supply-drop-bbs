@@ -174,14 +174,22 @@ pub struct NodeInfo {
     pub last_heard: u32,
 }
 
+/// Meshtastic node owner/user info (`mesh.proto User`).
+///
+/// Used in `NodeInfo` (received during config sync) and in admin owner
+/// get/set operations (`AdminMessage` fields 3/4/32).
 #[derive(Clone, PartialEq, Message)]
 pub struct User {
+    /// Unique node ID string, e.g. `"!aabbccdd"` (hex of the 32-bit node number).
     #[prost(string, tag = "1")]
     pub id: String,
+    /// Full display name (~39 chars max in firmware).
     #[prost(string, tag = "2")]
     pub long_name: String,
+    /// Short display name shown on OLED/mesh maps. Firmware enforces ≤ 4 chars.
     #[prost(string, tag = "3")]
     pub short_name: String,
+    /// Node's Curve25519 public key (32 bytes), broadcast on the mesh for PKC DMs.
     #[prost(bytes = "vec", tag = "8")]
     pub public_key: Vec<u8>,
 }
@@ -271,29 +279,71 @@ pub fn synthetic_pubkey(node_num: u32) -> [u8; 32] {
 }
 
 pub const PORT_ADMIN_APP: i32 = 67;
+/// `config_type` for `GetConfigRequest` — LoRa radio config (`Config.lora`, field 6).
+pub const CONFIG_TYPE_LORA: i32 = 5;
+/// `config_type` for `GetConfigRequest` — Security / PKC config (`Config.security`, field 8).
+pub const CONFIG_TYPE_SECURITY: i32 = 7;
 
+// ── Admin proto types (admin.proto + mesh.proto, subset) ──────────────────────
+// Note: `User` is already defined above (re-used for NodeInfo; same fields).
+
+/// Meshtastic security config (`config.proto Config.SecurityConfig`, subset).
+#[derive(Clone, PartialEq, Message)]
+pub struct SecurityConfig {
+    /// Node's Curve25519 public key — shared with mesh peers.
+    #[prost(bytes = "vec", tag = "1")]
+    pub public_key: Vec<u8>,
+    /// Node's Curve25519 private key (on-device; only visible if serial is enabled).
+    #[prost(bytes = "vec", tag = "2")]
+    pub private_key: Vec<u8>,
+    /// Allow admin commands over the legacy unencrypted admin channel.
+    #[prost(bool, tag = "8")]
+    pub admin_channel_enabled: bool,
+}
+
+/// Meshtastic admin message (`admin.proto AdminMessage`).
+///
+/// Field numbers match the current Meshtastic admin.proto.  The `session_passkey`
+/// (field 101) is a replay-attack guard: the device returns it in every GET
+/// response and the client must echo it back in SET commands within 300 s.
 #[derive(Clone, PartialEq, Message)]
 pub struct AdminMessage {
-    #[prost(oneof = "admin_message::PayloadVariant", tags = "6, 11, 13")]
+    #[prost(oneof = "admin_message::PayloadVariant", tags = "3, 4, 5, 6, 32, 34")]
     pub payload_variant: Option<admin_message::PayloadVariant>,
+    /// Replay-attack guard — echo back in all SET commands.
+    #[prost(bytes = "vec", tag = "101")]
+    pub session_passkey: Vec<u8>,
 }
 
 pub mod admin_message {
     use super::*;
     #[derive(Clone, PartialEq, Oneof)]
     pub enum PayloadVariant {
+        /// Request the node's owner/user info (send `true`).
+        #[prost(bool, tag = "3")]
+        GetOwnerRequest(bool),
+        /// Node's owner/user info (response to `GetOwnerRequest`).
+        #[prost(message, tag = "4")]
+        GetOwnerResponse(super::User),
+        /// Request a config type (`ConfigType` enum: 5 = LoRa, 7 = Security).
+        #[prost(int32, tag = "5")]
+        GetConfigRequest(i32),
+        /// Config payload (response to `GetConfigRequest`).
         #[prost(message, tag = "6")]
         GetConfigResponse(super::MtConfig),
-        #[prost(message, tag = "11")]
+        /// Update the node's owner/user info.
+        #[prost(message, tag = "32")]
+        SetOwner(super::User),
+        /// Update a config section.
+        #[prost(message, tag = "34")]
         SetConfig(super::MtConfig),
-        #[prost(int32, tag = "13")]
-        GetConfigRequest(i32),
     }
 }
 
+/// Subset of Meshtastic `Config` (`config.proto Config`).
 #[derive(Clone, PartialEq, Message)]
 pub struct MtConfig {
-    #[prost(oneof = "mt_config::PayloadVariant", tags = "3")]
+    #[prost(oneof = "mt_config::PayloadVariant", tags = "6, 8")]
     pub payload_variant: Option<mt_config::PayloadVariant>,
 }
 
@@ -301,8 +351,12 @@ pub mod mt_config {
     use super::*;
     #[derive(Clone, PartialEq, Oneof)]
     pub enum PayloadVariant {
-        #[prost(message, tag = "3")]
+        /// `Config.lora` — LoRa radio parameters (field 6 in Config oneof).
+        #[prost(message, tag = "6")]
         Lora(super::LoRaConfig),
+        /// `Config.security` — PKC / key settings (field 8 in Config oneof).
+        #[prost(message, tag = "8")]
+        Security(super::SecurityConfig),
     }
 }
 
@@ -334,16 +388,11 @@ pub struct LoRaConfig {
     pub override_frequency: f32,
 }
 
-/// CONFIG_TYPE_LORA = 5
-pub const CONFIG_TYPE_LORA: i32 = 5;
+// ── Admin packet helpers ──────────────────────────────────────────────────────
 
-pub fn admin_get_lora_config(to_node: u32, request_id: u32) -> ToRadio {
+/// Wrap an encoded `AdminMessage` in a `ToRadio` admin packet.
+fn admin_packet(to_node: u32, request_id: u32, admin: AdminMessage) -> ToRadio {
     use prost::Message as _;
-    let admin = AdminMessage {
-        payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
-            CONFIG_TYPE_LORA,
-        )),
-    };
     ToRadio {
         payload_variant: Some(to_radio::PayloadVariant::Packet(MeshPacket {
             from: 0,
@@ -372,39 +421,80 @@ pub fn admin_get_lora_config(to_node: u32, request_id: u32) -> ToRadio {
     }
 }
 
-pub fn admin_set_lora_config(to_node: u32, request_id: u32, config: LoRaConfig) -> ToRadio {
-    use prost::Message as _;
-    let admin = AdminMessage {
-        payload_variant: Some(admin_message::PayloadVariant::SetConfig(MtConfig {
-            payload_variant: Some(mt_config::PayloadVariant::Lora(config)),
-        })),
-    };
-    ToRadio {
-        payload_variant: Some(to_radio::PayloadVariant::Packet(MeshPacket {
-            from: 0,
-            to: to_node,
-            channel: 0,
-            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
-                portnum: PORT_ADMIN_APP,
-                payload: admin.encode_to_vec(),
-                want_response: true,
-                dest: to_node,
-                source: to_node,
-                request_id,
-                reply_id: 0,
+/// Build a `GetConfigRequest` for the LoRa config.
+pub fn admin_get_lora_config(to_node: u32, request_id: u32) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
+                CONFIG_TYPE_LORA,
+            )),
+            session_passkey: Vec::new(),
+        },
+    )
+}
+
+/// Build a `SetConfig` for the LoRa config, echoing back the session passkey.
+pub fn admin_set_lora_config(
+    to_node: u32,
+    request_id: u32,
+    config: LoRaConfig,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetConfig(MtConfig {
+                payload_variant: Some(mt_config::PayloadVariant::Lora(config)),
             })),
-            id: request_id,
-            rx_time: 0,
-            rx_snr: 0.0,
-            hop_limit: 0,
-            want_ack: false,
-            priority: PRIORITY_RELIABLE,
-            rx_rssi: 0,
-            via_mqtt: false,
-            hop_start: 0,
-            public_key: Vec::new(),
-        })),
-    }
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `GetOwnerRequest`.
+pub fn admin_get_owner(to_node: u32, request_id: u32) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetOwnerRequest(true)),
+            session_passkey: Vec::new(),
+        },
+    )
+}
+
+/// Build a `SetOwner` command, echoing back the session passkey.
+pub fn admin_set_owner(
+    to_node: u32,
+    request_id: u32,
+    user: User,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetOwner(user)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `GetConfigRequest` for the Security config.
+pub fn admin_get_security_config(to_node: u32, request_id: u32) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
+                CONFIG_TYPE_SECURITY,
+            )),
+            session_passkey: Vec::new(),
+        },
+    )
 }
 
 #[cfg(test)]

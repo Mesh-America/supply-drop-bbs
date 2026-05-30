@@ -61,12 +61,31 @@ pub enum MeshtasticAdminRequest {
         /// One-shot channel to deliver the result back to the caller.
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Fetch the node's owner/user info (long name, short name, public key).
+    GetOwner {
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticOwnerInfo, String>>,
+    },
+    /// Update the node's owner/user info.
+    SetOwner {
+        /// New long name, or `None` to leave unchanged.
+        long_name: Option<String>,
+        /// New short name (≤ 4 chars), or `None` to leave unchanged.
+        short_name: Option<String>,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Fetch the device's security / PKC configuration.
+    GetSecurity {
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticSecurityInfo, String>>,
+    },
 }
 
 use crate::admin::{
     AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports,
     AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, MeshRadioParams,
-    MeshtasticLoRaConfig,
+    MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -480,6 +499,32 @@ pub trait Host: Send + Sync {
     ) -> Result<(), HostError> {
         let _ = config;
         Err(HostError::NotSupported("admin_set_meshtastic_lora".into()))
+    }
+
+    /// Fetch the Meshtastic device's owner/user info (long name, short name,
+    /// public key).
+    async fn admin_get_meshtastic_owner(&self) -> Result<MeshtasticOwnerInfo, HostError> {
+        Err(HostError::NotSupported("admin_get_meshtastic_owner".into()))
+    }
+
+    /// Update the Meshtastic device's owner/user info.
+    ///
+    /// Pass `None` for any field that should not be changed.  The implementation
+    /// fetches the current owner first, merges the new values, then writes back.
+    async fn admin_set_meshtastic_owner(
+        &self,
+        long_name: Option<String>,
+        short_name: Option<String>,
+    ) -> Result<(), HostError> {
+        let _ = (long_name, short_name);
+        Err(HostError::NotSupported("admin_set_meshtastic_owner".into()))
+    }
+
+    /// Fetch the Meshtastic device's security / PKC configuration.
+    async fn admin_get_meshtastic_security(&self) -> Result<MeshtasticSecurityInfo, HostError> {
+        Err(HostError::NotSupported(
+            "admin_get_meshtastic_security".into(),
+        ))
     }
 
     // ── Mesh node credentials ────────────────────────────────────────────────────

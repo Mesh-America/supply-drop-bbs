@@ -53,7 +53,7 @@ pub use admin::{
     AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity,
     AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStaleRoom,
     AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups, MeshRadioParams,
-    MeshtasticLoRaConfig,
+    MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };
 pub use advert::{AdvertBus, AdvertRecord};
 pub use command::{Command, Response};
