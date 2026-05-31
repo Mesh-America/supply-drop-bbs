@@ -2009,6 +2009,9 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
             NodeAction::ImportKey { port, baud, .. } => (port.clone(), *baud),
             NodeAction::SetRadio { port, baud, .. } => (port.clone(), *baud),
             // Meshtastic commands are intercepted and returned-from early above.
+            // Only present when the meshtastic feature adds those NodeAction
+            // variants; without it the arms above are already exhaustive.
+            #[cfg(feature = "transport-meshtastic")]
             _ => unreachable!("Meshtastic commands should have been handled above"),
         };
 
@@ -2120,6 +2123,9 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
                 OutboundFrame::GetBattAndStorage
             }
             // Meshtastic commands are handled before this block — unreachable here.
+            // Gated so the match stays exhaustive (no unreachable arm) in builds
+            // without the meshtastic feature, where those variants don't exist.
+            #[cfg(feature = "transport-meshtastic")]
             _ => unreachable!("Meshtastic commands should have been handled above"),
         };
 
