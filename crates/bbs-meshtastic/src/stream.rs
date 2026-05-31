@@ -249,6 +249,7 @@ fn describe_from_radio(frame: &FromRadio) -> String {
     match &frame.payload_variant {
         Some(P::MyInfo(i)) => format!("MyInfo(node=0x{:08x})", i.my_node_num),
         Some(P::NodeInfo(_)) => "NodeInfo".to_owned(),
+        Some(P::Config(_)) => "Config".to_owned(),
         Some(P::ConfigCompleteId(id)) => format!("ConfigCompleteId({id})"),
         Some(P::Rebooted(_)) => "Rebooted".to_owned(),
         Some(P::Packet(p)) => match &p.payload_variant {

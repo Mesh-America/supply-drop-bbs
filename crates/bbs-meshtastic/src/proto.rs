@@ -38,7 +38,7 @@ pub mod to_radio {
 pub struct FromRadio {
     #[prost(uint32, tag = "1")]
     pub id: u32,
-    #[prost(oneof = "from_radio::PayloadVariant", tags = "2, 3, 4, 7, 8")]
+    #[prost(oneof = "from_radio::PayloadVariant", tags = "2, 3, 4, 5, 7, 8")]
     pub payload_variant: Option<from_radio::PayloadVariant>,
 }
 
@@ -53,6 +53,11 @@ pub mod from_radio {
         MyInfo(super::MyNodeInfo),
         #[prost(message, tag = "4")]
         NodeInfo(super::NodeInfo),
+        /// `Config` section streamed during the initial `want_config` sync
+        /// (e.g. the current LoRa config). Lets us read the device's live
+        /// settings without an explicit admin GET.
+        #[prost(message, tag = "5")]
+        Config(super::MtConfig),
         #[prost(uint32, tag = "7")]
         ConfigCompleteId(u32),
         #[prost(bool, tag = "8")]

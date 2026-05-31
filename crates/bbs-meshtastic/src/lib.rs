@@ -704,9 +704,16 @@ async fn event_loop(
                         )
                         && auto_apply.has_anything()
                     {
-                        let node = state.lock().expect("state poisoned").my_node_num;
+                        let (node, device_lora) = {
+                            let s = state.lock().expect("state poisoned");
+                            (s.my_node_num, s.device_lora.clone())
+                        };
                         if let Some(node) = node {
-                            enqueue_auto_apply(&auto_apply, &mut deferred_writes);
+                            enqueue_auto_apply(
+                                &auto_apply,
+                                device_lora.as_ref(),
+                                &mut deferred_writes,
+                            );
                             request_session_key(
                                 &cmd_tx,
                                 node,
@@ -859,11 +866,27 @@ async fn event_loop(
     }
 }
 
+/// Whether the operator's desired LoRa settings differ from the device's
+/// current config in a way that warrants a write. We only compare the fields
+/// apply-on-connect actually sets (`use_preset`, `modem_preset`, `region`); the
+/// remaining fields are preset-derived on the device and not something the
+/// operator configures here, so comparing them would force a needless write
+/// (and reboot) every connect.
+fn lora_differs(desired: &proto::LoRaConfig, current: &proto::LoRaConfig) -> bool {
+    desired.use_preset != current.use_preset
+        || desired.modem_preset != current.modem_preset
+        || desired.region != current.region
+}
+
 /// Queue the operator's configured radio and node-name settings as deferred
 /// writes, to be sent once a session passkey is obtained. Called once per
 /// connection after config sync completes — this is what makes settings from
 /// setup or the web UI take effect automatically on connect.
-fn enqueue_auto_apply(cfg: &AutoApplyConfig, deferred: &mut Vec<DeferredWrite>) {
+fn enqueue_auto_apply(
+    cfg: &AutoApplyConfig,
+    device_lora: Option<&proto::LoRaConfig>,
+    deferred: &mut Vec<DeferredWrite>,
+) {
     if let Some(radio) = &cfg.radio {
         if radio.region.is_some() || radio.modem_preset.is_some() {
             let lora = proto::LoRaConfig {
@@ -874,12 +897,25 @@ fn enqueue_auto_apply(cfg: &AutoApplyConfig, deferred: &mut Vec<DeferredWrite>) 
                 region: region_str_to_int(radio.region.as_deref().unwrap_or("UNSET")),
                 ..Default::default()
             };
-            info!(
-                region = radio.region.as_deref().unwrap_or("UNSET"),
-                modem_preset = radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
-                "meshtastic: queuing radio config from config.toml for apply-on-connect"
-            );
-            deferred.push(DeferredWrite::Lora { lora, reply: None });
+            // Writing LoRa config reboots the radio — even when nothing changed.
+            // Only queue the write when the device's current region/preset
+            // actually differs from what the operator configured. Skipping the
+            // no-op write keeps the radio online (and hearing adverts) instead
+            // of cycling through a reboot on every reconnect.
+            if device_lora.is_some_and(|cur| !lora_differs(&lora, cur)) {
+                info!(
+                    region = radio.region.as_deref().unwrap_or("UNSET"),
+                    modem_preset = radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
+                    "meshtastic: radio config already matches device, skipping write (no reboot)"
+                );
+            } else {
+                info!(
+                    region = radio.region.as_deref().unwrap_or("UNSET"),
+                    modem_preset = radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
+                    "meshtastic: queuing radio config from config.toml for apply-on-connect"
+                );
+                deferred.push(DeferredWrite::Lora { lora, reply: None });
+            }
         }
     }
     if cfg.short_name.is_some() || cfg.long_name.is_some() {
@@ -1383,6 +1419,19 @@ async fn handle_from_radio(
         Some(from_radio::PayloadVariant::NodeInfo(node)) => {
             record_node_advert(host, node);
         }
+        Some(from_radio::PayloadVariant::Config(cfg)) => {
+            // Capture the device's current LoRa config from the sync stream so
+            // apply-on-connect can skip a redundant (reboot-inducing) write.
+            if let Some(proto::mt_config::PayloadVariant::Lora(lora)) = cfg.payload_variant {
+                debug!(
+                    region = lora.region,
+                    modem_preset = lora.modem_preset,
+                    use_preset = lora.use_preset,
+                    "meshtastic: captured device LoRa config from sync"
+                );
+                state.lock().expect("state mutex poisoned").device_lora = Some(lora);
+            }
+        }
         Some(from_radio::PayloadVariant::Packet(packet)) => {
             handle_packet(
                 packet,
@@ -1440,7 +1489,8 @@ fn record_node_advert(host: &Arc<dyn Host>, node: NodeInfo) {
         })
         .unwrap_or((0, 0));
 
-    host.advert_bus().upsert(pubkey, name, 0, lat_1e6, lon_1e6);
+    host.advert_bus()
+        .upsert(pubkey, name, 0, lat_1e6, lon_1e6, TRANSPORT_NAME);
 }
 
 #[allow(clippy::too_many_arguments)]

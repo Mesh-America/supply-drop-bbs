@@ -21,6 +21,11 @@ pub struct SessionEntry {
 #[derive(Debug, Default)]
 pub struct SessionState {
     pub my_node_num: Option<u32>,
+    /// The device's current LoRa config, captured from the `want_config` sync
+    /// stream. Used to skip redundant LoRa writes on connect — writing LoRa
+    /// config (even unchanged) reboots the radio, so we only write when the
+    /// desired region/preset actually differs from what the device reports.
+    pub device_lora: Option<crate::proto::LoRaConfig>,
     pub by_node: HashMap<u32, SessionEntry>,
     pub by_session: HashMap<SessionId, u32>,
 }
