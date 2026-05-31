@@ -13,6 +13,7 @@ interface Advert {
   type_name: string
   lat: number
   lon: number
+  transport: string
 }
 
 const auth = useAuthStore()
@@ -96,6 +97,7 @@ onUnmounted(() => { if (timer !== undefined) window.clearInterval(timer) })
 const columns = [
   { key: 'ts', label: 'last seen' },
   { key: 'name', label: 'name' },
+  { key: 'transport', label: 'transport' },
   { key: 'type_name', label: 'type' },
   { key: 'pubkey', label: 'pubkey' },
   { key: 'location', label: 'location' },
@@ -163,6 +165,10 @@ const columns = [
       empty="No adverts heard yet (is mesh transport enabled and connected?)."
     >
       <template #[`cell:ts`]="{ row }">{{ fmtLocal(row.ts) }}</template>
+      <template #[`cell:transport`]="{ row }">
+        <span v-if="row.transport" class="badge" :class="`transport-${row.transport}`">{{ row.transport }}</span>
+        <span v-else class="muted">—</span>
+      </template>
       <template #[`cell:type_name`]="{ row }">
         <span class="badge" :class="`type-${row.type_name}`">{{ row.type_name }}</span>
       </template>
@@ -211,4 +217,6 @@ h1 { margin: 0; }
 .badge.type-room     { background: #f0e2c2; color: #604010; }
 .badge.type-sensor   { background: #f0d2d2; color: #602020; }
 .badge.type-unknown  { background: var(--row-alt); color: var(--muted); }
+.badge.transport-meshcore   { background: #d2dff0; color: #203560; }
+.badge.transport-meshtastic { background: #e2d2f0; color: #402060; }
 </style>

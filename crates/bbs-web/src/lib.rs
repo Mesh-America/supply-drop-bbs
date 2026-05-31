@@ -943,6 +943,7 @@ struct AdvertResponse {
     type_name: String,
     lat: f64,
     lon: f64,
+    transport: String,
 }
 
 async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -957,6 +958,7 @@ async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             type_name: adv_type_name(r.adv_type).to_owned(),
             lat: r.lat,
             lon: r.lon,
+            transport: r.transport,
         })
         .collect();
     Json(out)

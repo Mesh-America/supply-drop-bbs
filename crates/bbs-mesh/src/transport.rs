@@ -49,6 +49,10 @@ use meshcore_companion::{
 /// Wire layout: `[prefix:1][len:2][CMD:1][txt_type:1][attempt:1][timestamp:4][prefix:6][text:N]`
 /// = 16 bytes of overhead.  Total frame must not exceed `MAX_FRAME_SIZE`.
 const MAX_REPLY_BYTES: usize = MAX_FRAME_SIZE - 16;
+
+/// Transport name recorded on advert records so the web UI can show which
+/// radio network each node was heard on.
+const TRANSPORT_NAME: &str = "meshcore";
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
@@ -542,6 +546,7 @@ async fn event_loop(
                                 info.adv_type,
                                 info.latitude,
                                 info.longitude,
+                                TRANSPORT_NAME,
                             );
                             // Record our own pubkey so the NewAdvert handler can
                             // detect self-advert echoes and preserve configured GPS.
@@ -566,6 +571,7 @@ async fn event_loop(
                                     info.adv_type,
                                     lat_1e6,
                                     lon_1e6,
+                                    TRANSPORT_NAME,
                                 );
                             }
                         } else {
@@ -802,7 +808,7 @@ async fn handle_frame(
         // Record in the shared advert bus so the web UI can display them.
         // Sessions are minted on first DM, not on advert.
         InboundFrame::Advert { pubkey } => {
-            host.advert_bus().upsert_short(pubkey);
+            host.advert_bus().upsert_short(pubkey, TRANSPORT_NAME);
             debug!(prefix = ?&pubkey[..6], "mesh: short advert received");
         }
         InboundFrame::NewAdvert(contact) => {
@@ -824,6 +830,7 @@ async fn handle_frame(
                 contact.adv_type,
                 gps_lat,
                 gps_lon,
+                TRANSPORT_NAME,
             );
             // Record the full pubkey so we can send ResetPath after delivers.
             let prefix: [u8; 6] = contact.pubkey[..6].try_into().expect("pubkey is 32 bytes");
@@ -851,6 +858,7 @@ async fn handle_frame(
                 contact.gps_lat,
                 contact.gps_lon,
                 contact.last_advert_timestamp as i64,
+                TRANSPORT_NAME,
             );
             // Record the full pubkey mapping so ResetPath can find the node.
             let prefix: [u8; 6] = contact.pubkey[..6].try_into().expect("pubkey is 32 bytes");

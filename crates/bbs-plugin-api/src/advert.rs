@@ -40,6 +40,9 @@ pub struct AdvertRecord {
     pub first_seen_secs: i64,
     /// Unix timestamp (seconds) when this node was most recently observed.
     pub last_seen_secs: i64,
+    /// Name of the transport this advert was heard on (e.g. `"meshcore"`,
+    /// `"meshtastic"`). Identifies which radio network the node belongs to.
+    pub transport: String,
 }
 
 // ── AdvertBus ─────────────────────────────────────────────────────────────────
@@ -87,7 +90,15 @@ impl AdvertBus {
     /// Insert or update a full advertisement from a named contact.
     ///
     /// Updates all fields for an existing record; preserves `first_seen_secs`.
-    pub fn upsert(&self, pubkey: [u8; 32], name: String, adv_type: u8, gps_lat: i32, gps_lon: i32) {
+    pub fn upsert(
+        &self,
+        pubkey: [u8; 32],
+        name: String,
+        adv_type: u8,
+        gps_lat: i32,
+        gps_lon: i32,
+        transport: &str,
+    ) {
         let now = unix_now();
         let lat = gps_lat as f64 / 1_000_000.0;
         let lon = gps_lon as f64 / 1_000_000.0;
@@ -100,12 +111,14 @@ impl AdvertBus {
             lon: 0.0,
             first_seen_secs: now,
             last_seen_secs: now,
+            transport: transport.to_owned(),
         });
         entry.name = name;
         entry.adv_type = adv_type;
         entry.lat = lat;
         entry.lon = lon;
         entry.last_seen_secs = now;
+        entry.transport = transport.to_owned();
     }
 
     /// Insert or update a full advertisement with an explicit `last_seen` timestamp.
@@ -121,6 +134,7 @@ impl AdvertBus {
     /// as unreliable and falls back to the current wall-clock time.
     ///
     /// Updates all fields for an existing record; preserves `first_seen_secs`.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_with_timestamp(
         &self,
         pubkey: [u8; 32],
@@ -129,6 +143,7 @@ impl AdvertBus {
         gps_lat: i32,
         gps_lon: i32,
         device_last_seen: i64,
+        transport: &str,
     ) {
         let now = unix_now();
         // Accept only plausible Unix timestamps. Devices without a synced RTC
@@ -155,11 +170,13 @@ impl AdvertBus {
             lon: 0.0,
             first_seen_secs: now,
             last_seen_secs: last_seen,
+            transport: transport.to_owned(),
         });
         entry.name = name;
         entry.adv_type = adv_type;
         entry.lat = lat;
         entry.lon = lon;
+        entry.transport = transport.to_owned();
         // Only advance last_seen — never move it backwards. A live advert
         // arriving later will always have a wall-clock time ≥ the stored value.
         if last_seen > entry.last_seen_secs {
@@ -171,12 +188,15 @@ impl AdvertBus {
     ///
     /// Updates `last_seen_secs` on an existing record without overwriting
     /// name, type, or location. Creates a minimal stub if unseen.
-    pub fn upsert_short(&self, pubkey: [u8; 32]) {
+    pub fn upsert_short(&self, pubkey: [u8; 32], transport: &str) {
         let now = unix_now();
         let mut records = self.records.lock().expect("advert bus poisoned");
         records
             .entry(pubkey)
-            .and_modify(|e| e.last_seen_secs = now)
+            .and_modify(|e| {
+                e.last_seen_secs = now;
+                e.transport = transport.to_owned();
+            })
             .or_insert_with(|| AdvertRecord {
                 pubkey_hex: hex_encode(&pubkey),
                 name: String::new(),
@@ -185,6 +205,7 @@ impl AdvertBus {
                 lon: 0.0,
                 first_seen_secs: now,
                 last_seen_secs: now,
+                transport: transport.to_owned(),
             });
     }
 
@@ -295,7 +316,7 @@ mod tests {
     #[test]
     fn zero_device_ts_falls_back_to_now() {
         let bus = AdvertBus::new();
-        bus.upsert_with_timestamp(dummy_key(1), "A".into(), 1, 0, 0, 0);
+        bus.upsert_with_timestamp(dummy_key(1), "A".into(), 1, 0, 0, 0, "meshcore");
         let records = bus.list();
         let ts = records[0].last_seen_secs;
         let now = now_secs();
@@ -311,7 +332,7 @@ mod tests {
     fn boot_relative_ts_is_rejected() {
         let bus = AdvertBus::new();
         let boot_relative: i64 = 3600; // 1 hour after epoch — clearly 1970
-        bus.upsert_with_timestamp(dummy_key(2), "B".into(), 1, 0, 0, boot_relative);
+        bus.upsert_with_timestamp(dummy_key(2), "B".into(), 1, 0, 0, boot_relative, "meshcore");
         let ts = bus.list()[0].last_seen_secs;
         let now = now_secs();
         assert!(
@@ -327,7 +348,15 @@ mod tests {
         let far_future: i64 = 2_000_000_000; // ~year 2033 — plausible false positive guard
                                              // Use a value well past now+fudge to ensure rejection.
         let very_far_future: i64 = 4_000_000_000; // ~year 2096
-        bus.upsert_with_timestamp(dummy_key(3), "C".into(), 1, 0, 0, very_far_future);
+        bus.upsert_with_timestamp(
+            dummy_key(3),
+            "C".into(),
+            1,
+            0,
+            0,
+            very_far_future,
+            "meshcore",
+        );
         let ts = bus.list()[0].last_seen_secs;
         let now = now_secs();
         assert!(
@@ -342,7 +371,7 @@ mod tests {
     fn plausible_ts_is_accepted() {
         let bus = AdvertBus::new();
         let plausible: i64 = 1_700_000_000; // Nov 2023 — clearly reasonable
-        bus.upsert_with_timestamp(dummy_key(4), "D".into(), 1, 0, 0, plausible);
+        bus.upsert_with_timestamp(dummy_key(4), "D".into(), 1, 0, 0, plausible, "meshcore");
         let ts = bus.list()[0].last_seen_secs;
         assert_eq!(ts, plausible, "plausible ts should be stored unchanged");
     }
@@ -351,7 +380,7 @@ mod tests {
     #[test]
     fn clear_empties_bus() {
         let bus = AdvertBus::new();
-        bus.upsert(dummy_key(5), "E".into(), 1, 0, 0);
+        bus.upsert(dummy_key(5), "E".into(), 1, 0, 0, "meshcore");
         assert_eq!(bus.list().len(), 1);
         bus.clear();
         assert_eq!(bus.list().len(), 0);
@@ -366,11 +395,35 @@ mod tests {
         let excluded_key = dummy_key(30);
 
         // old_key was last seen in Nov 2023.
-        bus.upsert_with_timestamp(old_key, "OldNode".into(), 1, 0, 0, 1_700_000_000);
+        bus.upsert_with_timestamp(
+            old_key,
+            "OldNode".into(),
+            1,
+            0,
+            0,
+            1_700_000_000,
+            "meshcore",
+        );
         // new_key was last seen in Jan 2025.
-        bus.upsert_with_timestamp(new_key, "NewNode".into(), 1, 0, 0, 1_735_689_600);
+        bus.upsert_with_timestamp(
+            new_key,
+            "NewNode".into(),
+            1,
+            0,
+            0,
+            1_735_689_600,
+            "meshcore",
+        );
         // excluded_key is even older but excluded.
-        bus.upsert_with_timestamp(excluded_key, "ExcludedNode".into(), 1, 0, 0, 1_500_000_000);
+        bus.upsert_with_timestamp(
+            excluded_key,
+            "ExcludedNode".into(),
+            1,
+            0,
+            0,
+            1_500_000_000,
+            "meshcore",
+        );
 
         let excluded_prefix: [u8; 6] = excluded_key[..6].try_into().unwrap();
         let result = bus.stalest_pubkey_excluding(&[excluded_prefix]);
@@ -387,7 +440,7 @@ mod tests {
     fn stalest_pubkey_excluding_all_excluded_returns_none() {
         let bus = AdvertBus::new();
         let key = dummy_key(11);
-        bus.upsert(key, "A".into(), 1, 0, 0);
+        bus.upsert(key, "A".into(), 1, 0, 0, "meshcore");
         let prefix: [u8; 6] = key[..6].try_into().unwrap();
         assert_eq!(bus.stalest_pubkey_excluding(&[prefix]), None);
     }
@@ -397,5 +450,24 @@ mod tests {
     fn stalest_pubkey_excluding_empty_bus_returns_none() {
         let bus = AdvertBus::new();
         assert_eq!(bus.stalest_pubkey_excluding(&[]), None);
+    }
+
+    /// The transport name is stored and surfaced via `list()`.
+    #[test]
+    fn transport_is_recorded() {
+        let bus = AdvertBus::new();
+        bus.upsert(dummy_key(40), "MC".into(), 1, 0, 0, "meshcore");
+        bus.upsert_short(dummy_key(41), "meshtastic");
+        let by_name: std::collections::HashMap<String, String> = bus
+            .list()
+            .into_iter()
+            .map(|r| (r.name, r.transport))
+            .collect();
+        assert_eq!(by_name.get("MC").map(String::as_str), Some("meshcore"));
+        // The short advert has no name; find it by transport instead.
+        assert!(
+            bus.list().iter().any(|r| r.transport == "meshtastic"),
+            "short advert should carry its transport"
+        );
     }
 }
