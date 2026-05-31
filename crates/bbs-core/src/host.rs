@@ -1561,6 +1561,20 @@ impl BbsHost {
                     // counter so they can't bypass the delay by opening fresh connections.
                     let delay_secs = {
                         let mut map = self.login_failures.lock().await;
+                        // Evict stale entries before inserting to bound map size.
+                        // On a busy node this keeps memory O(active_usernames) rather
+                        // than O(all_usernames_ever). Hard cap prevents unbounded growth
+                        // even if eviction somehow misses entries.
+                        const MAX_FAILURE_ENTRIES: usize = 1_000;
+                        if map.len() >= MAX_FAILURE_ENTRIES {
+                            map.retain(|_, (_, t)| t.elapsed().as_secs() <= 600);
+                            // If still over cap after eviction, clear entirely — this
+                            // should never happen in practice (1 000 simultaneous unique
+                            // attackers is not a realistic mesh scenario).
+                            if map.len() >= MAX_FAILURE_ENTRIES {
+                                map.clear();
+                            }
+                        }
                         let entry = map
                             .entry(username.as_str().to_owned())
                             .or_insert((0, Instant::now()));
