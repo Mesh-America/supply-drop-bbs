@@ -402,16 +402,25 @@ fn admin_packet(to_node: u32, request_id: u32, admin: AdminMessage) -> ToRadio {
                 portnum: PORT_ADMIN_APP,
                 payload: admin.encode_to_vec(),
                 want_response: true,
-                dest: to_node,
-                source: to_node,
-                request_id,
+                // dest/source/request_id/reply_id must be 0 on an outbound
+                // request — they are only populated on *responses*. Setting
+                // source/dest to the node's own number makes the firmware treat
+                // the packet as self-originated and silently ignore it (no admin
+                // response, and SET commands never apply). The response is
+                // correlated via the MeshPacket `id` below, which the device
+                // echoes back in the response's `request_id`.
+                dest: 0,
+                source: 0,
+                request_id: 0,
                 reply_id: 0,
             })),
             id: request_id,
             rx_time: 0,
             rx_snr: 0.0,
             hop_limit: 0,
-            want_ack: false,
+            // Request a delivery ack as well, matching the Meshtastic app's
+            // admin-message behavior.
+            want_ack: true,
             priority: PRIORITY_RELIABLE,
             rx_rssi: 0,
             via_mqtt: false,

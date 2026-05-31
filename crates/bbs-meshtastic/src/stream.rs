@@ -187,7 +187,7 @@ where
         tokio::select! {
             frame = read_from_radio(reader) => match frame {
                 Ok(frame) => {
-                    debug!("meshtastic: rx FromRadio");
+                    debug!(frame = %describe_from_radio(&frame), "meshtastic: rx FromRadio");
                     if event_tx.send(ClientEvent::FromRadio(frame)).await.is_err() {
                         return SessionOutcome::Shutdown;
                     }
@@ -237,6 +237,34 @@ async fn write_to_radio<W: AsyncWrite + Unpin>(writer: &mut W, msg: &ToRadio) ->
         ));
     }
     writer.write_all(&wire).await
+}
+
+/// One-line human description of a `FromRadio` frame for debug logging.
+///
+/// For packets it includes the portnum and request_id/reply_id so that admin
+/// responses (portnum 67) and their correlation IDs are visible in the log —
+/// essential for diagnosing whether the device answers admin GET requests.
+fn describe_from_radio(frame: &FromRadio) -> String {
+    use crate::proto::{from_radio::PayloadVariant as P, mesh_packet::PayloadVariant as MP};
+    match &frame.payload_variant {
+        Some(P::MyInfo(i)) => format!("MyInfo(node=0x{:08x})", i.my_node_num),
+        Some(P::NodeInfo(_)) => "NodeInfo".to_owned(),
+        Some(P::ConfigCompleteId(id)) => format!("ConfigCompleteId({id})"),
+        Some(P::Rebooted(_)) => "Rebooted".to_owned(),
+        Some(P::Packet(p)) => match &p.payload_variant {
+            Some(MP::Decoded(d)) => format!(
+                "Packet(port={}, from=0x{:08x}, req_id={}, reply_id={}, {}B)",
+                d.portnum,
+                p.from,
+                d.request_id,
+                d.reply_id,
+                d.payload.len()
+            ),
+            Some(MP::Encrypted(_)) => "Packet(encrypted)".to_owned(),
+            None => "Packet(empty)".to_owned(),
+        },
+        None => "<empty>".to_owned(),
+    }
 }
 
 pub async fn read_from_radio<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<FromRadio> {
