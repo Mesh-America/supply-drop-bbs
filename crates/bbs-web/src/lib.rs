@@ -2758,12 +2758,31 @@ async fn api_patch_meshtastic_radio_config(
 
     // Then try to push to the live device via the transport.
     match state.host.admin_set_meshtastic_lora(config).await {
-        Ok(()) => Json(serde_json::json!({
-            "ok": true,
-            "saved": saved.is_ok(),
-            "applied": true,
-        }))
-        .into_response(),
+        Ok(()) => {
+            // Read back the device's actual config to confirm the write landed.
+            // A LoRa parameter *change* makes the device reboot, in which case
+            // the read-back times out — report applied-but-not-yet-confirmed.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            match state.host.admin_get_meshtastic_lora().await {
+                Ok(device) => Json(serde_json::json!({
+                    "ok": true,
+                    "saved": saved.is_ok(),
+                    "applied": true,
+                    "confirmed": true,
+                    "device_config": device,
+                }))
+                .into_response(),
+                Err(_) => Json(serde_json::json!({
+                    "ok": true,
+                    "saved": saved.is_ok(),
+                    "applied": true,
+                    "confirmed": false,
+                    "message": "Settings sent. The device may be rebooting to apply them; \
+                                use \"Load from device\" in a few seconds to confirm.",
+                }))
+                .into_response(),
+            }
+        }
         Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => {
             // Transport not connected — that's OK if we saved to config.
             if saved.unwrap_or(false) {
@@ -2771,6 +2790,7 @@ async fn api_patch_meshtastic_radio_config(
                     "ok": true,
                     "saved": true,
                     "applied": false,
+                    "confirmed": false,
                     "message": "Saved to config.toml. The device is not connected right now; \
                                 these settings will be applied automatically the next time the \
                                 BBS connects to it.",
@@ -2850,18 +2870,36 @@ async fn api_patch_meshtastic_owner(
         .admin_set_meshtastic_owner(body.long_name, body.short_name)
         .await
     {
-        Ok(()) => Json(serde_json::json!({
-            "ok": true,
-            "saved": saved.is_ok(),
-            "applied": true,
-        }))
-        .into_response(),
+        Ok(()) => {
+            // Read back the device's actual owner info to confirm. A name change
+            // does not reboot the device, so this read-back is reliable.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            match state.host.admin_get_meshtastic_owner().await {
+                Ok(owner) => Json(serde_json::json!({
+                    "ok": true,
+                    "saved": saved.is_ok(),
+                    "applied": true,
+                    "confirmed": true,
+                    "device_owner": owner,
+                }))
+                .into_response(),
+                Err(_) => Json(serde_json::json!({
+                    "ok": true,
+                    "saved": saved.is_ok(),
+                    "applied": true,
+                    "confirmed": false,
+                    "message": "Name sent. Use \"Load from device\" in a few seconds to confirm.",
+                }))
+                .into_response(),
+            }
+        }
         Err(HostError::NotSupported(_)) => {
             if saved.unwrap_or(false) {
                 Json(serde_json::json!({
                     "ok": true,
                     "saved": true,
                     "applied": false,
+                    "confirmed": false,
                     "message": "Saved to config.toml. The device is not connected right now; \
                                 this name will be applied automatically the next time the BBS \
                                 connects to it.",

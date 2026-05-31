@@ -522,24 +522,28 @@ const meshtasticTxPower = ref(17)
 const meshtasticChannelNum = ref(0)
 const meshtasticOverrideFrequency = ref(0)
 
+function applyMeshtasticRadioFields(r: any) {
+  meshtasticUsePreset.value         = r.use_preset ?? false
+  meshtasticModemPreset.value       = r.modem_preset ?? 0
+  meshtasticBandwidth.value         = r.bandwidth ?? 0
+  meshtasticSpreadFactor.value      = r.spread_factor ?? 11
+  meshtasticCodingRate.value        = r.coding_rate ?? 8
+  meshtasticFrequencyOffset.value   = r.frequency_offset ?? 0
+  meshtasticRegion.value            = r.region ?? 0
+  meshtasticHopLimit.value          = r.hop_limit ?? 3
+  meshtasticTxEnabled.value         = r.tx_enabled ?? true
+  meshtasticTxPower.value           = r.tx_power ?? 17
+  meshtasticChannelNum.value        = r.channel_num ?? 0
+  meshtasticOverrideFrequency.value = r.override_frequency ?? 0
+}
+
 async function loadMeshtasticRadio() {
   meshtasticRadioLoading.value = true
   meshtasticRadioError.value = null
   meshtasticRadioOk.value = null
   try {
     const r = await api.get<any>('/api/v1/meshtastic-radio-config')
-    meshtasticUsePreset.value         = r.use_preset ?? false
-    meshtasticModemPreset.value       = r.modem_preset ?? 0
-    meshtasticBandwidth.value         = r.bandwidth ?? 0
-    meshtasticSpreadFactor.value      = r.spread_factor ?? 11
-    meshtasticCodingRate.value        = r.coding_rate ?? 8
-    meshtasticFrequencyOffset.value   = r.frequency_offset ?? 0
-    meshtasticRegion.value            = r.region ?? 0
-    meshtasticHopLimit.value          = r.hop_limit ?? 3
-    meshtasticTxEnabled.value         = r.tx_enabled ?? true
-    meshtasticTxPower.value           = r.tx_power ?? 17
-    meshtasticChannelNum.value        = r.channel_num ?? 0
-    meshtasticOverrideFrequency.value = r.override_frequency ?? 0
+    applyMeshtasticRadioFields(r)
     meshtasticRadioOk.value = 'Loaded from device.'
   } catch (e: any) {
     meshtasticRadioError.value = e?.message ?? 'failed to load meshtastic radio config'
@@ -567,10 +571,14 @@ async function saveMeshtasticRadio() {
       channel_num:        meshtasticChannelNum.value,
       override_frequency: meshtasticOverrideFrequency.value,
     })
-    if (res?.applied === false && res?.saved) {
+    if (res?.applied === false) {
       meshtasticRadioOk.value = 'Saved. The device is not connected right now — these settings will be applied automatically the next time the BBS connects to it.'
+    } else if (res?.confirmed && res?.device_config) {
+      // Update the form to reflect the device's actual current values.
+      applyMeshtasticRadioFields(res.device_config)
+      meshtasticRadioOk.value = 'Applied — confirmed on device.'
     } else {
-      meshtasticRadioOk.value = 'Radio config saved and applied to device.'
+      meshtasticRadioOk.value = res?.message ?? 'Settings sent — use "Load from device" shortly to confirm.'
     }
   } catch (e: any) {
     meshtasticRadioError.value = e?.message ?? 'failed to save meshtastic radio config'
@@ -631,11 +639,15 @@ async function saveMeshtasticOwner() {
       long_name: meshtasticLongName.value || null,
       short_name: meshtasticShortName.value || null,
     })
-    if (res?.applied === false && res?.saved) {
+    if (res?.applied === false) {
       meshtasticOwnerOk.value = 'Saved. The device is not connected right now — this name will be applied automatically the next time the BBS connects to it.'
+    } else if (res?.confirmed && res?.device_owner) {
+      meshtasticOwner.value = res.device_owner
+      meshtasticLongName.value = res.device_owner.long_name
+      meshtasticShortName.value = res.device_owner.short_name
+      meshtasticOwnerOk.value = 'Applied — confirmed on device.'
     } else {
-      meshtasticOwnerOk.value = 'Node name saved and applied to device.'
-      await loadMeshtasticOwner()
+      meshtasticOwnerOk.value = res?.message ?? 'Name sent — use "Load from device" shortly to confirm.'
     }
   } catch (e: any) {
     meshtasticOwnerError.value = e?.message ?? 'failed to save device owner info'
