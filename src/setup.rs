@@ -1852,18 +1852,22 @@ fn build_toml(p: &TomlParams<'_>) -> String {
             }
         }
     }
-    // [plugins.meshtastic.radio] — only when Meshtastic is enabled and params chosen
+    // [plugins.meshtastic.radio] — written whenever Meshtastic is enabled so the
+    // recommended radio defaults are present and editable.
     #[cfg(feature = "transport-meshtastic")]
-    if p.use_meshtastic
-        && (p.meshtastic_radio_region.is_some() || p.meshtastic_radio_preset.is_some())
-    {
+    if p.use_meshtastic {
         writeln!(s, "\n[plugins.meshtastic.radio]").unwrap();
         if let Some(region) = p.meshtastic_radio_region {
-            writeln!(s, "region       = {}", toml_str(region)).unwrap();
+            writeln!(s, "region          = {}", toml_str(region)).unwrap();
         }
         if let Some(preset) = p.meshtastic_radio_preset {
-            writeln!(s, "modem_preset = {}", toml_str(preset)).unwrap();
+            writeln!(s, "modem_preset    = {}", toml_str(preset)).unwrap();
         }
+        // Recommended defaults, applied to the device automatically on connect.
+        writeln!(s, "rx_boosted_gain = true").unwrap();
+        writeln!(s, "hops            = 3").unwrap();
+        writeln!(s, "ignore_mqtt     = true").unwrap();
+        writeln!(s, "tx_enabled      = true").unwrap();
     }
 
     // Suppress unused-variable warnings when feature is off.

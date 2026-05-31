@@ -2616,10 +2616,15 @@ fn meshtastic_preset_name(n: i32) -> &'static str {
 /// Write region and modem_preset strings into `[plugins.meshtastic.radio]`
 /// in the operator config file.  Returns `Ok(true)` when written,
 /// `Ok(false)` when no config path is configured.
+#[allow(clippy::too_many_arguments)]
 fn save_meshtastic_radio_to_config(
     config_path: &Option<String>,
     region_int: i32,
     preset_int: i32,
+    hops: u32,
+    rx_boosted_gain: bool,
+    ignore_mqtt: bool,
+    tx_enabled: bool,
 ) -> Result<bool, String> {
     let path = match config_path {
         Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
@@ -2660,6 +2665,22 @@ fn save_meshtastic_radio_to_config(
     radio.insert(
         "modem_preset",
         toml_edit::Item::Value(toml_edit::Value::from(meshtastic_preset_name(preset_int))),
+    );
+    radio.insert(
+        "hops",
+        toml_edit::Item::Value(toml_edit::Value::from(hops as i64)),
+    );
+    radio.insert(
+        "rx_boosted_gain",
+        toml_edit::Item::Value(toml_edit::Value::from(rx_boosted_gain)),
+    );
+    radio.insert(
+        "ignore_mqtt",
+        toml_edit::Item::Value(toml_edit::Value::from(ignore_mqtt)),
+    );
+    radio.insert(
+        "tx_enabled",
+        toml_edit::Item::Value(toml_edit::Value::from(tx_enabled)),
     );
 
     std::fs::write(&path, doc.to_string()).map_err(|e| format!("write error: {e}"))?;
@@ -2753,7 +2774,15 @@ async fn api_patch_meshtastic_radio_config(
 
     // Always save region + modem_preset to config.toml first.
     let config_path = &state.config.config_path;
-    let saved = save_meshtastic_radio_to_config(config_path, config.region, config.modem_preset);
+    let saved = save_meshtastic_radio_to_config(
+        config_path,
+        config.region,
+        config.modem_preset,
+        config.hop_limit,
+        config.sx126x_rx_boosted_gain,
+        config.ignore_mqtt,
+        config.tx_enabled,
+    );
     if let Err(ref e) = saved {
         tracing::warn!("meshtastic radio: could not save to config.toml: {e}");
     }

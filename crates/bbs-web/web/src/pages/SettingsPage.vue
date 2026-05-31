@@ -521,6 +521,8 @@ const meshtasticTxEnabled = ref(true)
 const meshtasticTxPower = ref(17)
 const meshtasticChannelNum = ref(0)
 const meshtasticOverrideFrequency = ref(0)
+const meshtasticRxBoostedGain = ref(true)
+const meshtasticIgnoreMqtt = ref(true)
 
 function applyMeshtasticRadioFields(r: any) {
   meshtasticUsePreset.value         = r.use_preset ?? false
@@ -535,6 +537,8 @@ function applyMeshtasticRadioFields(r: any) {
   meshtasticTxPower.value           = r.tx_power ?? 17
   meshtasticChannelNum.value        = r.channel_num ?? 0
   meshtasticOverrideFrequency.value = r.override_frequency ?? 0
+  meshtasticRxBoostedGain.value     = r.sx126x_rx_boosted_gain ?? true
+  meshtasticIgnoreMqtt.value        = r.ignore_mqtt ?? true
 }
 
 async function loadMeshtasticRadio() {
@@ -570,6 +574,8 @@ async function saveMeshtasticRadio() {
       tx_power:           meshtasticTxPower.value,
       channel_num:        meshtasticChannelNum.value,
       override_frequency: meshtasticOverrideFrequency.value,
+      sx126x_rx_boosted_gain: meshtasticRxBoostedGain.value,
+      ignore_mqtt:        meshtasticIgnoreMqtt.value,
     })
     if (res?.applied === false) {
       meshtasticRadioOk.value = 'Saved. The device is not connected right now — these settings will be applied automatically the next time the BBS connects to it.'
@@ -1158,6 +1164,14 @@ chmod g+w {{ configFile }}</pre>
             <label style="display:flex;align-items:center;gap:0.5rem;">
               <input type="checkbox" v-model="meshtasticTxEnabled" :disabled="meshtasticRadioLoading" />
               TX enabled
+            </label>
+            <label style="display:flex;align-items:center;gap:0.5rem;">
+              <input type="checkbox" v-model="meshtasticRxBoostedGain" :disabled="meshtasticRadioLoading" />
+              RX boosted gain
+            </label>
+            <label style="display:flex;align-items:center;gap:0.5rem;">
+              <input type="checkbox" v-model="meshtasticIgnoreMqtt" :disabled="meshtasticRadioLoading" />
+              Ignore MQTT
             </label>
           </div>
         </div>
