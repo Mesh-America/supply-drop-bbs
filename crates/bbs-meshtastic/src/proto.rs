@@ -365,6 +365,10 @@ pub mod admin_message {
         /// Set the node's clock (Unix seconds). Does not reboot the device.
         #[prost(uint32, tag = "43")]
         SetTimeOnly(u32),
+        /// Reboot the node in N seconds (or <0 to cancel). On boot the firmware
+        /// broadcasts its NodeInfo, which is how neighbours (re)discover it.
+        #[prost(int32, tag = "97")]
+        RebootSeconds(i32),
         /// Update the node's owner/user info.
         #[prost(message, tag = "32")]
         SetOwner(super::User),
@@ -650,6 +654,20 @@ pub fn admin_remove_fixed_position(
         request_id,
         AdminMessage {
             payload_variant: Some(admin_message::PayloadVariant::RemoveFixedPosition(true)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `RebootSeconds` admin command (reboot the node after `secs`),
+/// echoing back the session passkey. On reboot the firmware re-broadcasts its
+/// NodeInfo, which is how neighbours re-acquire the node.
+pub fn admin_reboot(to_node: u32, request_id: u32, secs: i32, session_passkey: Vec<u8>) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::RebootSeconds(secs)),
             session_passkey,
         },
     )

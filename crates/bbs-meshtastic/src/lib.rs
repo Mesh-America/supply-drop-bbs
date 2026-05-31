@@ -34,7 +34,7 @@ use crate::{
     command::{format_response, parse_command, render_notification, truncate_utf8},
     proto::{
         admin_get_lora_config, admin_get_owner, admin_get_security_config, admin_get_session_key,
-        admin_message, admin_remove_fixed_position, admin_set_device_config,
+        admin_message, admin_reboot, admin_remove_fixed_position, admin_set_device_config,
         admin_set_fixed_position, admin_set_lora_config, admin_set_owner, admin_set_time,
         direct_text_packet, from_radio, mesh_packet, mt_config, node_key, synthetic_pubkey,
         AdminMessage, Data, LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR,
@@ -583,6 +583,11 @@ enum DeferredWrite {
     },
     /// Write the merged DeviceConfig (e.g. node_info_broadcast_secs). Reboots.
     Device { device: proto::DeviceConfig },
+    /// Reboot the radio after `secs` (forces a boot-time NodeInfo broadcast).
+    Reboot {
+        secs: i32,
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    },
     /// Sync the device clock to the host's current time. No reply, no reboot.
     Time,
     /// Set a fixed GPS position (decimal degrees). No reply, no reboot.
@@ -658,6 +663,22 @@ async fn flush_deferred_writes(
                     .is_ok()
                 {
                     info!("meshtastic: applied device config (node_info_broadcast_secs) to device");
+                }
+            }
+            DeferredWrite::Reboot { secs, reply } => {
+                let ok = cmd_tx
+                    .send(admin_reboot(node, rid, secs, passkey.to_vec()))
+                    .await
+                    .is_ok();
+                if let Some(r) = reply {
+                    let _ = r.send(if ok {
+                        Ok(())
+                    } else {
+                        Err("meshtastic client disconnected".into())
+                    });
+                }
+                if ok {
+                    info!(secs, "meshtastic: requested radio reboot");
                 }
             }
             DeferredWrite::Time => {
@@ -770,6 +791,7 @@ async fn event_loop(
                         let r = match w {
                             DeferredWrite::Lora { reply, .. } => reply,
                             DeferredWrite::Owner { reply, .. } => reply,
+                            DeferredWrite::Reboot { reply, .. } => reply,
                             DeferredWrite::Device { .. }
                             | DeferredWrite::Time
                             | DeferredWrite::SetFixedPosition { .. }
@@ -899,6 +921,7 @@ async fn event_loop(
                             MeshtasticAdminRequest::GetSecurity { reply } => { let _ = reply.send(Err(e)); }
                             // Not connected yet → empty snapshot rather than an error.
                             MeshtasticAdminRequest::GetSnapshot { reply } => { let _ = reply.send(Ok(Default::default())); }
+                            MeshtasticAdminRequest::Reboot { reply, .. } => { let _ = reply.send(Err(e)); }
                         }
                     }
                     reject_no_num(req);
@@ -991,6 +1014,15 @@ async fn event_loop(
                             )
                         };
                         let _ = reply.send(Ok(snapshot));
+                    }
+                    MeshtasticAdminRequest::Reboot { seconds, reply } => {
+                        // Admin write → needs a session passkey; queue it and
+                        // request the key (sent once the passkey arrives).
+                        deferred_writes.push(DeferredWrite::Reboot {
+                            secs: seconds,
+                            reply: Some(reply),
+                        });
+                        request_session_key(&cmd_tx, my_node_num, &mut session_requested, &deferred_writes).await;
                     }
                 }
             },

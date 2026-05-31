@@ -569,6 +569,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/meshtastic-security", get(api_get_meshtastic_security))
         .route("/meshtastic-device", get(api_get_meshtastic_device))
+        .route("/meshtastic-reboot", post(api_reboot_meshtastic))
         .route("/node-identity", get(api_get_node_identity))
         .route("/node-identity/export-key", post(api_export_node_key))
         .route("/node-identity/import-key", post(api_import_node_key))
@@ -2772,6 +2773,37 @@ fn save_meshtastic_owner_to_config(
 }
 
 // ── Meshtastic radio config ───────────────────────────────────────────────────
+
+/// `POST /api/v1/meshtastic-reboot` — reboot the connected Meshtastic radio.
+/// On boot the firmware re-broadcasts its NodeInfo, so neighbours re-acquire
+/// the node — the firmware-supported way to force a re-announce on demand.
+async fn api_reboot_meshtastic(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    // 5s gives the HTTP response time to leave before the radio drops off.
+    match state.host.admin_reboot_meshtastic(5).await {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "message": "Radio reboot requested. It will drop off for ~30s, then re-announce \
+                        itself to the mesh on boot.",
+        }))
+        .into_response(),
+        Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
 
 /// `GET /api/v1/meshtastic-device` — combined snapshot (LoRa + owner + security)
 /// served from the config captured during the last connect-time sync. One call,

@@ -773,6 +773,24 @@ async function refreshMeshtasticDevice() {
   }
 }
 
+// Reboot the radio (forces a boot-time NodeInfo broadcast so neighbours
+// re-acquire the node). The device drops off for ~30s.
+const meshtasticRebooting = ref(false)
+const meshtasticRebootMsg = ref<string | null>(null)
+async function rebootMeshtasticRadio() {
+  if (!confirm('Reboot the Meshtastic radio? It drops off the mesh for ~30s, then re-announces itself to neighbours on boot.')) return
+  meshtasticRebooting.value = true
+  meshtasticRebootMsg.value = null
+  try {
+    const res = await api.post<any>('/api/v1/meshtastic-reboot', {})
+    meshtasticRebootMsg.value = res?.message ?? 'Reboot requested.'
+  } catch (e: any) {
+    meshtasticRebootMsg.value = e?.message ?? 'failed to reboot radio'
+  } finally {
+    meshtasticRebooting.value = false
+  }
+}
+
 // ── Node identity ─────────────────────────────────────────────────────────────
 
 interface NodeIdentityData {
@@ -1369,6 +1387,19 @@ chmod g+w {{ configFile }}</pre>
         </div>
         <div v-else class="muted" style="margin:0.5rem 0;">
           {{ meshtasticSecurityLoading ? 'Loading…' : 'Not available — device not connected, or use "Refresh from device" above.' }}
+        </div>
+
+        <h3 style="margin: 1.5rem 0 0.5rem">Re-announce</h3>
+        <p class="hint">
+          Reboot the radio to force a fresh NodeInfo broadcast so neighbouring nodes
+          re-acquire this BBS. Use this if the BBS disappears from another node's list.
+          The radio also re-announces automatically about once an hour.
+        </p>
+        <div v-if="meshtasticRebootMsg" class="notice ok-notice">{{ meshtasticRebootMsg }}</div>
+        <div class="actions" style="margin-top:0.5rem;">
+          <button type="button" class="secondary" :disabled="meshtasticRebooting" @click="rebootMeshtasticRadio">
+            {{ meshtasticRebooting ? 'rebooting…' : 'reboot radio (re-announce)' }}
+          </button>
         </div>
       </section>
 

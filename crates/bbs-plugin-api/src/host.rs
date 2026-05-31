@@ -87,6 +87,14 @@ pub enum MeshtasticAdminRequest {
         /// One-shot channel to deliver the snapshot back to the caller.
         reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticDeviceSnapshot, String>>,
     },
+    /// Reboot the radio after `seconds`. On boot the firmware re-broadcasts its
+    /// NodeInfo, so neighbours re-acquire the node.
+    Reboot {
+        /// Seconds until reboot.
+        seconds: i32,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 use crate::admin::{
@@ -542,6 +550,13 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported(
             "admin_get_meshtastic_snapshot".into(),
         ))
+    }
+
+    /// Reboot the connected Meshtastic radio after `seconds`. Forces a fresh
+    /// boot-time NodeInfo broadcast so neighbours re-acquire the node.
+    async fn admin_reboot_meshtastic(&self, seconds: i32) -> Result<(), HostError> {
+        let _ = seconds;
+        Err(HostError::NotSupported("admin_reboot_meshtastic".into()))
     }
 
     // ── Mesh node credentials ────────────────────────────────────────────────────
