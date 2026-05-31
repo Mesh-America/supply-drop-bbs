@@ -1093,14 +1093,18 @@ fn enqueue_auto_apply(
                     "meshtastic: radio config already matches device, skipping write (no reboot)"
                 );
             } else {
+                // Log exactly which fields differ so a spurious reboot-on-every-
+                // connect can be diagnosed (the device may not report a field we
+                // force, making the compare always fail).
                 info!(
-                    region = radio.region.as_deref().unwrap_or("(unchanged)"),
-                    modem_preset = radio.modem_preset.as_deref().unwrap_or("(unchanged)"),
-                    hops = radio.hops,
-                    tx_enabled = radio.tx_enabled,
-                    rx_boosted_gain = radio.rx_boosted_gain,
-                    ignore_mqtt = radio.ignore_mqtt,
-                    "meshtastic: queuing radio config from config.toml for apply-on-connect"
+                    use_preset = ?(current.use_preset, desired.use_preset),
+                    region = ?(current.region, desired.region),
+                    modem_preset = ?(current.modem_preset, desired.modem_preset),
+                    hop_limit = ?(current.hop_limit, desired.hop_limit),
+                    tx_enabled = ?(current.tx_enabled, desired.tx_enabled),
+                    rx_boosted_gain = ?(current.sx126x_rx_boosted_gain, desired.sx126x_rx_boosted_gain),
+                    ignore_mqtt = ?(current.ignore_mqtt, desired.ignore_mqtt),
+                    "meshtastic: queuing radio config — fields differ (current, desired)"
                 );
                 deferred.push(DeferredWrite::Lora {
                     lora: desired,
@@ -1130,9 +1134,12 @@ fn enqueue_auto_apply(
             );
         } else {
             info!(
-                long_name = %user.long_name,
-                short_name = %user.short_name,
-                "meshtastic: queuing node name from config.toml for apply-on-connect"
+                captured = device_owner.is_some(),
+                device_long = device_owner.map(|u| u.long_name.as_str()).unwrap_or("<not captured>"),
+                device_short = device_owner.map(|u| u.short_name.as_str()).unwrap_or("<not captured>"),
+                config_long = %user.long_name,
+                config_short = %user.short_name,
+                "meshtastic: queuing node name — differs from device (or device owner not captured)"
             );
             deferred.push(DeferredWrite::Owner { user, reply: None });
         }
