@@ -252,6 +252,12 @@ pub struct MeshtasticLoRaConfig {
     pub channel_num: u32,
     /// Override frequency in MHz (0 = use region default).
     pub override_frequency: f32,
+    /// SX126x RX boosted gain — improves receive sensitivity.
+    #[serde(default)]
+    pub sx126x_rx_boosted_gain: bool,
+    /// Ignore packets that arrived over MQTT.
+    #[serde(default)]
+    pub ignore_mqtt: bool,
 }
 
 /// Meshtastic node owner / identity info.

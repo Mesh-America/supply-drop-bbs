@@ -393,6 +393,15 @@ pub mod admin_message {
         /// Config payload (response to `GetConfigRequest`).
         #[prost(message, tag = "6")]
         GetConfigResponse(super::MtConfig),
+        /// Set a fixed GPS position on the node (enables fixed-position mode).
+        #[prost(message, tag = "41")]
+        SetFixedPosition(super::Position),
+        /// Clear any fixed position and disable fixed-position mode.
+        #[prost(bool, tag = "42")]
+        RemoveFixedPosition(bool),
+        /// Set the node's clock (Unix seconds). Does not reboot the device.
+        #[prost(uint32, tag = "43")]
+        SetTimeOnly(u32),
         /// Update the node's owner/user info.
         #[prost(message, tag = "32")]
         SetOwner(super::User),
@@ -446,8 +455,14 @@ pub struct LoRaConfig {
     pub tx_power: i32,
     #[prost(uint32, tag = "11")]
     pub channel_num: u32,
+    /// SX126x RX boosted gain — improves receive sensitivity on SX126x radios.
+    #[prost(bool, tag = "13")]
+    pub sx126x_rx_boosted_gain: bool,
     #[prost(float, tag = "14")]
     pub override_frequency: f32,
+    /// Ignore packets that arrived over MQTT.
+    #[prost(bool, tag = "104")]
+    pub ignore_mqtt: bool,
 }
 
 // ── Admin packet helpers ──────────────────────────────────────────────────────
@@ -552,6 +567,65 @@ pub fn admin_set_owner(
         request_id,
         AdminMessage {
             payload_variant: Some(admin_message::PayloadVariant::SetOwner(user)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `SetTimeOnly` command to sync the device clock, echoing the passkey.
+pub fn admin_set_time(
+    to_node: u32,
+    request_id: u32,
+    unix_secs: u32,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetTimeOnly(unix_secs)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `SetFixedPosition` command from decimal-degree coordinates.
+///
+/// Meshtastic stores latitude/longitude as integers in units of 1e-7 degrees.
+pub fn admin_set_fixed_position(
+    to_node: u32,
+    request_id: u32,
+    lat_deg: f64,
+    lon_deg: f64,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    let position = Position {
+        latitude_i: Some((lat_deg * 1e7) as i32),
+        longitude_i: Some((lon_deg * 1e7) as i32),
+        altitude: 0,
+        time: 0,
+    };
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetFixedPosition(position)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `RemoveFixedPosition` command (clears fixed position).
+pub fn admin_remove_fixed_position(
+    to_node: u32,
+    request_id: u32,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::RemoveFixedPosition(true)),
             session_passkey,
         },
     )

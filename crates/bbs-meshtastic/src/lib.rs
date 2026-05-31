@@ -34,7 +34,8 @@ use crate::{
     command::{format_response, parse_command, render_notification, truncate_utf8},
     proto::{
         admin_get_lora_config, admin_get_owner, admin_get_security_config, admin_get_session_key,
-        admin_message, admin_set_lora_config, admin_set_owner, direct_text_packet, from_radio,
+        admin_message, admin_remove_fixed_position, admin_set_fixed_position,
+        admin_set_lora_config, admin_set_owner, admin_set_time, direct_text_packet, from_radio,
         mesh_packet, mt_config, node_key, nodeinfo_broadcast, synthetic_pubkey, AdminMessage, Data,
         LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP,
         PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
@@ -68,7 +69,7 @@ pub enum MeshtasticConnectionType {
 /// completes after the transport connects (see `apply_config_on_connect`), so
 /// changes made in setup or the web admin UI take effect the next time the BBS
 /// connects.  The device persists the settings in its own flash.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshtasticRadioConfig {
     /// Meshtastic region code (e.g. `"US"`, `"EU_868"`, `"ANZ"`).
@@ -84,6 +85,35 @@ pub struct MeshtasticRadioConfig {
     /// default and works well for most outdoor deployments.
     #[serde(default)]
     pub modem_preset: Option<String>,
+
+    /// Enable SX126x RX boosted gain — improves receive sensitivity. Default on.
+    #[serde(default = "default_true")]
+    pub rx_boosted_gain: bool,
+
+    /// Maximum number of hops for packets originated by this node. Default 3.
+    #[serde(default = "default_radio_hops")]
+    pub hops: u32,
+
+    /// Ignore packets that arrived over MQTT. Default on.
+    #[serde(default = "default_true")]
+    pub ignore_mqtt: bool,
+
+    /// Whether the radio transmitter is enabled. Default on.
+    #[serde(default = "default_true")]
+    pub tx_enabled: bool,
+}
+
+impl Default for MeshtasticRadioConfig {
+    fn default() -> Self {
+        Self {
+            region: None,
+            modem_preset: None,
+            rx_boosted_gain: true,
+            hops: default_radio_hops(),
+            ignore_mqtt: true,
+            tx_enabled: true,
+        }
+    }
 }
 
 /// Configuration for the Meshtastic transport (`[plugins.meshtastic]`).
@@ -206,6 +236,12 @@ impl MeshtasticConfig {
 
 fn default_enabled() -> bool {
     false
+}
+fn default_true() -> bool {
+    true
+}
+fn default_radio_hops() -> u32 {
+    3
 }
 fn default_baud_rate() -> u32 {
     115_200
@@ -534,17 +570,6 @@ struct AutoApplyConfig {
     long_name: Option<String>,
 }
 
-impl AutoApplyConfig {
-    /// True when there is at least one setting to push.
-    fn has_anything(&self) -> bool {
-        self.radio
-            .as_ref()
-            .is_some_and(|r| r.region.is_some() || r.modem_preset.is_some())
-            || self.short_name.is_some()
-            || self.long_name.is_some()
-    }
-}
-
 /// Pending admin request in the Meshtastic event loop.
 ///
 /// Only GET operations are tracked here — they wait for the device's response.
@@ -594,6 +619,12 @@ enum DeferredWrite {
         user: proto::User,
         reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     },
+    /// Sync the device clock to the host's current time. No reply, no reboot.
+    Time,
+    /// Set a fixed GPS position (decimal degrees). No reply, no reboot.
+    SetFixedPosition { lat: f64, lon: f64 },
+    /// Clear any fixed GPS position. No reply, no reboot.
+    RemoveFixedPosition,
 }
 
 /// Extract the `session_passkey` (AdminMessage field 101) from an inbound admin
@@ -656,8 +687,51 @@ async fn flush_deferred_writes(
                     info!("meshtastic: applied node owner info to device");
                 }
             }
+            DeferredWrite::Time => {
+                let secs = unix_now_secs();
+                if cmd_tx
+                    .send(admin_set_time(node, rid, secs, passkey.to_vec()))
+                    .await
+                    .is_ok()
+                {
+                    info!(unix_secs = secs, "meshtastic: synced device time");
+                }
+            }
+            DeferredWrite::SetFixedPosition { lat, lon } => {
+                if cmd_tx
+                    .send(admin_set_fixed_position(
+                        node,
+                        rid,
+                        lat,
+                        lon,
+                        passkey.to_vec(),
+                    ))
+                    .await
+                    .is_ok()
+                {
+                    info!(lat, lon, "meshtastic: set fixed position on device");
+                }
+            }
+            DeferredWrite::RemoveFixedPosition => {
+                if cmd_tx
+                    .send(admin_remove_fixed_position(node, rid, passkey.to_vec()))
+                    .await
+                    .is_ok()
+                {
+                    info!("meshtastic: cleared fixed position on device");
+                }
+            }
         }
     }
+}
+
+/// Current Unix time in seconds (truncated to u32, the wire field width).
+fn unix_now_secs() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -723,6 +797,9 @@ async fn event_loop(
                         let r = match w {
                             DeferredWrite::Lora { reply, .. } => reply,
                             DeferredWrite::Owner { reply, .. } => reply,
+                            DeferredWrite::Time
+                            | DeferredWrite::SetFixedPosition { .. }
+                            | DeferredWrite::RemoveFixedPosition => None,
                         };
                         if let Some(r) = r {
                             let _ = r.send(Err("device disconnected".into()));
@@ -748,13 +825,24 @@ async fn event_loop(
                             msg.payload_variant,
                             Some(from_radio::PayloadVariant::ConfigCompleteId(_))
                         )
-                        && auto_apply.has_anything()
                     {
                         let (node, device_lora, device_owner) = {
                             let s = state.lock().expect("state poisoned");
                             (s.my_node_num, s.device_lora.clone(), s.device_owner.clone())
                         };
                         if let Some(node) = node {
+                            // Always sync the device clock to system time on connect.
+                            deferred_writes.push(DeferredWrite::Time);
+                            // Manage fixed position from the host's configured GPS:
+                            // set it when a location is configured, clear it otherwise.
+                            match host.node_location() {
+                                Some((lat, lon)) => deferred_writes
+                                    .push(DeferredWrite::SetFixedPosition { lat, lon }),
+                                None => {
+                                    deferred_writes.push(DeferredWrite::RemoveFixedPosition)
+                                }
+                            }
+                            // Push configured radio params + node name (skip-if-unchanged).
                             enqueue_auto_apply(
                                 &auto_apply,
                                 device_lora.as_ref(),
@@ -876,6 +964,8 @@ async fn event_loop(
                             tx_power: config.tx_power,
                             channel_num: config.channel_num,
                             override_frequency: config.override_frequency,
+                            sx126x_rx_boosted_gain: config.sx126x_rx_boosted_gain,
+                            ignore_mqtt: config.ignore_mqtt,
                         };
                         // Queue the write and request a session key. The write is
                         // sent (and `reply` completed) once the passkey arrives.
@@ -913,18 +1003,6 @@ async fn event_loop(
     }
 }
 
-/// Whether the operator's desired LoRa settings differ from the device's
-/// current config in a way that warrants a write. We only compare the fields
-/// apply-on-connect actually sets (`use_preset`, `modem_preset`, `region`); the
-/// remaining fields are preset-derived on the device and not something the
-/// operator configures here, so comparing them would force a needless write
-/// (and reboot) every connect.
-fn lora_differs(desired: &proto::LoRaConfig, current: &proto::LoRaConfig) -> bool {
-    desired.use_preset != current.use_preset
-        || desired.modem_preset != current.modem_preset
-        || desired.region != current.region
-}
-
 /// Queue the operator's configured radio and node-name settings as deferred
 /// writes, to be sent once a session passkey is obtained. Called once per
 /// connection after config sync completes — this is what makes settings from
@@ -936,34 +1014,51 @@ fn enqueue_auto_apply(
     deferred: &mut Vec<DeferredWrite>,
 ) {
     if let Some(radio) = &cfg.radio {
-        if radio.region.is_some() || radio.modem_preset.is_some() {
-            let lora = proto::LoRaConfig {
-                use_preset: true,
-                modem_preset: preset_str_to_int(
-                    radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
-                ),
-                region: region_str_to_int(radio.region.as_deref().unwrap_or("UNSET")),
-                ..Default::default()
-            };
-            // Writing LoRa config reboots the radio — even when nothing changed.
-            // Only queue the write when the device's current region/preset
-            // actually differs from what the operator configured. Skipping the
-            // no-op write keeps the radio online (and hearing adverts) instead
-            // of cycling through a reboot on every reconnect.
-            if device_lora.is_some_and(|cur| !lora_differs(&lora, cur)) {
+        // Build the desired config by *overlaying* our settings onto the
+        // device's current LoRa config — never from a zeroed default. A bare
+        // `LoRaConfig { .. ..Default::default() }` would set tx_enabled=false and
+        // hop_limit=0, clobbering the radio every write. Region/preset are only
+        // touched when explicitly configured (so we never blank a set region).
+        //
+        // Writing LoRa config reboots the radio even when unchanged, so we skip
+        // the write entirely when the merged result equals what's on the device.
+        if let Some(current) = device_lora {
+            let mut desired = current.clone();
+            desired.use_preset = true;
+            if let Some(p) = radio.modem_preset.as_deref() {
+                desired.modem_preset = preset_str_to_int(p);
+            }
+            if let Some(r) = radio.region.as_deref() {
+                desired.region = region_str_to_int(r);
+            }
+            desired.hop_limit = radio.hops;
+            desired.tx_enabled = radio.tx_enabled;
+            desired.sx126x_rx_boosted_gain = radio.rx_boosted_gain;
+            desired.ignore_mqtt = radio.ignore_mqtt;
+            if desired == *current {
                 info!(
-                    region = radio.region.as_deref().unwrap_or("UNSET"),
-                    modem_preset = radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
                     "meshtastic: radio config already matches device, skipping write (no reboot)"
                 );
             } else {
                 info!(
-                    region = radio.region.as_deref().unwrap_or("UNSET"),
-                    modem_preset = radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
+                    region = radio.region.as_deref().unwrap_or("(unchanged)"),
+                    modem_preset = radio.modem_preset.as_deref().unwrap_or("(unchanged)"),
+                    hops = radio.hops,
+                    tx_enabled = radio.tx_enabled,
+                    rx_boosted_gain = radio.rx_boosted_gain,
+                    ignore_mqtt = radio.ignore_mqtt,
                     "meshtastic: queuing radio config from config.toml for apply-on-connect"
                 );
-                deferred.push(DeferredWrite::Lora { lora, reply: None });
+                deferred.push(DeferredWrite::Lora {
+                    lora: desired,
+                    reply: None,
+                });
             }
+        } else {
+            warn!(
+                "meshtastic: device LoRa config not captured during sync; \
+                 skipping radio apply to avoid clobbering device settings"
+            );
         }
     }
     if cfg.short_name.is_some() || cfg.long_name.is_some() {
@@ -1061,6 +1156,8 @@ fn try_handle_admin_response(
                                 tx_power: lora.tx_power,
                                 channel_num: lora.channel_num,
                                 override_frequency: lora.override_frequency,
+                                sx126x_rx_boosted_gain: lora.sx126x_rx_boosted_gain,
+                                ignore_mqtt: lora.ignore_mqtt,
                             };
                             let _ = reply.send(Ok(config));
                         }
