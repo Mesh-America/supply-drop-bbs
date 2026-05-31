@@ -500,22 +500,22 @@ impl AutoApplyConfig {
 }
 
 /// Pending admin request in the Meshtastic event loop.
+///
+/// Only GET operations are tracked here — they wait for the device's response.
+/// SET operations (LoRa config, owner) are fire-and-forget: Meshtastic does not
+/// send a reliable admin response for config writes — it applies them silently
+/// (and reboots only when a LoRa parameter actually changes). Waiting for an ACK
+/// would always time out, so SET requests reply success as soon as the command
+/// is sent to the device.
+#[allow(clippy::enum_variant_names)] // all are Get* by design; Set* are fire-and-forget
 enum PendingMeshtasticAdmin {
     GetLora {
         request_id: u32,
         reply: tokio::sync::oneshot::Sender<Result<bbs_plugin_api::MeshtasticLoRaConfig, String>>,
     },
-    SetLora {
-        request_id: u32,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
-    },
     GetOwner {
         request_id: u32,
         reply: tokio::sync::oneshot::Sender<Result<bbs_plugin_api::MeshtasticOwnerInfo, String>>,
-    },
-    SetOwner {
-        request_id: u32,
-        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
     GetSecurity {
         request_id: u32,
@@ -561,9 +561,7 @@ async fn event_loop(
                         let err = "device disconnected".to_owned();
                         match op {
                             PendingMeshtasticAdmin::GetLora { reply, .. } => { let _ = reply.send(Err(err)); }
-                            PendingMeshtasticAdmin::SetLora { reply, .. } => { let _ = reply.send(Err(err)); }
                             PendingMeshtasticAdmin::GetOwner { reply, .. } => { let _ = reply.send(Err(err)); }
-                            PendingMeshtasticAdmin::SetOwner { reply, .. } => { let _ = reply.send(Err(err)); }
                             PendingMeshtasticAdmin::GetSecurity { reply, .. } => { let _ = reply.send(Err(err)); }
                         }
                     }
@@ -677,10 +675,15 @@ async fn event_loop(
                             override_frequency: config.override_frequency,
                         };
                         let passkey = last_session_passkey.clone();
+                        // Fire-and-forget: Meshtastic does not send a reliable admin
+                        // response for a config write — it applies it silently (and
+                        // reboots only if a LoRa parameter actually changed). Waiting
+                        // for an ACK would always time out, so report success once
+                        // the command has been handed to the device.
                         if cmd_tx.send(admin_set_lora_config(my_node_num, rid, lora, passkey)).await.is_err() {
                             let _ = reply.send(Err("meshtastic client disconnected".into()));
                         } else {
-                            pending_admin = Some(PendingMeshtasticAdmin::SetLora { request_id: rid, reply });
+                            let _ = reply.send(Ok(()));
                         }
                     }
                     MeshtasticAdminRequest::GetOwner { reply } => {
@@ -692,10 +695,10 @@ async fn event_loop(
                         }
                     }
                     MeshtasticAdminRequest::SetOwner { long_name, short_name, reply } => {
-                        // For SetOwner we need the current values to merge — do a
-                        // GetOwner first and then set. For simplicity, send SetOwner
-                        // with only the provided fields; the device keeps others.
-                        // We synthesize a User with empty fields for what we don't change.
+                        // Firmware only copies non-empty long_name/short_name from
+                        // the User and never overwrites the PKC public key on a
+                        // SetOwner, so sending empty id/public_key is safe and
+                        // leaves the node identity key intact.
                         let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let user = User {
                             id: String::new(),
@@ -704,10 +707,13 @@ async fn event_loop(
                             public_key: Vec::new(),
                         };
                         let passkey = last_session_passkey.clone();
+                        // Fire-and-forget, consistent with SetLoRaConfig: Meshtastic
+                        // applies the owner change without a reliable admin response.
+                        // Report success once the command has been sent.
                         if cmd_tx.send(admin_set_owner(my_node_num, rid, user, passkey)).await.is_err() {
                             let _ = reply.send(Err("meshtastic client disconnected".into()));
                         } else {
-                            pending_admin = Some(PendingMeshtasticAdmin::SetOwner { request_id: rid, reply });
+                            let _ = reply.send(Ok(()));
                         }
                     }
                     MeshtasticAdminRequest::GetSecurity { reply } => {
@@ -864,15 +870,6 @@ fn try_handle_admin_response(
             }
             true
         }
-        Some(PendingMeshtasticAdmin::SetLora { request_id, reply }) => {
-            if data.reply_id != request_id && data.request_id != request_id {
-                *pending_admin = Some(PendingMeshtasticAdmin::SetLora { request_id, reply });
-                return false;
-            }
-            // Any matching admin packet is the ACK for a SET command.
-            let _ = reply.send(Ok(()));
-            true
-        }
         Some(PendingMeshtasticAdmin::GetOwner { request_id, reply }) => {
             if data.reply_id != request_id && data.request_id != request_id {
                 *pending_admin = Some(PendingMeshtasticAdmin::GetOwner { request_id, reply });
@@ -904,14 +901,6 @@ fn try_handle_admin_response(
                     let _ = reply.send(Err(format!("failed to decode admin response: {e}")));
                 }
             }
-            true
-        }
-        Some(PendingMeshtasticAdmin::SetOwner { request_id, reply }) => {
-            if data.reply_id != request_id && data.request_id != request_id {
-                *pending_admin = Some(PendingMeshtasticAdmin::SetOwner { request_id, reply });
-                return false;
-            }
-            let _ = reply.send(Ok(()));
             true
         }
         Some(PendingMeshtasticAdmin::GetSecurity { request_id, reply }) => {
