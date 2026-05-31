@@ -750,14 +750,15 @@ async fn event_loop(
                         )
                         && auto_apply.has_anything()
                     {
-                        let (node, device_lora) = {
+                        let (node, device_lora, device_owner) = {
                             let s = state.lock().expect("state poisoned");
-                            (s.my_node_num, s.device_lora.clone())
+                            (s.my_node_num, s.device_lora.clone(), s.device_owner.clone())
                         };
                         if let Some(node) = node {
                             enqueue_auto_apply(
                                 &auto_apply,
                                 device_lora.as_ref(),
+                                device_owner.as_ref(),
                                 &mut deferred_writes,
                             );
                             request_session_key(
@@ -931,6 +932,7 @@ fn lora_differs(desired: &proto::LoRaConfig, current: &proto::LoRaConfig) -> boo
 fn enqueue_auto_apply(
     cfg: &AutoApplyConfig,
     device_lora: Option<&proto::LoRaConfig>,
+    device_owner: Option<&(String, String)>,
     deferred: &mut Vec<DeferredWrite>,
 ) {
     if let Some(radio) = &cfg.radio {
@@ -965,15 +967,27 @@ fn enqueue_auto_apply(
         }
     }
     if cfg.short_name.is_some() || cfg.long_name.is_some() {
-        info!(
-            long_name = cfg.long_name.as_deref().unwrap_or(""),
-            short_name = cfg.short_name.as_deref().unwrap_or(""),
-            "meshtastic: queuing node name from config.toml for apply-on-connect"
-        );
-        deferred.push(DeferredWrite::Owner {
-            user: owner_user(cfg.long_name.as_deref(), cfg.short_name.as_deref()),
-            reply: None,
-        });
+        let user = owner_user(cfg.long_name.as_deref(), cfg.short_name.as_deref());
+        // SetOwner also reboots the radio on current firmware. Skip the write
+        // when the device already carries this exact (clamped) name — otherwise
+        // every connect reboots the device and resets its periodic NodeInfo
+        // broadcast timer, so neighbours never learn about us.
+        let already_set = device_owner
+            .is_some_and(|(long, short)| *long == user.long_name && *short == user.short_name);
+        if already_set {
+            info!(
+                long_name = %user.long_name,
+                short_name = %user.short_name,
+                "meshtastic: node name already matches device, skipping write (no reboot)"
+            );
+        } else {
+            info!(
+                long_name = %user.long_name,
+                short_name = %user.short_name,
+                "meshtastic: queuing node name from config.toml for apply-on-connect"
+            );
+            deferred.push(DeferredWrite::Owner { user, reply: None });
+        }
     }
 }
 
@@ -1463,6 +1477,16 @@ async fn handle_from_radio(
             );
         }
         Some(from_radio::PayloadVariant::NodeInfo(node)) => {
+            // If this is our own node, capture the current owner name so
+            // apply-on-connect can skip a redundant (reboot-inducing) SetOwner.
+            {
+                let mut st = state.lock().expect("state mutex poisoned");
+                if Some(node.num) == st.my_node_num {
+                    if let Some(u) = &node.user {
+                        st.device_owner = Some((u.long_name.clone(), u.short_name.clone()));
+                    }
+                }
+            }
             record_node_advert(host, node);
         }
         Some(from_radio::PayloadVariant::Config(cfg)) => {

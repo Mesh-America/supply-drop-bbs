@@ -26,6 +26,12 @@ pub struct SessionState {
     /// config (even unchanged) reboots the radio, so we only write when the
     /// desired region/preset actually differs from what the device reports.
     pub device_lora: Option<crate::proto::LoRaConfig>,
+    /// The device's current owner `(long_name, short_name)`, captured from the
+    /// local node's NodeInfo during sync. Writing the owner (`SetOwner`) also
+    /// reboots the radio on current firmware, so we skip the write when the
+    /// configured name already matches — keeping the radio online so its own
+    /// periodic NodeInfo broadcasts (how neighbours discover us) keep firing.
+    pub device_owner: Option<(String, String)>,
     pub by_node: HashMap<u32, SessionEntry>,
     pub by_session: HashMap<SessionId, u32>,
 }
