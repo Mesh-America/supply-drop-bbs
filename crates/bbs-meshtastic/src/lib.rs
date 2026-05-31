@@ -33,10 +33,10 @@ use bbs_plugin_api::MeshtasticAdminRequest;
 use crate::{
     command::{format_response, parse_command, render_notification, truncate_utf8},
     proto::{
-        admin_get_lora_config, admin_get_owner, admin_get_security_config, admin_message,
-        admin_set_lora_config, admin_set_owner, direct_text_packet, from_radio, mesh_packet,
-        mt_config, node_key, synthetic_pubkey, AdminMessage, Data, LoRaConfig, MeshPacket,
-        MtConfig, NodeInfo, User, BROADCAST_ADDR, PORT_ADMIN_APP, PORT_NODEINFO_APP,
+        admin_get_lora_config, admin_get_owner, admin_get_security_config, admin_get_session_key,
+        admin_message, admin_set_lora_config, admin_set_owner, direct_text_packet, from_radio,
+        mesh_packet, mt_config, node_key, synthetic_pubkey, AdminMessage, Data, LoRaConfig,
+        MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP, PORT_NODEINFO_APP,
         PORT_TEXT_MESSAGE_APP,
     },
     session::SessionState,
@@ -533,6 +533,87 @@ fn pending_reply_abandoned(op: &PendingMeshtasticAdmin) -> bool {
     }
 }
 
+/// An admin WRITE waiting for a fresh session passkey before it can be sent.
+///
+/// Meshtastic gates admin writes on an 8-byte `session_passkey` that the device
+/// only hands out in a get-response. So a write is deferred: we send a
+/// session-key request, and once the passkey arrives we build and send the
+/// write with it echoed in.
+enum DeferredWrite {
+    Lora {
+        lora: proto::LoRaConfig,
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    },
+    Owner {
+        user: proto::User,
+        reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    },
+}
+
+/// Extract the `session_passkey` (AdminMessage field 101) from an inbound admin
+/// packet, if present. Every Meshtastic admin get-response carries a fresh
+/// 8-byte passkey; harvesting it lets us authorize subsequent writes.
+fn harvest_session_passkey(msg: &proto::FromRadio) -> Option<Vec<u8>> {
+    use prost::Message as _;
+    let Some(from_radio::PayloadVariant::Packet(p)) = &msg.payload_variant else {
+        return None;
+    };
+    let Some(mesh_packet::PayloadVariant::Decoded(d)) = &p.payload_variant else {
+        return None;
+    };
+    if d.portnum != PORT_ADMIN_APP {
+        return None;
+    }
+    let admin = AdminMessage::decode(d.payload.as_slice()).ok()?;
+    (!admin.session_passkey.is_empty()).then_some(admin.session_passkey)
+}
+
+/// Send all deferred writes now that a session passkey is available.
+async fn flush_deferred_writes(
+    cmd_tx: &mpsc::Sender<proto::ToRadio>,
+    node: u32,
+    passkey: &[u8],
+    deferred: &mut Vec<DeferredWrite>,
+) {
+    for w in deferred.drain(..) {
+        let rid = random_packet_id();
+        match w {
+            DeferredWrite::Lora { lora, reply } => {
+                let ok = cmd_tx
+                    .send(admin_set_lora_config(node, rid, lora, passkey.to_vec()))
+                    .await
+                    .is_ok();
+                if let Some(r) = reply {
+                    let _ = r.send(if ok {
+                        Ok(())
+                    } else {
+                        Err("meshtastic client disconnected".into())
+                    });
+                }
+                if ok {
+                    info!("meshtastic: applied LoRa config to device");
+                }
+            }
+            DeferredWrite::Owner { user, reply } => {
+                let ok = cmd_tx
+                    .send(admin_set_owner(node, rid, user, passkey.to_vec()))
+                    .await
+                    .is_ok();
+                if let Some(r) = reply {
+                    let _ = r.send(if ok {
+                        Ok(())
+                    } else {
+                        Err("meshtastic client disconnected".into())
+                    });
+                }
+                if ok {
+                    info!("meshtastic: applied node owner info to device");
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop(
     mut client: MeshtasticClient,
@@ -551,11 +632,15 @@ async fn event_loop(
     auto_apply: AutoApplyConfig,
 ) {
     let mut pending_admin: Option<PendingMeshtasticAdmin> = None;
-    // Session passkey received from the last GET response; echo it back in SET
-    // commands as a replay-attack guard (Meshtastic 2.5+, field 101).
+    // Session passkey received from the last admin get-response; required to
+    // authorize admin writes (Meshtastic AdminMessage field 101).
     let mut last_session_passkey: Vec<u8> = Vec::new();
-    // Whether we've pushed the config.toml settings to the device on this
-    // connection. Reset on disconnect so settings re-apply after a reconnect.
+    // Admin writes waiting for a fresh session passkey before they can be sent.
+    let mut deferred_writes: Vec<DeferredWrite> = Vec::new();
+    // True once we've sent a session-key request and are awaiting the passkey.
+    let mut session_requested = false;
+    // Whether we've queued the config.toml auto-apply on this connection.
+    // Reset on disconnect so settings re-apply after a reconnect.
     let mut auto_applied = false;
     // Periodically reap a pending GET whose caller has given up (its oneshot
     // receiver was dropped after the caller's own timeout). Without this, a GET
@@ -587,6 +672,17 @@ async fn event_loop(
                             PendingMeshtasticAdmin::GetSecurity { reply, .. } => { let _ = reply.send(Err(err)); }
                         }
                     }
+                    // Fail any deferred writes whose caller is waiting.
+                    for w in deferred_writes.drain(..) {
+                        let r = match w {
+                            DeferredWrite::Lora { reply, .. } => reply,
+                            DeferredWrite::Owner { reply, .. } => reply,
+                        };
+                        if let Some(r) = r {
+                            let _ = r.send(Err("device disconnected".into()));
+                        }
+                    }
+                    session_requested = false;
                     auto_applied = false;
                     if will_retry {
                         info!("meshtastic: radio disconnected, will retry");
@@ -598,7 +694,9 @@ async fn event_loop(
                 Some(ClientEvent::FromRadio(msg)) => {
                     // Auto-apply config.toml settings once config sync completes.
                     // ConfigCompleteId marks the end of the initial sync, by which
-                    // point MyInfo (node number) has already been received.
+                    // point MyInfo (node number) has already been received. We
+                    // enqueue the writes and request a session key; the writes are
+                    // sent once the passkey arrives (below).
                     if !auto_applied
                         && matches!(
                             msg.payload_variant,
@@ -606,11 +704,36 @@ async fn event_loop(
                         )
                         && auto_apply.has_anything()
                     {
-                        let node_num = state.lock().expect("state mutex poisoned").my_node_num;
-                        if let Some(node_num) = node_num {
-                            apply_config_on_connect(&cmd_tx, node_num, &auto_apply, &packet_counter)
-                                .await;
+                        let node = state.lock().expect("state poisoned").my_node_num;
+                        if let Some(node) = node {
+                            enqueue_auto_apply(&auto_apply, &mut deferred_writes);
+                            request_session_key(
+                                &cmd_tx,
+                                node,
+                                &mut session_requested,
+                                &deferred_writes,
+                            )
+                            .await;
                             auto_applied = true;
+                        }
+                    }
+
+                    // Harvest a session passkey from any admin response and, once
+                    // we have one, flush queued writes.
+                    if let Some(pk) = harvest_session_passkey(&msg) {
+                        last_session_passkey = pk;
+                    }
+                    if !deferred_writes.is_empty() && !last_session_passkey.is_empty() {
+                        let node = state.lock().expect("state poisoned").my_node_num;
+                        if let Some(node) = node {
+                            flush_deferred_writes(
+                                &cmd_tx,
+                                node,
+                                &last_session_passkey,
+                                &mut deferred_writes,
+                            )
+                            .await;
+                            session_requested = false;
                         }
                     }
 
@@ -656,19 +779,24 @@ async fn event_loop(
                     reject_no_num(req);
                     continue;
                 };
-                if pending_admin.is_some() {
-                    // Another admin operation is in flight — reject immediately.
-                    fn reject_busy(req: MeshtasticAdminRequest) {
-                        let e = "another admin operation is already in progress".to_owned();
-                        match req {
-                            MeshtasticAdminRequest::GetLoRaConfig { reply } => { let _ = reply.send(Err(e)); }
-                            MeshtasticAdminRequest::SetLoRaConfig { reply, .. } => { let _ = reply.send(Err(e)); }
-                            MeshtasticAdminRequest::GetOwner { reply } => { let _ = reply.send(Err(e)); }
-                            MeshtasticAdminRequest::SetOwner { reply, .. } => { let _ = reply.send(Err(e)); }
-                            MeshtasticAdminRequest::GetSecurity { reply } => { let _ = reply.send(Err(e)); }
-                        }
+                // Only GET operations use `pending_admin` (one in flight at a
+                // time). SET operations are queued as deferred writes, so they
+                // are not blocked by a pending GET.
+                if pending_admin.is_some()
+                    && matches!(
+                        req,
+                        MeshtasticAdminRequest::GetLoRaConfig { .. }
+                            | MeshtasticAdminRequest::GetOwner { .. }
+                            | MeshtasticAdminRequest::GetSecurity { .. }
+                    )
+                {
+                    let e = "another admin operation is already in progress".to_owned();
+                    match req {
+                        MeshtasticAdminRequest::GetLoRaConfig { reply } => { let _ = reply.send(Err(e)); }
+                        MeshtasticAdminRequest::GetOwner { reply } => { let _ = reply.send(Err(e)); }
+                        MeshtasticAdminRequest::GetSecurity { reply } => { let _ = reply.send(Err(e)); }
+                        _ => unreachable!(),
                     }
-                    reject_busy(req);
                     continue;
                 }
                 match req {
@@ -681,7 +809,6 @@ async fn event_loop(
                         }
                     }
                     MeshtasticAdminRequest::SetLoRaConfig { config, reply } => {
-                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let lora = LoRaConfig {
                             use_preset: config.use_preset,
                             modem_preset: config.modem_preset,
@@ -696,17 +823,10 @@ async fn event_loop(
                             channel_num: config.channel_num,
                             override_frequency: config.override_frequency,
                         };
-                        let passkey = last_session_passkey.clone();
-                        // Fire-and-forget: Meshtastic does not send a reliable admin
-                        // response for a config write — it applies it silently (and
-                        // reboots only if a LoRa parameter actually changed). Waiting
-                        // for an ACK would always time out, so report success once
-                        // the command has been handed to the device.
-                        if cmd_tx.send(admin_set_lora_config(my_node_num, rid, lora, passkey)).await.is_err() {
-                            let _ = reply.send(Err("meshtastic client disconnected".into()));
-                        } else {
-                            let _ = reply.send(Ok(()));
-                        }
+                        // Queue the write and request a session key. The write is
+                        // sent (and `reply` completed) once the passkey arrives.
+                        deferred_writes.push(DeferredWrite::Lora { lora, reply: Some(reply) });
+                        request_session_key(&cmd_tx, my_node_num, &mut session_requested, &deferred_writes).await;
                     }
                     MeshtasticAdminRequest::GetOwner { reply } => {
                         let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -717,26 +837,9 @@ async fn event_loop(
                         }
                     }
                     MeshtasticAdminRequest::SetOwner { long_name, short_name, reply } => {
-                        // Firmware only copies non-empty long_name/short_name from
-                        // the User and never overwrites the PKC public key on a
-                        // SetOwner, so sending empty id/public_key is safe and
-                        // leaves the node identity key intact.
-                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let user = User {
-                            id: String::new(),
-                            long_name: long_name.unwrap_or_default(),
-                            short_name: short_name.unwrap_or_default(),
-                            public_key: Vec::new(),
-                        };
-                        let passkey = last_session_passkey.clone();
-                        // Fire-and-forget, consistent with SetLoRaConfig: Meshtastic
-                        // applies the owner change without a reliable admin response.
-                        // Report success once the command has been sent.
-                        if cmd_tx.send(admin_set_owner(my_node_num, rid, user, passkey)).await.is_err() {
-                            let _ = reply.send(Err("meshtastic client disconnected".into()));
-                        } else {
-                            let _ = reply.send(Ok(()));
-                        }
+                        let user = owner_user(long_name.as_deref(), short_name.as_deref());
+                        deferred_writes.push(DeferredWrite::Owner { user, reply: Some(reply) });
+                        request_session_key(&cmd_tx, my_node_num, &mut session_requested, &deferred_writes).await;
                     }
                     MeshtasticAdminRequest::GetSecurity { reply } => {
                         let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -756,73 +859,59 @@ async fn event_loop(
     }
 }
 
-/// Push the operator's configured radio and node-name settings to the device.
-///
-/// Called once per connection after config sync completes.  Fire-and-forget:
-/// the device applies SetConfig / SetOwner and persists them in flash, so we
-/// don't block on ACKs here.  This is what makes settings configured in setup
-/// or the web UI take effect automatically — no CLI step required.
-///
-/// `SetOwner` is sent with an empty `public_key`; Meshtastic firmware only
-/// copies `long_name`/`short_name` from the message and never overwrites the
-/// node's PKC key from a SetOwner (the key is managed via SecurityConfig), so
-/// the node's identity key is preserved.
-async fn apply_config_on_connect(
-    cmd_tx: &mpsc::Sender<proto::ToRadio>,
-    node_num: u32,
-    cfg: &AutoApplyConfig,
-    packet_counter: &AtomicU32,
-) {
-    use proto::{admin_set_lora_config, admin_set_owner, LoRaConfig, User};
-
-    // Radio config (region + modem preset).
+/// Queue the operator's configured radio and node-name settings as deferred
+/// writes, to be sent once a session passkey is obtained. Called once per
+/// connection after config sync completes — this is what makes settings from
+/// setup or the web UI take effect automatically on connect.
+fn enqueue_auto_apply(cfg: &AutoApplyConfig, deferred: &mut Vec<DeferredWrite>) {
     if let Some(radio) = &cfg.radio {
         if radio.region.is_some() || radio.modem_preset.is_some() {
-            let region = region_str_to_int(radio.region.as_deref().unwrap_or("UNSET"));
-            let preset = preset_str_to_int(radio.modem_preset.as_deref().unwrap_or("LONG_FAST"));
-            let lora = LoRaConfig {
+            let lora = proto::LoRaConfig {
                 use_preset: true,
-                modem_preset: preset,
-                region,
+                modem_preset: preset_str_to_int(
+                    radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
+                ),
+                region: region_str_to_int(radio.region.as_deref().unwrap_or("UNSET")),
                 ..Default::default()
             };
-            let rid = packet_counter.fetch_add(1, Ordering::Relaxed);
             info!(
                 region = radio.region.as_deref().unwrap_or("UNSET"),
                 modem_preset = radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
-                "meshtastic: auto-applying radio config from config.toml"
+                "meshtastic: queuing radio config from config.toml for apply-on-connect"
             );
-            if cmd_tx
-                .send(admin_set_lora_config(node_num, rid, lora, Vec::new()))
-                .await
-                .is_err()
-            {
-                warn!("meshtastic: failed to send auto-apply radio config");
-            }
+            deferred.push(DeferredWrite::Lora { lora, reply: None });
         }
     }
-
-    // Node name (long + short).
     if cfg.short_name.is_some() || cfg.long_name.is_some() {
-        let user = User {
-            id: String::new(),
-            long_name: cfg.long_name.clone().unwrap_or_default(),
-            short_name: cfg.short_name.clone().unwrap_or_default(),
-            public_key: Vec::new(),
-        };
-        let rid = packet_counter.fetch_add(1, Ordering::Relaxed);
         info!(
             long_name = cfg.long_name.as_deref().unwrap_or(""),
             short_name = cfg.short_name.as_deref().unwrap_or(""),
-            "meshtastic: auto-applying node name from config.toml"
+            "meshtastic: queuing node name from config.toml for apply-on-connect"
         );
-        if cmd_tx
-            .send(admin_set_owner(node_num, rid, user, Vec::new()))
-            .await
-            .is_err()
-        {
-            warn!("meshtastic: failed to send auto-apply node name");
-        }
+        deferred.push(DeferredWrite::Owner {
+            user: owner_user(cfg.long_name.as_deref(), cfg.short_name.as_deref()),
+            reply: None,
+        });
+    }
+}
+
+/// Request a session key from the device (to authorize queued writes), unless a
+/// request is already outstanding or there is nothing to write.
+async fn request_session_key(
+    cmd_tx: &mpsc::Sender<proto::ToRadio>,
+    node: u32,
+    session_requested: &mut bool,
+    deferred: &[DeferredWrite],
+) {
+    if *session_requested || deferred.is_empty() {
+        return;
+    }
+    if cmd_tx
+        .send(admin_get_session_key(node, random_packet_id()))
+        .await
+        .is_ok()
+    {
+        *session_requested = true;
     }
 }
 
@@ -1030,12 +1119,7 @@ pub async fn apply_radio_from_config(
     baud_override: Option<u32>,
     addr_override: Option<String>,
 ) -> Result<(), String> {
-    use proto::{
-        admin_set_lora_config, from_radio, mesh_packet, want_config, LoRaConfig, PORT_ADMIN_APP,
-    };
-    use std::time::Duration;
-    use stream::ClientEvent;
-    use tokio::time::timeout;
+    use proto::{admin_set_lora_config, LoRaConfig};
 
     let radio_cfg = config.radio.as_ref().ok_or_else(|| {
         "no [plugins.meshtastic.radio] in config.toml — \
@@ -1053,63 +1137,16 @@ pub async fn apply_radio_from_config(
     );
 
     let mut client = make_client(config, port_override, baud_override, addr_override)?;
-
-    timeout(Duration::from_secs(15), async {
-        let cmd_tx = client.sender();
-        let mut my_node_num: Option<u32> = None;
-        let mut sent = false;
-
-        cmd_tx
-            .send(want_config(42))
-            .await
-            .map_err(|_| "send failed".to_owned())?;
-
-        while let Some(event) = client.recv().await {
-            match event {
-                ClientEvent::Connected => {}
-                ClientEvent::Disconnected { .. } => return Err("device disconnected".to_owned()),
-                ClientEvent::FromRadio(msg) => {
-                    if my_node_num.is_none() {
-                        if let Some(from_radio::PayloadVariant::MyInfo(info)) = &msg.payload_variant
-                        {
-                            my_node_num = Some(info.my_node_num);
-                        }
-                    }
-                    if let Some(node_num) = my_node_num {
-                        if !sent {
-                            let lora = LoRaConfig {
-                                use_preset: true,
-                                modem_preset: preset,
-                                region,
-                                ..Default::default()
-                            };
-                            cmd_tx
-                                .send(admin_set_lora_config(node_num, 0x1234_5601, lora, vec![]))
-                                .await
-                                .map_err(|_| "send failed".to_owned())?;
-                            sent = true;
-                        }
-                    }
-                    // Any admin packet after we sent = ACK.
-                    if sent {
-                        if let Some(from_radio::PayloadVariant::Packet(pkt)) = &msg.payload_variant
-                        {
-                            if let Some(mesh_packet::PayloadVariant::Decoded(d)) =
-                                &pkt.payload_variant
-                            {
-                                if d.portnum == PORT_ADMIN_APP {
-                                    return Ok(());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Err("connection closed unexpectedly".to_owned())
+    run_admin_write(&mut client, move |node, passkey| {
+        let lora = LoRaConfig {
+            use_preset: true,
+            modem_preset: preset,
+            region,
+            ..Default::default()
+        };
+        admin_set_lora_config(node, random_packet_id(), lora, passkey)
     })
     .await
-    .map_err(|_| "timed out (15s) — is the device connected and not in use?".to_owned())?
 }
 
 /// Connect to the Meshtastic device and push the node name stored in `config`.
@@ -1122,14 +1159,7 @@ pub async fn apply_owner_from_config(
     baud_override: Option<u32>,
     addr_override: Option<String>,
 ) -> Result<(), String> {
-    use prost::Message as _;
-    use proto::{
-        admin_get_owner, admin_message, admin_set_owner, from_radio, mesh_packet, want_config,
-        AdminMessage, User, PORT_ADMIN_APP,
-    };
-    use std::time::Duration;
-    use stream::ClientEvent;
-    use tokio::time::timeout;
+    use proto::admin_set_owner;
 
     if config.long_name.is_none() && config.short_name.is_none() {
         return Err(
@@ -1140,12 +1170,47 @@ pub async fn apply_owner_from_config(
     }
 
     let mut client = make_client(config, port_override, baud_override, addr_override)?;
+    let user = owner_user(config.long_name.as_deref(), config.short_name.as_deref());
+    eprintln!(
+        "Pushing owner: long_name={:?}, short_name={:?}",
+        user.long_name, user.short_name
+    );
+    run_admin_write(&mut client, move |node, passkey| {
+        admin_set_owner(node, random_packet_id(), user.clone(), passkey)
+    })
+    .await
+}
 
-    timeout(Duration::from_secs(15), async {
+/// Drive a Meshtastic admin WRITE against a freshly-connected device, handling
+/// the full handshake the firmware requires:
+///
+/// 1. `want_config` and wait for `ConfigCompleteId` (the device ignores admin
+///    packets received mid-sync).
+/// 2. Send `get_config_request: SESSIONKEY_CONFIG` and harvest the 8-byte
+///    `session_passkey` the device returns (AdminMessage field 101).
+/// 3. Build the write with that passkey echoed in and send it.
+///
+/// The passkey is what authorizes the write; without it the firmware drops the
+/// admin message. The passkey is valid for ~300 s and must come from a recent
+/// get-response.
+async fn run_admin_write<F>(client: &mut stream::MeshtasticClient, build: F) -> Result<(), String>
+where
+    F: FnOnce(u32, Vec<u8>) -> proto::ToRadio,
+{
+    use prost::Message as _;
+    use proto::{
+        admin_get_session_key, admin_message, from_radio, mesh_packet, want_config, AdminMessage,
+        PORT_ADMIN_APP,
+    };
+    use std::time::Duration;
+    use stream::ClientEvent;
+    use tokio::time::timeout;
+
+    timeout(Duration::from_secs(20), async move {
         let cmd_tx = client.sender();
         let mut my_node_num: Option<u32> = None;
-        let mut existing_owner: Option<User> = None;
-        let mut phase = 0u8; // 0=wait-node-num 1=wait-get-owner-ack 2=wait-set-ack
+        let mut requested_key = false;
+        let sess_req_id = random_packet_id();
 
         cmd_tx
             .send(want_config(42))
@@ -1154,67 +1219,55 @@ pub async fn apply_owner_from_config(
 
         while let Some(event) = client.recv().await {
             match event {
-                ClientEvent::Connected => {}
                 ClientEvent::Disconnected { .. } => return Err("device disconnected".to_owned()),
+                ClientEvent::Connected => {}
                 ClientEvent::FromRadio(msg) => {
-                    if my_node_num.is_none() {
-                        if let Some(from_radio::PayloadVariant::MyInfo(info)) = &msg.payload_variant
-                        {
+                    match &msg.payload_variant {
+                        Some(from_radio::PayloadVariant::MyInfo(info)) => {
                             my_node_num = Some(info.my_node_num);
-                            // Fetch existing owner to preserve public key.
+                        }
+                        Some(from_radio::PayloadVariant::ConfigCompleteId(_)) if !requested_key => {
+                            let Some(node) = my_node_num else {
+                                return Err("config sync completed without a node number".into());
+                            };
+                            // Step 2: request a session key to authorize the write.
                             cmd_tx
-                                .send(admin_get_owner(info.my_node_num, 0x1234_5601))
+                                .send(admin_get_session_key(node, sess_req_id))
                                 .await
                                 .map_err(|_| "send failed".to_owned())?;
-                            phase = 1;
+                            requested_key = true;
                         }
-                    }
-                    if let Some(from_radio::PayloadVariant::Packet(pkt)) = &msg.payload_variant {
-                        if let Some(mesh_packet::PayloadVariant::Decoded(d)) = &pkt.payload_variant
-                        {
-                            if d.portnum == PORT_ADMIN_APP {
-                                if phase == 1 {
+                        Some(from_radio::PayloadVariant::Packet(packet)) if requested_key => {
+                            // Look for the admin response carrying the session passkey.
+                            if let Some(mesh_packet::PayloadVariant::Decoded(d)) =
+                                &packet.payload_variant
+                            {
+                                if d.portnum == PORT_ADMIN_APP {
                                     if let Ok(adm) = AdminMessage::decode(d.payload.as_slice()) {
-                                        if let Some(
-                                            admin_message::PayloadVariant::GetOwnerResponse(u),
-                                        ) = adm.payload_variant
-                                        {
-                                            existing_owner = Some(u);
+                                        // Only act on a get-response (it carries the
+                                        // passkey); ignore our own echoed requests.
+                                        let is_resp = matches!(
+                                            adm.payload_variant,
+                                            Some(admin_message::PayloadVariant::GetConfigResponse(
+                                                _
+                                            ))
+                                        );
+                                        if is_resp || !adm.session_passkey.is_empty() {
+                                            let node = my_node_num.unwrap();
+                                            let pkt = build(node, adm.session_passkey);
+                                            cmd_tx
+                                                .send(pkt)
+                                                .await
+                                                .map_err(|_| "send failed".to_owned())?;
+                                            // Flush before dropping the connection.
+                                            tokio::time::sleep(Duration::from_millis(2000)).await;
+                                            return Ok(());
                                         }
                                     }
-                                    if let Some(owner) = existing_owner.take() {
-                                        let new_user = User {
-                                            id: owner.id,
-                                            long_name: config
-                                                .long_name
-                                                .clone()
-                                                .unwrap_or(owner.long_name),
-                                            short_name: config
-                                                .short_name
-                                                .clone()
-                                                .unwrap_or(owner.short_name),
-                                            public_key: owner.public_key,
-                                        };
-                                        eprintln!(
-                                            "Pushing owner: long_name={:?}, short_name={:?}",
-                                            new_user.long_name, new_user.short_name
-                                        );
-                                        cmd_tx
-                                            .send(admin_set_owner(
-                                                my_node_num.unwrap(),
-                                                0x1234_5602,
-                                                new_user,
-                                                vec![],
-                                            ))
-                                            .await
-                                            .map_err(|_| "send failed".to_owned())?;
-                                        phase = 2;
-                                    }
-                                } else if phase == 2 {
-                                    return Ok(());
                                 }
                             }
                         }
+                        _ => {}
                     }
                 }
             }
@@ -1222,7 +1275,44 @@ pub async fn apply_owner_from_config(
         Err("connection closed unexpectedly".to_owned())
     })
     .await
-    .map_err(|_| "timed out (15s) — is the device connected and not in use?".to_owned())?
+    .map_err(|_| "timed out (20s) — is the device connected and not in use?".to_owned())?
+}
+
+/// Build a Meshtastic owner `User` with firmware-safe field lengths.
+///
+/// The firmware decodes these into fixed buffers — `short_name` is `char[5]`
+/// (max **4** chars + null) and `long_name` is `char[40]` (max **39**). A value
+/// that overflows makes the device reject the *entire* admin message with
+/// `Can't decode protobuf reason='string overflow'`, so we clamp here. `id` and
+/// `public_key` are left empty: firmware ignores them on SetOwner and never
+/// overwrites the node's PKC key from one.
+fn owner_user(long_name: Option<&str>, short_name: Option<&str>) -> proto::User {
+    fn clamp(s: &str, max_chars: usize) -> String {
+        s.chars().take(max_chars).collect()
+    }
+    proto::User {
+        id: String::new(),
+        long_name: long_name.map(|s| clamp(s, 39)).unwrap_or_default(),
+        short_name: short_name.map(|s| clamp(s, 4)).unwrap_or_default(),
+        public_key: Vec::new(),
+    }
+}
+
+/// Generate an unpredictable, non-zero 32-bit packet id.
+///
+/// Meshtastic deduplicates received packets by `(from, id)`. Reusing fixed or
+/// process-restart-repeating ids causes the device to silently discard our
+/// admin packets as duplicates, so each packet needs a fresh, varied id —
+/// exactly what the Meshtastic app does (it uses random ids).
+fn random_packet_id() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() ^ (d.as_secs() as u32))
+        .unwrap_or(0);
+    // Mix and ensure non-zero.
+    let id = nanos.wrapping_mul(2_654_435_761).rotate_left(13) ^ 0x9E37_79B9;
+    id | 1
 }
 
 /// Build a [`MeshtasticClient`] from config + optional CLI overrides.
@@ -1784,6 +1874,7 @@ serial_port = "/dev/ttyAMA0"
             via_mqtt: false,
             hop_start: 0,
             public_key: Vec::new(),
+            pki_encrypted: false,
         };
         assert_eq!(text_payload(&packet), Some("hello".to_owned()));
     }

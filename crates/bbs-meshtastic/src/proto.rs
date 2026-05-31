@@ -90,6 +90,12 @@ pub struct MeshPacket {
     pub hop_start: u32,
     #[prost(bytes = "vec", tag = "16")]
     pub public_key: Vec<u8>,
+    /// Marks the packet as using public-key cryptography. The Meshtastic app
+    /// sets this on admin messages to the local node; firmware with PKC enabled
+    /// and the legacy admin channel disabled requires it, otherwise the admin
+    /// request is silently dropped.
+    #[prost(bool, tag = "17")]
+    pub pki_encrypted: bool,
 }
 
 pub mod mesh_packet {
@@ -261,6 +267,7 @@ pub fn direct_text_packet(
             via_mqtt: false,
             hop_start: 0,
             public_key: Vec::new(),
+            pki_encrypted: false,
         })),
     }
 }
@@ -278,11 +285,19 @@ pub fn synthetic_pubkey(node_num: u32) -> [u8; 32] {
     key
 }
 
-pub const PORT_ADMIN_APP: i32 = 67;
+/// Meshtastic `PortNum::ADMIN_APP`. This is **6**, not 67 — 67 is
+/// `TELEMETRY_APP`. Sending admin messages on 67 makes the device's telemetry
+/// module consume them and the admin module never processes them.
+pub const PORT_ADMIN_APP: i32 = 6;
 /// `config_type` for `GetConfigRequest` — LoRa radio config (`Config.lora`, field 6).
 pub const CONFIG_TYPE_LORA: i32 = 5;
 /// `config_type` for `GetConfigRequest` — Security / PKC config (`Config.security`, field 8).
 pub const CONFIG_TYPE_SECURITY: i32 = 7;
+/// `config_type` for `GetConfigRequest` — session key. Requesting this opens the
+/// admin session for the connection; current Meshtastic firmware silently drops
+/// admin *writes* that aren't preceded by it. The Meshtastic app sends this
+/// before every admin set.
+pub const CONFIG_TYPE_SESSIONKEY: i32 = 8;
 
 // ── Admin proto types (admin.proto + mesh.proto, subset) ──────────────────────
 // Note: `User` is already defined above (re-used for NodeInfo; same fields).
@@ -417,15 +432,18 @@ fn admin_packet(to_node: u32, request_id: u32, admin: AdminMessage) -> ToRadio {
             id: request_id,
             rx_time: 0,
             rx_snr: 0.0,
-            hop_limit: 0,
-            // Request a delivery ack as well, matching the Meshtastic app's
-            // admin-message behavior.
+            hop_limit: 3,
             want_ack: true,
             priority: PRIORITY_RELIABLE,
             rx_rssi: 0,
             via_mqtt: false,
             hop_start: 0,
             public_key: Vec::new(),
+            // Plaintext local-serial admin. Must be false: with it set, the
+            // firmware tries to PKI-decrypt our plaintext payload into garbage
+            // ("Can't decode protobuf"). The local trusted path (from==0) needs
+            // no encryption.
+            pki_encrypted: false,
         })),
     }
 }
@@ -500,6 +518,22 @@ pub fn admin_get_security_config(to_node: u32, request_id: u32) -> ToRadio {
         AdminMessage {
             payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
                 CONFIG_TYPE_SECURITY,
+            )),
+            session_passkey: Vec::new(),
+        },
+    )
+}
+
+/// Build a session-key `GetConfigRequest`. Send this immediately before an
+/// admin write to open the admin session — firmware drops writes that aren't
+/// preceded by it.
+pub fn admin_get_session_key(to_node: u32, request_id: u32) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
+                CONFIG_TYPE_SESSIONKEY,
             )),
             session_passkey: Vec::new(),
         },
