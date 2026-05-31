@@ -1541,6 +1541,9 @@ fn owner_user(long_name: Option<&str>, short_name: Option<&str>) -> proto::User 
         id: String::new(),
         long_name: long_name.map(|s| clamp(s, 39)).unwrap_or_default(),
         short_name: short_name.map(|s| clamp(s, 4)).unwrap_or_default(),
+        // Left 0 (CLIENT): prost omits default-value int32 from the wire, so
+        // SetOwner never sends a role and can't clobber the device's real role.
+        role: 0,
         public_key: Vec::new(),
     }
 }
@@ -1718,8 +1721,18 @@ fn record_node_advert(host: &Arc<dyn Host>, node: NodeInfo) {
         })
         .unwrap_or((0, 0));
 
-    host.advert_bus()
-        .upsert(pubkey, name, 0, lat_1e6, lon_1e6, TRANSPORT_NAME);
+    // Record the device role (Config.DeviceConfig.Role) as the advert "type".
+    // The web interprets this per-transport (a Meshtastic role, not a MeshCore
+    // advert type).
+    let role = node.user.as_ref().map(|u| u.role).unwrap_or(0);
+    host.advert_bus().upsert(
+        pubkey,
+        name,
+        role.clamp(0, u8::MAX as i32) as u8,
+        lat_1e6,
+        lon_1e6,
+        TRANSPORT_NAME,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]

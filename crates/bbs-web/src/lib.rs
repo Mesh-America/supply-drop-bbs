@@ -956,7 +956,7 @@ async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             pubkey: r.pubkey_hex,
             name: r.name,
             adv_type: r.adv_type,
-            type_name: adv_type_name(r.adv_type).to_owned(),
+            type_name: adv_type_name(&r.transport, r.adv_type).to_owned(),
             lat: r.lat,
             lon: r.lon,
             transport: r.transport,
@@ -975,12 +975,38 @@ async fn api_adverts_clear(State(state): State<Arc<AppState>>) -> impl IntoRespo
     axum::http::StatusCode::NO_CONTENT
 }
 
-fn adv_type_name(t: u8) -> &'static str {
+/// Human-readable advert "type", interpreted per transport.
+///
+/// MeshCore uses its advert-type byte; Meshtastic reports the device role
+/// (`Config.DeviceConfig.Role`) which we surface as the type instead.
+fn adv_type_name(transport: &str, t: u8) -> &'static str {
+    if transport == "meshtastic" {
+        return meshtastic_role_name(t);
+    }
     match t {
         1 => "chat",
         2 => "repeater",
         3 => "room",
         4 => "sensor",
+        _ => "unknown",
+    }
+}
+
+/// Map a Meshtastic device role value to a short label.
+fn meshtastic_role_name(role: u8) -> &'static str {
+    match role {
+        0 => "client",
+        1 => "client_mute",
+        2 => "router",
+        3 => "router_client",
+        4 => "repeater",
+        5 => "tracker",
+        6 => "sensor",
+        7 => "tak",
+        8 => "client_hidden",
+        9 => "lost_and_found",
+        10 => "tak_tracker",
+        11 => "router_late",
         _ => "unknown",
     }
 }

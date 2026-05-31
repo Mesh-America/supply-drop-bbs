@@ -200,6 +200,11 @@ pub struct User {
     /// Short display name shown on OLED/mesh maps. Firmware enforces ≤ 4 chars.
     #[prost(string, tag = "3")]
     pub short_name: String,
+    /// Device role (`Config.DeviceConfig.Role`): 0=CLIENT, 1=CLIENT_MUTE,
+    /// 2=ROUTER, 3=ROUTER_CLIENT, 4=REPEATER, 5=TRACKER, 6=SENSOR, 7=TAK,
+    /// 8=CLIENT_HIDDEN, 9=LOST_AND_FOUND, 10=TAK_TRACKER, 11=ROUTER_LATE.
+    #[prost(int32, tag = "7")]
+    pub role: i32,
     /// Node's Curve25519 public key (32 bytes), broadcast on the mesh for PKC DMs.
     #[prost(bytes = "vec", tag = "8")]
     pub public_key: Vec<u8>,
