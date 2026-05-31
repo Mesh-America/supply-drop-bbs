@@ -400,17 +400,12 @@ install -m 644 "$SRC_DIR/supply-drop-bbs.service" "$UNIT_FILE"
 systemctl daemon-reload
 success "Systemd unit installed"
 
-# ── Sudoers rule — web UI service restart ─────────────────────────────────────
-# Grants the service user permission to run exactly one command as root:
-# restarting its own systemd unit. Scoped as tightly as possible.
-
-SUDOERS_FILE="/etc/sudoers.d/supply-drop-bbs"
-_systemctl_path=$(command -v systemctl || echo /usr/bin/systemctl)
-info "Installing sudoers rule for web-UI service restart..."
-echo "${SERVICE_USER} ALL=(root) NOPASSWD: ${_systemctl_path} restart supply-drop-bbs" \
-    > "$SUDOERS_FILE"
-chmod 440 "$SUDOERS_FILE"
-success "Sudoers rule installed ($SUDOERS_FILE)"
+# ── Web-UI service restart ────────────────────────────────────────────────────
+# No sudoers rule is needed: the unit runs with NoNewPrivileges=yes (so `sudo`
+# can't escalate anyway), and the web-UI "restart service" simply exits the
+# process — systemd's Restart=always then starts a fresh instance. Remove any
+# stale sudoers rule from older installs.
+rm -f /etc/sudoers.d/supply-drop-bbs
 
 # ── Setup wizard ──────────────────────────────────────────────────────────────
 

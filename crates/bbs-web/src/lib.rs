@@ -1731,12 +1731,17 @@ async fn api_restart(
         )
         .await;
 
-    // Spawn restart after a short delay so the 202 response can leave first.
+    // Exit the process and let systemd's `Restart=` policy start a fresh
+    // instance (picking up the new binary/config). We deliberately do NOT shell
+    // out to `sudo systemctl restart`: the unit runs as a non-root user with
+    // `NoNewPrivileges=true`, so `sudo` cannot escalate ("no new privileges flag
+    // is set") and the restart silently fails. Exiting works without any
+    // privileges. A non-zero code triggers `Restart=on-failure`; `Restart=always`
+    // restarts on any exit. The short delay lets the 202 response flush first.
+    tracing::warn!("web admin: service restart requested — exiting for systemd to restart");
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = std::process::Command::new("sudo")
-            .args(["systemctl", "restart", "supply-drop-bbs"])
-            .spawn();
+        std::process::exit(1);
     });
 
     (

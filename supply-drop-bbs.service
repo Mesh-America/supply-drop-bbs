@@ -13,7 +13,10 @@ Group=supply-drop
 # dialout gives access to the radio's serial port
 SupplementaryGroups=dialout
 ExecStart=/usr/local/bin/supply-drop-bbs run --config /etc/supply-drop-bbs/config.toml
-Restart=on-failure
+# `always` so the web-UI "restart service" (which works by exiting the process,
+# since NoNewPrivileges blocks `sudo systemctl`) reliably brings the service
+# back, and so the BBS auto-recovers from any unexpected exit.
+Restart=always
 RestartSec=5s
 StandardOutput=journal
 StandardError=journal
