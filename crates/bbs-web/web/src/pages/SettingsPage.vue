@@ -564,6 +564,25 @@ const meshtasticDerivedFreq = computed<number | null>(() => {
   return Math.round(freq * 1000) / 1000
 })
 
+// What the Frequency field shows/edits: the override when set, otherwise the
+// region/preset-derived default. Entering the derived value (or 0/blank) clears
+// the override so the device keeps deriving it from the region.
+const meshtasticFreqInput = computed<number>({
+  get() {
+    if (meshtasticOverrideFrequency.value && meshtasticOverrideFrequency.value !== 0) {
+      return meshtasticOverrideFrequency.value
+    }
+    return meshtasticDerivedFreq.value ?? 0
+  },
+  set(v) {
+    if (!v || v === meshtasticDerivedFreq.value) {
+      meshtasticOverrideFrequency.value = 0
+    } else {
+      meshtasticOverrideFrequency.value = v
+    }
+  },
+})
+
 function applyMeshtasticRadioFields(r: any) {
   meshtasticUsePreset.value         = r.use_preset ?? false
   meshtasticModemPreset.value       = r.modem_preset ?? 0
@@ -664,7 +683,7 @@ const meshtasticSecurityLoading = ref(false)
 const meshtasticSecurityError = ref<string | null>(null)
 const meshtasticSecurity = ref<MeshtasticSecurityData | null>(null)
 
-async function loadMeshtasticOwner() {
+async function loadMeshtasticOwner(opts: { silent?: boolean } = {}) {
   meshtasticOwnerLoading.value = true
   meshtasticOwnerError.value = null
   meshtasticOwnerOk.value = null
@@ -673,9 +692,11 @@ async function loadMeshtasticOwner() {
     meshtasticOwner.value = r
     meshtasticLongName.value = r.long_name
     meshtasticShortName.value = r.short_name
-    meshtasticOwnerOk.value = 'Loaded from device.'
+    if (!opts.silent) meshtasticOwnerOk.value = 'Loaded from device.'
   } catch (e: any) {
-    meshtasticOwnerError.value = e?.message ?? 'failed to load device owner info'
+    if (!opts.silent) {
+      meshtasticOwnerError.value = e?.message ?? 'failed to load device owner info'
+    }
   } finally {
     meshtasticOwnerLoading.value = false
   }
@@ -840,6 +861,7 @@ onMounted(() => {
   loadRadioConfig()
   loadNodeIdentity()
   loadMeshtasticRadio({ silent: true })
+  loadMeshtasticOwner({ silent: true })
 })
 </script>
 
@@ -1208,17 +1230,21 @@ chmod g+w {{ configFile }}</pre>
           <div class="field">
             <label>Frequency (MHz)</label>
             <input
-              v-model.number="meshtasticOverrideFrequency"
+              v-model.number="meshtasticFreqInput"
               type="number"
               step="0.001"
-              :placeholder="meshtasticDerivedFreq !== null ? String(meshtasticDerivedFreq) : ''"
               :disabled="meshtasticRadioLoading"
             />
             <p class="hint">
-              <template v-if="meshtasticDerivedFreq !== null">
-                Region/preset default: <strong>{{ meshtasticDerivedFreq }} MHz</strong>.
+              <template v-if="meshtasticOverrideFrequency && meshtasticOverrideFrequency !== 0">
+                Overriding the region default.
               </template>
-              Leave 0 to use the default; enter a value to override.
+              <template v-else-if="meshtasticDerivedFreq !== null">
+                Derived from region + preset. Edit to override.
+              </template>
+              <template v-else>
+                Select a region to see the operating frequency.
+              </template>
             </p>
           </div>
         </div>
@@ -1263,8 +1289,8 @@ chmod g+w {{ configFile }}</pre>
         <div v-if="meshtasticOwnerError" class="notice error-notice">{{ meshtasticOwnerError }}</div>
         <div v-if="meshtasticOwnerOk" class="notice ok-notice">{{ meshtasticOwnerOk }}</div>
 
-        <div v-if="meshtasticOwner" class="field-row">
-          <div class="field">
+        <div class="field-row">
+          <div v-if="meshtasticOwner" class="field">
             <label>Node ID</label>
             <code style="display:block;padding:0.3rem 0;">{{ meshtasticOwner.id }}</code>
           </div>
@@ -1277,15 +1303,16 @@ chmod g+w {{ configFile }}</pre>
             <input v-model="meshtasticShortName" type="text" maxlength="4" :disabled="meshtasticOwnerLoading" />
           </div>
         </div>
-        <div v-else class="muted" style="margin:0.5rem 0;">
-          {{ meshtasticOwnerLoading ? 'Loading…' : 'Not loaded — click "Load from device" to read.' }}
-        </div>
+        <p class="hint">
+          Saved to config.toml and pushed to the device. Applied automatically on the next
+          connect even if the device is offline now.
+        </p>
 
         <div class="actions" style="margin-top:0.75rem;">
-          <button type="button" :disabled="meshtasticOwnerLoading" @click="loadMeshtasticOwner">
+          <button type="button" :disabled="meshtasticOwnerLoading" @click="loadMeshtasticOwner()">
             {{ meshtasticOwnerLoading ? 'loading…' : 'load from device' }}
           </button>
-          <button type="button" :disabled="meshtasticOwnerLoading || meshtasticOwnerSaving || !meshtasticOwner" @click="saveMeshtasticOwner">
+          <button type="button" :disabled="meshtasticOwnerLoading || meshtasticOwnerSaving" @click="saveMeshtasticOwner">
             {{ meshtasticOwnerSaving ? 'saving…' : 'save to device' }}
           </button>
         </div>
