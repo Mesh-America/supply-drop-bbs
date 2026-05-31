@@ -471,6 +471,39 @@ a TCP stream. Default port for `meshtasticd` is `4403`.
 |--------|--------|--------------------|----------|-----------------------------|
 | `addr` | string | `"127.0.0.1:4403"` | no       | Address of the meshtasticd listener |
 
+### Node name
+
+| Key          | Type   | Default | Required | Description                                              |
+|--------------|--------|---------|----------|----------------------------------------------------------|
+| `long_name`  | string | (unset) | no       | Node long name shown on mesh maps (≤ 39 chars)           |
+| `short_name` | string | (unset) | no       | Node short name shown on OLED / maps (≤ 4 chars)         |
+
+### Radio settings — `[plugins.meshtastic.radio]`
+
+These are pushed to the connected device automatically when the BBS connects,
+so changes made here (or in the web **Settings** page) take effect on the next
+connect. Writes are **skipped when the value already matches the device**, so the
+radio only reboots when something actually changed.
+
+| Key               | Type    | Default     | Required | Description                                                        |
+|-------------------|---------|-------------|----------|--------------------------------------------------------------------|
+| `region`          | string  | (unset)     | no       | Region code, e.g. `"US"`, `"EU_868"`, `"ANZ"`. Leave unset to keep the device's current region. |
+| `modem_preset`    | string  | `"LONG_FAST"` | no     | LoRa modem preset, e.g. `"LONG_FAST"`, `"MEDIUM_SLOW"`             |
+| `hops`            | integer | `3`         | no       | Max hops for packets this node originates                          |
+| `rx_boosted_gain` | bool    | `true`      | no       | SX126x RX boosted gain (improves receive sensitivity)              |
+| `ignore_mqtt`     | bool    | `true`      | no       | Ignore packets that arrived over MQTT                              |
+| `tx_enabled`      | bool    | `true`      | no       | Whether the radio transmitter is enabled                           |
+
+On connect the BBS also:
+
+- **syncs the device clock** to system time,
+- **sets a fixed GPS position** from the `[location]` config (or clears it when no
+  location is configured), and
+- sets the device's `node_info_broadcast_secs` to **3600 s (1 h, the firmware
+  minimum)** so the node re-announces itself to the mesh hourly. This is the
+  firmware-native way neighbouring nodes discover the BBS; you can also force an
+  immediate re-announce with the **"reboot radio"** button on the Settings page.
+
 ### Example
 
 ```toml
@@ -478,6 +511,16 @@ a TCP stream. Default port for `meshtasticd` is `4403`.
 enabled         = true
 connection_type = "serial"
 serial_port     = "/dev/ttyUSB0"
+long_name       = "Supply Drop BBS"
+short_name      = "SDB"
+
+[plugins.meshtastic.radio]
+region          = "US"
+modem_preset    = "LONG_FAST"
+hops            = 3
+rx_boosted_gain = true
+ignore_mqtt     = true
+tx_enabled      = true
 ```
 
 ## `[plugins.web]` - admin web (only if `admin-web` feature enabled)

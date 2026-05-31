@@ -238,6 +238,22 @@
 # reconnect_delay_initial_ms = 1000
 # reconnect_delay_max_ms = 60000
 
+# Node name shown on the mesh (long ≤ 39 chars, short ≤ 4 chars).
+# long_name = "Supply Drop BBS"
+# short_name = "SDB"
+
+# Radio settings pushed to the device on connect (skip-if-unchanged, so the
+# radio only reboots when a value actually changes). On connect the BBS also
+# syncs the device clock, sets a fixed position from [location], and sets the
+# device's node_info_broadcast_secs to 1h so the node re-announces hourly.
+# [plugins.meshtastic.radio]
+# region          = "US"          # e.g. US, EU_868, ANZ; omit to keep current
+# modem_preset    = "LONG_FAST"   # e.g. LONG_FAST, MEDIUM_SLOW
+# hops            = 3             # max hops for packets we originate
+# rx_boosted_gain = true          # SX126x RX boosted gain
+# ignore_mqtt     = true          # ignore MQTT-sourced packets
+# tx_enabled      = true          # radio transmitter enabled
+
 
 # ─── Plugin: web admin ────────────────────────────────────────────
 #
