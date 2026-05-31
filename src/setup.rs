@@ -1169,6 +1169,59 @@ pub fn run_wizard(config_out: Option<&Path>) {
         println!("HAT config written to {}.", yaml_path.display());
     }
 
+    // ── Apply Meshtastic settings to device ───────────────────────────────────
+    //
+    // The device is connected right now (user just configured the serial port),
+    // so we push the settings immediately.  If the push fails (device not
+    // present, wrong port, etc.) we warn and continue — the user can run the
+    // CLI commands later.
+    #[cfg(feature = "transport-meshtastic")]
+    if use_meshtastic {
+        let has_radio = meshtastic_radio_region.is_some() || meshtastic_radio_preset.is_some();
+        let has_owner = meshtastic_short_name.is_some() || meshtastic_long_name.is_some();
+        if has_radio || has_owner {
+            section("Applying Meshtastic settings to device");
+            // Load the config we just wrote so the push functions see the
+            // correct connection type, serial port, baud rate, etc.
+            let loaded = crate::config::load(Some(&out_path)).unwrap_or_default();
+            let mt_cfg = &loaded.plugins.meshtastic;
+
+            if has_radio {
+                println!("Pushing radio config (region / modem preset)…");
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        bbs_meshtastic::apply_radio_from_config(mt_cfg, None, None, None),
+                    )
+                });
+                match result {
+                    Ok(()) => println!("  ✓  Radio configuration applied."),
+                    Err(e) => {
+                        println!("  ✗  Could not apply radio config: {e}");
+                        println!("     Run later with: supply-drop-bbs node set-meshtastic-radio");
+                    }
+                }
+                println!();
+            }
+
+            if has_owner {
+                println!("Pushing node name…");
+                let result = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(
+                        bbs_meshtastic::apply_owner_from_config(mt_cfg, None, None, None),
+                    )
+                });
+                match result {
+                    Ok(()) => println!("  ✓  Node name applied."),
+                    Err(e) => {
+                        println!("  ✗  Could not apply node name: {e}");
+                        println!("     Run later with: supply-drop-bbs node set-meshtastic-owner");
+                    }
+                }
+                println!();
+            }
+        }
+    }
+
     // ── Next steps ────────────────────────────────────────────────────────────
     section("Next steps");
     print_next_steps(

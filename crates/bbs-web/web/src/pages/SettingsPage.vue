@@ -553,7 +553,7 @@ async function saveMeshtasticRadio() {
   meshtasticRadioError.value = null
   meshtasticRadioOk.value = null
   try {
-    await api.patch('/api/v1/meshtastic-radio-config', {
+    const res = await api.patch<any>('/api/v1/meshtastic-radio-config', {
       use_preset:         meshtasticUsePreset.value,
       modem_preset:       meshtasticModemPreset.value,
       bandwidth:          meshtasticBandwidth.value,
@@ -567,7 +567,11 @@ async function saveMeshtasticRadio() {
       channel_num:        meshtasticChannelNum.value,
       override_frequency: meshtasticOverrideFrequency.value,
     })
-    meshtasticRadioOk.value = 'Radio config saved to device.'
+    if (res?.applied === false && res?.saved) {
+      meshtasticRadioOk.value = 'Saved to config.toml. Device not connected — settings will apply next time you run: supply-drop-bbs node set-meshtastic-radio'
+    } else {
+      meshtasticRadioOk.value = 'Radio config saved and applied to device.'
+    }
   } catch (e: any) {
     meshtasticRadioError.value = e?.message ?? 'failed to save meshtastic radio config'
   } finally {
@@ -623,12 +627,16 @@ async function saveMeshtasticOwner() {
   meshtasticOwnerError.value = null
   meshtasticOwnerOk.value = null
   try {
-    await api.patch('/api/v1/meshtastic-owner', {
+    const res = await api.patch<any>('/api/v1/meshtastic-owner', {
       long_name: meshtasticLongName.value || null,
       short_name: meshtasticShortName.value || null,
     })
-    meshtasticOwnerOk.value = 'Device owner info updated.'
-    await loadMeshtasticOwner()
+    if (res?.applied === false && res?.saved) {
+      meshtasticOwnerOk.value = 'Saved to config.toml. Device not connected — settings will apply next time you run: supply-drop-bbs node set-meshtastic-owner'
+    } else {
+      meshtasticOwnerOk.value = 'Node name saved and applied to device.'
+      await loadMeshtasticOwner()
+    }
   } catch (e: any) {
     meshtasticOwnerError.value = e?.message ?? 'failed to save device owner info'
   } finally {
