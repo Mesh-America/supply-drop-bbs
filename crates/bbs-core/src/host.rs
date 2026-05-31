@@ -778,6 +778,35 @@ impl Host for BbsHost {
             .map_err(bbs_plugin_api::HostError::Internal)
     }
 
+    async fn admin_get_meshtastic_snapshot(
+        &self,
+    ) -> Result<bbs_plugin_api::MeshtasticDeviceSnapshot, bbs_plugin_api::HostError> {
+        let tx = self
+            .meshtastic_admin_tx
+            .read()
+            .expect("meshtastic_admin_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshtasticAdminRequest::GetSnapshot { reply: reply_tx })
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport disconnected".into())
+            })?;
+        // The snapshot is served from cache, so this resolves near-instantly.
+        tokio::time::timeout(std::time::Duration::from_secs(5), reply_rx)
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic snapshot timed out".into())
+            })?
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic snapshot cancelled".into())
+            })?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
     // ── Admin / web-UI operations ─────────────────────────────────────────────
 
     async fn admin_verify_credentials(

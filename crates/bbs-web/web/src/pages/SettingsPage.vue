@@ -741,6 +741,38 @@ async function loadMeshtasticSecurity() {
   }
 }
 
+// Populate radio + owner + security in a single call from the cached snapshot
+// (captured during the last connect-time sync). Used on page load — no buttons,
+// no device round-trip. Silent: stays quiet if the transport isn't connected.
+async function loadMeshtasticSnapshot() {
+  try {
+    const s = await api.get<any>('/api/v1/meshtastic-device')
+    if (s?.lora) applyMeshtasticRadioFields(s.lora)
+    if (s?.owner) {
+      meshtasticOwner.value = s.owner
+      meshtasticLongName.value = s.owner.long_name
+      meshtasticShortName.value = s.owner.short_name
+    }
+    if (s?.security) meshtasticSecurity.value = s.security
+  } catch {
+    // No transport / not connected — leave sections at their defaults.
+  }
+}
+
+// Manual "refresh from device": live reads against the device, one section at a
+// time (only one admin op may be in flight). Surfaces errors, unlike the load.
+const meshtasticRefreshing = ref(false)
+async function refreshMeshtasticDevice() {
+  meshtasticRefreshing.value = true
+  try {
+    await loadMeshtasticRadio()
+    await loadMeshtasticOwner()
+    await loadMeshtasticSecurity()
+  } finally {
+    meshtasticRefreshing.value = false
+  }
+}
+
 // ── Node identity ─────────────────────────────────────────────────────────────
 
 interface NodeIdentityData {
@@ -860,8 +892,7 @@ onMounted(() => {
   loadAccessPolicy()
   loadRadioConfig()
   loadNodeIdentity()
-  loadMeshtasticRadio({ silent: true })
-  loadMeshtasticOwner({ silent: true })
+  loadMeshtasticSnapshot()
 })
 </script>
 
@@ -1266,12 +1297,13 @@ chmod g+w {{ configFile }}</pre>
         </div>
 
         <div class="actions">
-          <button type="button" :disabled="meshtasticRadioLoading" @click="loadMeshtasticRadio()">
-            {{ meshtasticRadioLoading ? 'loading…' : 'load from device' }}
-          </button>
           <button type="button" :disabled="meshtasticRadioLoading || meshtasticRadioSaving" @click="saveMeshtasticRadio">
             {{ meshtasticRadioSaving ? 'saving…' : 'save to device' }}
           </button>
+          <button type="button" class="secondary" :disabled="meshtasticRefreshing" @click="refreshMeshtasticDevice">
+            {{ meshtasticRefreshing ? 'refreshing…' : 'refresh from device' }}
+          </button>
+          <span class="hint">Values shown are from the last device sync. Refresh to re-read live.</span>
         </div>
       </section>
 
@@ -1309,9 +1341,6 @@ chmod g+w {{ configFile }}</pre>
         </p>
 
         <div class="actions" style="margin-top:0.75rem;">
-          <button type="button" :disabled="meshtasticOwnerLoading" @click="loadMeshtasticOwner()">
-            {{ meshtasticOwnerLoading ? 'loading…' : 'load from device' }}
-          </button>
           <button type="button" :disabled="meshtasticOwnerLoading || meshtasticOwnerSaving" @click="saveMeshtasticOwner">
             {{ meshtasticOwnerSaving ? 'saving…' : 'save to device' }}
           </button>
@@ -1339,13 +1368,7 @@ chmod g+w {{ configFile }}</pre>
           </p>
         </div>
         <div v-else class="muted" style="margin:0.5rem 0;">
-          {{ meshtasticSecurityLoading ? 'Loading…' : 'Not loaded — click "Load security config" to read.' }}
-        </div>
-
-        <div class="actions" style="margin-top:0.75rem;">
-          <button type="button" :disabled="meshtasticSecurityLoading" @click="loadMeshtasticSecurity">
-            {{ meshtasticSecurityLoading ? 'loading…' : 'load security config' }}
-          </button>
+          {{ meshtasticSecurityLoading ? 'Loading…' : 'Not available — device not connected, or use "Refresh from device" above.' }}
         </div>
       </section>
 

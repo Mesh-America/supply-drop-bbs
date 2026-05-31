@@ -568,6 +568,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api_get_meshtastic_owner).patch(api_patch_meshtastic_owner),
         )
         .route("/meshtastic-security", get(api_get_meshtastic_security))
+        .route("/meshtastic-device", get(api_get_meshtastic_device))
         .route("/node-identity", get(api_get_node_identity))
         .route("/node-identity/export-key", post(api_export_node_key))
         .route("/node-identity/import-key", post(api_import_node_key))
@@ -2740,6 +2741,31 @@ fn save_meshtastic_owner_to_config(
 }
 
 // ── Meshtastic radio config ───────────────────────────────────────────────────
+
+/// `GET /api/v1/meshtastic-device` — combined snapshot (LoRa + owner + security)
+/// served from the config captured during the last connect-time sync. One call,
+/// no device round-trip; used to populate the Settings page on load.
+async fn api_get_meshtastic_device(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_meshtastic_snapshot().await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
 
 async fn api_get_meshtastic_radio_config(
     State(state): State<Arc<AppState>>,

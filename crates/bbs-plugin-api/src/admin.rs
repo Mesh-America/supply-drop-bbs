@@ -287,6 +287,19 @@ pub struct MeshtasticSecurityInfo {
     pub admin_channel_enabled: bool,
 }
 
+/// A combined snapshot of the connected Meshtastic device's settings, served
+/// from the config captured during the last connect-time sync (no live admin
+/// round-trip). Any field is `None` if the device hasn't reported it yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MeshtasticDeviceSnapshot {
+    /// LoRa radio configuration.
+    pub lora: Option<MeshtasticLoRaConfig>,
+    /// Node owner / identity info.
+    pub owner: Option<MeshtasticOwnerInfo>,
+    /// Security / PKC configuration.
+    pub security: Option<MeshtasticSecurityInfo>,
+}
+
 /// One entry in the durable audit log.
 ///
 /// Written whenever a privileged action is performed: ban, unban, validate,

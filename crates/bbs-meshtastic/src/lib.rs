@@ -916,6 +916,8 @@ async fn event_loop(
                             MeshtasticAdminRequest::GetOwner { reply } => { let _ = reply.send(Err(e)); }
                             MeshtasticAdminRequest::SetOwner { reply, .. } => { let _ = reply.send(Err(e)); }
                             MeshtasticAdminRequest::GetSecurity { reply } => { let _ = reply.send(Err(e)); }
+                            // Not connected yet → empty snapshot rather than an error.
+                            MeshtasticAdminRequest::GetSnapshot { reply } => { let _ = reply.send(Ok(Default::default())); }
                         }
                     }
                     reject_no_num(req);
@@ -997,6 +999,18 @@ async fn event_loop(
                             pending_admin = Some(PendingMeshtasticAdmin::GetSecurity { request_id: rid, reply });
                         }
                     }
+                    MeshtasticAdminRequest::GetSnapshot { reply } => {
+                        // Served instantly from the sync cache — no device round-trip.
+                        let snapshot = {
+                            let st = state.lock().expect("state mutex poisoned");
+                            device_snapshot(
+                                st.device_lora.as_ref(),
+                                st.device_owner.as_ref(),
+                                st.device_security.as_ref(),
+                            )
+                        };
+                        let _ = reply.send(Ok(snapshot));
+                    }
                 }
             },
             _ = shutdown_rx.changed() => {
@@ -1014,7 +1028,7 @@ async fn event_loop(
 fn enqueue_auto_apply(
     cfg: &AutoApplyConfig,
     device_lora: Option<&proto::LoRaConfig>,
-    device_owner: Option<&(String, String)>,
+    device_owner: Option<&proto::User>,
     deferred: &mut Vec<DeferredWrite>,
 ) {
     if let Some(radio) = &cfg.radio {
@@ -1072,7 +1086,7 @@ fn enqueue_auto_apply(
         // every connect reboots the device and resets its periodic NodeInfo
         // broadcast timer, so neighbours never learn about us.
         let already_set = device_owner
-            .is_some_and(|(long, short)| *long == user.long_name && *short == user.short_name);
+            .is_some_and(|u| u.long_name == user.long_name && u.short_name == user.short_name);
         if already_set {
             info!(
                 long_name = %user.long_name,
@@ -1475,6 +1489,42 @@ where
     .map_err(|_| "timed out (20s) — is the device connected and not in use?".to_owned())?
 }
 
+/// Build a combined device snapshot DTO from the cached sync config.
+fn device_snapshot(
+    lora: Option<&proto::LoRaConfig>,
+    owner: Option<&proto::User>,
+    security: Option<&proto::SecurityConfig>,
+) -> bbs_plugin_api::MeshtasticDeviceSnapshot {
+    bbs_plugin_api::MeshtasticDeviceSnapshot {
+        lora: lora.map(|l| bbs_plugin_api::MeshtasticLoRaConfig {
+            use_preset: l.use_preset,
+            modem_preset: l.modem_preset,
+            bandwidth: l.bandwidth,
+            spread_factor: l.spread_factor,
+            coding_rate: l.coding_rate,
+            frequency_offset: l.frequency_offset,
+            region: l.region,
+            hop_limit: l.hop_limit,
+            tx_enabled: l.tx_enabled,
+            tx_power: l.tx_power,
+            channel_num: l.channel_num,
+            override_frequency: l.override_frequency,
+            sx126x_rx_boosted_gain: l.sx126x_rx_boosted_gain,
+            ignore_mqtt: l.ignore_mqtt,
+        }),
+        owner: owner.map(|u| bbs_plugin_api::MeshtasticOwnerInfo {
+            id: u.id.clone(),
+            long_name: u.long_name.clone(),
+            short_name: u.short_name.clone(),
+            public_key_hex: hex_encode(&u.public_key),
+        }),
+        security: security.map(|s| bbs_plugin_api::MeshtasticSecurityInfo {
+            public_key_hex: hex_encode(&s.public_key),
+            admin_channel_enabled: s.admin_channel_enabled,
+        }),
+    }
+}
+
 /// Build a Meshtastic owner `User` with firmware-safe field lengths.
 ///
 /// The firmware decodes these into fixed buffers — `short_name` is `char[5]`
@@ -1584,23 +1634,31 @@ async fn handle_from_radio(
                 let mut st = state.lock().expect("state mutex poisoned");
                 if Some(node.num) == st.my_node_num {
                     if let Some(u) = &node.user {
-                        st.device_owner = Some((u.long_name.clone(), u.short_name.clone()));
+                        st.device_owner = Some(u.clone());
                     }
                 }
             }
             record_node_advert(host, node);
         }
         Some(from_radio::PayloadVariant::Config(cfg)) => {
-            // Capture the device's current LoRa config from the sync stream so
-            // apply-on-connect can skip a redundant (reboot-inducing) write.
-            if let Some(proto::mt_config::PayloadVariant::Lora(lora)) = cfg.payload_variant {
-                debug!(
-                    region = lora.region,
-                    modem_preset = lora.modem_preset,
-                    use_preset = lora.use_preset,
-                    "meshtastic: captured device LoRa config from sync"
-                );
-                state.lock().expect("state mutex poisoned").device_lora = Some(lora);
+            // Capture the device's current config from the sync stream so
+            // apply-on-connect can skip redundant (reboot-inducing) writes and
+            // the web can serve a snapshot without a live admin round-trip.
+            match cfg.payload_variant {
+                Some(proto::mt_config::PayloadVariant::Lora(lora)) => {
+                    debug!(
+                        region = lora.region,
+                        modem_preset = lora.modem_preset,
+                        use_preset = lora.use_preset,
+                        "meshtastic: captured device LoRa config from sync"
+                    );
+                    state.lock().expect("state mutex poisoned").device_lora = Some(lora);
+                }
+                Some(proto::mt_config::PayloadVariant::Security(sec)) => {
+                    debug!("meshtastic: captured device security config from sync");
+                    state.lock().expect("state mutex poisoned").device_security = Some(sec);
+                }
+                None => {}
             }
         }
         Some(from_radio::PayloadVariant::Packet(packet)) => {

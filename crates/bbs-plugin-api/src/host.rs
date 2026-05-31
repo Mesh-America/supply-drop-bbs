@@ -80,6 +80,13 @@ pub enum MeshtasticAdminRequest {
         /// One-shot channel to deliver the result back to the caller.
         reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticSecurityInfo, String>>,
     },
+    /// Fetch a combined snapshot (LoRa + owner + security) from the cache
+    /// captured during the last connect-time sync. Answered instantly without a
+    /// device round-trip.
+    GetSnapshot {
+        /// One-shot channel to deliver the snapshot back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticDeviceSnapshot, String>>,
+    },
 }
 
 use crate::admin::{
@@ -524,6 +531,16 @@ pub trait Host: Send + Sync {
     async fn admin_get_meshtastic_security(&self) -> Result<MeshtasticSecurityInfo, HostError> {
         Err(HostError::NotSupported(
             "admin_get_meshtastic_security".into(),
+        ))
+    }
+
+    /// Fetch a combined snapshot of the Meshtastic device settings from the
+    /// cache captured during the last connect-time sync (no device round-trip).
+    async fn admin_get_meshtastic_snapshot(
+        &self,
+    ) -> Result<crate::admin::MeshtasticDeviceSnapshot, HostError> {
+        Err(HostError::NotSupported(
+            "admin_get_meshtastic_snapshot".into(),
         ))
     }
 
