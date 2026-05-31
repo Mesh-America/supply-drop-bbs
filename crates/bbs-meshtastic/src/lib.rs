@@ -469,7 +469,6 @@ impl Plugin for MeshtasticTransport {
         // periodic timer, so this is the only way to appear promptly.
         let advert_cmd_tx = self.cmd_tx.clone();
         let advert_state = Arc::clone(&self.state);
-        let advert_counter = Arc::clone(&self.packet_counter);
         let advert_long = self.long_name.clone();
         let advert_short = self.short_name.clone();
         let advert_hop = self.hop_limit;
@@ -490,7 +489,8 @@ impl Plugin for MeshtasticTransport {
                             user.id = format_node_id(node);
                             // Flood → multi-hop (configured hop limit); direct → neighbours only.
                             let hop = if flood { advert_hop } else { 0 };
-                            let id = advert_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // Varied id so the mesh doesn't dedup the broadcast.
+                            let id = random_packet_id();
                             if advert_cmd_tx
                                 .send(nodeinfo_broadcast(id, user, hop, advert_want_ack))
                                 .await
@@ -943,7 +943,11 @@ async fn event_loop(
                 }
                 match req {
                     MeshtasticAdminRequest::GetLoRaConfig { reply } => {
-                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Use a varied packet id, not the sequential counter: the
+                        // device dedups by (from, id) and silently drops admin
+                        // requests whose id it has seen before, so a low/repeating
+                        // id yields no response (the GET then reaps as abandoned).
+                        let rid = random_packet_id();
                         if cmd_tx.send(admin_get_lora_config(my_node_num, rid)).await.is_err() {
                             let _ = reply.send(Err("meshtastic client disconnected".into()));
                         } else {
@@ -973,7 +977,7 @@ async fn event_loop(
                         request_session_key(&cmd_tx, my_node_num, &mut session_requested, &deferred_writes).await;
                     }
                     MeshtasticAdminRequest::GetOwner { reply } => {
-                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let rid = random_packet_id();
                         if cmd_tx.send(admin_get_owner(my_node_num, rid)).await.is_err() {
                             let _ = reply.send(Err("meshtastic client disconnected".into()));
                         } else {
@@ -986,7 +990,7 @@ async fn event_loop(
                         request_session_key(&cmd_tx, my_node_num, &mut session_requested, &deferred_writes).await;
                     }
                     MeshtasticAdminRequest::GetSecurity { reply } => {
-                        let rid = packet_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let rid = random_packet_id();
                         if cmd_tx.send(admin_get_security_config(my_node_num, rid)).await.is_err() {
                             let _ = reply.send(Err("meshtastic client disconnected".into()));
                         } else {
