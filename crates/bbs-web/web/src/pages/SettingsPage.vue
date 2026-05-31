@@ -430,11 +430,364 @@ async function saveRadioConfig() {
     }
     const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
     radioConfig.value = updated
-    radioSaveOk.value = 'Radio config saved. Apply to device with: sudo supply-drop-bbs node set-radio'
+    radioSaveOk.value = 'Radio config saved to config.toml.'
   } catch (e: any) {
     radioSaveError.value = e?.message ?? 'failed to save radio config'
   } finally {
     radioSaving.value = false
+  }
+}
+
+const radioApplying = ref(false)
+const radioApplyOk = ref<string | null>(null)
+const radioApplyError = ref<string | null>(null)
+
+async function applyRadioConfig() {
+  radioApplying.value  = true
+  radioApplyOk.value   = null
+  radioApplyError.value = null
+  try {
+    await api.post('/api/v1/radio-config/apply', {
+      frequency_hz:     radioFrequencyHz.value     ? parseInt(radioFrequencyHz.value, 10)     : 0,
+      bandwidth_hz:     radioBandwidthHz.value     ? parseInt(radioBandwidthHz.value, 10)     : 0,
+      spreading_factor: radioSpreadingFactor.value ? parseInt(radioSpreadingFactor.value, 10) : 0,
+      coding_rate:      radioCodingRate.value      ? parseInt(radioCodingRate.value, 10)      : 0,
+      tx_power_dbm:     radioTxPowerDbm.value      ? parseInt(radioTxPowerDbm.value, 10)      : 0,
+    })
+    radioApplyOk.value = 'Radio parameters applied to device.'
+  } catch (e: any) {
+    radioApplyError.value = e?.message ?? 'failed to apply radio config'
+  } finally {
+    radioApplying.value = false
+  }
+}
+
+// ── Meshtastic region / modem preset constants ────────────────────────────────
+
+const MESHTASTIC_REGIONS = [
+  { value: 0,  label: 'UNSET — not configured' },
+  { value: 1,  label: 'US — United States (902–928 MHz)' },
+  { value: 2,  label: 'EU_433 — Europe 433 MHz' },
+  { value: 3,  label: 'EU_868 — Europe 868 MHz' },
+  { value: 4,  label: 'CN — China 470–510 MHz' },
+  { value: 5,  label: 'JP — Japan 920–923 MHz' },
+  { value: 6,  label: 'ANZ — Australia/New Zealand 915–928 MHz' },
+  { value: 7,  label: 'KR — South Korea 920–923 MHz' },
+  { value: 8,  label: 'TW — Taiwan 920–925 MHz' },
+  { value: 9,  label: 'RU — Russia 868 MHz' },
+  { value: 10, label: 'IN — India 865–867 MHz' },
+  { value: 11, label: 'NZ_865 — New Zealand 865 MHz' },
+  { value: 12, label: 'TH — Thailand 920–925 MHz' },
+  { value: 13, label: 'LORA_24 — 2.4 GHz (SX128x)' },
+  { value: 14, label: 'UA_433 — Ukraine 433 MHz' },
+  { value: 15, label: 'UA_868 — Ukraine 868 MHz' },
+  { value: 16, label: 'MY_433 — Malaysia 433 MHz' },
+  { value: 17, label: 'MY_919 — Malaysia 919 MHz' },
+  { value: 18, label: 'SG_923 — Singapore 923 MHz' },
+]
+
+const MESHTASTIC_PRESETS = [
+  { value: 0, label: 'LONG_FAST — long range, fast (default)' },
+  { value: 1, label: 'LONG_SLOW — long range, slow (deprecated in 2.7)' },
+  { value: 3, label: 'MEDIUM_SLOW — medium range, slow' },
+  { value: 4, label: 'MEDIUM_FAST — medium range, fast' },
+  { value: 5, label: 'SHORT_SLOW — short range, slow' },
+  { value: 6, label: 'SHORT_FAST — short range, fast' },
+  { value: 7, label: 'LONG_MODERATE — long range, moderate (125 kHz)' },
+  { value: 8, label: 'SHORT_TURBO — fastest (500 kHz, not legal everywhere)' },
+  { value: 9, label: 'LONG_TURBO — long range, 500 kHz' },
+  { value: 10, label: 'LITE_FAST — EU_866 compliant, ~MEDIUM_FAST range' },
+  { value: 11, label: 'LITE_SLOW — EU_866 compliant, ~LONG_FAST range' },
+  { value: 12, label: 'NARROW_FAST — EU_868 62.5 kHz, ~SHORT_SLOW range' },
+  { value: 13, label: 'NARROW_SLOW — EU_868 62.5 kHz, ~LONG_FAST range' },
+]
+
+// Region frequency ranges (MHz) and preset bandwidths (kHz), used to show the
+// frequency the device will operate on. Mirrors the Meshtastic firmware's
+// region table and modem-preset bandwidths.
+const MESHTASTIC_REGION_FREQ: Record<number, { start: number; end: number }> = {
+  1:  { start: 902.0,  end: 928.0 },   // US
+  2:  { start: 433.0,  end: 434.0 },   // EU_433
+  3:  { start: 869.4,  end: 869.65 },  // EU_868
+  4:  { start: 470.0,  end: 510.0 },   // CN
+  5:  { start: 920.8,  end: 927.8 },   // JP
+  6:  { start: 915.0,  end: 928.0 },   // ANZ
+  7:  { start: 920.0,  end: 923.0 },   // KR
+  8:  { start: 920.0,  end: 925.0 },   // TW
+  9:  { start: 868.7,  end: 869.2 },   // RU
+  10: { start: 865.0,  end: 867.0 },   // IN
+  11: { start: 864.0,  end: 868.0 },   // NZ_865
+  12: { start: 920.0,  end: 925.0 },   // TH
+  13: { start: 2400.0, end: 2483.5 },  // LORA_24
+  14: { start: 433.0,  end: 434.7 },   // UA_433
+  15: { start: 868.0,  end: 868.6 },   // UA_868
+  16: { start: 433.0,  end: 435.0 },   // MY_433
+  17: { start: 919.0,  end: 924.0 },   // MY_919
+  18: { start: 917.0,  end: 925.0 },   // SG_923
+}
+const MESHTASTIC_PRESET_BW_KHZ: Record<number, number> = {
+  0: 250, 1: 125, 3: 250, 4: 250, 5: 250, 6: 250,
+  7: 125, 8: 500, 9: 500, 10: 250, 11: 250, 12: 62.5, 13: 62.5,
+}
+
+// ── Meshtastic radio ──────────────────────────────────────────────────────────
+
+const meshtasticRadioLoading = ref(false)
+const meshtasticRadioSaving = ref(false)
+const meshtasticRadioError = ref<string | null>(null)
+const meshtasticRadioOk = ref<string | null>(null)
+
+const meshtasticUsePreset = ref(false)
+const meshtasticModemPreset = ref(0)
+const meshtasticBandwidth = ref(0)
+const meshtasticSpreadFactor = ref(11)
+const meshtasticCodingRate = ref(8)
+const meshtasticFrequencyOffset = ref(0)
+const meshtasticRegion = ref(0)
+const meshtasticHopLimit = ref(3)
+const meshtasticTxEnabled = ref(true)
+const meshtasticTxPower = ref(17)
+const meshtasticChannelNum = ref(0)
+const meshtasticOverrideFrequency = ref(0)
+const meshtasticRxBoostedGain = ref(true)
+const meshtasticIgnoreMqtt = ref(true)
+
+// Frequency (MHz) the device will use, derived from region + preset + channel
+// slot. Channel slot is the configured channel_num (1-based; 0 = device auto-
+// selects slot 1 by default, or a slot hashed from the channel name).
+const meshtasticDerivedFreq = computed<number | null>(() => {
+  const r = MESHTASTIC_REGION_FREQ[meshtasticRegion.value]
+  if (!r) return null
+  const bw = MESHTASTIC_PRESET_BW_KHZ[meshtasticModemPreset.value] ?? 250
+  const slot = meshtasticChannelNum.value > 0 ? meshtasticChannelNum.value - 1 : 0
+  const freq = r.start + bw / 2000 + slot * (bw / 1000)
+  return Math.round(freq * 1000) / 1000
+})
+
+// What the Frequency field shows/edits: the override when set, otherwise the
+// region/preset-derived default. Entering the derived value (or 0/blank) clears
+// the override so the device keeps deriving it from the region.
+const meshtasticFreqInput = computed<number>({
+  get() {
+    if (meshtasticOverrideFrequency.value && meshtasticOverrideFrequency.value !== 0) {
+      return meshtasticOverrideFrequency.value
+    }
+    return meshtasticDerivedFreq.value ?? 0
+  },
+  set(v) {
+    if (!v || v === meshtasticDerivedFreq.value) {
+      meshtasticOverrideFrequency.value = 0
+    } else {
+      meshtasticOverrideFrequency.value = v
+    }
+  },
+})
+
+function applyMeshtasticRadioFields(r: any) {
+  meshtasticUsePreset.value         = r.use_preset ?? false
+  meshtasticModemPreset.value       = r.modem_preset ?? 0
+  meshtasticBandwidth.value         = r.bandwidth ?? 0
+  meshtasticSpreadFactor.value      = r.spread_factor ?? 11
+  meshtasticCodingRate.value        = r.coding_rate ?? 8
+  meshtasticFrequencyOffset.value   = r.frequency_offset ?? 0
+  meshtasticRegion.value            = r.region ?? 0
+  meshtasticHopLimit.value          = r.hop_limit ?? 3
+  meshtasticTxEnabled.value         = r.tx_enabled ?? true
+  meshtasticTxPower.value           = r.tx_power ?? 17
+  meshtasticChannelNum.value        = r.channel_num ?? 0
+  meshtasticOverrideFrequency.value = r.override_frequency ?? 0
+  meshtasticRxBoostedGain.value     = r.sx126x_rx_boosted_gain ?? true
+  meshtasticIgnoreMqtt.value        = r.ignore_mqtt ?? true
+}
+
+async function loadMeshtasticRadio(opts: { silent?: boolean } = {}) {
+  meshtasticRadioLoading.value = true
+  meshtasticRadioError.value = null
+  meshtasticRadioOk.value = null
+  try {
+    const r = await api.get<any>('/api/v1/meshtastic-radio-config')
+    applyMeshtasticRadioFields(r)
+    if (!opts.silent) meshtasticRadioOk.value = 'Loaded from device.'
+  } catch (e: any) {
+    // On the silent mount-time load, stay quiet when the transport isn't
+    // connected — the user can hit "load from device" explicitly.
+    if (!opts.silent) {
+      meshtasticRadioError.value = e?.message ?? 'failed to load meshtastic radio config'
+    }
+  } finally {
+    meshtasticRadioLoading.value = false
+  }
+}
+
+async function saveMeshtasticRadio() {
+  meshtasticRadioSaving.value = true
+  meshtasticRadioError.value = null
+  meshtasticRadioOk.value = null
+  try {
+    const res = await api.patch<any>('/api/v1/meshtastic-radio-config', {
+      // We always operate in preset mode; bandwidth/SF/CR are preset-derived.
+      use_preset:         true,
+      modem_preset:       meshtasticModemPreset.value,
+      bandwidth:          meshtasticBandwidth.value,
+      spread_factor:      meshtasticSpreadFactor.value,
+      coding_rate:        meshtasticCodingRate.value,
+      frequency_offset:   meshtasticFrequencyOffset.value,
+      region:             meshtasticRegion.value,
+      hop_limit:          meshtasticHopLimit.value,
+      tx_enabled:         meshtasticTxEnabled.value,
+      tx_power:           meshtasticTxPower.value,
+      channel_num:        meshtasticChannelNum.value,
+      override_frequency: meshtasticOverrideFrequency.value,
+      sx126x_rx_boosted_gain: meshtasticRxBoostedGain.value,
+      ignore_mqtt:        meshtasticIgnoreMqtt.value,
+    })
+    if (res?.applied === false) {
+      meshtasticRadioOk.value = 'Saved. The device is not connected right now — these settings will be applied automatically the next time the BBS connects to it.'
+    } else if (res?.confirmed && res?.device_config) {
+      // Update the form to reflect the device's actual current values.
+      applyMeshtasticRadioFields(res.device_config)
+      meshtasticRadioOk.value = 'Applied — confirmed on device.'
+    } else {
+      meshtasticRadioOk.value = res?.message ?? 'Settings sent — use "Load from device" shortly to confirm.'
+    }
+  } catch (e: any) {
+    meshtasticRadioError.value = e?.message ?? 'failed to save meshtastic radio config'
+  } finally {
+    meshtasticRadioSaving.value = false
+  }
+}
+
+// ── Meshtastic device (owner + security) ─────────────────────────────────────
+
+interface MeshtasticOwnerData {
+  id: string
+  long_name: string
+  short_name: string
+  public_key_hex: string
+}
+
+interface MeshtasticSecurityData {
+  public_key_hex: string
+  admin_channel_enabled: boolean
+}
+
+const meshtasticOwnerLoading = ref(false)
+const meshtasticOwnerSaving = ref(false)
+const meshtasticOwnerError = ref<string | null>(null)
+const meshtasticOwnerOk = ref<string | null>(null)
+const meshtasticOwner = ref<MeshtasticOwnerData | null>(null)
+const meshtasticLongName = ref('')
+const meshtasticShortName = ref('')
+
+const meshtasticSecurityLoading = ref(false)
+const meshtasticSecurityError = ref<string | null>(null)
+const meshtasticSecurity = ref<MeshtasticSecurityData | null>(null)
+
+async function loadMeshtasticOwner(opts: { silent?: boolean } = {}) {
+  meshtasticOwnerLoading.value = true
+  meshtasticOwnerError.value = null
+  meshtasticOwnerOk.value = null
+  try {
+    const r = await api.get<MeshtasticOwnerData>('/api/v1/meshtastic-owner')
+    meshtasticOwner.value = r
+    meshtasticLongName.value = r.long_name
+    meshtasticShortName.value = r.short_name
+    if (!opts.silent) meshtasticOwnerOk.value = 'Loaded from device.'
+  } catch (e: any) {
+    if (!opts.silent) {
+      meshtasticOwnerError.value = e?.message ?? 'failed to load device owner info'
+    }
+  } finally {
+    meshtasticOwnerLoading.value = false
+  }
+}
+
+async function saveMeshtasticOwner() {
+  meshtasticOwnerSaving.value = true
+  meshtasticOwnerError.value = null
+  meshtasticOwnerOk.value = null
+  try {
+    const res = await api.patch<any>('/api/v1/meshtastic-owner', {
+      long_name: meshtasticLongName.value || null,
+      short_name: meshtasticShortName.value || null,
+    })
+    if (res?.applied === false) {
+      meshtasticOwnerOk.value = 'Saved. The device is not connected right now — this name will be applied automatically the next time the BBS connects to it.'
+    } else if (res?.confirmed && res?.device_owner) {
+      meshtasticOwner.value = res.device_owner
+      meshtasticLongName.value = res.device_owner.long_name
+      meshtasticShortName.value = res.device_owner.short_name
+      meshtasticOwnerOk.value = 'Applied — confirmed on device.'
+    } else {
+      meshtasticOwnerOk.value = res?.message ?? 'Name sent — use "Load from device" shortly to confirm.'
+    }
+  } catch (e: any) {
+    meshtasticOwnerError.value = e?.message ?? 'failed to save device owner info'
+  } finally {
+    meshtasticOwnerSaving.value = false
+  }
+}
+
+async function loadMeshtasticSecurity() {
+  meshtasticSecurityLoading.value = true
+  meshtasticSecurityError.value = null
+  try {
+    const r = await api.get<MeshtasticSecurityData>('/api/v1/meshtastic-security')
+    meshtasticSecurity.value = r
+  } catch (e: any) {
+    meshtasticSecurityError.value = e?.message ?? 'failed to load security config'
+  } finally {
+    meshtasticSecurityLoading.value = false
+  }
+}
+
+// Populate radio + owner + security in a single call from the cached snapshot
+// (captured during the last connect-time sync). Used on page load — no buttons,
+// no device round-trip. Silent: stays quiet if the transport isn't connected.
+async function loadMeshtasticSnapshot() {
+  try {
+    const s = await api.get<any>('/api/v1/meshtastic-device')
+    if (s?.lora) applyMeshtasticRadioFields(s.lora)
+    if (s?.owner) {
+      meshtasticOwner.value = s.owner
+      meshtasticLongName.value = s.owner.long_name
+      meshtasticShortName.value = s.owner.short_name
+    }
+    if (s?.security) meshtasticSecurity.value = s.security
+  } catch {
+    // No transport / not connected — leave sections at their defaults.
+  }
+}
+
+// Manual "refresh from device": live reads against the device, one section at a
+// time (only one admin op may be in flight). Surfaces errors, unlike the load.
+const meshtasticRefreshing = ref(false)
+async function refreshMeshtasticDevice() {
+  meshtasticRefreshing.value = true
+  try {
+    await loadMeshtasticRadio()
+    await loadMeshtasticOwner()
+    await loadMeshtasticSecurity()
+  } finally {
+    meshtasticRefreshing.value = false
+  }
+}
+
+// Reboot the radio (forces a boot-time NodeInfo broadcast so neighbours
+// re-acquire the node). The device drops off for ~30s.
+const meshtasticRebooting = ref(false)
+const meshtasticRebootMsg = ref<string | null>(null)
+async function rebootMeshtasticRadio() {
+  if (!confirm('Reboot the Meshtastic radio? It drops off the mesh for ~30s, then re-announces itself to neighbours on boot.')) return
+  meshtasticRebooting.value = true
+  meshtasticRebootMsg.value = null
+  try {
+    const res = await api.post<any>('/api/v1/meshtastic-reboot', {})
+    meshtasticRebootMsg.value = res?.message ?? 'Reboot requested.'
+  } catch (e: any) {
+    meshtasticRebootMsg.value = e?.message ?? 'failed to reboot radio'
+  } finally {
+    meshtasticRebooting.value = false
   }
 }
 
@@ -539,12 +892,25 @@ function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text).catch(() => {})
 }
 
+// Which settings tab is visible. Sections are grouped by area so the two
+// MeshCore pieces (radio + identity) and the two Meshtastic pieces (radio +
+// device) live together instead of being interleaved.
+type SettingsTab = 'general' | 'meshcore' | 'meshtastic' | 'system'
+const settingsTab = ref<SettingsTab>('general')
+const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
+  { id: 'general', label: 'General' },
+  { id: 'meshcore', label: 'MeshCore' },
+  { id: 'meshtastic', label: 'Meshtastic' },
+  { id: 'system', label: 'System' },
+]
+
 onMounted(() => {
   load()
   loadRooms()
   loadAccessPolicy()
   loadRadioConfig()
   loadNodeIdentity()
+  loadMeshtasticSnapshot()
 })
 </script>
 
@@ -577,10 +943,24 @@ chmod g+w {{ configFile }}</pre>
     <div v-if="saveOk" class="notice ok-notice">{{ saveOk }}</div>
     <div v-if="saveError" class="notice error-notice">{{ saveError }}</div>
 
+    <nav v-if="!loadError" class="settings-tabs" role="tablist">
+      <button
+        v-for="t in SETTINGS_TABS"
+        :key="t.id"
+        type="button"
+        role="tab"
+        :class="{ active: settingsTab === t.id }"
+        :aria-selected="settingsTab === t.id"
+        @click="settingsTab = t.id"
+      >
+        {{ t.label }}
+      </button>
+    </nav>
+
     <form v-if="!loadError" @submit.prevent="save" class="settings-form" novalidate>
 
       <!-- BBS Identity -->
-      <section class="card">
+      <section v-show="settingsTab === 'general'" class="card">
         <h2>BBS identity</h2>
 
         <div class="field" :class="{ 'has-error': validationErrors.bbs_name }">
@@ -631,7 +1011,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- GPS location -->
-      <section class="card">
+      <section v-show="settingsTab === 'general'" class="card">
         <h2>GPS location</h2>
         <p class="hint">
           When set, the mesh transport sends your coordinates to the radio on connect so your
@@ -661,7 +1041,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Backup -->
-      <section class="card">
+      <section v-show="settingsTab === 'system'" class="card">
         <h2>Automatic backups</h2>
         <div class="field checkbox-field">
           <label>
@@ -689,7 +1069,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Security -->
-      <section class="card">
+      <section v-show="settingsTab === 'system'" class="card">
         <h2>Security</h2>
         <div class="field-row">
           <div class="field" :class="{ 'has-error': validationErrors.security_session_web_hours }">
@@ -719,7 +1099,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Logging -->
-      <section class="card">
+      <section v-show="settingsTab === 'system'" class="card">
         <h2>Logging</h2>
         <div class="field">
           <label>Log level</label>
@@ -730,16 +1110,8 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
-      <div class="actions">
-        <button type="submit" :disabled="saving || !writable || !isDirty || !isFormValid">
-          {{ saving ? 'saving…' : 'save settings' }}
-        </button>
-        <span v-if="!writable" class="hint">config file is not writable</span>
-        <span v-else-if="!isDirty" class="hint">no unsaved changes</span>
-      </div>
-
       <!-- Access policy -->
-      <section class="card">
+      <section v-show="settingsTab === 'general'" class="card">
         <h2>Access policy</h2>
         <p class="hint">
           Controls how new registrations are handled. Changes take effect
@@ -799,31 +1171,21 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
-      <!-- MeshCore Radio -->
-      <section class="card">
+      <!-- MeshCore Radio — shown for all MeshCore connection types -->
+      <section v-if="radioConfig" v-show="settingsTab === 'meshcore'" class="card">
         <h2>MeshCore radio</h2>
         <p class="hint">
-          LoRa parameters for the MeshCore companion device
-          <span v-if="radioConfig?.connection_type === 'serial' && radioConfig?.serial_port">
-            (<code>{{ radioConfig.serial_port }}</code>)
-          </span>
-          <span v-else-if="radioConfig?.connection_type === 'hat'">
-            (Pi HAT via pymc-companion)
-          </span>
-          <span v-else-if="radioConfig?.connection_type === 'tcp'">
-            (TCP — pymc-companion)
-          </span>.
-          Saved to <code>[plugins.mesh.radio]</code> in config.toml.
-          Settings are <strong>not</strong> applied automatically — after saving, run:
-          <code>sudo supply-drop-bbs node set-radio</code>
-        </p>
-        <p class="hint" style="margin-top: 0.3rem">
-          Using Meshtastic? Radio parameters are configured in the Meshtastic app — they are not managed here.
+          LoRa parameters for the MeshCore companion device.
+          Save here to record them in config.toml. Use <strong>Apply to device</strong>
+          to push the current values directly to the live companion device over the
+          existing connection.
         </p>
 
         <div v-if="radioError" class="notice error-notice">{{ radioError }}</div>
         <div v-if="radioSaveOk" class="notice ok-notice">{{ radioSaveOk }}</div>
         <div v-if="radioSaveError" class="notice error-notice">{{ radioSaveError }}</div>
+        <div v-if="radioApplyOk" class="notice ok-notice">{{ radioApplyOk }}</div>
+        <div v-if="radioApplyError" class="notice error-notice">{{ radioApplyError }}</div>
 
         <div class="field">
           <label>Region preset</label>
@@ -866,19 +1228,191 @@ chmod g+w {{ configFile }}</pre>
           <button type="button" :disabled="radioSaving || radioLoading || !writable" @click="saveRadioConfig">
             {{ radioSaving ? 'saving…' : 'save radio config' }}
           </button>
+          <button type="button" :disabled="radioApplying || radioLoading || !radioConfig" @click="applyRadioConfig">
+            {{ radioApplying ? 'applying…' : 'apply to device' }}
+          </button>
           <span v-if="!writable" class="hint">config file is not writable</span>
         </div>
       </section>
 
-      <!-- Node identity -->
-      <section class="card">
-        <h2>Node identity</h2>
+      <!-- Meshtastic radio -->
+      <section v-show="settingsTab === 'meshtastic'" class="card">
+        <h2>Meshtastic radio</h2>
         <p class="hint">
-          The MeshCore companion device's identity keypair. The public key identifies
-          your node on the mesh network and is shared with other stations to contact you.
-          Use <strong>Set node key</strong> to paste a known 64-character hex key (e.g. when
-          migrating to new hardware). Export the private key for backup before a firmware
-          flash. <strong>Keep the private key secret.</strong>
+          LoRa radio configuration for the connected Meshtastic device.
+          Use <strong>Load from device</strong> to read the current settings,
+          edit them, then <strong>Save to device</strong> to push them back.
+        </p>
+
+        <div v-if="meshtasticRadioError" class="notice error-notice">{{ meshtasticRadioError }}</div>
+        <div v-if="meshtasticRadioOk" class="notice ok-notice">{{ meshtasticRadioOk }}</div>
+
+        <!-- Region and modem preset — dropdowns -->
+        <div class="field-row">
+          <div class="field">
+            <label>Region</label>
+            <select v-model.number="meshtasticRegion" :disabled="meshtasticRadioLoading">
+              <option v-for="r in MESHTASTIC_REGIONS" :key="r.value" :value="r.value">
+                {{ r.label }}
+              </option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Modem preset</label>
+            <select v-model.number="meshtasticModemPreset" :disabled="meshtasticRadioLoading">
+              <option v-for="p in MESHTASTIC_PRESETS" :key="p.value" :value="p.value">
+                {{ p.label }}
+              </option>
+            </select>
+            <p class="hint">Bandwidth, spreading factor, and coding rate are set by the preset.</p>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>TX power (dBm)</label>
+            <input v-model.number="meshtasticTxPower" type="number" :disabled="meshtasticRadioLoading" />
+          </div>
+          <div class="field">
+            <label>Hop limit</label>
+            <input v-model.number="meshtasticHopLimit" type="number" min="0" max="7" :disabled="meshtasticRadioLoading" />
+          </div>
+          <div class="field">
+            <label>Frequency (MHz)</label>
+            <input
+              v-model.number="meshtasticFreqInput"
+              type="number"
+              step="0.001"
+              :disabled="meshtasticRadioLoading"
+            />
+            <p class="hint">
+              <template v-if="meshtasticOverrideFrequency && meshtasticOverrideFrequency !== 0">
+                Overriding the region default.
+              </template>
+              <template v-else-if="meshtasticDerivedFreq !== null">
+                Derived from region + preset. Edit to override.
+              </template>
+              <template v-else>
+                Select a region to see the operating frequency.
+              </template>
+            </p>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field" style="display:flex;flex-direction:column;gap:0.5rem;">
+            <label style="display:flex;align-items:center;gap:0.5rem;">
+              <input type="checkbox" v-model="meshtasticTxEnabled" :disabled="meshtasticRadioLoading" />
+              TX enabled
+            </label>
+            <label style="display:flex;align-items:center;gap:0.5rem;">
+              <input type="checkbox" v-model="meshtasticRxBoostedGain" :disabled="meshtasticRadioLoading" />
+              RX boosted gain
+            </label>
+            <label style="display:flex;align-items:center;gap:0.5rem;">
+              <input type="checkbox" v-model="meshtasticIgnoreMqtt" :disabled="meshtasticRadioLoading" />
+              Ignore MQTT
+            </label>
+          </div>
+        </div>
+
+        <div class="actions">
+          <button type="button" :disabled="meshtasticRadioLoading || meshtasticRadioSaving" @click="saveMeshtasticRadio">
+            {{ meshtasticRadioSaving ? 'saving…' : 'save to device' }}
+          </button>
+          <button type="button" class="secondary" :disabled="meshtasticRefreshing" @click="refreshMeshtasticDevice">
+            {{ meshtasticRefreshing ? 'refreshing…' : 'refresh from device' }}
+          </button>
+          <span class="hint">Values shown are from the last device sync. Refresh to re-read live.</span>
+        </div>
+      </section>
+
+      <!-- Meshtastic device — owner info and PKC key -->
+      <section v-show="settingsTab === 'meshtastic'" class="card">
+        <h2>Meshtastic device <span class="badge">Meshtastic</span></h2>
+        <p class="hint">
+          Node identity and PKC (public-key cryptography) settings for the connected
+          Meshtastic radio. The public key is derived from the device's private key and is
+          broadcast on the mesh so other nodes can send you encrypted direct messages.
+        </p>
+
+        <!-- Owner / node name -->
+        <h3 style="margin: 1rem 0 0.5rem">Node name</h3>
+        <div v-if="meshtasticOwnerError" class="notice error-notice">{{ meshtasticOwnerError }}</div>
+        <div v-if="meshtasticOwnerOk" class="notice ok-notice">{{ meshtasticOwnerOk }}</div>
+
+        <div class="field-row">
+          <div v-if="meshtasticOwner" class="field">
+            <label>Node ID</label>
+            <code style="display:block;padding:0.3rem 0;">{{ meshtasticOwner.id }}</code>
+          </div>
+          <div class="field">
+            <label>Long name</label>
+            <input v-model="meshtasticLongName" type="text" maxlength="39" :disabled="meshtasticOwnerLoading" />
+          </div>
+          <div class="field">
+            <label>Short name <span class="hint" style="display:inline">(≤ 4 chars)</span></label>
+            <input v-model="meshtasticShortName" type="text" maxlength="4" :disabled="meshtasticOwnerLoading" />
+          </div>
+        </div>
+        <p class="hint">
+          Saved to config.toml and pushed to the device. Applied automatically on the next
+          connect even if the device is offline now.
+        </p>
+
+        <div class="actions" style="margin-top:0.75rem;">
+          <button type="button" :disabled="meshtasticOwnerLoading || meshtasticOwnerSaving" @click="saveMeshtasticOwner">
+            {{ meshtasticOwnerSaving ? 'saving…' : 'save to device' }}
+          </button>
+        </div>
+
+        <!-- PKC public key -->
+        <h3 style="margin: 1.5rem 0 0.5rem">Public key (PKC)</h3>
+        <div v-if="meshtasticSecurityError" class="notice error-notice">{{ meshtasticSecurityError }}</div>
+
+        <div v-if="meshtasticSecurity" class="field">
+          <label>Public key (Curve25519, hex)</label>
+          <div class="key-display">
+            <code class="key-hex">{{ meshtasticSecurity.public_key_hex || '(not set)' }}</code>
+            <button
+              v-if="meshtasticSecurity.public_key_hex"
+              type="button"
+              class="icon-btn"
+              title="Copy public key"
+              @click="copyToClipboard(meshtasticSecurity.public_key_hex)"
+            >⎘</button>
+          </div>
+          <p class="hint" style="margin-top:0.3rem;">
+            Admin channel: <strong>{{ meshtasticSecurity.admin_channel_enabled ? 'enabled' : 'disabled' }}</strong>.
+            To manage the private key or admin keys, use the Meshtastic app or meshtasticd CLI.
+          </p>
+        </div>
+        <div v-else class="muted" style="margin:0.5rem 0;">
+          {{ meshtasticSecurityLoading ? 'Loading…' : 'Not available — device not connected, or use "Refresh from device" above.' }}
+        </div>
+
+        <h3 style="margin: 1.5rem 0 0.5rem">Re-announce</h3>
+        <p class="hint">
+          Reboot the radio to force a fresh NodeInfo broadcast so neighbouring nodes
+          re-acquire this BBS. Use this if the BBS disappears from another node's list.
+          The radio also re-announces automatically about once an hour.
+        </p>
+        <div v-if="meshtasticRebootMsg" class="notice ok-notice">{{ meshtasticRebootMsg }}</div>
+        <div class="actions" style="margin-top:0.5rem;">
+          <button type="button" class="secondary" :disabled="meshtasticRebooting" @click="rebootMeshtasticRadio">
+            {{ meshtasticRebooting ? 'rebooting…' : 'reboot radio (re-announce)' }}
+          </button>
+        </div>
+      </section>
+
+      <!-- Node identity -->
+      <section v-show="settingsTab === 'meshcore'" class="card">
+        <h2>Node identity <span class="badge">MeshCore</span></h2>
+        <p class="hint">
+          The <strong>MeshCore</strong> companion device's identity keypair. The public key
+          identifies your node on the MeshCore mesh network and is shared with other stations
+          to contact you. Use <strong>Set node key</strong> to paste a known 64-character hex
+          key (e.g. when migrating to new hardware). Export the private key for backup before a
+          firmware flash. <strong>Keep the private key secret.</strong>
+          For Meshtastic PKC keys, see the <em>Meshtastic device</em> section below.
         </p>
 
         <div v-if="nodeIdentityError" class="notice error-notice">{{ nodeIdentityError }}</div>
@@ -957,7 +1491,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Service restart -->
-      <section class="card">
+      <section v-show="settingsTab === 'system'" class="card">
         <h2>Service</h2>
         <p class="hint">
           Restart the systemd service to apply config changes. The web UI will
@@ -973,6 +1507,18 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
+      <!-- Global save for the config-file-backed settings (General + System). -->
+      <div
+        v-show="settingsTab === 'general' || settingsTab === 'system'"
+        class="actions save-actions"
+      >
+        <button type="submit" :disabled="saving || !writable || !isDirty || !isFormValid">
+          {{ saving ? 'saving…' : 'save settings' }}
+        </button>
+        <span v-if="!writable" class="hint">config file is not writable</span>
+        <span v-else-if="!isDirty" class="hint">no unsaved changes</span>
+      </div>
+
     </form>
   </div>
 </template>
@@ -981,6 +1527,31 @@ chmod g+w {{ configFile }}</pre>
 .page { display: flex; flex-direction: column; gap: 1.2rem; }
 .page-header { display: flex; flex-direction: column; gap: 0.2rem; }
 h1 { margin: 0; }
+
+.settings-tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.settings-tabs button {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.5rem 0.9rem;
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+.settings-tabs button:hover { color: var(--fg); }
+.settings-tabs button.active {
+  color: var(--fg);
+  border-bottom-color: var(--accent, #4a90d9);
+  font-weight: 600;
+}
+.save-actions { position: sticky; bottom: 0; }
 h2 { margin: 0 0 1rem; font-size: 1em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .small { font-size: 0.85em; }
 p { margin: 0; }

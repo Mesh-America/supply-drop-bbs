@@ -558,6 +558,18 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/radio-config",
             get(api_get_radio_config).patch(api_patch_radio_config),
         )
+        .route("/radio-config/apply", post(api_apply_radio_config))
+        .route(
+            "/meshtastic-radio-config",
+            get(api_get_meshtastic_radio_config).patch(api_patch_meshtastic_radio_config),
+        )
+        .route(
+            "/meshtastic-owner",
+            get(api_get_meshtastic_owner).patch(api_patch_meshtastic_owner),
+        )
+        .route("/meshtastic-security", get(api_get_meshtastic_security))
+        .route("/meshtastic-device", get(api_get_meshtastic_device))
+        .route("/meshtastic-reboot", post(api_reboot_meshtastic))
         .route("/node-identity", get(api_get_node_identity))
         .route("/node-identity/export-key", post(api_export_node_key))
         .route("/node-identity/import-key", post(api_import_node_key))
@@ -933,6 +945,7 @@ struct AdvertResponse {
     type_name: String,
     lat: f64,
     lon: f64,
+    transport: String,
 }
 
 async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
@@ -944,9 +957,10 @@ async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             pubkey: r.pubkey_hex,
             name: r.name,
             adv_type: r.adv_type,
-            type_name: adv_type_name(r.adv_type).to_owned(),
+            type_name: adv_type_name(&r.transport, r.adv_type).to_owned(),
             lat: r.lat,
             lon: r.lon,
+            transport: r.transport,
         })
         .collect();
     Json(out)
@@ -962,12 +976,38 @@ async fn api_adverts_clear(State(state): State<Arc<AppState>>) -> impl IntoRespo
     axum::http::StatusCode::NO_CONTENT
 }
 
-fn adv_type_name(t: u8) -> &'static str {
+/// Human-readable advert "type", interpreted per transport.
+///
+/// MeshCore uses its advert-type byte; Meshtastic reports the device role
+/// (`Config.DeviceConfig.Role`) which we surface as the type instead.
+fn adv_type_name(transport: &str, t: u8) -> &'static str {
+    if transport == "meshtastic" {
+        return meshtastic_role_name(t);
+    }
     match t {
         1 => "chat",
         2 => "repeater",
         3 => "room",
         4 => "sensor",
+        _ => "unknown",
+    }
+}
+
+/// Map a Meshtastic device role value to a short label.
+fn meshtastic_role_name(role: u8) -> &'static str {
+    match role {
+        0 => "client",
+        1 => "client_mute",
+        2 => "router",
+        3 => "router_client",
+        4 => "repeater",
+        5 => "tracker",
+        6 => "sensor",
+        7 => "tak",
+        8 => "client_hidden",
+        9 => "lost_and_found",
+        10 => "tak_tracker",
+        11 => "router_late",
         _ => "unknown",
     }
 }
@@ -1692,12 +1732,17 @@ async fn api_restart(
         )
         .await;
 
-    // Spawn restart after a short delay so the 202 response can leave first.
+    // Exit the process and let systemd's `Restart=` policy start a fresh
+    // instance (picking up the new binary/config). We deliberately do NOT shell
+    // out to `sudo systemctl restart`: the unit runs as a non-root user with
+    // `NoNewPrivileges=true`, so `sudo` cannot escalate ("no new privileges flag
+    // is set") and the restart silently fails. Exiting works without any
+    // privileges. A non-zero code triggers `Restart=on-failure`; `Restart=always`
+    // restarts on any exit. The short delay lets the 202 response flush first.
+    tracing::warn!("web admin: service restart requested — exiting for systemd to restart");
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let _ = std::process::Command::new("sudo")
-            .args(["systemctl", "restart", "supply-drop-bbs"])
-            .spawn();
+        std::process::exit(1);
     });
 
     (
@@ -2514,6 +2559,512 @@ async fn api_patch_radio_config(
         presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
+}
+
+// ── Radio config apply (MeshCore) ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct ApplyRadioBody {
+    frequency_hz: u32,
+    bandwidth_hz: u32,
+    spreading_factor: u8,
+    coding_rate: u8,
+    tx_power_dbm: i8,
+}
+
+async fn api_apply_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(body): Json<ApplyRadioBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let params = bbs_plugin_api::MeshRadioParams {
+        frequency_hz: body.frequency_hz,
+        bandwidth_hz: body.bandwidth_hz,
+        spreading_factor: body.spreading_factor,
+        coding_rate: body.coding_rate,
+        tx_power_dbm: body.tx_power_dbm,
+    };
+    match state.host.admin_apply_mesh_radio(params).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => {
+            let status = match &e {
+                HostError::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
+                HostError::NotSupported(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json_error(&format!("{e}")))).into_response()
+        }
+    }
+}
+
+// ── Meshtastic config.toml helpers ───────────────────────────────────────────
+
+fn meshtastic_region_name(n: i32) -> &'static str {
+    match n {
+        1 => "US",
+        2 => "EU_433",
+        3 => "EU_868",
+        4 => "CN",
+        5 => "JP",
+        6 => "ANZ",
+        7 => "KR",
+        8 => "TW",
+        9 => "RU",
+        10 => "IN",
+        11 => "NZ_865",
+        12 => "TH",
+        13 => "LORA_24",
+        14 => "UA_433",
+        15 => "UA_868",
+        16 => "MY_433",
+        17 => "MY_919",
+        18 => "SG_923",
+        _ => "UNSET",
+    }
+}
+
+fn meshtastic_preset_name(n: i32) -> &'static str {
+    match n {
+        0 => "LONG_FAST",
+        1 => "LONG_SLOW",
+        2 => "VERY_LONG_SLOW",
+        3 => "MEDIUM_SLOW",
+        4 => "MEDIUM_FAST",
+        5 => "SHORT_SLOW",
+        6 => "SHORT_FAST",
+        7 => "LONG_MODERATE",
+        8 => "SHORT_TURBO",
+        9 => "LONG_TURBO",
+        10 => "LITE_FAST",
+        11 => "LITE_SLOW",
+        12 => "NARROW_FAST",
+        13 => "NARROW_SLOW",
+        _ => "LONG_FAST",
+    }
+}
+
+/// Write region and modem_preset strings into `[plugins.meshtastic.radio]`
+/// in the operator config file.  Returns `Ok(true)` when written,
+/// `Ok(false)` when no config path is configured.
+#[allow(clippy::too_many_arguments)]
+fn save_meshtastic_radio_to_config(
+    config_path: &Option<String>,
+    region_int: i32,
+    preset_int: i32,
+    hops: u32,
+    rx_boosted_gain: bool,
+    ignore_mqtt: bool,
+    tx_enabled: bool,
+) -> Result<bool, String> {
+    let path = match config_path {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => return Ok(false),
+    };
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("config parse error: {e}"))?;
+
+    // Ensure [plugins.meshtastic.radio] table path exists.
+    if doc.get("plugins").is_none() {
+        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let plugins = doc["plugins"].as_table_mut().unwrap();
+    if plugins.get("meshtastic").is_none() {
+        plugins.insert(
+            "meshtastic",
+            toml_edit::Item::Table(toml_edit::Table::new()),
+        );
+    }
+    let mt = plugins
+        .get_mut("meshtastic")
+        .unwrap()
+        .as_table_mut()
+        .unwrap();
+    if mt.get("radio").is_none() {
+        mt.insert("radio", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let radio = mt.get_mut("radio").unwrap().as_table_mut().unwrap();
+
+    if region_int != 0 {
+        radio.insert(
+            "region",
+            toml_edit::Item::Value(toml_edit::Value::from(meshtastic_region_name(region_int))),
+        );
+    }
+    radio.insert(
+        "modem_preset",
+        toml_edit::Item::Value(toml_edit::Value::from(meshtastic_preset_name(preset_int))),
+    );
+    radio.insert(
+        "hops",
+        toml_edit::Item::Value(toml_edit::Value::from(hops as i64)),
+    );
+    radio.insert(
+        "rx_boosted_gain",
+        toml_edit::Item::Value(toml_edit::Value::from(rx_boosted_gain)),
+    );
+    radio.insert(
+        "ignore_mqtt",
+        toml_edit::Item::Value(toml_edit::Value::from(ignore_mqtt)),
+    );
+    radio.insert(
+        "tx_enabled",
+        toml_edit::Item::Value(toml_edit::Value::from(tx_enabled)),
+    );
+
+    std::fs::write(&path, doc.to_string()).map_err(|e| format!("write error: {e}"))?;
+    Ok(true)
+}
+
+/// Write short_name and/or long_name into `[plugins.meshtastic]`
+/// in the operator config file.
+fn save_meshtastic_owner_to_config(
+    config_path: &Option<String>,
+    short_name: Option<&str>,
+    long_name: Option<&str>,
+) -> Result<bool, String> {
+    let path = match config_path {
+        Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
+        _ => return Ok(false),
+    };
+    if short_name.is_none() && long_name.is_none() {
+        return Ok(true);
+    }
+    let raw = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = raw
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| format!("config parse error: {e}"))?;
+
+    if doc.get("plugins").is_none() {
+        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let plugins = doc["plugins"].as_table_mut().unwrap();
+    if plugins.get("meshtastic").is_none() {
+        plugins.insert(
+            "meshtastic",
+            toml_edit::Item::Table(toml_edit::Table::new()),
+        );
+    }
+    let mt = plugins
+        .get_mut("meshtastic")
+        .unwrap()
+        .as_table_mut()
+        .unwrap();
+
+    if let Some(sn) = short_name {
+        mt.insert(
+            "short_name",
+            toml_edit::Item::Value(toml_edit::Value::from(sn)),
+        );
+    }
+    if let Some(ln) = long_name {
+        mt.insert(
+            "long_name",
+            toml_edit::Item::Value(toml_edit::Value::from(ln)),
+        );
+    }
+
+    std::fs::write(&path, doc.to_string()).map_err(|e| format!("write error: {e}"))?;
+    Ok(true)
+}
+
+// ── Meshtastic radio config ───────────────────────────────────────────────────
+
+/// `POST /api/v1/meshtastic-reboot` — reboot the connected Meshtastic radio.
+/// On boot the firmware re-broadcasts its NodeInfo, so neighbours re-acquire
+/// the node — the firmware-supported way to force a re-announce on demand.
+async fn api_reboot_meshtastic(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    // 5s gives the HTTP response time to leave before the radio drops off.
+    match state.host.admin_reboot_meshtastic(5).await {
+        Ok(()) => Json(serde_json::json!({
+            "ok": true,
+            "message": "Radio reboot requested. It will drop off for ~30s, then re-announce \
+                        itself to the mesh on boot.",
+        }))
+        .into_response(),
+        Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/v1/meshtastic-device` — combined snapshot (LoRa + owner + security)
+/// served from the config captured during the last connect-time sync. One call,
+/// no device round-trip; used to populate the Settings page on load.
+async fn api_get_meshtastic_device(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_meshtastic_snapshot().await {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_get_meshtastic_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_meshtastic_lora().await {
+        Ok(config) => Json(config).into_response(),
+        Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_patch_meshtastic_radio_config(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(config): Json<bbs_plugin_api::MeshtasticLoRaConfig>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    // Always save region + modem_preset to config.toml first.
+    let config_path = &state.config.config_path;
+    let saved = save_meshtastic_radio_to_config(
+        config_path,
+        config.region,
+        config.modem_preset,
+        config.hop_limit,
+        config.sx126x_rx_boosted_gain,
+        config.ignore_mqtt,
+        config.tx_enabled,
+    );
+    if let Err(ref e) = saved {
+        tracing::warn!("meshtastic radio: could not save to config.toml: {e}");
+    }
+
+    // Then try to push to the live device via the transport.
+    match state.host.admin_set_meshtastic_lora(config).await {
+        Ok(()) => {
+            // Read back the device's actual config to confirm the write landed.
+            // A LoRa parameter *change* makes the device reboot, in which case
+            // the read-back times out — report applied-but-not-yet-confirmed.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            match state.host.admin_get_meshtastic_lora().await {
+                Ok(device) => Json(serde_json::json!({
+                    "ok": true,
+                    "saved": saved.is_ok(),
+                    "applied": true,
+                    "confirmed": true,
+                    "device_config": device,
+                }))
+                .into_response(),
+                Err(_) => Json(serde_json::json!({
+                    "ok": true,
+                    "saved": saved.is_ok(),
+                    "applied": true,
+                    "confirmed": false,
+                    "message": "Settings sent. The device may be rebooting to apply them; \
+                                use \"Load from device\" in a few seconds to confirm.",
+                }))
+                .into_response(),
+            }
+        }
+        Err(HostError::NotSupported(_)) | Err(HostError::Internal(_)) => {
+            // Transport not connected — that's OK if we saved to config.
+            if saved.unwrap_or(false) {
+                Json(serde_json::json!({
+                    "ok": true,
+                    "saved": true,
+                    "applied": false,
+                    "confirmed": false,
+                    "message": "Saved to config.toml. The device is not connected right now; \
+                                these settings will be applied automatically the next time the \
+                                BBS connects to it.",
+                }))
+                .into_response()
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json_error(
+                        "Meshtastic transport not connected and no config path configured",
+                    )),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+// ── Meshtastic owner / user info ──────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+struct PatchMeshtasticOwnerBody {
+    long_name: Option<String>,
+    short_name: Option<String>,
+}
+
+async fn api_get_meshtastic_owner(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_meshtastic_owner().await {
+        Ok(info) => Json(info).into_response(),
+        Err(HostError::NotSupported(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_patch_meshtastic_owner(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(body): Json<PatchMeshtasticOwnerBody>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+
+    // Always save short/long name to config.toml first.
+    let config_path = &state.config.config_path;
+    let saved = save_meshtastic_owner_to_config(
+        config_path,
+        body.short_name.as_deref(),
+        body.long_name.as_deref(),
+    );
+    if let Err(ref e) = saved {
+        tracing::warn!("meshtastic owner: could not save to config.toml: {e}");
+    }
+
+    // Then try to push to the live device via the transport.
+    match state
+        .host
+        .admin_set_meshtastic_owner(body.long_name, body.short_name)
+        .await
+    {
+        Ok(()) => {
+            // Read back the device's actual owner info to confirm. A name change
+            // does not reboot the device, so this read-back is reliable.
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            match state.host.admin_get_meshtastic_owner().await {
+                Ok(owner) => Json(serde_json::json!({
+                    "ok": true,
+                    "saved": saved.is_ok(),
+                    "applied": true,
+                    "confirmed": true,
+                    "device_owner": owner,
+                }))
+                .into_response(),
+                Err(_) => Json(serde_json::json!({
+                    "ok": true,
+                    "saved": saved.is_ok(),
+                    "applied": true,
+                    "confirmed": false,
+                    "message": "Name sent. Use \"Load from device\" in a few seconds to confirm.",
+                }))
+                .into_response(),
+            }
+        }
+        Err(HostError::NotSupported(_)) => {
+            if saved.unwrap_or(false) {
+                Json(serde_json::json!({
+                    "ok": true,
+                    "saved": true,
+                    "applied": false,
+                    "confirmed": false,
+                    "message": "Saved to config.toml. The device is not connected right now; \
+                                this name will be applied automatically the next time the BBS \
+                                connects to it.",
+                }))
+                .into_response()
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json_error(
+                        "Meshtastic transport not connected and no config path configured",
+                    )),
+                )
+                    .into_response()
+            }
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+// ── Meshtastic security / PKC info ────────────────────────────────────────────
+
+async fn api_get_meshtastic_security(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_meshtastic_security().await {
+        Ok(info) => Json(info).into_response(),
+        Err(HostError::NotSupported(_)) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("Meshtastic transport not connected")),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
 }
 
 // ── Node identity ─────────────────────────────────────────────────────────────

@@ -38,11 +38,69 @@ pub enum MeshKeyRequest {
         /// One-shot channel to deliver the result back to the caller.
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Apply LoRa radio parameters to the companion device.
+    ApplyRadio {
+        /// The radio parameters to apply.
+        params: crate::admin::MeshRadioParams,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+}
+
+/// Request sent from [`Host`] to the Meshtastic transport's admin channel.
+pub enum MeshtasticAdminRequest {
+    /// Fetch the current LoRa radio config from the device.
+    GetLoRaConfig {
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticLoRaConfig, String>>,
+    },
+    /// Push a new LoRa radio config to the device.
+    SetLoRaConfig {
+        /// The LoRa config to write to the device.
+        config: crate::admin::MeshtasticLoRaConfig,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Fetch the node's owner/user info (long name, short name, public key).
+    GetOwner {
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticOwnerInfo, String>>,
+    },
+    /// Update the node's owner/user info.
+    SetOwner {
+        /// New long name, or `None` to leave unchanged.
+        long_name: Option<String>,
+        /// New short name (≤ 4 chars), or `None` to leave unchanged.
+        short_name: Option<String>,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Fetch the device's security / PKC configuration.
+    GetSecurity {
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticSecurityInfo, String>>,
+    },
+    /// Fetch a combined snapshot (LoRa + owner + security) from the cache
+    /// captured during the last connect-time sync. Answered instantly without a
+    /// device round-trip.
+    GetSnapshot {
+        /// One-shot channel to deliver the snapshot back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<crate::admin::MeshtasticDeviceSnapshot, String>>,
+    },
+    /// Reboot the radio after `seconds`. On boot the firmware re-broadcasts its
+    /// NodeInfo, so neighbours re-acquire the node.
+    Reboot {
+        /// Seconds until reboot.
+        seconds: i32,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 use crate::admin::{
     AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports,
-    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo,
+    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, MeshRadioParams,
+    MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -428,6 +486,77 @@ pub trait Host: Send + Sync {
     async fn admin_import_node_key(&self, hex: String) -> Result<(), HostError> {
         let _ = hex;
         Err(HostError::NotSupported("admin_import_node_key".into()))
+    }
+
+    /// Apply LoRa radio parameters to the MeshCore companion device.
+    /// Requires the mesh transport to be connected.
+    async fn admin_apply_mesh_radio(&self, params: MeshRadioParams) -> Result<(), HostError> {
+        let _ = params;
+        Err(HostError::NotSupported("admin_apply_mesh_radio".into()))
+    }
+
+    /// Register the Meshtastic transport's admin command channel.
+    fn register_meshtastic_admin_ops(
+        &self,
+        _sender: tokio::sync::mpsc::Sender<MeshtasticAdminRequest>,
+    ) {
+    }
+
+    /// Fetch the current LoRa radio config from the Meshtastic device.
+    async fn admin_get_meshtastic_lora(&self) -> Result<MeshtasticLoRaConfig, HostError> {
+        Err(HostError::NotSupported("admin_get_meshtastic_lora".into()))
+    }
+
+    /// Push a new LoRa radio config to the Meshtastic device.
+    async fn admin_set_meshtastic_lora(
+        &self,
+        config: MeshtasticLoRaConfig,
+    ) -> Result<(), HostError> {
+        let _ = config;
+        Err(HostError::NotSupported("admin_set_meshtastic_lora".into()))
+    }
+
+    /// Fetch the Meshtastic device's owner/user info (long name, short name,
+    /// public key).
+    async fn admin_get_meshtastic_owner(&self) -> Result<MeshtasticOwnerInfo, HostError> {
+        Err(HostError::NotSupported("admin_get_meshtastic_owner".into()))
+    }
+
+    /// Update the Meshtastic device's owner/user info.
+    ///
+    /// Pass `None` for any field that should not be changed.  The implementation
+    /// fetches the current owner first, merges the new values, then writes back.
+    async fn admin_set_meshtastic_owner(
+        &self,
+        long_name: Option<String>,
+        short_name: Option<String>,
+    ) -> Result<(), HostError> {
+        let _ = (long_name, short_name);
+        Err(HostError::NotSupported("admin_set_meshtastic_owner".into()))
+    }
+
+    /// Fetch the Meshtastic device's security / PKC configuration.
+    async fn admin_get_meshtastic_security(&self) -> Result<MeshtasticSecurityInfo, HostError> {
+        Err(HostError::NotSupported(
+            "admin_get_meshtastic_security".into(),
+        ))
+    }
+
+    /// Fetch a combined snapshot of the Meshtastic device settings from the
+    /// cache captured during the last connect-time sync (no device round-trip).
+    async fn admin_get_meshtastic_snapshot(
+        &self,
+    ) -> Result<crate::admin::MeshtasticDeviceSnapshot, HostError> {
+        Err(HostError::NotSupported(
+            "admin_get_meshtastic_snapshot".into(),
+        ))
+    }
+
+    /// Reboot the connected Meshtastic radio after `seconds`. Forces a fresh
+    /// boot-time NodeInfo broadcast so neighbours re-acquire the node.
+    async fn admin_reboot_meshtastic(&self, seconds: i32) -> Result<(), HostError> {
+        let _ = seconds;
+        Err(HostError::NotSupported("admin_reboot_meshtastic".into()))
     }
 
     // ── Mesh node credentials ────────────────────────────────────────────────────

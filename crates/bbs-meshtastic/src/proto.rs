@@ -38,7 +38,7 @@ pub mod to_radio {
 pub struct FromRadio {
     #[prost(uint32, tag = "1")]
     pub id: u32,
-    #[prost(oneof = "from_radio::PayloadVariant", tags = "2, 3, 4, 7, 8")]
+    #[prost(oneof = "from_radio::PayloadVariant", tags = "2, 3, 4, 5, 7, 8")]
     pub payload_variant: Option<from_radio::PayloadVariant>,
 }
 
@@ -53,6 +53,11 @@ pub mod from_radio {
         MyInfo(super::MyNodeInfo),
         #[prost(message, tag = "4")]
         NodeInfo(super::NodeInfo),
+        /// `Config` section streamed during the initial `want_config` sync
+        /// (e.g. the current LoRa config). Lets us read the device's live
+        /// settings without an explicit admin GET.
+        #[prost(message, tag = "5")]
+        Config(super::MtConfig),
         #[prost(uint32, tag = "7")]
         ConfigCompleteId(u32),
         #[prost(bool, tag = "8")]
@@ -90,6 +95,12 @@ pub struct MeshPacket {
     pub hop_start: u32,
     #[prost(bytes = "vec", tag = "16")]
     pub public_key: Vec<u8>,
+    /// Marks the packet as using public-key cryptography. The Meshtastic app
+    /// sets this on admin messages to the local node; firmware with PKC enabled
+    /// and the legacy admin channel disabled requires it, otherwise the admin
+    /// request is silently dropped.
+    #[prost(bool, tag = "17")]
+    pub pki_encrypted: bool,
 }
 
 pub mod mesh_packet {
@@ -174,14 +185,27 @@ pub struct NodeInfo {
     pub last_heard: u32,
 }
 
+/// Meshtastic node owner/user info (`mesh.proto User`).
+///
+/// Used in `NodeInfo` (received during config sync) and in admin owner
+/// get/set operations (`AdminMessage` fields 3/4/32).
 #[derive(Clone, PartialEq, Message)]
 pub struct User {
+    /// Unique node ID string, e.g. `"!aabbccdd"` (hex of the 32-bit node number).
     #[prost(string, tag = "1")]
     pub id: String,
+    /// Full display name (~39 chars max in firmware).
     #[prost(string, tag = "2")]
     pub long_name: String,
+    /// Short display name shown on OLED/mesh maps. Firmware enforces ≤ 4 chars.
     #[prost(string, tag = "3")]
     pub short_name: String,
+    /// Device role (`Config.DeviceConfig.Role`): 0=CLIENT, 1=CLIENT_MUTE,
+    /// 2=ROUTER, 3=ROUTER_CLIENT, 4=REPEATER, 5=TRACKER, 6=SENSOR, 7=TAK,
+    /// 8=CLIENT_HIDDEN, 9=LOST_AND_FOUND, 10=TAK_TRACKER, 11=ROUTER_LATE.
+    #[prost(int32, tag = "7")]
+    pub role: i32,
+    /// Node's Curve25519 public key (32 bytes), broadcast on the mesh for PKC DMs.
     #[prost(bytes = "vec", tag = "8")]
     pub public_key: Vec<u8>,
 }
@@ -253,6 +277,7 @@ pub fn direct_text_packet(
             via_mqtt: false,
             hop_start: 0,
             public_key: Vec::new(),
+            pki_encrypted: false,
         })),
     }
 }
@@ -268,6 +293,414 @@ pub fn synthetic_pubkey(node_num: u32) -> [u8; 32] {
     key[1] = b'T';
     key[2..6].copy_from_slice(&node_num.to_be_bytes());
     key
+}
+
+/// Meshtastic `PortNum::ADMIN_APP`. This is **6**, not 67 — 67 is
+/// `TELEMETRY_APP`. Sending admin messages on 67 makes the device's telemetry
+/// module consume them and the admin module never processes them.
+pub const PORT_ADMIN_APP: i32 = 6;
+/// `config_type` for `GetConfigRequest` — LoRa radio config (`Config.lora`, field 6).
+pub const CONFIG_TYPE_LORA: i32 = 5;
+/// `config_type` for `GetConfigRequest` — Security / PKC config (`Config.security`, field 8).
+pub const CONFIG_TYPE_SECURITY: i32 = 7;
+/// `config_type` for `GetConfigRequest` — session key. Requesting this opens the
+/// admin session for the connection; current Meshtastic firmware silently drops
+/// admin *writes* that aren't preceded by it. The Meshtastic app sends this
+/// before every admin set.
+pub const CONFIG_TYPE_SESSIONKEY: i32 = 8;
+
+// ── Admin proto types (admin.proto + mesh.proto, subset) ──────────────────────
+// Note: `User` is already defined above (re-used for NodeInfo; same fields).
+
+/// Meshtastic security config (`config.proto Config.SecurityConfig`, subset).
+#[derive(Clone, PartialEq, Message)]
+pub struct SecurityConfig {
+    /// Node's Curve25519 public key — shared with mesh peers.
+    #[prost(bytes = "vec", tag = "1")]
+    pub public_key: Vec<u8>,
+    /// Node's Curve25519 private key (on-device; only visible if serial is enabled).
+    #[prost(bytes = "vec", tag = "2")]
+    pub private_key: Vec<u8>,
+    /// Allow admin commands over the legacy unencrypted admin channel.
+    #[prost(bool, tag = "8")]
+    pub admin_channel_enabled: bool,
+}
+
+/// Meshtastic admin message (`admin.proto AdminMessage`).
+///
+/// Field numbers match the current Meshtastic admin.proto.  The `session_passkey`
+/// (field 101) is a replay-attack guard: the device returns it in every GET
+/// response and the client must echo it back in SET commands within 300 s.
+#[derive(Clone, PartialEq, Message)]
+pub struct AdminMessage {
+    #[prost(oneof = "admin_message::PayloadVariant", tags = "3, 4, 5, 6, 32, 34")]
+    pub payload_variant: Option<admin_message::PayloadVariant>,
+    /// Replay-attack guard — echo back in all SET commands.
+    #[prost(bytes = "vec", tag = "101")]
+    pub session_passkey: Vec<u8>,
+}
+
+pub mod admin_message {
+    use super::*;
+    #[derive(Clone, PartialEq, Oneof)]
+    pub enum PayloadVariant {
+        /// Request the node's owner/user info (send `true`).
+        #[prost(bool, tag = "3")]
+        GetOwnerRequest(bool),
+        /// Node's owner/user info (response to `GetOwnerRequest`).
+        #[prost(message, tag = "4")]
+        GetOwnerResponse(super::User),
+        /// Request a config type (`ConfigType` enum: 5 = LoRa, 7 = Security).
+        #[prost(int32, tag = "5")]
+        GetConfigRequest(i32),
+        /// Config payload (response to `GetConfigRequest`).
+        #[prost(message, tag = "6")]
+        GetConfigResponse(super::MtConfig),
+        /// Set a fixed GPS position on the node (enables fixed-position mode).
+        #[prost(message, tag = "41")]
+        SetFixedPosition(super::Position),
+        /// Clear any fixed position and disable fixed-position mode.
+        #[prost(bool, tag = "42")]
+        RemoveFixedPosition(bool),
+        /// Set the node's clock (Unix seconds). Does not reboot the device.
+        #[prost(uint32, tag = "43")]
+        SetTimeOnly(u32),
+        /// Reboot the node in N seconds (or <0 to cancel). On boot the firmware
+        /// broadcasts its NodeInfo, which is how neighbours (re)discover it.
+        #[prost(int32, tag = "97")]
+        RebootSeconds(i32),
+        /// Update the node's owner/user info.
+        #[prost(message, tag = "32")]
+        SetOwner(super::User),
+        /// Update a config section.
+        #[prost(message, tag = "34")]
+        SetConfig(super::MtConfig),
+    }
+}
+
+/// Subset of Meshtastic `Config` (`config.proto Config`).
+#[derive(Clone, PartialEq, Message)]
+pub struct MtConfig {
+    #[prost(oneof = "mt_config::PayloadVariant", tags = "1, 6, 8")]
+    pub payload_variant: Option<mt_config::PayloadVariant>,
+}
+
+pub mod mt_config {
+    use super::*;
+    #[derive(Clone, PartialEq, Oneof)]
+    pub enum PayloadVariant {
+        /// `Config.device` — device role / node-info broadcast interval, etc.
+        #[prost(message, tag = "1")]
+        Device(super::DeviceConfig),
+        /// `Config.lora` — LoRa radio parameters (field 6 in Config oneof).
+        #[prost(message, tag = "6")]
+        Lora(super::LoRaConfig),
+        /// `Config.security` — PKC / key settings (field 8 in Config oneof).
+        #[prost(message, tag = "8")]
+        Security(super::SecurityConfig),
+    }
+}
+
+/// Meshtastic `Config.DeviceConfig` (subset — all current fields, so a
+/// read-modify-write round-trip preserves everything we don't touch).
+///
+/// Field numbers verified against meshtastic/protobufs config.proto.
+#[derive(Clone, PartialEq, Message)]
+pub struct DeviceConfig {
+    /// Device role (`Config.DeviceConfig.Role`). MUST be preserved on a merge —
+    /// clobbering it (e.g. ROUTER→CLIENT) would break the node's mesh behavior.
+    #[prost(int32, tag = "1")]
+    pub role: i32,
+    /// Deprecated `serial_enabled`; preserved on round-trip.
+    #[prost(bool, tag = "2")]
+    pub serial_enabled: bool,
+    #[prost(uint32, tag = "4")]
+    pub button_gpio: u32,
+    #[prost(uint32, tag = "5")]
+    pub buzzer_gpio: u32,
+    /// Rebroadcast mode (`RebroadcastMode` enum).
+    #[prost(int32, tag = "6")]
+    pub rebroadcast_mode: i32,
+    /// Seconds between NodeInfo broadcasts (firmware minimum 3600).
+    #[prost(uint32, tag = "7")]
+    pub node_info_broadcast_secs: u32,
+    #[prost(bool, tag = "8")]
+    pub double_tap_as_button_press: bool,
+    /// Deprecated `is_managed`; preserved on round-trip.
+    #[prost(bool, tag = "9")]
+    pub is_managed: bool,
+    #[prost(bool, tag = "10")]
+    pub disable_triple_click: bool,
+    #[prost(string, tag = "11")]
+    pub tzdef: String,
+    #[prost(bool, tag = "12")]
+    pub led_heartbeat_disabled: bool,
+    /// Buzzer mode (`BuzzerMode` enum).
+    #[prost(int32, tag = "13")]
+    pub buzzer_mode: i32,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct LoRaConfig {
+    #[prost(bool, tag = "1")]
+    pub use_preset: bool,
+    #[prost(int32, tag = "2")]
+    pub modem_preset: i32,
+    #[prost(uint32, tag = "3")]
+    pub bandwidth: u32,
+    #[prost(uint32, tag = "4")]
+    pub spread_factor: u32,
+    #[prost(uint32, tag = "5")]
+    pub coding_rate: u32,
+    #[prost(float, tag = "6")]
+    pub frequency_offset: f32,
+    #[prost(int32, tag = "7")]
+    pub region: i32,
+    #[prost(uint32, tag = "8")]
+    pub hop_limit: u32,
+    #[prost(bool, tag = "9")]
+    pub tx_enabled: bool,
+    #[prost(int32, tag = "10")]
+    pub tx_power: i32,
+    #[prost(uint32, tag = "11")]
+    pub channel_num: u32,
+    /// SX126x RX boosted gain — improves receive sensitivity on SX126x radios.
+    #[prost(bool, tag = "13")]
+    pub sx126x_rx_boosted_gain: bool,
+    #[prost(float, tag = "14")]
+    pub override_frequency: f32,
+    /// Ignore packets that arrived over MQTT.
+    #[prost(bool, tag = "104")]
+    pub ignore_mqtt: bool,
+}
+
+// ── Admin packet helpers ──────────────────────────────────────────────────────
+
+/// Wrap an encoded `AdminMessage` in a `ToRadio` admin packet.
+fn admin_packet(to_node: u32, request_id: u32, admin: AdminMessage) -> ToRadio {
+    use prost::Message as _;
+    ToRadio {
+        payload_variant: Some(to_radio::PayloadVariant::Packet(MeshPacket {
+            from: 0,
+            to: to_node,
+            channel: 0,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+                portnum: PORT_ADMIN_APP,
+                payload: admin.encode_to_vec(),
+                want_response: true,
+                // dest/source/request_id/reply_id must be 0 on an outbound
+                // request — they are only populated on *responses*. Setting
+                // source/dest to the node's own number makes the firmware treat
+                // the packet as self-originated and silently ignore it (no admin
+                // response, and SET commands never apply). The response is
+                // correlated via the MeshPacket `id` below, which the device
+                // echoes back in the response's `request_id`.
+                dest: 0,
+                source: 0,
+                request_id: 0,
+                reply_id: 0,
+            })),
+            id: request_id,
+            rx_time: 0,
+            rx_snr: 0.0,
+            hop_limit: 3,
+            want_ack: true,
+            priority: PRIORITY_RELIABLE,
+            rx_rssi: 0,
+            via_mqtt: false,
+            hop_start: 0,
+            public_key: Vec::new(),
+            // Plaintext local-serial admin. Must be false: with it set, the
+            // firmware tries to PKI-decrypt our plaintext payload into garbage
+            // ("Can't decode protobuf"). The local trusted path (from==0) needs
+            // no encryption.
+            pki_encrypted: false,
+        })),
+    }
+}
+
+/// Build a `GetConfigRequest` for the LoRa config.
+pub fn admin_get_lora_config(to_node: u32, request_id: u32) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
+                CONFIG_TYPE_LORA,
+            )),
+            session_passkey: Vec::new(),
+        },
+    )
+}
+
+/// Build a `SetConfig` for the LoRa config, echoing back the session passkey.
+pub fn admin_set_lora_config(
+    to_node: u32,
+    request_id: u32,
+    config: LoRaConfig,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetConfig(MtConfig {
+                payload_variant: Some(mt_config::PayloadVariant::Lora(config)),
+            })),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `SetConfig` for the Device config, echoing back the session passkey.
+pub fn admin_set_device_config(
+    to_node: u32,
+    request_id: u32,
+    config: DeviceConfig,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetConfig(MtConfig {
+                payload_variant: Some(mt_config::PayloadVariant::Device(config)),
+            })),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `GetOwnerRequest`.
+pub fn admin_get_owner(to_node: u32, request_id: u32) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetOwnerRequest(true)),
+            session_passkey: Vec::new(),
+        },
+    )
+}
+
+/// Build a `SetOwner` command, echoing back the session passkey.
+pub fn admin_set_owner(
+    to_node: u32,
+    request_id: u32,
+    user: User,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetOwner(user)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `SetTimeOnly` command to sync the device clock, echoing the passkey.
+pub fn admin_set_time(
+    to_node: u32,
+    request_id: u32,
+    unix_secs: u32,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetTimeOnly(unix_secs)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `SetFixedPosition` command from decimal-degree coordinates.
+///
+/// Meshtastic stores latitude/longitude as integers in units of 1e-7 degrees.
+pub fn admin_set_fixed_position(
+    to_node: u32,
+    request_id: u32,
+    lat_deg: f64,
+    lon_deg: f64,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    let position = Position {
+        latitude_i: Some((lat_deg * 1e7) as i32),
+        longitude_i: Some((lon_deg * 1e7) as i32),
+        altitude: 0,
+        time: 0,
+    };
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetFixedPosition(position)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `RemoveFixedPosition` command (clears fixed position).
+pub fn admin_remove_fixed_position(
+    to_node: u32,
+    request_id: u32,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::RemoveFixedPosition(true)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `RebootSeconds` admin command (reboot the node after `secs`),
+/// echoing back the session passkey. On reboot the firmware re-broadcasts its
+/// NodeInfo, which is how neighbours re-acquire the node.
+pub fn admin_reboot(to_node: u32, request_id: u32, secs: i32, session_passkey: Vec<u8>) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::RebootSeconds(secs)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `GetConfigRequest` for the Security config.
+pub fn admin_get_security_config(to_node: u32, request_id: u32) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
+                CONFIG_TYPE_SECURITY,
+            )),
+            session_passkey: Vec::new(),
+        },
+    )
+}
+
+/// Build a session-key `GetConfigRequest`. Send this immediately before an
+/// admin write to open the admin session — firmware drops writes that aren't
+/// preceded by it.
+pub fn admin_get_session_key(to_node: u32, request_id: u32) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::GetConfigRequest(
+                CONFIG_TYPE_SESSIONKEY,
+            )),
+            session_passkey: Vec::new(),
+        },
+    )
 }
 
 #[cfg(test)]

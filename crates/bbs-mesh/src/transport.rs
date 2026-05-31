@@ -49,6 +49,10 @@ use meshcore_companion::{
 /// Wire layout: `[prefix:1][len:2][CMD:1][txt_type:1][attempt:1][timestamp:4][prefix:6][text:N]`
 /// = 16 bytes of overhead.  Total frame must not exceed `MAX_FRAME_SIZE`.
 const MAX_REPLY_BYTES: usize = MAX_FRAME_SIZE - 16;
+
+/// Transport name recorded on advert records so the web UI can show which
+/// radio network each node was heard on.
+const TRANSPORT_NAME: &str = "meshcore";
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
@@ -484,6 +488,13 @@ enum PendingKeyOp {
     Import {
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    ApplyRadio {
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+        /// true = waiting for SetRadioParams Ok; false = waiting for SetRadioTxPower Ok
+        waiting_for_params: bool,
+        /// tx_power to send after params Ok arrives
+        tx_power_dbm: i8,
+    },
 }
 
 /// Background task: receive [`ClientEvent`]s and dispatch them.
@@ -535,6 +546,7 @@ async fn event_loop(
                                 info.adv_type,
                                 info.latitude,
                                 info.longitude,
+                                TRANSPORT_NAME,
                             );
                             // Record our own pubkey so the NewAdvert handler can
                             // detect self-advert echoes and preserve configured GPS.
@@ -559,6 +571,7 @@ async fn event_loop(
                                     info.adv_type,
                                     lat_1e6,
                                     lon_1e6,
+                                    TRANSPORT_NAME,
                                 );
                             }
                         } else {
@@ -597,6 +610,7 @@ async fn event_loop(
                             match op {
                                 PendingKeyOp::Export { reply } => { let _ = reply.send(Err(err)); }
                                 PendingKeyOp::Import { reply } => { let _ = reply.send(Err(err)); }
+                                PendingKeyOp::ApplyRadio { reply, .. } => { let _ = reply.send(Err(err)); }
                             }
                         }
                         if will_retry {
@@ -620,11 +634,30 @@ async fn event_loop(
                                 }
                             }
                             InboundFrame::Ok => {
-                                if let Some(PendingKeyOp::Import { reply }) = pending_key_op.take() {
-                                    let _ = reply.send(Ok(()));
-                                    true
-                                } else {
-                                    false
+                                match pending_key_op.take() {
+                                    Some(PendingKeyOp::Import { reply }) => {
+                                        let _ = reply.send(Ok(()));
+                                        true
+                                    }
+                                    Some(PendingKeyOp::ApplyRadio { reply, waiting_for_params: true, tx_power_dbm }) => {
+                                        // Params acknowledged — now send TX power
+                                        let _ = cmd_tx.send(OutboundFrame::SetRadioTxPower { power_dbm: tx_power_dbm }).await;
+                                        pending_key_op = Some(PendingKeyOp::ApplyRadio {
+                                            reply,
+                                            waiting_for_params: false,
+                                            tx_power_dbm,
+                                        });
+                                        true
+                                    }
+                                    Some(PendingKeyOp::ApplyRadio { reply, waiting_for_params: false, .. }) => {
+                                        // TX power acknowledged — done
+                                        let _ = reply.send(Ok(()));
+                                        true
+                                    }
+                                    other => {
+                                        pending_key_op = other;
+                                        false
+                                    }
                                 }
                             }
                             // Device returned an error frame while a key op was in
@@ -635,6 +668,7 @@ async fn event_loop(
                                     match op {
                                         PendingKeyOp::Export { reply } => { let _ = reply.send(Err(msg)); }
                                         PendingKeyOp::Import { reply } => { let _ = reply.send(Err(msg)); }
+                                        PendingKeyOp::ApplyRadio { reply, .. } => { let _ = reply.send(Err(msg)); }
                                     }
                                     true
                                 } else {
@@ -666,6 +700,23 @@ async fn event_loop(
                         } else {
                             let _ = cmd_tx.send(OutboundFrame::ImportPrivateKey { key }).await;
                             pending_key_op = Some(PendingKeyOp::Import { reply });
+                        }
+                    }
+                    MeshKeyRequest::ApplyRadio { params, reply } => {
+                        if pending_key_op.is_some() {
+                            let _ = reply.send(Err("another device operation is already in progress".into()));
+                        } else {
+                            let _ = cmd_tx.send(OutboundFrame::SetRadioParams {
+                                frequency_hz: params.frequency_hz,
+                                bandwidth_hz: params.bandwidth_hz,
+                                spreading_factor: params.spreading_factor,
+                                coding_rate: params.coding_rate,
+                            }).await;
+                            pending_key_op = Some(PendingKeyOp::ApplyRadio {
+                                reply,
+                                waiting_for_params: true,
+                                tx_power_dbm: params.tx_power_dbm,
+                            });
                         }
                     }
                 }
@@ -757,7 +808,7 @@ async fn handle_frame(
         // Record in the shared advert bus so the web UI can display them.
         // Sessions are minted on first DM, not on advert.
         InboundFrame::Advert { pubkey } => {
-            host.advert_bus().upsert_short(pubkey);
+            host.advert_bus().upsert_short(pubkey, TRANSPORT_NAME);
             debug!(prefix = ?&pubkey[..6], "mesh: short advert received");
         }
         InboundFrame::NewAdvert(contact) => {
@@ -779,6 +830,7 @@ async fn handle_frame(
                 contact.adv_type,
                 gps_lat,
                 gps_lon,
+                TRANSPORT_NAME,
             );
             // Record the full pubkey so we can send ResetPath after delivers.
             let prefix: [u8; 6] = contact.pubkey[..6].try_into().expect("pubkey is 32 bytes");
@@ -806,6 +858,7 @@ async fn handle_frame(
                 contact.gps_lat,
                 contact.gps_lon,
                 contact.last_advert_timestamp as i64,
+                TRANSPORT_NAME,
             );
             // Record the full pubkey mapping so ResetPath can find the node.
             let prefix: [u8; 6] = contact.pubkey[..6].try_into().expect("pubkey is 32 bytes");

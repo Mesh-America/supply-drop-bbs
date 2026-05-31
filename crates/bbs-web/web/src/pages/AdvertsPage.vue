@@ -13,6 +13,7 @@ interface Advert {
   type_name: string
   lat: number
   lon: number
+  transport: string
 }
 
 const auth = useAuthStore()
@@ -87,6 +88,25 @@ const groups = computed(() => {
   return m
 })
 
+// ── Transport / type filters ────────────────────────────────────────────────
+const filterTransport = ref('')
+const filterType = ref('')
+
+const transportOptions = computed(() =>
+  [...new Set(rows.value.map((r) => r.transport).filter(Boolean))].sort(),
+)
+const typeOptions = computed(() =>
+  [...new Set(rows.value.map((r) => r.type_name).filter(Boolean))].sort(),
+)
+
+const filteredRows = computed(() =>
+  rows.value.filter(
+    (r) =>
+      (!filterTransport.value || r.transport === filterTransport.value) &&
+      (!filterType.value || r.type_name === filterType.value),
+  ),
+)
+
 onMounted(() => {
   load()
   timer = window.setInterval(load, 5000)
@@ -96,6 +116,7 @@ onUnmounted(() => { if (timer !== undefined) window.clearInterval(timer) })
 const columns = [
   { key: 'ts', label: 'last seen' },
   { key: 'name', label: 'name' },
+  { key: 'transport', label: 'transport' },
   { key: 'type_name', label: 'type' },
   { key: 'pubkey', label: 'pubkey' },
   { key: 'location', label: 'location' },
@@ -153,16 +174,44 @@ const columns = [
       </span>
     </p>
 
+    <!-- Transport / type filters -->
+    <div class="advert-filters">
+      <label>
+        transport
+        <select v-model="filterTransport">
+          <option value="">all</option>
+          <option v-for="t in transportOptions" :key="t" :value="t">{{ t }}</option>
+        </select>
+      </label>
+      <label>
+        type
+        <select v-model="filterType">
+          <option value="">all</option>
+          <option v-for="t in typeOptions" :key="t" :value="t">{{ t }}</option>
+        </select>
+      </label>
+      <button
+        v-if="filterTransport || filterType"
+        type="button"
+        class="link-btn"
+        @click="filterTransport = ''; filterType = ''"
+      >clear filters</button>
+    </div>
+
     <p v-if="error" class="error">{{ error }}</p>
 
     <DataTable
       :columns="columns"
-      :rows="rows"
+      :rows="filteredRows"
       :row-key="(r) => `${r.ts}-${r.pubkey}`"
       :page-size="50"
       empty="No adverts heard yet (is mesh transport enabled and connected?)."
     >
       <template #[`cell:ts`]="{ row }">{{ fmtLocal(row.ts) }}</template>
+      <template #[`cell:transport`]="{ row }">
+        <span v-if="row.transport" class="badge" :class="`transport-${row.transport}`">{{ row.transport }}</span>
+        <span v-else class="muted">—</span>
+      </template>
       <template #[`cell:type_name`]="{ row }">
         <span class="badge" :class="`type-${row.type_name}`">{{ row.type_name }}</span>
       </template>
@@ -198,7 +247,29 @@ h1 { margin: 0; }
 .status-line { margin: 0; padding: 0.25rem 0.5rem; border-radius: 3px; }
 .status-line.ok    { color: #2a8a2a; border: 1px solid #2a8a2a; background: rgba(42,138,42,0.08); }
 .status-line.error { color: var(--error); border: 1px solid var(--error); background: rgba(200,60,60,0.08); }
-.btn-danger { color: var(--error); border-color: var(--error); }
+.btn-danger {
+  background: var(--error);
+  color: #fff;
+  border-color: var(--error);
+}
+.btn-danger:hover:not(:disabled) { filter: brightness(1.08); }
+.btn-danger:disabled { opacity: 0.5; }
+
+.advert-filters {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  flex-wrap: wrap;
+  font-size: 0.85em;
+  color: var(--muted);
+}
+.advert-filters label { display: flex; align-items: center; gap: 0.4rem; }
+.advert-filters select { font: inherit; padding: 0.15rem 0.3rem; }
+.link-btn {
+  background: none; border: none; padding: 0;
+  color: var(--accent, #4a90d9); cursor: pointer; font: inherit;
+  text-decoration: underline;
+}
 
 .type-summary { margin: 0; display: flex; flex-wrap: wrap; gap: 0.4rem; }
 
@@ -211,4 +282,17 @@ h1 { margin: 0; }
 .badge.type-room     { background: #f0e2c2; color: #604010; }
 .badge.type-sensor   { background: #f0d2d2; color: #602020; }
 .badge.type-unknown  { background: var(--row-alt); color: var(--muted); }
+/* Meshtastic device roles */
+.badge.type-client        { background: #d2efd2; color: #205020; }
+.badge.type-client_mute   { background: #e0e8d2; color: #404f20; }
+.badge.type-client_hidden { background: var(--row-alt); color: var(--muted); }
+.badge.type-router        { background: #d2dff0; color: #203560; }
+.badge.type-router_client { background: #d2dff0; color: #203560; }
+.badge.type-router_late   { background: #d2dff0; color: #203560; }
+.badge.type-tracker       { background: #e2d2f0; color: #402060; }
+.badge.type-tak           { background: #f0e2c2; color: #604010; }
+.badge.type-tak_tracker   { background: #f0e2c2; color: #604010; }
+.badge.type-lost_and_found { background: #f0d2d2; color: #602020; }
+.badge.transport-meshcore   { background: #d2dff0; color: #203560; }
+.badge.transport-meshtastic { background: #e2d2f0; color: #402060; }
 </style>

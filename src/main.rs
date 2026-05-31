@@ -360,6 +360,52 @@ enum NodeAction {
         #[arg(long)]
         list_presets: bool,
     },
+
+    /// Apply Meshtastic LoRa radio configuration from config.toml to the device.
+    ///
+    /// Reads `[plugins.meshtastic.radio]` (region and modem preset) and pushes
+    /// them to the connected Meshtastic radio.  The device stores the settings
+    /// in its own flash so they survive power cycles.
+    ///
+    /// The BBS service must **not** be running on the same port when you run this.
+    ///
+    /// Example:
+    ///   supply-drop-bbs node set-meshtastic-radio
+    #[cfg(feature = "transport-meshtastic")]
+    SetMeshtasticRadio {
+        /// Serial port (e.g. /dev/ttyUSB0, COM3). Defaults to serial_port in config.toml.
+        #[arg(long)]
+        port: Option<String>,
+        /// Baud rate. Defaults to the value in config.toml or 115200.
+        #[arg(long)]
+        baud: Option<u32>,
+        /// TCP address for meshtasticd (e.g. 127.0.0.1:4403). Defaults to addr in config.toml.
+        #[arg(long)]
+        addr: Option<String>,
+    },
+
+    /// Apply Meshtastic node name (long name + short name) from config.toml to the device.
+    ///
+    /// Reads `[plugins.meshtastic]` `long_name` and `short_name` and pushes them
+    /// to the connected Meshtastic radio.  The existing PKC public key is
+    /// preserved by fetching owner info from the device first.
+    ///
+    /// The BBS service must **not** be running on the same port when you run this.
+    ///
+    /// Example:
+    ///   supply-drop-bbs node set-meshtastic-owner
+    #[cfg(feature = "transport-meshtastic")]
+    SetMeshtasticOwner {
+        /// Serial port. Defaults to serial_port in config.toml.
+        #[arg(long)]
+        port: Option<String>,
+        /// Baud rate. Defaults to the value in config.toml or 115200.
+        #[arg(long)]
+        baud: Option<u32>,
+        /// TCP address. Defaults to addr in config.toml.
+        #[arg(long)]
+        addr: Option<String>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -1872,7 +1918,56 @@ fn save_radio_config(config_path: Option<&std::path::Path>, r: &ResolvedRadio) {
     }
 }
 
+// ── Meshtastic node command handler ──────────────────────────────────────────
+
+#[cfg(feature = "transport-meshtastic")]
+async fn cmd_node_meshtastic(config_path: Option<&std::path::Path>, action: NodeAction) {
+    let cfg = config::load(config_path).unwrap_or_default();
+    let mt_cfg = &cfg.plugins.meshtastic;
+
+    let (port_flag, baud_flag, addr_flag, is_set_radio) = match &action {
+        NodeAction::SetMeshtasticRadio { port, baud, addr } => {
+            (port.clone(), *baud, addr.clone(), true)
+        }
+        NodeAction::SetMeshtasticOwner { port, baud, addr } => {
+            (port.clone(), *baud, addr.clone(), false)
+        }
+        _ => unreachable!(),
+    };
+
+    let result = if is_set_radio {
+        bbs_meshtastic::apply_radio_from_config(mt_cfg, port_flag, baud_flag, addr_flag).await
+    } else {
+        bbs_meshtastic::apply_owner_from_config(mt_cfg, port_flag, baud_flag, addr_flag).await
+    };
+
+    match result {
+        Ok(()) => {
+            if is_set_radio {
+                eprintln!("Meshtastic radio config applied successfully.");
+            } else {
+                eprintln!("Meshtastic owner info applied successfully.");
+            }
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
+    // ── Meshtastic node commands ──────────────────────────────────────────────
+    #[cfg(feature = "transport-meshtastic")]
+    match &action {
+        NodeAction::SetMeshtasticRadio { .. } | NodeAction::SetMeshtasticOwner { .. } => {
+            cmd_node_meshtastic(config_path, action).await;
+            return;
+        }
+        _ => {}
+    }
+
+    // ── MeshCore node commands ────────────────────────────────────────────────
     #[cfg(feature = "transport-mesh")]
     {
         use meshcore_companion::{
@@ -1913,6 +2008,8 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
             NodeAction::ExportKey { port, baud } => (port.clone(), *baud),
             NodeAction::ImportKey { port, baud, .. } => (port.clone(), *baud),
             NodeAction::SetRadio { port, baud, .. } => (port.clone(), *baud),
+            // Meshtastic commands are intercepted and returned-from early above.
+            _ => unreachable!("Meshtastic commands should have been handled above"),
         };
 
         let port = match port_flag.or_else(|| {
@@ -2022,6 +2119,8 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
                 // Placeholder — the actual send is handled specially below.
                 OutboundFrame::GetBattAndStorage
             }
+            // Meshtastic commands are handled before this block — unreachable here.
+            _ => unreachable!("Meshtastic commands should have been handled above"),
         };
 
         let serial_cfg = SerialConfig {

@@ -378,7 +378,7 @@ User=supply-drop
 Group=supply-drop
 SupplementaryGroups=dialout
 ExecStart=/usr/local/bin/supply-drop-bbs run --config /etc/supply-drop-bbs/config.toml
-Restart=on-failure
+Restart=always
 RestartSec=5s
 StandardOutput=journal
 StandardError=journal
@@ -390,6 +390,12 @@ PrivateTmp=yes
 [Install]
 WantedBy=multi-user.target
 ```
+
+> **Web "Restart service" button.** The web admin's restart action works by having
+> the BBS process **exit**, which `Restart=always` then brings back up — it does
+> *not* shell out to `systemctl`, because the unit runs as a non-root user with
+> `NoNewPrivileges=yes` (so `sudo` can't escalate). No sudoers rule is needed; if
+> an older install left `/etc/sudoers.d/supply-drop-bbs`, it's removed on upgrade.
 
 ### Pi HAT - two services
 

@@ -21,6 +21,25 @@ pub struct SessionEntry {
 #[derive(Debug, Default)]
 pub struct SessionState {
     pub my_node_num: Option<u32>,
+    /// The device's current LoRa config, captured from the `want_config` sync
+    /// stream. Used to skip redundant LoRa writes on connect — writing LoRa
+    /// config (even unchanged) reboots the radio, so we only write when the
+    /// desired region/preset actually differs from what the device reports.
+    pub device_lora: Option<crate::proto::LoRaConfig>,
+    /// The device's current owner `User` (id, long/short name, public key),
+    /// captured from the local node's NodeInfo during sync. Writing the owner
+    /// (`SetOwner`) also reboots the radio on current firmware, so we skip the
+    /// write when the configured name already matches — keeping the radio online
+    /// so its own periodic NodeInfo broadcasts (how neighbours discover us) keep
+    /// firing. Also serves the web "device snapshot" without a live admin round-trip.
+    pub device_owner: Option<crate::proto::User>,
+    /// The device's current security/PKC config, captured during sync. Lets the
+    /// web serve the public key + admin-channel state without a live admin GET.
+    pub device_security: Option<crate::proto::SecurityConfig>,
+    /// The device's current DeviceConfig, captured during sync. Used to merge
+    /// `node_info_broadcast_secs` (and skip-if-unchanged) without clobbering
+    /// role/other device fields.
+    pub device_config: Option<crate::proto::DeviceConfig>,
     pub by_node: HashMap<u32, SessionEntry>,
     pub by_session: HashMap<SessionId, u32>,
 }

@@ -41,6 +41,10 @@ struct Existing {
     meshtastic_connection_type: String,
     meshtastic_serial_port: Option<String>,
     meshtastic_baud_rate: u32,
+    meshtastic_radio_region: Option<String>,
+    meshtastic_radio_preset: Option<String>,
+    meshtastic_short_name: Option<String>,
+    meshtastic_long_name: Option<String>,
     // Web
     web_enabled: bool,
     web_bind: String,
@@ -136,6 +140,24 @@ fn load_existing(out_path: &Path) -> Existing {
         .and_then(|v| v.as_integer())
         .map(|v| v as u32)
         .unwrap_or(115_200);
+    let meshtastic_radio_region = meshtastic
+        .and_then(|m| m.get("radio"))
+        .and_then(|r| r.get("region"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let meshtastic_radio_preset = meshtastic
+        .and_then(|m| m.get("radio"))
+        .and_then(|r| r.get("modem_preset"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let meshtastic_short_name = meshtastic
+        .and_then(|m| m.get("short_name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let meshtastic_long_name = meshtastic
+        .and_then(|m| m.get("long_name"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
 
     // Web
     let web_enabled = web
@@ -234,6 +256,10 @@ fn load_existing(out_path: &Path) -> Existing {
         meshtastic_connection_type,
         meshtastic_serial_port,
         meshtastic_baud_rate,
+        meshtastic_radio_region,
+        meshtastic_radio_preset,
+        meshtastic_short_name,
+        meshtastic_long_name,
         web_enabled,
         web_bind,
         web_backup_dir,
@@ -385,6 +411,31 @@ pub fn run_wizard(config_out: Option<&Path>) {
     }
 
     let ex = load_existing(&out_path);
+
+    // ── BBS identity ──────────────────────────────────────────────────────────
+    //
+    // Collected first so it is clear there is exactly one BBS instance.
+    // All radio transports (MeshCore, Meshtastic, …) configured below are
+    // simply different ways to reach the same BBS — they do not have
+    // separate identities.
+    section("BBS identity");
+
+    let bbs_name: String = Input::with_theme(&theme)
+        .with_prompt("BBS name")
+        .default(ex.bbs_name.clone())
+        .interact_text()
+        .unwrap_or_else(|_| cancelled());
+
+    // ── Data storage ──────────────────────────────────────────────────────────
+    section("Data storage");
+
+    let data_dir_str: String = Input::with_theme(&theme)
+        .with_prompt("Data directory")
+        .default(ex.data_dir.clone())
+        .interact_text()
+        .unwrap_or_else(|_| cancelled());
+
+    let data_dir = PathBuf::from(&data_dir_str);
 
     // ── Protocol selection ────────────────────────────────────────────────────
     //
@@ -716,25 +767,157 @@ pub fn run_wizard(config_out: Option<&Path>) {
         meshtastic_addr = None;
     }
 
-    // ── BBS identity ──────────────────────────────────────────────────────────
-    section("BBS identity");
+    // ── Meshtastic radio parameters ───────────────────────────────────────────
 
-    let bbs_name: String = Input::with_theme(&theme)
-        .with_prompt("BBS name")
-        .default(ex.bbs_name.clone())
-        .interact_text()
-        .unwrap_or_else(|_| cancelled());
+    /// (code, display label)
+    const MESHTASTIC_REGIONS: &[(&str, &str)] = &[
+        ("US", "United States"),
+        ("EU_433", "Europe 433 MHz"),
+        ("EU_868", "Europe 868 MHz"),
+        ("ANZ", "Australia / New Zealand"),
+        ("JP", "Japan"),
+        ("CN", "China"),
+        ("KR", "South Korea"),
+        ("TW", "Taiwan"),
+        ("RU", "Russia"),
+        ("IN", "India"),
+        ("NZ_865", "New Zealand 865 MHz"),
+        ("TH", "Thailand"),
+        ("LORA_24", "2.4 GHz LoRa"),
+        ("UA_433", "Ukraine 433 MHz"),
+        ("UA_868", "Ukraine 868 MHz"),
+        ("MY_433", "Malaysia 433 MHz"),
+        ("MY_919", "Malaysia 919 MHz"),
+        ("SG_923", "Singapore 923 MHz"),
+    ];
 
-    // ── Data storage ──────────────────────────────────────────────────────────
-    section("Data storage");
+    /// (code, display label)
+    const MESHTASTIC_PRESETS: &[(&str, &str)] = &[
+        (
+            "LONG_FAST",
+            "Long range, fast      (default — good starting point)",
+        ),
+        ("LONG_MODERATE", "Long range, moderate"),
+        ("MEDIUM_SLOW", "Medium range, slow"),
+        ("MEDIUM_FAST", "Medium range, fast"),
+        ("SHORT_SLOW", "Short range, slow"),
+        ("SHORT_FAST", "Short range, fast"),
+        ("LONG_SLOW", "Long range, slow      (very slow data rate)"),
+        (
+            "MAX_RANGE",
+            "Maximum range         (extremely slow data rate)",
+        ),
+        ("SHORT_TURBO", "Short range, turbo    (high data rate)"),
+    ];
 
-    let data_dir_str: String = Input::with_theme(&theme)
-        .with_prompt("Data directory")
-        .default(ex.data_dir.clone())
-        .interact_text()
-        .unwrap_or_else(|_| cancelled());
+    let (meshtastic_radio_region, meshtastic_radio_preset): (Option<String>, Option<String>) =
+        if use_meshtastic {
+            section("Meshtastic radio parameters");
 
-    let data_dir = PathBuf::from(&data_dir_str);
+            println!("Select the region and modem preset for your Meshtastic device.");
+            println!("These are saved to config.toml and can be pushed to the device");
+            println!("at any time via the web admin (Settings → Meshtastic radio).");
+            println!("Skip if the device is already configured correctly.");
+            println!();
+
+            let configure = Confirm::with_theme(&theme)
+                .with_prompt("Configure Meshtastic radio parameters now?")
+                .default(ex.meshtastic_radio_region.is_some())
+                .interact()
+                .unwrap_or_else(|_| cancelled());
+
+            if configure {
+                let region_labels: Vec<String> = MESHTASTIC_REGIONS
+                    .iter()
+                    .map(|(code, name)| format!("{code:<10} {name}"))
+                    .collect();
+                let default_region = ex
+                    .meshtastic_radio_region
+                    .as_deref()
+                    .and_then(|r| MESHTASTIC_REGIONS.iter().position(|(c, _)| *c == r))
+                    .unwrap_or(0); // US
+                let region_choice =
+                    prompt_select(&theme, "Select your region", &region_labels, default_region);
+                let region = MESHTASTIC_REGIONS[region_choice].0.to_owned();
+
+                println!();
+                let preset_labels: Vec<String> = MESHTASTIC_PRESETS
+                    .iter()
+                    .map(|(_, d)| d.to_string())
+                    .collect();
+                let default_preset = ex
+                    .meshtastic_radio_preset
+                    .as_deref()
+                    .and_then(|p| MESHTASTIC_PRESETS.iter().position(|(c, _)| *c == p))
+                    .unwrap_or(0); // LONG_FAST
+                let preset_choice = prompt_select(
+                    &theme,
+                    "Select modem preset",
+                    &preset_labels,
+                    default_preset,
+                );
+                let preset = MESHTASTIC_PRESETS[preset_choice].0.to_owned();
+
+                (Some(region), Some(preset))
+            } else {
+                (
+                    ex.meshtastic_radio_region.clone(),
+                    ex.meshtastic_radio_preset.clone(),
+                )
+            }
+        } else {
+            (None, None)
+        };
+
+    // ── Meshtastic node name ──────────────────────────────────────────────────
+
+    let (meshtastic_short_name, meshtastic_long_name): (Option<String>, Option<String>) =
+        if use_meshtastic {
+            section("Meshtastic node name");
+
+            println!("Set the long name (full display name) and short name (≤ 4 chars,");
+            println!("shown on mesh maps). These are saved to config.toml and can be");
+            println!("pushed to the device via the web admin UI at any time.");
+            println!();
+
+            let configure = Confirm::with_theme(&theme)
+                .with_prompt("Configure Meshtastic node name?")
+                .default(ex.meshtastic_short_name.is_some() || ex.meshtastic_long_name.is_some())
+                .interact()
+                .unwrap_or_else(|_| cancelled());
+
+            if configure {
+                let long: String = Input::with_theme(&theme)
+                    .with_prompt("Long name (full display name)")
+                    .default(ex.meshtastic_long_name.clone().unwrap_or_default())
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                let short: String = Input::with_theme(&theme)
+                    .with_prompt("Short name (≤ 4 chars, shown on maps)")
+                    .default(ex.meshtastic_short_name.clone().unwrap_or_default())
+                    .validate_with(|v: &String| {
+                        if v.chars().count() <= 4 {
+                            Ok(())
+                        } else {
+                            Err("Short name must be 4 characters or fewer")
+                        }
+                    })
+                    .interact_text()
+                    .unwrap_or_else(|_| cancelled());
+
+                let ln = if long.is_empty() { None } else { Some(long) };
+                let sn = if short.is_empty() { None } else { Some(short) };
+                (sn, ln)
+            } else {
+                (
+                    ex.meshtastic_short_name.clone(),
+                    ex.meshtastic_long_name.clone(),
+                )
+            }
+        } else {
+            (None, None)
+        };
 
     // ── Web admin ─────────────────────────────────────────────────────────────
     section("Web admin UI");
@@ -872,6 +1055,10 @@ pub fn run_wizard(config_out: Option<&Path>) {
         meshtastic_serial_port: meshtastic_serial_port.as_deref(),
         meshtastic_baud_rate,
         meshtastic_addr: meshtastic_addr.as_deref(),
+        meshtastic_radio_region: meshtastic_radio_region.as_deref(),
+        meshtastic_radio_preset: meshtastic_radio_preset.as_deref(),
+        meshtastic_short_name: meshtastic_short_name.as_deref(),
+        meshtastic_long_name: meshtastic_long_name.as_deref(),
         web_enabled,
         web_bind: web_bind.as_deref(),
         web_backup_dir: web_backup_dir.as_deref(),
@@ -981,6 +1168,11 @@ pub fn run_wizard(config_out: Option<&Path>) {
         }
         println!("HAT config written to {}.", yaml_path.display());
     }
+
+    // Meshtastic radio and node-name settings are applied to the device
+    // automatically by the transport when the BBS connects (see the
+    // auto-apply-on-connect logic in bbs-meshtastic).  No setup-time push is
+    // needed — the operator just starts the BBS and the settings take effect.
 
     // ── Next steps ────────────────────────────────────────────────────────────
     section("Next steps");
@@ -1515,6 +1707,10 @@ struct TomlParams<'a> {
     meshtastic_serial_port: Option<&'a str>,
     meshtastic_baud_rate: Option<u32>,
     meshtastic_addr: Option<&'a str>,
+    meshtastic_radio_region: Option<&'a str>,
+    meshtastic_radio_preset: Option<&'a str>,
+    meshtastic_short_name: Option<&'a str>,
+    meshtastic_long_name: Option<&'a str>,
     // Web
     web_enabled: bool,
     web_bind: Option<&'a str>,
@@ -1648,8 +1844,32 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 }
                 _ => {}
             }
+            if let Some(sn) = p.meshtastic_short_name {
+                writeln!(s, "short_name = {}", toml_str(sn)).unwrap();
+            }
+            if let Some(ln) = p.meshtastic_long_name {
+                writeln!(s, "long_name  = {}", toml_str(ln)).unwrap();
+            }
         }
     }
+    // [plugins.meshtastic.radio] — written whenever Meshtastic is enabled so the
+    // recommended radio defaults are present and editable.
+    #[cfg(feature = "transport-meshtastic")]
+    if p.use_meshtastic {
+        writeln!(s, "\n[plugins.meshtastic.radio]").unwrap();
+        if let Some(region) = p.meshtastic_radio_region {
+            writeln!(s, "region          = {}", toml_str(region)).unwrap();
+        }
+        if let Some(preset) = p.meshtastic_radio_preset {
+            writeln!(s, "modem_preset    = {}", toml_str(preset)).unwrap();
+        }
+        // Recommended defaults, applied to the device automatically on connect.
+        writeln!(s, "rx_boosted_gain = true").unwrap();
+        writeln!(s, "hops            = 3").unwrap();
+        writeln!(s, "ignore_mqtt     = true").unwrap();
+        writeln!(s, "tx_enabled      = true").unwrap();
+    }
+
     // Suppress unused-variable warnings when feature is off.
     #[cfg(not(feature = "transport-meshtastic"))]
     {
@@ -1659,6 +1879,10 @@ fn build_toml(p: &TomlParams<'_>) -> String {
             p.meshtastic_serial_port,
             p.meshtastic_baud_rate,
             p.meshtastic_addr,
+            p.meshtastic_radio_region,
+            p.meshtastic_radio_preset,
+            p.meshtastic_short_name,
+            p.meshtastic_long_name,
         );
     }
 
@@ -1811,6 +2035,17 @@ fn print_next_steps(
         println!("    supply-drop-bbs node import-key <64-char-hex>");
         println!();
         println!("  The BBS service must not be running when using these commands.");
+        println!();
+    }
+
+    // Meshtastic settings note
+    if use_meshtastic {
+        println!("Meshtastic radio and node settings:");
+        println!();
+        println!("  The region, modem preset, and node name were saved to config.toml.");
+        println!("  They are applied to the device automatically when the BBS connects —");
+        println!("  just start the BBS and they take effect. You can change them any time");
+        println!("  from Settings in the web admin UI (also applied automatically).");
         println!();
     }
 

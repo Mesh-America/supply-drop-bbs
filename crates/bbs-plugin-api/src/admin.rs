@@ -210,6 +210,96 @@ pub struct AdminAccessPolicy {
     pub guest_room_id: Option<i64>,
 }
 
+/// Radio parameters applied to a MeshCore companion device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshRadioParams {
+    /// Centre frequency in Hz (e.g. 910_525_000 for 910.525 MHz).
+    pub frequency_hz: u32,
+    /// Channel bandwidth in Hz (e.g. 62_500 for 62.5 kHz).
+    pub bandwidth_hz: u32,
+    /// LoRa spreading factor (7–12).
+    pub spreading_factor: u8,
+    /// Coding rate denominator (5–8, meaning 4/5 through 4/8).
+    pub coding_rate: u8,
+    /// Transmit power in dBm.
+    pub tx_power_dbm: i8,
+}
+
+/// Meshtastic LoRa radio configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshtasticLoRaConfig {
+    /// Whether to use a built-in modem preset instead of custom parameters.
+    pub use_preset: bool,
+    /// Meshtastic modem preset enum value (used when `use_preset` is true).
+    pub modem_preset: i32,
+    /// Channel bandwidth (device-specific units).
+    pub bandwidth: u32,
+    /// LoRa spreading factor (7–12).
+    pub spread_factor: u32,
+    /// Coding rate denominator (5–8).
+    pub coding_rate: u32,
+    /// Frequency offset in MHz.
+    pub frequency_offset: f32,
+    /// Meshtastic region enum value.
+    pub region: i32,
+    /// Maximum number of hops for mesh routing.
+    pub hop_limit: u32,
+    /// Whether the transmitter is enabled.
+    pub tx_enabled: bool,
+    /// Transmit power in dBm.
+    pub tx_power: i32,
+    /// LoRa channel number (0 = use frequency directly).
+    pub channel_num: u32,
+    /// Override frequency in MHz (0 = use region default).
+    pub override_frequency: f32,
+    /// SX126x RX boosted gain — improves receive sensitivity.
+    #[serde(default)]
+    pub sx126x_rx_boosted_gain: bool,
+    /// Ignore packets that arrived over MQTT.
+    #[serde(default)]
+    pub ignore_mqtt: bool,
+}
+
+/// Meshtastic node owner / identity info.
+///
+/// Returned by [`crate::host::Host::admin_get_meshtastic_owner`].
+/// The public key is hex-encoded (64 lower-case hex chars for 32 bytes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshtasticOwnerInfo {
+    /// Unique node ID string, e.g. `"!aabbccdd"`.
+    pub id: String,
+    /// Full display name.
+    pub long_name: String,
+    /// Short display name (≤ 4 chars on hardware).
+    pub short_name: String,
+    /// Curve25519 public key, hex-encoded (64 chars = 32 bytes).
+    pub public_key_hex: String,
+}
+
+/// Meshtastic security / PKC configuration.
+///
+/// Returned by [`crate::host::Host::admin_get_meshtastic_security`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MeshtasticSecurityInfo {
+    /// Node's Curve25519 public key, hex-encoded (64 chars).
+    pub public_key_hex: String,
+    /// Whether the legacy insecure admin channel is enabled.
+    pub admin_channel_enabled: bool,
+}
+
+/// A combined snapshot of the connected Meshtastic device's settings, served
+/// from the config captured during the last connect-time sync (no live admin
+/// round-trip). Any field is `None` if the device hasn't reported it yet.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MeshtasticDeviceSnapshot {
+    /// LoRa radio configuration.
+    pub lora: Option<MeshtasticLoRaConfig>,
+    /// Node owner / identity info.
+    pub owner: Option<MeshtasticOwnerInfo>,
+    /// Security / PKC configuration.
+    pub security: Option<MeshtasticSecurityInfo>,
+}
+
 /// One entry in the durable audit log.
 ///
 /// Written whenever a privileged action is performed: ban, unban, validate,
