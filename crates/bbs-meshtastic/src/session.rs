@@ -36,6 +36,10 @@ pub struct SessionState {
     /// The device's current security/PKC config, captured during sync. Lets the
     /// web serve the public key + admin-channel state without a live admin GET.
     pub device_security: Option<crate::proto::SecurityConfig>,
+    /// The device's current DeviceConfig, captured during sync. Used to merge
+    /// `node_info_broadcast_secs` (and skip-if-unchanged) without clobbering
+    /// role/other device fields.
+    pub device_config: Option<crate::proto::DeviceConfig>,
     pub by_node: HashMap<u32, SessionEntry>,
     pub by_session: HashMap<SessionId, u32>,
 }

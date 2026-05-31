@@ -34,11 +34,11 @@ use crate::{
     command::{format_response, parse_command, render_notification, truncate_utf8},
     proto::{
         admin_get_lora_config, admin_get_owner, admin_get_security_config, admin_get_session_key,
-        admin_message, admin_remove_fixed_position, admin_set_fixed_position,
-        admin_set_lora_config, admin_set_owner, admin_set_time, direct_text_packet, from_radio,
-        mesh_packet, mt_config, node_key, nodeinfo_broadcast, synthetic_pubkey, AdminMessage, Data,
-        LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP,
-        PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
+        admin_message, admin_remove_fixed_position, admin_set_device_config,
+        admin_set_fixed_position, admin_set_lora_config, admin_set_owner, admin_set_time,
+        direct_text_packet, from_radio, mesh_packet, mt_config, node_key, synthetic_pubkey,
+        AdminMessage, Data, LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR,
+        PORT_ADMIN_APP, PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
     },
     session::SessionState,
     stream::{ClientEvent, MeshtasticClient, SerialConfig, TcpConfig},
@@ -463,51 +463,13 @@ impl Plugin for MeshtasticTransport {
             }
         });
 
-        // Self-advert: when the sysop hits "send advert" in the web UI, broadcast
-        // our node info so neighbouring Meshtastic nodes add us to their node
-        // list. The firmware otherwise only announces on boot and on a slow
-        // periodic timer, so this is the only way to appear promptly.
-        let advert_cmd_tx = self.cmd_tx.clone();
-        let advert_state = Arc::clone(&self.state);
-        let advert_long = self.long_name.clone();
-        let advert_short = self.short_name.clone();
-        let advert_hop = self.hop_limit;
-        let advert_want_ack = self.want_ack;
-        let mut advert_send_rx = self.host.advert_bus().subscribe_send();
-        let mut advert_shutdown_rx = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    result = advert_send_rx.recv() => match result {
-                        Ok(flood) => {
-                            let node = advert_state.lock().expect("state mutex poisoned").my_node_num;
-                            let Some(node) = node else {
-                                warn!("meshtastic: send-advert requested before node number known");
-                                continue;
-                            };
-                            let mut user = owner_user(advert_long.as_deref(), advert_short.as_deref());
-                            user.id = format_node_id(node);
-                            // Flood → multi-hop (configured hop limit); direct → neighbours only.
-                            let hop = if flood { advert_hop } else { 0 };
-                            // Varied id so the mesh doesn't dedup the broadcast.
-                            let id = random_packet_id();
-                            if advert_cmd_tx
-                                .send(nodeinfo_broadcast(id, user, hop, advert_want_ack))
-                                .await
-                                .is_ok()
-                            {
-                                info!(flood, "meshtastic: broadcast self node info (send advert)");
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("meshtastic: advert-send stream lagged by {n}");
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    },
-                    _ = advert_shutdown_rx.changed() => break,
-                }
-            }
-        });
+        // NB: the meshtastic transport intentionally does NOT subscribe to the
+        // advert-send bus. Meshtastic NodeInfo is only ever *originated* by the
+        // device firmware (on boot, on a periodic timer, on hearing an unknown
+        // node, or when answering a NodeInfo request) — a client-injected
+        // NODEINFO_APP packet is not retransmitted by the firmware, so a manual
+        // "send advert" can't make us appear. Discoverability is handled by
+        // lowering `node_info_broadcast_secs` on connect (see enqueue_auto_apply).
 
         info!("meshtastic transport started");
         Ok(())
@@ -619,6 +581,8 @@ enum DeferredWrite {
         user: proto::User,
         reply: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     },
+    /// Write the merged DeviceConfig (e.g. node_info_broadcast_secs). Reboots.
+    Device { device: proto::DeviceConfig },
     /// Sync the device clock to the host's current time. No reply, no reboot.
     Time,
     /// Set a fixed GPS position (decimal degrees). No reply, no reboot.
@@ -685,6 +649,15 @@ async fn flush_deferred_writes(
                 }
                 if ok {
                     info!("meshtastic: applied node owner info to device");
+                }
+            }
+            DeferredWrite::Device { device } => {
+                if cmd_tx
+                    .send(admin_set_device_config(node, rid, device, passkey.to_vec()))
+                    .await
+                    .is_ok()
+                {
+                    info!("meshtastic: applied device config (node_info_broadcast_secs) to device");
                 }
             }
             DeferredWrite::Time => {
@@ -797,7 +770,8 @@ async fn event_loop(
                         let r = match w {
                             DeferredWrite::Lora { reply, .. } => reply,
                             DeferredWrite::Owner { reply, .. } => reply,
-                            DeferredWrite::Time
+                            DeferredWrite::Device { .. }
+                            | DeferredWrite::Time
                             | DeferredWrite::SetFixedPosition { .. }
                             | DeferredWrite::RemoveFixedPosition => None,
                         };
@@ -826,9 +800,14 @@ async fn event_loop(
                             Some(from_radio::PayloadVariant::ConfigCompleteId(_))
                         )
                     {
-                        let (node, device_lora, device_owner) = {
+                        let (node, device_lora, device_owner, device_config) = {
                             let s = state.lock().expect("state poisoned");
-                            (s.my_node_num, s.device_lora.clone(), s.device_owner.clone())
+                            (
+                                s.my_node_num,
+                                s.device_lora.clone(),
+                                s.device_owner.clone(),
+                                s.device_config.clone(),
+                            )
                         };
                         if let Some(node) = node {
                             // Always sync the device clock to system time on connect.
@@ -842,11 +821,13 @@ async fn event_loop(
                                     deferred_writes.push(DeferredWrite::RemoveFixedPosition)
                                 }
                             }
-                            // Push configured radio params + node name (skip-if-unchanged).
+                            // Push configured radio params, node name, and the
+                            // node-info broadcast interval (all skip-if-unchanged).
                             enqueue_auto_apply(
                                 &auto_apply,
                                 device_lora.as_ref(),
                                 device_owner.as_ref(),
+                                device_config.as_ref(),
                                 &mut deferred_writes,
                             );
                             request_session_key(
@@ -857,41 +838,6 @@ async fn event_loop(
                             )
                             .await;
                             auto_applied = true;
-
-                            // Re-announce ourselves shortly after connecting so
-                            // neighbours (and the sysop's companion) re-acquire the
-                            // BBS node after a service restart. The firmware only
-                            // broadcasts NodeInfo on its own boot and a slow periodic
-                            // timer (~3h) — a software restart triggers neither, so
-                            // without this the node looks stale until a manual advert.
-                            // Use the device's real owner (with its public key) when
-                            // captured, else the configured name.
-                            let mut advert_user = device_owner.clone().unwrap_or_else(|| {
-                                owner_user(
-                                    auto_apply.long_name.as_deref(),
-                                    auto_apply.short_name.as_deref(),
-                                )
-                            });
-                            if advert_user.id.is_empty() {
-                                advert_user.id = format_node_id(node);
-                            }
-                            let advert_tx = cmd_tx.clone();
-                            tokio::spawn(async move {
-                                // Let config sync + any deferred writes settle first.
-                                tokio::time::sleep(Duration::from_secs(5)).await;
-                                if advert_tx
-                                    .send(nodeinfo_broadcast(
-                                        random_packet_id(),
-                                        advert_user,
-                                        hop_limit,
-                                        false,
-                                    ))
-                                    .await
-                                    .is_ok()
-                                {
-                                    info!("meshtastic: broadcast self node info on connect");
-                                }
-                            });
                         }
                     }
 
@@ -1056,6 +1002,12 @@ async fn event_loop(
     }
 }
 
+/// Target NodeInfo broadcast interval pushed to the device so it re-announces
+/// itself periodically (firmware minimum is 3600s / 1h — lower values are
+/// clamped by the firmware). This is the only firmware-supported way to keep a
+/// node discoverable; client-injected NodeInfo packets are not retransmitted.
+const NODE_INFO_BROADCAST_SECS: u32 = 3600;
+
 /// Queue the operator's configured radio and node-name settings as deferred
 /// writes, to be sent once a session passkey is obtained. Called once per
 /// connection after config sync completes — this is what makes settings from
@@ -1064,8 +1016,26 @@ fn enqueue_auto_apply(
     cfg: &AutoApplyConfig,
     device_lora: Option<&proto::LoRaConfig>,
     device_owner: Option<&proto::User>,
+    device_config: Option<&proto::DeviceConfig>,
     deferred: &mut Vec<DeferredWrite>,
 ) {
+    // Device config: lower node_info_broadcast_secs so the firmware re-announces
+    // the node hourly. Merge onto the captured DeviceConfig so role and every
+    // other field are preserved; skip the write (and its reboot) when unchanged.
+    if let Some(current) = device_config {
+        if current.node_info_broadcast_secs != NODE_INFO_BROADCAST_SECS {
+            let mut desired = current.clone();
+            desired.node_info_broadcast_secs = NODE_INFO_BROADCAST_SECS;
+            info!(
+                from = current.node_info_broadcast_secs,
+                to = NODE_INFO_BROADCAST_SECS,
+                "meshtastic: queuing device config — node_info_broadcast_secs change"
+            );
+            deferred.push(DeferredWrite::Device { device: desired });
+        } else {
+            info!("meshtastic: node_info_broadcast_secs already matches, skipping (no reboot)");
+        }
+    }
     if let Some(radio) = &cfg.radio {
         // Build the desired config by *overlaying* our settings onto the
         // device's current LoRa config — never from a zeroed default. A bare
@@ -1702,6 +1672,14 @@ async fn handle_from_radio(
                 Some(proto::mt_config::PayloadVariant::Security(sec)) => {
                     debug!("meshtastic: captured device security config from sync");
                     state.lock().expect("state mutex poisoned").device_security = Some(sec);
+                }
+                Some(proto::mt_config::PayloadVariant::Device(dev)) => {
+                    debug!(
+                        node_info_broadcast_secs = dev.node_info_broadcast_secs,
+                        role = dev.role,
+                        "meshtastic: captured device config from sync"
+                    );
+                    state.lock().expect("state mutex poisoned").device_config = Some(dev);
                 }
                 None => {}
             }

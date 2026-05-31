@@ -282,48 +282,6 @@ pub fn direct_text_packet(
     }
 }
 
-/// Broadcast our own node info (owner `User`) to the whole mesh.
-///
-/// This is the Meshtastic equivalent of MeshCore's self-advert: it makes the
-/// radio transmit a `NODEINFO_APP` packet so other nodes add us to their node
-/// list. The firmware otherwise only broadcasts node info on boot and on a slow
-/// periodic timer (~3 h by default), so without this a freshly-configured BBS
-/// node can take hours to appear on neighbouring devices.
-///
-/// `from` is left 0 (local origin); the firmware stamps it with our node
-/// number before transmit. `want_response` is false — this is an announcement,
-/// not a request for replies.
-pub fn nodeinfo_broadcast(packet_id: u32, user: User, hop_limit: u32, want_ack: bool) -> ToRadio {
-    use prost::Message as _;
-    ToRadio {
-        payload_variant: Some(to_radio::PayloadVariant::Packet(MeshPacket {
-            from: 0,
-            to: BROADCAST_ADDR,
-            channel: 0,
-            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
-                portnum: PORT_NODEINFO_APP,
-                payload: user.encode_to_vec(),
-                want_response: false,
-                dest: 0,
-                source: 0,
-                request_id: 0,
-                reply_id: 0,
-            })),
-            id: packet_id,
-            rx_time: 0,
-            rx_snr: 0.0,
-            hop_limit,
-            want_ack,
-            priority: PRIORITY_RELIABLE,
-            rx_rssi: 0,
-            via_mqtt: false,
-            hop_start: 0,
-            public_key: Vec::new(),
-            pki_encrypted: false,
-        })),
-    }
-}
-
 pub fn node_key(node_num: u32) -> [u8; 6] {
     let n = node_num.to_be_bytes();
     [b'M', b'T', n[0], n[1], n[2], n[3]]
@@ -419,7 +377,7 @@ pub mod admin_message {
 /// Subset of Meshtastic `Config` (`config.proto Config`).
 #[derive(Clone, PartialEq, Message)]
 pub struct MtConfig {
-    #[prost(oneof = "mt_config::PayloadVariant", tags = "6, 8")]
+    #[prost(oneof = "mt_config::PayloadVariant", tags = "1, 6, 8")]
     pub payload_variant: Option<mt_config::PayloadVariant>,
 }
 
@@ -427,6 +385,9 @@ pub mod mt_config {
     use super::*;
     #[derive(Clone, PartialEq, Oneof)]
     pub enum PayloadVariant {
+        /// `Config.device` — device role / node-info broadcast interval, etc.
+        #[prost(message, tag = "1")]
+        Device(super::DeviceConfig),
         /// `Config.lora` — LoRa radio parameters (field 6 in Config oneof).
         #[prost(message, tag = "6")]
         Lora(super::LoRaConfig),
@@ -434,6 +395,45 @@ pub mod mt_config {
         #[prost(message, tag = "8")]
         Security(super::SecurityConfig),
     }
+}
+
+/// Meshtastic `Config.DeviceConfig` (subset — all current fields, so a
+/// read-modify-write round-trip preserves everything we don't touch).
+///
+/// Field numbers verified against meshtastic/protobufs config.proto.
+#[derive(Clone, PartialEq, Message)]
+pub struct DeviceConfig {
+    /// Device role (`Config.DeviceConfig.Role`). MUST be preserved on a merge —
+    /// clobbering it (e.g. ROUTER→CLIENT) would break the node's mesh behavior.
+    #[prost(int32, tag = "1")]
+    pub role: i32,
+    /// Deprecated `serial_enabled`; preserved on round-trip.
+    #[prost(bool, tag = "2")]
+    pub serial_enabled: bool,
+    #[prost(uint32, tag = "4")]
+    pub button_gpio: u32,
+    #[prost(uint32, tag = "5")]
+    pub buzzer_gpio: u32,
+    /// Rebroadcast mode (`RebroadcastMode` enum).
+    #[prost(int32, tag = "6")]
+    pub rebroadcast_mode: i32,
+    /// Seconds between NodeInfo broadcasts (firmware minimum 3600).
+    #[prost(uint32, tag = "7")]
+    pub node_info_broadcast_secs: u32,
+    #[prost(bool, tag = "8")]
+    pub double_tap_as_button_press: bool,
+    /// Deprecated `is_managed`; preserved on round-trip.
+    #[prost(bool, tag = "9")]
+    pub is_managed: bool,
+    #[prost(bool, tag = "10")]
+    pub disable_triple_click: bool,
+    #[prost(string, tag = "11")]
+    pub tzdef: String,
+    #[prost(bool, tag = "12")]
+    pub led_heartbeat_disabled: bool,
+    /// Buzzer mode (`BuzzerMode` enum).
+    #[prost(int32, tag = "13")]
+    pub buzzer_mode: i32,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -542,6 +542,25 @@ pub fn admin_set_lora_config(
         AdminMessage {
             payload_variant: Some(admin_message::PayloadVariant::SetConfig(MtConfig {
                 payload_variant: Some(mt_config::PayloadVariant::Lora(config)),
+            })),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `SetConfig` for the Device config, echoing back the session passkey.
+pub fn admin_set_device_config(
+    to_node: u32,
+    request_id: u32,
+    config: DeviceConfig,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetConfig(MtConfig {
+                payload_variant: Some(mt_config::PayloadVariant::Device(config)),
             })),
             session_passkey,
         },
