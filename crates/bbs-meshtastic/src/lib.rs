@@ -523,6 +523,16 @@ enum PendingMeshtasticAdmin {
     },
 }
 
+/// True when the caller waiting on a pending GET has dropped its receiver
+/// (i.e. timed out and given up), so the pending op can be safely discarded.
+fn pending_reply_abandoned(op: &PendingMeshtasticAdmin) -> bool {
+    match op {
+        PendingMeshtasticAdmin::GetLora { reply, .. } => reply.is_closed(),
+        PendingMeshtasticAdmin::GetOwner { reply, .. } => reply.is_closed(),
+        PendingMeshtasticAdmin::GetSecurity { reply, .. } => reply.is_closed(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn event_loop(
     mut client: MeshtasticClient,
@@ -547,9 +557,21 @@ async fn event_loop(
     // Whether we've pushed the config.toml settings to the device on this
     // connection. Reset on disconnect so settings re-apply after a reconnect.
     let mut auto_applied = false;
+    // Periodically reap a pending GET whose caller has given up (its oneshot
+    // receiver was dropped after the caller's own timeout). Without this, a GET
+    // that never gets a device response would leave `pending_admin` set forever
+    // and block every later admin operation with "another operation in progress".
+    let mut reap = tokio::time::interval(Duration::from_secs(2));
+    reap.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            _ = reap.tick() => {
+                if pending_admin.as_ref().is_some_and(pending_reply_abandoned) {
+                    warn!("meshtastic: clearing abandoned pending admin GET (no device response)");
+                    pending_admin = None;
+                }
+            }
             event = client.recv() => match event {
                 Some(ClientEvent::Connected) => {
                     info!("meshtastic: connected to radio");
