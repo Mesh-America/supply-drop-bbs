@@ -857,6 +857,41 @@ async fn event_loop(
                             )
                             .await;
                             auto_applied = true;
+
+                            // Re-announce ourselves shortly after connecting so
+                            // neighbours (and the sysop's companion) re-acquire the
+                            // BBS node after a service restart. The firmware only
+                            // broadcasts NodeInfo on its own boot and a slow periodic
+                            // timer (~3h) — a software restart triggers neither, so
+                            // without this the node looks stale until a manual advert.
+                            // Use the device's real owner (with its public key) when
+                            // captured, else the configured name.
+                            let mut advert_user = device_owner.clone().unwrap_or_else(|| {
+                                owner_user(
+                                    auto_apply.long_name.as_deref(),
+                                    auto_apply.short_name.as_deref(),
+                                )
+                            });
+                            if advert_user.id.is_empty() {
+                                advert_user.id = format_node_id(node);
+                            }
+                            let advert_tx = cmd_tx.clone();
+                            tokio::spawn(async move {
+                                // Let config sync + any deferred writes settle first.
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                if advert_tx
+                                    .send(nodeinfo_broadcast(
+                                        random_packet_id(),
+                                        advert_user,
+                                        hop_limit,
+                                        false,
+                                    ))
+                                    .await
+                                    .is_ok()
+                                {
+                                    info!("meshtastic: broadcast self node info on connect");
+                                }
+                            });
                         }
                     }
 
