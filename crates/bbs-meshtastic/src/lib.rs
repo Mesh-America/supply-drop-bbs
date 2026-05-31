@@ -64,10 +64,10 @@ pub enum MeshtasticConnectionType {
 
 /// Radio parameter configuration stored in `[plugins.meshtastic.radio]`.
 ///
-/// These values are **not** pushed to the device automatically on connect.
-/// Apply them on demand via the web admin UI (Settings → Meshtastic radio)
-/// or `supply-drop-bbs node set-meshtastic-radio` once that command is added.
-/// Once applied the device persists the settings in its own flash.
+/// These values are pushed to the device automatically once config sync
+/// completes after the transport connects (see `apply_config_on_connect`), so
+/// changes made in setup or the web admin UI take effect the next time the BBS
+/// connects.  The device persists the settings in its own flash.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct MeshtasticRadioConfig {
@@ -144,9 +144,7 @@ pub struct MeshtasticConfig {
 
     /// Radio parameter configuration.
     ///
-    /// Stored here for reference and applied on demand via the web admin UI
-    /// (Settings → Meshtastic radio).  **Not** pushed automatically on every
-    /// connect — the device persists radio settings in its own flash.
+    /// Applied to the device automatically when the BBS connects.
     ///
     /// Example:
     /// ```toml
@@ -159,16 +157,13 @@ pub struct MeshtasticConfig {
 
     /// Short node name shown on OLED maps and mesh UIs (≤ 4 chars).
     ///
-    /// Stored here for reference.  Push to the device via the web admin UI
-    /// (Settings → Meshtastic device → Node name → Save to device) or by
-    /// running `supply-drop-bbs node set-meshtastic-owner` once that CLI
-    /// command is available.
+    /// Applied to the device automatically when the BBS connects.
     #[serde(default)]
     pub short_name: Option<String>,
 
     /// Full node display name shown in Meshtastic apps.
     ///
-    /// Stored alongside `short_name`; applied on demand via the web admin UI.
+    /// Applied to the device automatically when the BBS connects.
     #[serde(default)]
     pub long_name: Option<String>,
 }
@@ -262,6 +257,13 @@ pub struct MeshtasticTransport {
     admin_tx: mpsc::Sender<MeshtasticAdminRequest>,
     /// Admin channel receiver — taken by `start()` into the event loop.
     admin_rx: Mutex<Option<mpsc::Receiver<MeshtasticAdminRequest>>>,
+    /// Radio config from `[plugins.meshtastic.radio]`, applied to the device
+    /// automatically once config sync completes after connecting.
+    radio_config: Option<MeshtasticRadioConfig>,
+    /// Short node name from `[plugins.meshtastic]`, applied on connect.
+    short_name: Option<String>,
+    /// Long node name from `[plugins.meshtastic]`, applied on connect.
+    long_name: Option<String>,
 }
 
 #[async_trait]
@@ -326,6 +328,9 @@ impl Plugin for MeshtasticTransport {
             packet_counter: Arc::new(AtomicU32::new(1)),
             admin_tx,
             admin_rx: Mutex::new(Some(admin_rx)),
+            radio_config: config.radio,
+            short_name: config.short_name,
+            long_name: config.long_name,
         })
     }
 
@@ -363,6 +368,11 @@ impl Plugin for MeshtasticTransport {
         let hop_limit = self.hop_limit;
         let want_ack = self.want_ack;
         let packet_counter = Arc::clone(&self.packet_counter);
+        let auto_apply = AutoApplyConfig {
+            radio: self.radio_config.clone(),
+            short_name: self.short_name.clone(),
+            long_name: self.long_name.clone(),
+        };
 
         tokio::spawn(event_loop(
             client,
@@ -378,6 +388,7 @@ impl Plugin for MeshtasticTransport {
             want_ack,
             packet_counter,
             admin_rx,
+            auto_apply,
         ));
 
         // Subscribe to advisory domain events, mirroring the MeshCore transport.
@@ -466,6 +477,28 @@ impl TransportEngine for MeshtasticTransport {
 
 // ── Event loop ────────────────────────────────────────────────────────────────
 
+/// Settings from config.toml that are pushed to the device automatically once
+/// config sync completes after each (re)connection.  This is what makes
+/// "configure in setup or web UI → it just works" true: the operator never has
+/// to run a CLI command to apply settings.
+#[derive(Clone, Default)]
+struct AutoApplyConfig {
+    radio: Option<MeshtasticRadioConfig>,
+    short_name: Option<String>,
+    long_name: Option<String>,
+}
+
+impl AutoApplyConfig {
+    /// True when there is at least one setting to push.
+    fn has_anything(&self) -> bool {
+        self.radio
+            .as_ref()
+            .is_some_and(|r| r.region.is_some() || r.modem_preset.is_some())
+            || self.short_name.is_some()
+            || self.long_name.is_some()
+    }
+}
+
 /// Pending admin request in the Meshtastic event loop.
 enum PendingMeshtasticAdmin {
     GetLora {
@@ -505,17 +538,22 @@ async fn event_loop(
     want_ack: bool,
     packet_counter: Arc<AtomicU32>,
     mut admin_rx: mpsc::Receiver<MeshtasticAdminRequest>,
+    auto_apply: AutoApplyConfig,
 ) {
     let mut pending_admin: Option<PendingMeshtasticAdmin> = None;
     // Session passkey received from the last GET response; echo it back in SET
     // commands as a replay-attack guard (Meshtastic 2.5+, field 101).
     let mut last_session_passkey: Vec<u8> = Vec::new();
+    // Whether we've pushed the config.toml settings to the device on this
+    // connection. Reset on disconnect so settings re-apply after a reconnect.
+    let mut auto_applied = false;
 
     loop {
         tokio::select! {
             event = client.recv() => match event {
                 Some(ClientEvent::Connected) => {
                     info!("meshtastic: connected to radio");
+                    auto_applied = false;
                 }
                 Some(ClientEvent::Disconnected { will_retry }) => {
                     // Fail any in-flight admin request.
@@ -529,6 +567,7 @@ async fn event_loop(
                             PendingMeshtasticAdmin::GetSecurity { reply, .. } => { let _ = reply.send(Err(err)); }
                         }
                     }
+                    auto_applied = false;
                     if will_retry {
                         info!("meshtastic: radio disconnected, will retry");
                     } else {
@@ -537,6 +576,24 @@ async fn event_loop(
                     }
                 }
                 Some(ClientEvent::FromRadio(msg)) => {
+                    // Auto-apply config.toml settings once config sync completes.
+                    // ConfigCompleteId marks the end of the initial sync, by which
+                    // point MyInfo (node number) has already been received.
+                    if !auto_applied
+                        && matches!(
+                            msg.payload_variant,
+                            Some(from_radio::PayloadVariant::ConfigCompleteId(_))
+                        )
+                        && auto_apply.has_anything()
+                    {
+                        let node_num = state.lock().expect("state mutex poisoned").my_node_num;
+                        if let Some(node_num) = node_num {
+                            apply_config_on_connect(&cmd_tx, node_num, &auto_apply, &packet_counter)
+                                .await;
+                            auto_applied = true;
+                        }
+                    }
+
                     // Check if this is an admin response packet before general dispatch.
                     let consumed = try_handle_admin_response(
                         &msg,
@@ -667,6 +724,76 @@ async fn event_loop(
                 info!("meshtastic: shutdown signal received");
                 break;
             }
+        }
+    }
+}
+
+/// Push the operator's configured radio and node-name settings to the device.
+///
+/// Called once per connection after config sync completes.  Fire-and-forget:
+/// the device applies SetConfig / SetOwner and persists them in flash, so we
+/// don't block on ACKs here.  This is what makes settings configured in setup
+/// or the web UI take effect automatically — no CLI step required.
+///
+/// `SetOwner` is sent with an empty `public_key`; Meshtastic firmware only
+/// copies `long_name`/`short_name` from the message and never overwrites the
+/// node's PKC key from a SetOwner (the key is managed via SecurityConfig), so
+/// the node's identity key is preserved.
+async fn apply_config_on_connect(
+    cmd_tx: &mpsc::Sender<proto::ToRadio>,
+    node_num: u32,
+    cfg: &AutoApplyConfig,
+    packet_counter: &AtomicU32,
+) {
+    use proto::{admin_set_lora_config, admin_set_owner, LoRaConfig, User};
+
+    // Radio config (region + modem preset).
+    if let Some(radio) = &cfg.radio {
+        if radio.region.is_some() || radio.modem_preset.is_some() {
+            let region = region_str_to_int(radio.region.as_deref().unwrap_or("UNSET"));
+            let preset = preset_str_to_int(radio.modem_preset.as_deref().unwrap_or("LONG_FAST"));
+            let lora = LoRaConfig {
+                use_preset: true,
+                modem_preset: preset,
+                region,
+                ..Default::default()
+            };
+            let rid = packet_counter.fetch_add(1, Ordering::Relaxed);
+            info!(
+                region = radio.region.as_deref().unwrap_or("UNSET"),
+                modem_preset = radio.modem_preset.as_deref().unwrap_or("LONG_FAST"),
+                "meshtastic: auto-applying radio config from config.toml"
+            );
+            if cmd_tx
+                .send(admin_set_lora_config(node_num, rid, lora, Vec::new()))
+                .await
+                .is_err()
+            {
+                warn!("meshtastic: failed to send auto-apply radio config");
+            }
+        }
+    }
+
+    // Node name (long + short).
+    if cfg.short_name.is_some() || cfg.long_name.is_some() {
+        let user = User {
+            id: String::new(),
+            long_name: cfg.long_name.clone().unwrap_or_default(),
+            short_name: cfg.short_name.clone().unwrap_or_default(),
+            public_key: Vec::new(),
+        };
+        let rid = packet_counter.fetch_add(1, Ordering::Relaxed);
+        info!(
+            long_name = cfg.long_name.as_deref().unwrap_or(""),
+            short_name = cfg.short_name.as_deref().unwrap_or(""),
+            "meshtastic: auto-applying node name from config.toml"
+        );
+        if cmd_tx
+            .send(admin_set_owner(node_num, rid, user, Vec::new()))
+            .await
+            .is_err()
+        {
+            warn!("meshtastic: failed to send auto-apply node name");
         }
     }
 }

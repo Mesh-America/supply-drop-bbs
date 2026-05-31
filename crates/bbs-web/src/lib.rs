@@ -2771,9 +2771,9 @@ async fn api_patch_meshtastic_radio_config(
                     "ok": true,
                     "saved": true,
                     "applied": false,
-                    "message": "Saved to config.toml. Settings will not take effect on the \
-                                device until you run: supply-drop-bbs node set-meshtastic-radio \
-                                (while the BBS is stopped).",
+                    "message": "Saved to config.toml. The device is not connected right now; \
+                                these settings will be applied automatically the next time the \
+                                BBS connects to it.",
                 }))
                 .into_response()
             } else {
@@ -2862,9 +2862,9 @@ async fn api_patch_meshtastic_owner(
                     "ok": true,
                     "saved": true,
                     "applied": false,
-                    "message": "Saved to config.toml. Settings will not take effect on the \
-                                device until you run: supply-drop-bbs node set-meshtastic-owner \
-                                (while the BBS is stopped).",
+                    "message": "Saved to config.toml. The device is not connected right now; \
+                                this name will be applied automatically the next time the BBS \
+                                connects to it.",
                 }))
                 .into_response()
             } else {
