@@ -502,6 +502,34 @@ const MESHTASTIC_PRESETS = [
   { value: 13, label: 'NARROW_SLOW — EU_868 62.5 kHz, ~LONG_FAST range' },
 ]
 
+// Region frequency ranges (MHz) and preset bandwidths (kHz), used to show the
+// frequency the device will operate on. Mirrors the Meshtastic firmware's
+// region table and modem-preset bandwidths.
+const MESHTASTIC_REGION_FREQ: Record<number, { start: number; end: number }> = {
+  1:  { start: 902.0,  end: 928.0 },   // US
+  2:  { start: 433.0,  end: 434.0 },   // EU_433
+  3:  { start: 869.4,  end: 869.65 },  // EU_868
+  4:  { start: 470.0,  end: 510.0 },   // CN
+  5:  { start: 920.8,  end: 927.8 },   // JP
+  6:  { start: 915.0,  end: 928.0 },   // ANZ
+  7:  { start: 920.0,  end: 923.0 },   // KR
+  8:  { start: 920.0,  end: 925.0 },   // TW
+  9:  { start: 868.7,  end: 869.2 },   // RU
+  10: { start: 865.0,  end: 867.0 },   // IN
+  11: { start: 864.0,  end: 868.0 },   // NZ_865
+  12: { start: 920.0,  end: 925.0 },   // TH
+  13: { start: 2400.0, end: 2483.5 },  // LORA_24
+  14: { start: 433.0,  end: 434.7 },   // UA_433
+  15: { start: 868.0,  end: 868.6 },   // UA_868
+  16: { start: 433.0,  end: 435.0 },   // MY_433
+  17: { start: 919.0,  end: 924.0 },   // MY_919
+  18: { start: 917.0,  end: 925.0 },   // SG_923
+}
+const MESHTASTIC_PRESET_BW_KHZ: Record<number, number> = {
+  0: 250, 1: 125, 3: 250, 4: 250, 5: 250, 6: 250,
+  7: 125, 8: 500, 9: 500, 10: 250, 11: 250, 12: 62.5, 13: 62.5,
+}
+
 // ── Meshtastic radio ──────────────────────────────────────────────────────────
 
 const meshtasticRadioLoading = ref(false)
@@ -524,6 +552,18 @@ const meshtasticOverrideFrequency = ref(0)
 const meshtasticRxBoostedGain = ref(true)
 const meshtasticIgnoreMqtt = ref(true)
 
+// Frequency (MHz) the device will use, derived from region + preset + channel
+// slot. Channel slot is the configured channel_num (1-based; 0 = device auto-
+// selects slot 1 by default, or a slot hashed from the channel name).
+const meshtasticDerivedFreq = computed<number | null>(() => {
+  const r = MESHTASTIC_REGION_FREQ[meshtasticRegion.value]
+  if (!r) return null
+  const bw = MESHTASTIC_PRESET_BW_KHZ[meshtasticModemPreset.value] ?? 250
+  const slot = meshtasticChannelNum.value > 0 ? meshtasticChannelNum.value - 1 : 0
+  const freq = r.start + bw / 2000 + slot * (bw / 1000)
+  return Math.round(freq * 1000) / 1000
+})
+
 function applyMeshtasticRadioFields(r: any) {
   meshtasticUsePreset.value         = r.use_preset ?? false
   meshtasticModemPreset.value       = r.modem_preset ?? 0
@@ -541,16 +581,20 @@ function applyMeshtasticRadioFields(r: any) {
   meshtasticIgnoreMqtt.value        = r.ignore_mqtt ?? true
 }
 
-async function loadMeshtasticRadio() {
+async function loadMeshtasticRadio(opts: { silent?: boolean } = {}) {
   meshtasticRadioLoading.value = true
   meshtasticRadioError.value = null
   meshtasticRadioOk.value = null
   try {
     const r = await api.get<any>('/api/v1/meshtastic-radio-config')
     applyMeshtasticRadioFields(r)
-    meshtasticRadioOk.value = 'Loaded from device.'
+    if (!opts.silent) meshtasticRadioOk.value = 'Loaded from device.'
   } catch (e: any) {
-    meshtasticRadioError.value = e?.message ?? 'failed to load meshtastic radio config'
+    // On the silent mount-time load, stay quiet when the transport isn't
+    // connected — the user can hit "load from device" explicitly.
+    if (!opts.silent) {
+      meshtasticRadioError.value = e?.message ?? 'failed to load meshtastic radio config'
+    }
   } finally {
     meshtasticRadioLoading.value = false
   }
@@ -562,7 +606,8 @@ async function saveMeshtasticRadio() {
   meshtasticRadioOk.value = null
   try {
     const res = await api.patch<any>('/api/v1/meshtastic-radio-config', {
-      use_preset:         meshtasticUsePreset.value,
+      // We always operate in preset mode; bandwidth/SF/CR are preset-derived.
+      use_preset:         true,
       modem_preset:       meshtasticModemPreset.value,
       bandwidth:          meshtasticBandwidth.value,
       spread_factor:      meshtasticSpreadFactor.value,
@@ -776,12 +821,25 @@ function copyToClipboard(text: string) {
   navigator.clipboard.writeText(text).catch(() => {})
 }
 
+// Which settings tab is visible. Sections are grouped by area so the two
+// MeshCore pieces (radio + identity) and the two Meshtastic pieces (radio +
+// device) live together instead of being interleaved.
+type SettingsTab = 'general' | 'meshcore' | 'meshtastic' | 'system'
+const settingsTab = ref<SettingsTab>('general')
+const SETTINGS_TABS: { id: SettingsTab; label: string }[] = [
+  { id: 'general', label: 'General' },
+  { id: 'meshcore', label: 'MeshCore' },
+  { id: 'meshtastic', label: 'Meshtastic' },
+  { id: 'system', label: 'System' },
+]
+
 onMounted(() => {
   load()
   loadRooms()
   loadAccessPolicy()
   loadRadioConfig()
   loadNodeIdentity()
+  loadMeshtasticRadio({ silent: true })
 })
 </script>
 
@@ -814,10 +872,24 @@ chmod g+w {{ configFile }}</pre>
     <div v-if="saveOk" class="notice ok-notice">{{ saveOk }}</div>
     <div v-if="saveError" class="notice error-notice">{{ saveError }}</div>
 
+    <nav v-if="!loadError" class="settings-tabs" role="tablist">
+      <button
+        v-for="t in SETTINGS_TABS"
+        :key="t.id"
+        type="button"
+        role="tab"
+        :class="{ active: settingsTab === t.id }"
+        :aria-selected="settingsTab === t.id"
+        @click="settingsTab = t.id"
+      >
+        {{ t.label }}
+      </button>
+    </nav>
+
     <form v-if="!loadError" @submit.prevent="save" class="settings-form" novalidate>
 
       <!-- BBS Identity -->
-      <section class="card">
+      <section v-show="settingsTab === 'general'" class="card">
         <h2>BBS identity</h2>
 
         <div class="field" :class="{ 'has-error': validationErrors.bbs_name }">
@@ -868,7 +940,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- GPS location -->
-      <section class="card">
+      <section v-show="settingsTab === 'general'" class="card">
         <h2>GPS location</h2>
         <p class="hint">
           When set, the mesh transport sends your coordinates to the radio on connect so your
@@ -898,7 +970,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Backup -->
-      <section class="card">
+      <section v-show="settingsTab === 'system'" class="card">
         <h2>Automatic backups</h2>
         <div class="field checkbox-field">
           <label>
@@ -926,7 +998,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Security -->
-      <section class="card">
+      <section v-show="settingsTab === 'system'" class="card">
         <h2>Security</h2>
         <div class="field-row">
           <div class="field" :class="{ 'has-error': validationErrors.security_session_web_hours }">
@@ -956,7 +1028,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Logging -->
-      <section class="card">
+      <section v-show="settingsTab === 'system'" class="card">
         <h2>Logging</h2>
         <div class="field">
           <label>Log level</label>
@@ -967,16 +1039,8 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
-      <div class="actions">
-        <button type="submit" :disabled="saving || !writable || !isDirty || !isFormValid">
-          {{ saving ? 'saving…' : 'save settings' }}
-        </button>
-        <span v-if="!writable" class="hint">config file is not writable</span>
-        <span v-else-if="!isDirty" class="hint">no unsaved changes</span>
-      </div>
-
       <!-- Access policy -->
-      <section class="card">
+      <section v-show="settingsTab === 'general'" class="card">
         <h2>Access policy</h2>
         <p class="hint">
           Controls how new registrations are handled. Changes take effect
@@ -1037,7 +1101,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- MeshCore Radio — shown for all MeshCore connection types -->
-      <section v-if="radioConfig" class="card">
+      <section v-if="radioConfig" v-show="settingsTab === 'meshcore'" class="card">
         <h2>MeshCore radio</h2>
         <p class="hint">
           LoRa parameters for the MeshCore companion device.
@@ -1101,7 +1165,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Meshtastic radio -->
-      <section class="card">
+      <section v-show="settingsTab === 'meshtastic'" class="card">
         <h2>Meshtastic radio</h2>
         <p class="hint">
           LoRa radio configuration for the connected Meshtastic device.
@@ -1124,43 +1188,42 @@ chmod g+w {{ configFile }}</pre>
           </div>
           <div class="field">
             <label>Modem preset</label>
-            <select v-model.number="meshtasticModemPreset" :disabled="meshtasticRadioLoading || !meshtasticUsePreset">
+            <select v-model.number="meshtasticModemPreset" :disabled="meshtasticRadioLoading">
               <option v-for="p in MESHTASTIC_PRESETS" :key="p.value" :value="p.value">
                 {{ p.label }}
               </option>
             </select>
-            <p class="hint">Only used when "Use preset" is enabled.</p>
+            <p class="hint">Bandwidth, spreading factor, and coding rate are set by the preset.</p>
           </div>
         </div>
-        <!-- Custom LoRa parameters — visible when not using preset -->
         <div class="field-row">
-          <div class="field">
-            <label>Spread factor</label>
-            <input v-model.number="meshtasticSpreadFactor" type="number" min="7" max="12" :disabled="meshtasticRadioLoading || meshtasticUsePreset" />
-          </div>
-          <div class="field">
-            <label>Bandwidth (kHz units)</label>
-            <input v-model.number="meshtasticBandwidth" type="number" min="0" :disabled="meshtasticRadioLoading || meshtasticUsePreset" />
-          </div>
           <div class="field">
             <label>TX power (dBm)</label>
             <input v-model.number="meshtasticTxPower" type="number" :disabled="meshtasticRadioLoading" />
           </div>
-        </div>
-        <div class="field-row">
           <div class="field">
             <label>Hop limit</label>
             <input v-model.number="meshtasticHopLimit" type="number" min="0" max="7" :disabled="meshtasticRadioLoading" />
           </div>
           <div class="field">
-            <label>Override frequency (MHz)</label>
-            <input v-model.number="meshtasticOverrideFrequency" type="number" step="0.001" :disabled="meshtasticRadioLoading" />
+            <label>Frequency (MHz)</label>
+            <input
+              v-model.number="meshtasticOverrideFrequency"
+              type="number"
+              step="0.001"
+              :placeholder="meshtasticDerivedFreq !== null ? String(meshtasticDerivedFreq) : ''"
+              :disabled="meshtasticRadioLoading"
+            />
+            <p class="hint">
+              <template v-if="meshtasticDerivedFreq !== null">
+                Region/preset default: <strong>{{ meshtasticDerivedFreq }} MHz</strong>.
+              </template>
+              Leave 0 to use the default; enter a value to override.
+            </p>
           </div>
-          <div class="field" style="display:flex;flex-direction:column;gap:0.5rem;justify-content:flex-end;">
-            <label style="display:flex;align-items:center;gap:0.5rem;">
-              <input type="checkbox" v-model="meshtasticUsePreset" :disabled="meshtasticRadioLoading" />
-              Use preset
-            </label>
+        </div>
+        <div class="field-row">
+          <div class="field" style="display:flex;flex-direction:column;gap:0.5rem;">
             <label style="display:flex;align-items:center;gap:0.5rem;">
               <input type="checkbox" v-model="meshtasticTxEnabled" :disabled="meshtasticRadioLoading" />
               TX enabled
@@ -1177,7 +1240,7 @@ chmod g+w {{ configFile }}</pre>
         </div>
 
         <div class="actions">
-          <button type="button" :disabled="meshtasticRadioLoading" @click="loadMeshtasticRadio">
+          <button type="button" :disabled="meshtasticRadioLoading" @click="loadMeshtasticRadio()">
             {{ meshtasticRadioLoading ? 'loading…' : 'load from device' }}
           </button>
           <button type="button" :disabled="meshtasticRadioLoading || meshtasticRadioSaving" @click="saveMeshtasticRadio">
@@ -1187,7 +1250,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Meshtastic device — owner info and PKC key -->
-      <section class="card">
+      <section v-show="settingsTab === 'meshtastic'" class="card">
         <h2>Meshtastic device <span class="badge">Meshtastic</span></h2>
         <p class="hint">
           Node identity and PKC (public-key cryptography) settings for the connected
@@ -1260,7 +1323,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Node identity -->
-      <section class="card">
+      <section v-show="settingsTab === 'meshcore'" class="card">
         <h2>Node identity <span class="badge">MeshCore</span></h2>
         <p class="hint">
           The <strong>MeshCore</strong> companion device's identity keypair. The public key
@@ -1347,7 +1410,7 @@ chmod g+w {{ configFile }}</pre>
       </section>
 
       <!-- Service restart -->
-      <section class="card">
+      <section v-show="settingsTab === 'system'" class="card">
         <h2>Service</h2>
         <p class="hint">
           Restart the systemd service to apply config changes. The web UI will
@@ -1363,6 +1426,18 @@ chmod g+w {{ configFile }}</pre>
         </div>
       </section>
 
+      <!-- Global save for the config-file-backed settings (General + System). -->
+      <div
+        v-show="settingsTab === 'general' || settingsTab === 'system'"
+        class="actions save-actions"
+      >
+        <button type="submit" :disabled="saving || !writable || !isDirty || !isFormValid">
+          {{ saving ? 'saving…' : 'save settings' }}
+        </button>
+        <span v-if="!writable" class="hint">config file is not writable</span>
+        <span v-else-if="!isDirty" class="hint">no unsaved changes</span>
+      </div>
+
     </form>
   </div>
 </template>
@@ -1371,6 +1446,31 @@ chmod g+w {{ configFile }}</pre>
 .page { display: flex; flex-direction: column; gap: 1.2rem; }
 .page-header { display: flex; flex-direction: column; gap: 0.2rem; }
 h1 { margin: 0; }
+
+.settings-tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.settings-tabs button {
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 0.5rem 0.9rem;
+  font: inherit;
+  color: var(--muted);
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+.settings-tabs button:hover { color: var(--fg); }
+.settings-tabs button.active {
+  color: var(--fg);
+  border-bottom-color: var(--accent, #4a90d9);
+  font-weight: 600;
+}
+.save-actions { position: sticky; bottom: 0; }
 h2 { margin: 0 0 1rem; font-size: 1em; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
 .small { font-size: 0.85em; }
 p { margin: 0; }
