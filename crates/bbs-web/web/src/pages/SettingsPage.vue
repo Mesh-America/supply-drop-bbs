@@ -568,7 +568,7 @@ async function saveMeshtasticRadio() {
       override_frequency: meshtasticOverrideFrequency.value,
     })
     if (res?.applied === false && res?.saved) {
-      meshtasticRadioOk.value = 'Saved to config.toml. Device not connected — settings will apply next time you run: supply-drop-bbs node set-meshtastic-radio'
+      meshtasticRadioOk.value = 'Saved. The device is not connected right now — these settings will be applied automatically the next time the BBS connects to it.'
     } else {
       meshtasticRadioOk.value = 'Radio config saved and applied to device.'
     }
@@ -632,7 +632,7 @@ async function saveMeshtasticOwner() {
       short_name: meshtasticShortName.value || null,
     })
     if (res?.applied === false && res?.saved) {
-      meshtasticOwnerOk.value = 'Saved to config.toml. Device not connected — settings will apply next time you run: supply-drop-bbs node set-meshtastic-owner'
+      meshtasticOwnerOk.value = 'Saved. The device is not connected right now — this name will be applied automatically the next time the BBS connects to it.'
     } else {
       meshtasticOwnerOk.value = 'Node name saved and applied to device.'
       await loadMeshtasticOwner()
