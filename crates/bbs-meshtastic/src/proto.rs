@@ -277,6 +277,48 @@ pub fn direct_text_packet(
     }
 }
 
+/// Broadcast our own node info (owner `User`) to the whole mesh.
+///
+/// This is the Meshtastic equivalent of MeshCore's self-advert: it makes the
+/// radio transmit a `NODEINFO_APP` packet so other nodes add us to their node
+/// list. The firmware otherwise only broadcasts node info on boot and on a slow
+/// periodic timer (~3 h by default), so without this a freshly-configured BBS
+/// node can take hours to appear on neighbouring devices.
+///
+/// `from` is left 0 (local origin); the firmware stamps it with our node
+/// number before transmit. `want_response` is false — this is an announcement,
+/// not a request for replies.
+pub fn nodeinfo_broadcast(packet_id: u32, user: User, hop_limit: u32, want_ack: bool) -> ToRadio {
+    use prost::Message as _;
+    ToRadio {
+        payload_variant: Some(to_radio::PayloadVariant::Packet(MeshPacket {
+            from: 0,
+            to: BROADCAST_ADDR,
+            channel: 0,
+            payload_variant: Some(mesh_packet::PayloadVariant::Decoded(Data {
+                portnum: PORT_NODEINFO_APP,
+                payload: user.encode_to_vec(),
+                want_response: false,
+                dest: 0,
+                source: 0,
+                request_id: 0,
+                reply_id: 0,
+            })),
+            id: packet_id,
+            rx_time: 0,
+            rx_snr: 0.0,
+            hop_limit,
+            want_ack,
+            priority: PRIORITY_RELIABLE,
+            rx_rssi: 0,
+            via_mqtt: false,
+            hop_start: 0,
+            public_key: Vec::new(),
+            pki_encrypted: false,
+        })),
+    }
+}
+
 pub fn node_key(node_num: u32) -> [u8; 6] {
     let n = node_num.to_be_bytes();
     [b'M', b'T', n[0], n[1], n[2], n[3]]

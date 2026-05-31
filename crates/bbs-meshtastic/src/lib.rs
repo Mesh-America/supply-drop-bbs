@@ -35,9 +35,9 @@ use crate::{
     proto::{
         admin_get_lora_config, admin_get_owner, admin_get_security_config, admin_get_session_key,
         admin_message, admin_set_lora_config, admin_set_owner, direct_text_packet, from_radio,
-        mesh_packet, mt_config, node_key, synthetic_pubkey, AdminMessage, Data, LoRaConfig,
-        MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP, PORT_NODEINFO_APP,
-        PORT_TEXT_MESSAGE_APP,
+        mesh_packet, mt_config, node_key, nodeinfo_broadcast, synthetic_pubkey, AdminMessage, Data,
+        LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP,
+        PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
     },
     session::SessionState,
     stream::{ClientEvent, MeshtasticClient, SerialConfig, TcpConfig},
@@ -423,6 +423,52 @@ impl Plugin for MeshtasticTransport {
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     },
                     _ = notif_shutdown_rx.changed() => break,
+                }
+            }
+        });
+
+        // Self-advert: when the sysop hits "send advert" in the web UI, broadcast
+        // our node info so neighbouring Meshtastic nodes add us to their node
+        // list. The firmware otherwise only announces on boot and on a slow
+        // periodic timer, so this is the only way to appear promptly.
+        let advert_cmd_tx = self.cmd_tx.clone();
+        let advert_state = Arc::clone(&self.state);
+        let advert_counter = Arc::clone(&self.packet_counter);
+        let advert_long = self.long_name.clone();
+        let advert_short = self.short_name.clone();
+        let advert_hop = self.hop_limit;
+        let advert_want_ack = self.want_ack;
+        let mut advert_send_rx = self.host.advert_bus().subscribe_send();
+        let mut advert_shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    result = advert_send_rx.recv() => match result {
+                        Ok(flood) => {
+                            let node = advert_state.lock().expect("state mutex poisoned").my_node_num;
+                            let Some(node) = node else {
+                                warn!("meshtastic: send-advert requested before node number known");
+                                continue;
+                            };
+                            let mut user = owner_user(advert_long.as_deref(), advert_short.as_deref());
+                            user.id = format_node_id(node);
+                            // Flood → multi-hop (configured hop limit); direct → neighbours only.
+                            let hop = if flood { advert_hop } else { 0 };
+                            let id = advert_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if advert_cmd_tx
+                                .send(nodeinfo_broadcast(id, user, hop, advert_want_ack))
+                                .await
+                                .is_ok()
+                            {
+                                info!(flood, "meshtastic: broadcast self node info (send advert)");
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("meshtastic: advert-send stream lagged by {n}");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    },
+                    _ = advert_shutdown_rx.changed() => break,
                 }
             }
         });
