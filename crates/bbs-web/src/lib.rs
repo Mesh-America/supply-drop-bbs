@@ -3210,9 +3210,20 @@ async fn api_sse_events(
 
 // ── Backups ───────────────────────────────────────────────────────────────────
 
-async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
+async fn api_trigger_backup(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
     use std::io::Write as _;
     use zip::{write::SimpleFileOptions, CompressionMethod};
+
+    if user.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop permission required")),
+        )
+            .into_response();
+    }
 
     let dir = match state.backup_dir() {
         Some(d) => d,
@@ -3293,7 +3304,18 @@ async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
+async fn api_list_backups(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop permission required")),
+        )
+            .into_response();
+    }
+
     let dir = match state.backup_dir() {
         Some(d) => d,
         None => {
@@ -3312,8 +3334,17 @@ async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
 
 async fn api_download_backup(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
     Path(filename): Path<String>,
 ) -> Response {
+    if user.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop permission required")),
+        )
+            .into_response();
+    }
+
     // Path traversal protection.
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return (
@@ -3357,8 +3388,17 @@ async fn api_download_backup(
 
 async fn api_delete_backup(
     State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
     Path(filename): Path<String>,
 ) -> Response {
+    if user.permission_level < 100 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("sysop permission required")),
+        )
+            .into_response();
+    }
+
     let dir = match state.backup_dir() {
         Some(d) => d,
         None => {
