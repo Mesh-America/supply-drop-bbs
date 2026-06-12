@@ -317,6 +317,15 @@ impl AppState {
             .expect("sessions poisoned")
             .remove(token);
     }
+
+    /// Remove all web sessions for `username` — called after ban or permission change
+    /// so stale cached `permission_level` values cannot be exploited.
+    fn invalidate_sessions_for(&self, username: &str) {
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .retain(|_, s| s.username != username);
+    }
 }
 
 // ── WebPlugin ─────────────────────────────────────────────────────────────────
@@ -1178,6 +1187,11 @@ async fn api_update_user(
             .await
         {
             Ok(()) => {
+                // Invalidate web sessions whenever status or permission level changes so
+                // a banned or demoted user cannot continue using a cached web token.
+                if body.status.is_some() || body.permission_level.is_some() {
+                    state.invalidate_sessions_for(&username);
+                }
                 if let Some(s) = body.status {
                     let action = if s == 1 { "ban" } else { "unban" };
                     if let Err(e) = state
