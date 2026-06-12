@@ -371,6 +371,15 @@ impl Plugin for WebPlugin {
 
         info!(addr = %addr, "web admin: listener bound");
 
+        if !addr.ip().is_loopback() && config.external_origin.is_none() {
+            warn!(
+                bind = %addr,
+                "web admin is exposed on a non-loopback address without \
+                 `web.external_origin` set — CSRF Origin validation is disabled. \
+                 Set `web.external_origin = \"https://your-domain\"` to enable it."
+            );
+        }
+
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
             state: Arc::new(AppState::new(host, config)),
@@ -620,12 +629,35 @@ fn build_router(state: Arc<AppState>) -> Router {
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
 
+/// Check that the `Origin` header matches the configured `external_origin`.
+///
+/// Returns `false` (reject) when `external_origin` is set and the request
+/// carries an `Origin` that doesn't match it.  Requests with no `Origin`
+/// header (same-origin navigations, server-side fetches) are always allowed.
+fn origin_allowed(state: &AppState, req: &Request) -> bool {
+    let Some(expected) = state.config.external_origin.as_deref() else {
+        return true; // no CSRF origin check configured
+    };
+    let Some(origin) = req.headers().get(header::ORIGIN) else {
+        return true; // no Origin header — not a cross-site request
+    };
+    origin.as_bytes() == expected.trim_end_matches('/').as_bytes()
+}
+
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     jar: CookieJar,
     mut req: Request,
     next: Next,
 ) -> Response {
+    if !origin_allowed(&state, &req) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("origin not allowed")),
+        )
+            .into_response();
+    }
+
     let token = jar
         .get(SESSION_COOKIE)
         .map(|c| c.value().to_owned())
