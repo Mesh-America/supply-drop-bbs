@@ -2535,13 +2535,21 @@ impl BbsHost {
         }
 
         // Level is Unvalidated — re-read from DB in case an out-of-process
-        // tool (CLI, direct DB edit) promoted this user since they logged in.
-        let fresh_level = UserStore::get_by_id(&self.db, user_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.permission_level)
-            .unwrap_or(level);
+        // tool (CLI, direct DB edit) promoted or banned this user since login.
+        let fresh = UserStore::get_by_id(&self.db, user_id).await.ok().flatten();
+
+        // Reject banned/deleted accounts found during the re-read.
+        if let Some(ref u) = fresh {
+            if !u.is_active() {
+                let mut sessions = self.sessions.write().await;
+                sessions.remove(&session);
+                return Err(Response::Text(
+                    "Your account has been suspended. Please contact the sysop.".into(),
+                ));
+            }
+        }
+
+        let fresh_level = fresh.map(|u| u.permission_level).unwrap_or(level);
 
         if fresh_level >= PermissionLevel::User {
             // Refresh the in-memory session so subsequent commands don't DB-check again.
