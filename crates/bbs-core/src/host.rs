@@ -1339,14 +1339,14 @@ impl Host for BbsHost {
     async fn mesh_node_restore(
         &self,
         session: SessionId,
-        prefix: [u8; 6],
+        pubkey: [u8; 32],
         ttl_days: u32,
     ) -> Result<Option<Username>, HostError> {
         // Look up a still-valid binding.
         let user_id = self
             .db
             .node_credentials()
-            .lookup(&prefix, ttl_days)
+            .lookup(&pubkey, ttl_days)
             .await
             .map_err(|e| HostError::Storage(format!("node_credential lookup: {e}")))?;
 
@@ -1381,7 +1381,7 @@ impl Host for BbsHost {
         // Refresh last_auth so the TTL clock resets on each successful auto-login.
         self.db
             .node_credentials()
-            .upsert(&prefix, user_id, Timestamp::now())
+            .upsert(&pubkey, user_id, Timestamp::now())
             .await
             .map_err(|e| HostError::Storage(format!("node_credential upsert: {e}")))?;
 
@@ -1389,7 +1389,7 @@ impl Host for BbsHost {
         Ok(Some(user.username))
     }
 
-    async fn mesh_node_bind(&self, session: SessionId, prefix: [u8; 6]) -> Result<(), HostError> {
+    async fn mesh_node_bind(&self, session: SessionId, pubkey: [u8; 32]) -> Result<(), HostError> {
         let user_id = {
             let sessions = self.sessions.read().await;
             sessions.get(&session).and_then(|r| r.user_id)
@@ -1399,15 +1399,15 @@ impl Host for BbsHost {
         };
         self.db
             .node_credentials()
-            .upsert(&prefix, user_id, Timestamp::now())
+            .upsert(&pubkey, user_id, Timestamp::now())
             .await
             .map_err(|e| HostError::Storage(format!("node_credential upsert: {e}")))
     }
 
-    async fn mesh_node_unbind(&self, prefix: [u8; 6]) -> Result<(), HostError> {
+    async fn mesh_node_unbind(&self, pubkey: [u8; 32]) -> Result<(), HostError> {
         self.db
             .node_credentials()
-            .delete(&prefix)
+            .delete(&pubkey)
             .await
             .map_err(|e| HostError::Storage(format!("node_credential delete: {e}")))
     }

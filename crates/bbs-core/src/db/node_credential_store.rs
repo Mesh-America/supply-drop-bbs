@@ -17,21 +17,21 @@ impl<'db> NodeCredentialStore<'db> {
         Self { db }
     }
 
-    /// Insert or refresh the binding for a node pubkey prefix.
+    /// Insert or refresh the binding for a node's full 32-byte public key.
     pub(crate) async fn upsert(
         &self,
-        prefix: &[u8; 6],
+        pubkey: &[u8; 32],
         user_id: UserId,
         now: Timestamp,
     ) -> Result<(), StoreError> {
-        let blob: &[u8] = prefix;
+        let blob: &[u8] = pubkey;
         let uid = user_id.as_i64();
         let ts = now.to_rfc3339();
         sqlx::query(
             r#"
-            INSERT INTO node_credentials (pubkey_prefix, user_id, last_auth)
+            INSERT INTO node_credentials (pubkey, user_id, last_auth)
             VALUES (?, ?, ?)
-            ON CONFLICT(pubkey_prefix) DO UPDATE
+            ON CONFLICT(pubkey) DO UPDATE
               SET user_id   = excluded.user_id,
                   last_auth = excluded.last_auth
             "#,
@@ -44,20 +44,20 @@ impl<'db> NodeCredentialStore<'db> {
         Ok(())
     }
 
-    /// Look up the user bound to this prefix, enforcing `ttl_days`.
+    /// Look up the user bound to this full 32-byte public key, enforcing `ttl_days`.
     ///
     /// Returns `None` when no binding exists or it has expired.
     pub(crate) async fn lookup(
         &self,
-        prefix: &[u8; 6],
+        pubkey: &[u8; 32],
         ttl_days: u32,
     ) -> Result<Option<UserId>, StoreError> {
-        let blob: &[u8] = prefix;
+        let blob: &[u8] = pubkey;
         let ttl = format!("-{ttl_days} days");
         let row = sqlx::query(
             r#"
             SELECT user_id FROM node_credentials
-            WHERE pubkey_prefix = ?
+            WHERE pubkey = ?
               AND last_auth >= datetime('now', ?)
             "#,
         )
@@ -75,10 +75,10 @@ impl<'db> NodeCredentialStore<'db> {
         }
     }
 
-    /// Remove the binding for this prefix (called on explicit logout).
-    pub(crate) async fn delete(&self, prefix: &[u8; 6]) -> Result<(), StoreError> {
-        let blob: &[u8] = prefix;
-        sqlx::query("DELETE FROM node_credentials WHERE pubkey_prefix = ?")
+    /// Remove the binding for this full 32-byte public key (called on explicit logout).
+    pub(crate) async fn delete(&self, pubkey: &[u8; 32]) -> Result<(), StoreError> {
+        let blob: &[u8] = pubkey;
+        sqlx::query("DELETE FROM node_credentials WHERE pubkey = ?")
             .bind(blob)
             .execute(&self.db.write_pool)
             .await?;

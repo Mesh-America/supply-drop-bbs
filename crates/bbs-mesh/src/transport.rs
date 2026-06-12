@@ -1040,6 +1040,13 @@ async fn dispatch_message(
         debug!(?session, prefix = ?sender_prefix, "mesh: new session minted");
     }
 
+    // Resolve the full 32-byte pubkey for this node (populated by advert/contact frames).
+    // Credential operations require the full key; if unavailable, they are skipped.
+    let full_pubkey: Option<[u8; 32]> = state
+        .lock()
+        .expect("state mutex poisoned")
+        .get_full_pubkey(&sender_prefix);
+
     // Determine whether this node already has an authenticated BBS session.
     // We greet unauthenticated nodes every time they contact us so they always
     // see the welcome message and know how to register/log in — not just the
@@ -1053,17 +1060,21 @@ async fn dispatch_message(
 
     if !already_authenticated {
         // Attempt auto-login via stored node credential (new sessions only;
-        // skip when TTL = 0 or the session already exists).
+        // skip when TTL = 0, the session already exists, or full pubkey unknown).
         let auto_username = if is_new && node_credential_ttl_days > 0 {
-            match host
-                .mesh_node_restore(session, sender_prefix, node_credential_ttl_days)
-                .await
-            {
-                Ok(u) => u,
-                Err(e) => {
-                    warn!(?session, "mesh: node_restore error: {e}");
-                    None
+            if let Some(pubkey) = full_pubkey {
+                match host
+                    .mesh_node_restore(session, pubkey, node_credential_ttl_days)
+                    .await
+                {
+                    Ok(u) => u,
+                    Err(e) => {
+                        warn!(?session, "mesh: node_restore error: {e}");
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None
@@ -1202,11 +1213,13 @@ async fn dispatch_message(
             active_sid = fresh_sid;
             // Attempt auto-login on the refreshed session before replaying the command.
             if node_credential_ttl_days > 0 {
-                if let Err(e) = host
-                    .mesh_node_restore(fresh_sid, sender_prefix, node_credential_ttl_days)
-                    .await
-                {
-                    warn!(?fresh_sid, "mesh: node_restore on refresh error: {e}");
+                if let Some(pubkey) = full_pubkey {
+                    if let Err(e) = host
+                        .mesh_node_restore(fresh_sid, pubkey, node_credential_ttl_days)
+                        .await
+                    {
+                        warn!(?fresh_sid, "mesh: node_restore on refresh error: {e}");
+                    }
                 }
             }
             // The original command was parsed with the stale transport state
@@ -1237,19 +1250,22 @@ async fn dispatch_message(
     };
 
     // ── Persist / clear node credential on auth state changes ────────────────
+    // Only operate when the full 32-byte pubkey is known; skip silently otherwise.
     if node_credential_ttl_days > 0 {
-        match &response {
-            Response::LoggedIn { .. } => {
-                if let Err(e) = host.mesh_node_bind(active_sid, sender_prefix).await {
-                    warn!(?active_sid, "mesh: node_bind error: {e}");
+        if let Some(pubkey) = full_pubkey {
+            match &response {
+                Response::LoggedIn { .. } => {
+                    if let Err(e) = host.mesh_node_bind(active_sid, pubkey).await {
+                        warn!(?active_sid, "mesh: node_bind error: {e}");
+                    }
                 }
-            }
-            Response::LoggedOut => {
-                if let Err(e) = host.mesh_node_unbind(sender_prefix).await {
-                    warn!("mesh: node_unbind error: {e}");
+                Response::LoggedOut => {
+                    if let Err(e) = host.mesh_node_unbind(pubkey).await {
+                        warn!("mesh: node_unbind error: {e}");
+                    }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
 
