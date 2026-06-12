@@ -605,15 +605,15 @@ mod tests {
 
     #[test]
     fn logout_and_quit() {
-        assert!(matches!(cmd("logout"), Command::Logout));
-        assert!(matches!(cmd("LOGOUT"), Command::Logout));
-        assert!(matches!(cmd("q"), Command::Logout));
-        assert!(matches!(cmd("Q"), Command::Logout));
+        assert!(matches!(cmd("logout"), Command::Quit));
+        assert!(matches!(cmd("LOGOUT"), Command::Quit));
+        assert!(matches!(cmd("q"), Command::Quit));
+        assert!(matches!(cmd("Q"), Command::Quit));
     }
 
     #[test]
-    fn whoami_is_unknown_on_cli() {
-        assert!(matches!(cmd("whoami"), Command::Unknown { .. }));
+    fn whoami_is_recognized_on_cli() {
+        assert!(matches!(cmd("whoami"), Command::Whoami));
     }
 
     #[test]
