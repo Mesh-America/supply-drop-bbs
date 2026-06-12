@@ -555,7 +555,10 @@ where
                         }
                     }
                     Some(Err(e)) => return SessionOutcome::IoError(e, false),
-                    None => return SessionOutcome::Shutdown,
+                    None => return SessionOutcome::IoError(
+                        io::Error::new(io::ErrorKind::BrokenPipe, "reader task exited unexpectedly"),
+                        false,
+                    ),
                 }
             }
 
