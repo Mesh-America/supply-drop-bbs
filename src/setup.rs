@@ -157,7 +157,7 @@ fn load_existing(out_path: &Path) -> Existing {
     let mesh_connection_type = mesh
         .and_then(|m| m.get("connection_type"))
         .and_then(|v| v.as_str())
-        .unwrap_or("serial")
+        .unwrap_or("tcp") // SYN-74: runtime default is Tcp, not serial
         .to_owned();
     let mesh_serial_port = mesh
         .and_then(|m| m.get("serial_port"))
@@ -181,7 +181,7 @@ fn load_existing(out_path: &Path) -> Existing {
     let meshtastic_connection_type = meshtastic
         .and_then(|m| m.get("connection_type"))
         .and_then(|v| v.as_str())
-        .unwrap_or("serial")
+        .unwrap_or("tcp") // SYN-74: runtime default is Tcp, not serial
         .to_owned();
     let meshtastic_serial_port = meshtastic
         .and_then(|m| m.get("serial_port"))
@@ -219,7 +219,7 @@ fn load_existing(out_path: &Path) -> Existing {
     let web_bind = web
         .and_then(|w| w.get("bind"))
         .and_then(|v| v.as_str())
-        .unwrap_or("0.0.0.0:8080")
+        .unwrap_or("127.0.0.1:8080") // SYN-73: runtime default is loopback-only
         .to_owned();
     let web_backup_dir = web
         .and_then(|w| w.get("backup_dir"))
@@ -227,12 +227,14 @@ fn load_existing(out_path: &Path) -> Existing {
         .map(str::to_owned);
 
     // GPS
+    // SYN-75: as_float() returns None for TOML integers (e.g. `latitude = 45`).
+    // Fall back to as_integer() so whole-valued coordinates survive a round-trip.
     let latitude = location
         .and_then(|l| l.get("latitude"))
-        .and_then(|v| v.as_float());
+        .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)));
     let longitude = location
         .and_then(|l| l.get("longitude"))
-        .and_then(|v| v.as_float());
+        .and_then(|v| v.as_float().or_else(|| v.as_integer().map(|i| i as f64)));
 
     // pymc-companion (HAT)
     let yaml_path = companion_yaml_path(out_path);
@@ -1799,10 +1801,13 @@ fn build_toml(p: &TomlParams<'_>) -> String {
     writeln!(s, "data_dir = {}", toml_str(&p.data_dir.to_string_lossy())).unwrap();
 
     // [location]
+    // SYN-75: use {:?} (Debug) so whole-valued floats emit `45.0` not `45`;
+    // a bare integer round-trips as TOML integer and as_float() returns None on
+    // the next wizard run, silently discarding GPS coordinates.
     if let (Some(lat), Some(lon)) = (p.latitude, p.longitude) {
         writeln!(s, "\n[location]").unwrap();
-        writeln!(s, "latitude  = {lat}").unwrap();
-        writeln!(s, "longitude = {lon}").unwrap();
+        writeln!(s, "latitude  = {lat:?}").unwrap();
+        writeln!(s, "longitude = {lon:?}").unwrap();
     }
 
     // [plugins.mesh]
