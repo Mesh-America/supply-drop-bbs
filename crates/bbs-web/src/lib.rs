@@ -991,7 +991,7 @@ async fn api_update_native_plugin(
 
     doc["plugins"][name.as_str()]["enabled"] = toml_edit::value(enabled);
 
-    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+    if let Err(e) = atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error(&format!("could not write config file: {e}"))),
@@ -2299,7 +2299,7 @@ async fn api_patch_config(
         doc["logging"]["level"] = toml_edit::value(v.to_ascii_uppercase());
     }
 
-    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+    if let Err(e) = atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error(&format!("could not write config file: {e}"))),
@@ -2610,7 +2610,7 @@ async fn api_patch_radio_config(
         }
     }
 
-    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+    if let Err(e) = atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes()) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error(&format!("could not write config file: {e}"))),
@@ -2803,7 +2803,8 @@ fn save_meshtastic_radio_to_config(
         toml_edit::Item::Value(toml_edit::Value::from(tx_enabled)),
     );
 
-    std::fs::write(&path, doc.to_string()).map_err(|e| format!("write error: {e}"))?;
+    atomic_write_file(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("write error: {e}"))?;
     Ok(true)
 }
 
@@ -2855,7 +2856,8 @@ fn save_meshtastic_owner_to_config(
         );
     }
 
-    std::fs::write(&path, doc.to_string()).map_err(|e| format!("write error: {e}"))?;
+    atomic_write_file(&path, doc.to_string().as_bytes())
+        .map_err(|e| format!("write error: {e}"))?;
     Ok(true)
 }
 
@@ -3332,38 +3334,54 @@ async fn api_trigger_backup(
     let db_entry_name = record.filename.clone();
 
     let zip_result = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-        let file = std::fs::File::create(&zip_path)?;
-        let mut zip = zip::ZipWriter::new(file);
-        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        // Write to a .tmp sibling; rename over the final path only on success
+        // so a crash mid-write never leaves a corrupt zip visible.
+        let mut tmp_name = zip_path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp_zip_path = std::path::PathBuf::from(tmp_name);
 
-        // Add database.
-        zip.start_file(&db_entry_name, opts)?;
-        zip.write_all(&std::fs::read(&db_path)?)?;
+        let write_result = (|| -> std::io::Result<()> {
+            let file = std::fs::File::create(&tmp_zip_path)?;
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
-        // Add config (best-effort — log a warning if the path doesn't exist).
-        if let Some(ref cfg) = config_path_opt {
-            if !cfg.is_empty() {
-                match std::fs::read(cfg) {
-                    Ok(bytes) => {
-                        zip.start_file("config.toml", opts)?;
-                        zip.write_all(&bytes)?;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "backup: could not include config file '{}': {} \
-                             — set config_path in [plugins.web] to the full \
-                             path of your config.toml",
-                            cfg,
-                            e
-                        );
+            // Add database.
+            zip.start_file(&db_entry_name, opts)?;
+            zip.write_all(&std::fs::read(&db_path)?)?;
+
+            // Add config (best-effort — log a warning if the path doesn't exist).
+            if let Some(ref cfg) = config_path_opt {
+                if !cfg.is_empty() {
+                    match std::fs::read(cfg) {
+                        Ok(bytes) => {
+                            zip.start_file("config.toml", opts)?;
+                            zip.write_all(&bytes)?;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "backup: could not include config file '{}': {} \
+                                 — set config_path in [plugins.web] to the full \
+                                 path of your config.toml",
+                                cfg,
+                                e
+                            );
+                        }
                     }
                 }
             }
+
+            let inner = zip.finish()?;
+            inner.sync_all()?;
+            drop(inner);
+            std::fs::rename(&tmp_zip_path, &zip_path)
+        })();
+
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp_zip_path);
+            return write_result.map(|_| 0);
         }
 
-        zip.finish()?;
-
-        // Remove the raw .db now that it is inside the zip.
+        // Remove the raw .db now that it is safely inside the zip.
         let _ = std::fs::remove_file(&db_path);
 
         Ok(std::fs::metadata(&zip_path)?.len())
@@ -3560,6 +3578,28 @@ async fn spa_handler(uri: axum::http::Uri) -> Response {
         )
             .into_response(),
     }
+}
+
+// ── File helpers ──────────────────────────────────────────────────────────────
+
+/// Write `contents` to `path` atomically: write to a `.tmp` sibling, fsync,
+/// then rename over the destination. The caller's data is never half-visible.
+fn atomic_write_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    let mut f = std::fs::File::create(&tmp)?;
+    if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────

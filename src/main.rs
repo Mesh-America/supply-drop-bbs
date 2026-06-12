@@ -1210,13 +1210,33 @@ fn open_config_for_edit(
     (path, doc)
 }
 
+/// Write `contents` to `path` atomically: write to a `.tmp` sibling, fsync,
+/// then rename over the destination.
+fn atomic_write_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp_name = path.as_os_str().to_owned();
+    tmp_name.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp_name);
+    let mut f = std::fs::File::create(&tmp)?;
+    if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    drop(f);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
 fn config_edit_bbs_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
     let (path, mut doc) = open_config_for_edit(config_path);
     if doc.get("bbs").is_none() {
         doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
     doc["bbs"][key] = toml_edit::value(value);
-    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
         eprintln!("error writing {}: {e}", path.display());
         std::process::exit(1);
     }
@@ -1228,7 +1248,7 @@ fn config_edit_bbs_string(config_path: Option<&std::path::Path>, key: &str, valu
         doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
     doc["bbs"][key] = toml_edit::value(value);
-    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
         eprintln!("error writing {}: {e}", path.display());
         std::process::exit(1);
     }
@@ -1239,7 +1259,7 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
     if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
         bbs.remove(key);
     }
-    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
         eprintln!("error writing {}: {e}", path.display());
         std::process::exit(1);
     }
@@ -1451,7 +1471,7 @@ fn write_plugin_file_sync(dir: &std::path::Path, cfg: &bbs_plugin_api::ProcessPl
         }
     };
     let path = dir.join(format!("{}.toml", cfg.name));
-    if let Err(e) = std::fs::write(&path, content) {
+    if let Err(e) = atomic_write_file(&path, content.as_bytes()) {
         eprintln!("error: cannot write {}: {e}", path.display());
         std::process::exit(1);
     }
@@ -1513,7 +1533,7 @@ fn write_plugins(
         aot.push(tbl);
     }
     doc["plugins"]["process"] = toml_edit::Item::ArrayOfTables(aot);
-    if let Err(e) = std::fs::write(path, doc.to_string()) {
+    if let Err(e) = atomic_write_file(path, doc.to_string().as_bytes()) {
         eprintln!("error writing config: {e}");
         std::process::exit(1);
     }
@@ -1911,7 +1931,7 @@ fn save_radio_config(config_path: Option<&std::path::Path>, r: &ResolvedRadio) {
     doc["plugins"]["mesh"]["radio"]["coding_rate"] = toml_edit::value(r.coding_rate as i64);
     doc["plugins"]["mesh"]["radio"]["tx_power_dbm"] = toml_edit::value(r.tx_power_dbm as i64);
 
-    if let Err(e) = std::fs::write(&path, doc.to_string()) {
+    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
         eprintln!("warning: --save: could not write {}: {e}", path.display());
     } else {
         eprintln!("Saved radio config to {}.", path.display());
