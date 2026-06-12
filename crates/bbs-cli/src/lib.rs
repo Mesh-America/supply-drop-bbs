@@ -59,7 +59,7 @@ use tracing::{debug, error, info, warn};
 
 // Unix-only: command/response types needed by the session implementation.
 #[cfg(unix)]
-use bbs_plugin_api::{identity::Username, Command, Response};
+use bbs_plugin_api::{Command, Response};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -511,57 +511,11 @@ async fn end_session(
 /// Parse a raw CLI input line into a [`Command`].
 ///
 /// Unlike the mesh transport there is no command prefix — CLI users type
-/// commands directly.  Workflow replies take priority when `awaiting_reply`
-/// is set.
+/// commands directly.  Delegates to the canonical [`Command::parse`] from
+/// `bbs-plugin-api` so all BBS commands are supported (SYN-45).
 #[cfg(unix)]
 fn parse_command(text: &str, awaiting_reply: bool) -> Command {
-    let text = text.trim();
-
-    if awaiting_reply {
-        return Command::WorkflowReply {
-            reply: text.to_owned(),
-        };
-    }
-
-    if text.is_empty() {
-        return Command::Unknown { raw: String::new() };
-    }
-
-    let (word, rest) = split_first_word(text);
-    let keyword = word.to_ascii_lowercase();
-
-    match keyword.as_str() {
-        "h" | "help" | "?" => Command::Help {
-            topic: rest.map(str::to_owned),
-        },
-        "register" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(u) => Command::Register { username: u },
-            None => Command::Help {
-                topic: Some("register".to_owned()),
-            },
-        },
-        "login" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(u) => Command::Login { username: u },
-            None => Command::Help {
-                topic: Some("login".to_owned()),
-            },
-        },
-        "logout" | "q" => Command::Logout,
-        _ => Command::Unknown {
-            raw: text.to_owned(),
-        },
-    }
-}
-
-#[cfg(unix)]
-fn split_first_word(s: &str) -> (&str, Option<&str>) {
-    match s.find(|c: char| c.is_ascii_whitespace()) {
-        None => (s, None),
-        Some(i) => {
-            let rest = s[i..].trim_start();
-            (&s[..i], if rest.is_empty() { None } else { Some(rest) })
-        }
-    }
+    Command::parse(text, awaiting_reply)
 }
 
 // ── Response rendering ────────────────────────────────────────────────────────
