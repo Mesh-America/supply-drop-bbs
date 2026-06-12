@@ -87,7 +87,7 @@ impl Database {
                     message_count: r.try_get("message_count")?,
                     created_at: r.try_get("created_at")?,
                     deletable: id > 5,
-                    locked: (2..=4).contains(&id),
+                    locked: id <= 5,
                 })
             })
             .collect::<Result<Vec<_>, sqlx::Error>>()

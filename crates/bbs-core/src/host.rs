@@ -1302,7 +1302,7 @@ impl Host for BbsHost {
             message_count: count,
             created_at: room.created_at.to_rfc3339(),
             deletable: room_id > 5,
-            locked: (2..=4).contains(&room_id),
+            locked: room_id <= 5,
         })
     }
 

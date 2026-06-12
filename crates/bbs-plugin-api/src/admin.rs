@@ -60,7 +60,7 @@ pub struct AdminRoomSummary {
     /// rooms (Lobby, Mail, Aides, Sysop, System).
     pub deletable: bool,
     /// Whether name, min_permission_level, and read_only are locked and cannot
-    /// be changed. True for Mail (2), Aides (3), and Sysop (4).
+    /// be changed. True for the five built-in system rooms (id <= 5).
     pub locked: bool,
 }
 
