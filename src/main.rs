@@ -578,6 +578,27 @@ async fn cmd_run(cli: &Cli) {
         "supply-drop-bbs starting"
     );
 
+    // SYN-3: warn operators whose configs set rate-limit keys that are not yet
+    // implemented, so they are not under the false impression these keys provide
+    // brute-force protection.
+    {
+        let sec = &cfg.security;
+        if sec.login_rate_per_min != 0 {
+            warn!(
+                login_rate_per_min = sec.login_rate_per_min,
+                "security.login_rate_per_min is set but rate limiting is NOT YET \
+                 IMPLEMENTED — login attempts are not throttled"
+            );
+        }
+        if sec.command_rate_per_min != 0 {
+            warn!(
+                command_rate_per_min = sec.command_rate_per_min,
+                "security.command_rate_per_min is set but rate limiting is NOT YET \
+                 IMPLEMENTED — command throughput is not throttled"
+            );
+        }
+    }
+
     // ── 3. Data directory ─────────────────────────────────────────────────────
     let data_dir = cfg
         .bbs

@@ -429,11 +429,17 @@ pub struct SecurityConfig {
     #[serde(default = "default_session_lifetime_mesh_secs")]
     pub session_lifetime_mesh_secs: u64,
 
-    /// Maximum failed login attempts per minute per source.
+    /// Reserved for future rate-limiting: maximum failed login attempts per
+    /// minute per source.  **Not yet implemented** — this value is parsed and
+    /// stored but no throttling code exists.  Setting a non-zero value has no
+    /// effect on login attempts today (SYN-3).
     #[serde(default = "default_login_rate_per_min")]
     pub login_rate_per_min: u32,
 
-    /// Maximum commands per minute per session.
+    /// Reserved for future rate-limiting: maximum commands per minute per
+    /// session.  **Not yet implemented** — this value is parsed and stored but
+    /// no throttling code exists.  Setting a non-default value has no effect
+    /// on command throughput today (SYN-3).
     #[serde(default = "default_command_rate_per_min")]
     pub command_rate_per_min: u32,
 }
