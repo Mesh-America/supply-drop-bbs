@@ -126,6 +126,10 @@ pub enum RegistryError {
     #[error("config write failed: {0}")]
     ConfigWrite(String),
 
+    /// The supplied plugin config is invalid (bad name, empty command, etc.).
+    #[error("invalid plugin config: {0}")]
+    InvalidConfig(String),
+
     /// Catch-all for unexpected errors.
     #[error("{0}")]
     Other(String),

@@ -22,6 +22,45 @@ use crate::transport::{ExitEvent, ProcessTransport};
 const LOG_RING_CAP: usize = 500;
 const LOG_TAIL: usize = 50;
 
+/// Validate a plugin name: must be non-empty, contain only `[a-zA-Z0-9_-]`,
+/// and must not start with a hyphen (which would look like a flag argument).
+///
+/// The name is used to construct a file path (`plugins.d/<name>.toml`).
+/// Rejecting path separators, dots, and other special characters prevents
+/// path traversal and unexpected file creation outside `plugins.d/`.
+fn validate_plugin_name(name: &str) -> Result<(), RegistryError> {
+    if name.is_empty() {
+        return Err(RegistryError::InvalidConfig(
+            "plugin name must not be empty".into(),
+        ));
+    }
+    if name.starts_with('-') {
+        return Err(RegistryError::InvalidConfig(
+            "plugin name must not start with '-'".into(),
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(RegistryError::InvalidConfig(format!(
+            "plugin name {name:?} contains invalid characters \
+             (only ASCII letters, digits, '_', and '-' are allowed)"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a plugin command: must be non-empty.
+fn validate_plugin_command(command: &str) -> Result<(), RegistryError> {
+    if command.is_empty() {
+        return Err(RegistryError::InvalidConfig(
+            "plugin command must not be empty".into(),
+        ));
+    }
+    Ok(())
+}
+
 // ── Internal state ────────────────────────────────────────────────────────────
 
 struct ManagedPlugin {
@@ -366,6 +405,9 @@ impl PluginRegistryApi for ProcessPluginManager {
     }
 
     async fn add_plugin(&self, config: ProcessPluginConfig) -> Result<(), RegistryError> {
+        validate_plugin_name(&config.name)?;
+        validate_plugin_command(&config.command)?;
+
         let name = config.name.clone();
 
         // Insert a `Starting` placeholder under the lock so that any concurrent
@@ -644,5 +686,56 @@ async fn plugin_exit_loop(
                 }
             } // end ExitEvent::Crash
         } // end match event
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_plugin_command, validate_plugin_name};
+
+    #[test]
+    fn valid_names_are_accepted() {
+        for name in &["my-plugin", "plugin_v2", "abc", "A1-B2_C3"] {
+            assert!(validate_plugin_name(name).is_ok(), "rejected {name:?}");
+        }
+    }
+
+    #[test]
+    fn empty_name_is_rejected() {
+        assert!(validate_plugin_name("").is_err());
+    }
+
+    #[test]
+    fn name_with_path_separator_is_rejected() {
+        assert!(validate_plugin_name("../evil").is_err());
+        assert!(validate_plugin_name("a/b").is_err());
+        assert!(validate_plugin_name(r"a\b").is_err());
+    }
+
+    #[test]
+    fn name_with_dot_is_rejected() {
+        assert!(validate_plugin_name("my.plugin").is_err());
+        assert!(validate_plugin_name(".hidden").is_err());
+    }
+
+    #[test]
+    fn name_starting_with_hyphen_is_rejected() {
+        assert!(validate_plugin_name("-bad").is_err());
+    }
+
+    #[test]
+    fn name_with_space_is_rejected() {
+        assert!(validate_plugin_name("bad name").is_err());
+    }
+
+    #[test]
+    fn empty_command_is_rejected() {
+        assert!(validate_plugin_command("").is_err());
+    }
+
+    #[test]
+    fn non_empty_command_is_accepted() {
+        assert!(validate_plugin_command("/usr/local/bin/my-plugin").is_ok());
+        assert!(validate_plugin_command("./plugin").is_ok());
     }
 }
