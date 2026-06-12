@@ -582,6 +582,7 @@ fn apply_socket_mode(path: &std::path::Path, mode_str: &str) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use bbs_plugin_api::identity::Username;
 
     fn cmd(text: &str) -> Command {
         parse_command(text, false)
