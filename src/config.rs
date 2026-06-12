@@ -432,15 +432,15 @@ pub struct SecurityConfig {
     /// Reserved for future rate-limiting: maximum failed login attempts per
     /// minute per source.  **Not yet implemented** — this value is parsed and
     /// stored but no throttling code exists.  Setting a non-zero value has no
-    /// effect on login attempts today (SYN-3).
-    #[serde(default = "default_login_rate_per_min")]
+    /// effect on login attempts today (SYN-3).  Default is `0` (disabled).
+    #[serde(default)]
     pub login_rate_per_min: u32,
 
     /// Reserved for future rate-limiting: maximum commands per minute per
     /// session.  **Not yet implemented** — this value is parsed and stored but
-    /// no throttling code exists.  Setting a non-default value has no effect
-    /// on command throughput today (SYN-3).
-    #[serde(default = "default_command_rate_per_min")]
+    /// no throttling code exists.  Setting a non-zero value has no effect
+    /// on command throughput today (SYN-3).  Default is `0` (disabled).
+    #[serde(default)]
     pub command_rate_per_min: u32,
 }
 
@@ -452,8 +452,8 @@ impl Default for SecurityConfig {
             argon2_parallelism: default_argon2_parallelism(),
             session_lifetime_web_secs: default_session_lifetime_web_secs(),
             session_lifetime_mesh_secs: default_session_lifetime_mesh_secs(),
-            login_rate_per_min: default_login_rate_per_min(),
-            command_rate_per_min: default_command_rate_per_min(),
+            login_rate_per_min: 0,
+            command_rate_per_min: 0,
         }
     }
 }
@@ -472,12 +472,6 @@ fn default_session_lifetime_web_secs() -> u64 {
 }
 fn default_session_lifetime_mesh_secs() -> u64 {
     3 * 24 * 60 * 60 // 3 days
-}
-fn default_login_rate_per_min() -> u32 {
-    5
-}
-fn default_command_rate_per_min() -> u32 {
-    60
 }
 
 // ── [backup] ──────────────────────────────────────────────────────────────────
