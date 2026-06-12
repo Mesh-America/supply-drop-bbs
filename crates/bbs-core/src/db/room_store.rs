@@ -334,6 +334,12 @@ impl RoomStore for Database {
     }
 
     async fn reorder(&self, room_id: RoomId, after_id: Option<RoomId>) -> Result<(), StoreError> {
+        // Moving a room after itself is a no-op; allowing it would produce a
+        // self-referencing prev_neighbor and corrupt the linked list.
+        if after_id == Some(room_id) {
+            return Ok(());
+        }
+
         let rid = room_id.as_i64();
         let mut tx = self.write_pool.begin().await?;
 
