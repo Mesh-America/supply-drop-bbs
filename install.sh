@@ -9,6 +9,11 @@
 #
 # To uninstall:
 #   sudo bash install.sh --uninstall
+#
+# Flags:
+#   --skip-verify   Skip SHA256 checksum verification (use only on air-gapped
+#                   installs where you have already verified the binary by
+#                   another means; leaving this off is strongly recommended)
 
 set -euo pipefail
 
@@ -31,6 +36,7 @@ SERVICE_USER="supply-drop"
 CONFIG_DIR="/etc/supply-drop-bbs"
 DATA_DIR="/var/lib/supply-drop-bbs"
 UNIT_FILE="/etc/systemd/system/supply-drop-bbs.service"
+SKIP_VERIFY=0
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 
@@ -39,6 +45,15 @@ info()    { echo -e "${BLUE}  →${NC} $*"; }
 success() { echo -e "${GREEN}  ✓${NC} $*"; }
 warn()    { echo -e "${YELLOW}  !${NC} $*"; }
 die()     { echo -e "${RED}  ✗${NC} $*" >&2; exit 1; }
+
+# ── Flag parsing ──────────────────────────────────────────────────────────────
+for arg in "$@"; do
+    case "$arg" in
+        --skip-verify) SKIP_VERIFY=1 ;;
+        --uninstall)   : ;;  # handled below
+        *) die "Unknown flag: $arg" ;;
+    esac
+done
 
 # ── Uninstaller ───────────────────────────────────────────────────────────────
 
@@ -303,17 +318,27 @@ for a in d.get('assets', []):
             rm -f "$tmp_sums"
 
             if [[ -z "$expected" ]]; then
-                warn "Binary not listed in SHA256SUMS — skipping verification."
+                if [[ "$SKIP_VERIFY" -eq 1 ]]; then
+                    warn "Binary not listed in SHA256SUMS — skipping verification (--skip-verify)."
+                else
+                    die "Binary '$binary_name' is not listed in SHA256SUMS. \
+Refusing to install an unverified binary. \
+Use --skip-verify only if you have verified the binary by another means."
+                fi
             elif [[ "$expected" != "$actual" ]]; then
-                warn "Checksum mismatch! (expected: $expected, got: $actual)"
-                warn "Refusing to install a corrupted binary — will build from source."
-                rm -f "$tmp_bin"
-                return 1
+                die "Checksum mismatch for '$binary_name'! \
+Expected: $expected  Got: $actual — refusing to install."
             else
                 success "Checksum verified"
             fi
         else
-            warn "Could not fetch SHA256SUMS — skipping checksum verification."
+            if [[ "$SKIP_VERIFY" -eq 1 ]]; then
+                warn "Could not fetch SHA256SUMS — skipping checksum verification (--skip-verify)."
+            else
+                die "Could not fetch SHA256SUMS from $sums_url. \
+Refusing to install an unverified binary. \
+Use --skip-verify only if you have verified the binary by another means."
+            fi
         fi
     fi
 
