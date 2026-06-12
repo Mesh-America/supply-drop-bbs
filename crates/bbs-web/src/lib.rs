@@ -3592,6 +3592,7 @@ fn registry_err(e: RegistryError) -> Response {
         RegistryError::NotFound(_) => StatusCode::NOT_FOUND,
         RegistryError::AlreadyExists(_) => StatusCode::CONFLICT,
         RegistryError::NotRunning(_) => StatusCode::CONFLICT,
+        RegistryError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(json_error(&e.to_string()))).into_response()
