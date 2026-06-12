@@ -175,7 +175,7 @@ fn default_bind() -> String {
     "127.0.0.1:8080".to_owned()
 }
 fn default_cookie_secure() -> bool {
-    false
+    true
 }
 fn default_config_path() -> Option<String> {
     Some("config.toml".to_owned())
@@ -1178,6 +1178,13 @@ async fn api_update_user(
             .await
         {
             Ok(()) => {
+                // Evict cached web sessions for the affected user so a ban or
+                // demotion takes effect immediately rather than after TTL expiry
+                // (SYN-2, SYN-23).
+                {
+                    let mut web_sessions = state.sessions.lock().expect("sessions poisoned");
+                    web_sessions.retain(|_, s| s.username != username);
+                }
                 if let Some(s) = body.status {
                     let action = if s == 1 { "ban" } else { "unban" };
                     if let Err(e) = state
@@ -1456,6 +1463,9 @@ async fn api_delete_message(
     Extension(caller): Extension<CurrentUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
     match state.host.admin_delete_message(id).await {
         Ok(true) => {
             let actor_str = format!("web:{}", caller.username);
@@ -3210,7 +3220,13 @@ async fn api_sse_events(
 
 // ── Backups ───────────────────────────────────────────────────────────────────
 
-async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
+async fn api_trigger_backup(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
     use std::io::Write as _;
     use zip::{write::SimpleFileOptions, CompressionMethod};
 
@@ -3293,7 +3309,13 @@ async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
+async fn api_list_backups(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
     let dir = match state.backup_dir() {
         Some(d) => d,
         None => {
@@ -3312,8 +3334,12 @@ async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
 
 async fn api_download_backup(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
     Path(filename): Path<String>,
 ) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
     // Path traversal protection.
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return (
@@ -3357,8 +3383,20 @@ async fn api_download_backup(
 
 async fn api_delete_backup(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
     Path(filename): Path<String>,
 ) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    // Path traversal guard — mirrors the check in api_download_backup (SYN-13).
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("invalid filename")),
+        )
+            .into_response();
+    }
     let dir = match state.backup_dir() {
         Some(d) => d,
         None => {
