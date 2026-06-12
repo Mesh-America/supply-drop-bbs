@@ -82,7 +82,7 @@ use rss_monitor::RssAlert;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -543,6 +543,42 @@ impl WebPlugin {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
+/// Fallback CSP used when `web.csp` is not set in config.
+///
+/// Allows same-origin scripts/styles/connections only. `unsafe-inline` is
+/// required for SPA frameworks that inline styles; `data:` for embedded images.
+const DEFAULT_CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; \
+     connect-src 'self'; font-src 'self' data:";
+
+async fn security_headers_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    let csp = state.config.csp.as_deref().unwrap_or(DEFAULT_CSP);
+    if let Ok(val) = HeaderValue::from_str(csp) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, val);
+    } else {
+        warn!(
+            csp,
+            "web.csp value is not a valid HTTP header value — skipped"
+        );
+    }
+    // Additional hardening headers that require no configuration.
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
 fn build_router(state: Arc<AppState>) -> Router {
     let protected_api = Router::new()
         .route("/auth/whoami", get(api_whoami))
@@ -624,6 +660,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .nest("/api/v1", protected_api)
         .nest("/api/v1", public_api)
         .fallback(spa_handler)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            security_headers_middleware,
+        ))
         .with_state(state)
 }
 
