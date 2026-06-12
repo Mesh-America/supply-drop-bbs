@@ -3435,8 +3435,15 @@ async fn api_download_backup(
     if caller.permission_level < 100 {
         return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
     }
-    // Path traversal protection.
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    // Path traversal + header injection protection.
+    // Reject path separators, parent traversal, double-quotes, and control
+    // characters (any of which could escape the Content-Disposition value).
+    if filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains("..")
+        || filename.contains('"')
+        || filename.chars().any(|c| c.is_ascii_control())
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error("invalid filename")),
@@ -3463,6 +3470,7 @@ async fn api_download_backup(
                 (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
                 (
                     header::CONTENT_DISPOSITION,
+                    // filename is validated above: no quotes or control chars.
                     format!("attachment; filename=\"{filename}\""),
                 ),
             ],
