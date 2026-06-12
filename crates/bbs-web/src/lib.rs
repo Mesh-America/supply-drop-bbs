@@ -82,7 +82,7 @@ use rss_monitor::RssAlert;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -678,11 +678,11 @@ fn build_router(state: Arc<AppState>) -> Router {
 /// Returns `false` (reject) when `external_origin` is set and the request
 /// carries an `Origin` that doesn't match it.  Requests with no `Origin`
 /// header (same-origin navigations, server-side fetches) are always allowed.
-fn origin_allowed(state: &AppState, req: &Request) -> bool {
+fn origin_allowed(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(expected) = state.config.external_origin.as_deref() else {
         return true; // no CSRF origin check configured
     };
-    let Some(origin) = req.headers().get(header::ORIGIN) else {
+    let Some(origin) = headers.get(header::ORIGIN) else {
         return true; // no Origin header — not a cross-site request
     };
     origin.as_bytes() == expected.trim_end_matches('/').as_bytes()
@@ -694,7 +694,7 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
-    if !origin_allowed(&state, &req) {
+    if !origin_allowed(&state, req.headers()) {
         return (
             StatusCode::FORBIDDEN,
             Json(json_error("origin not allowed")),
@@ -752,9 +752,17 @@ struct LoginResponse {
 
 async fn api_login(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     jar: CookieJar,
     Json(body): Json<LoginRequest>,
 ) -> Response {
+    if !origin_allowed(&state, &headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("origin not allowed")),
+        )
+            .into_response();
+    }
     let level = match state
         .host
         .admin_verify_credentials(&body.username, &body.password)
