@@ -282,6 +282,7 @@ pub fn direct_text_packet(
     }
 }
 
+#[allow(dead_code)]
 pub fn node_key(node_num: u32) -> [u8; 6] {
     let n = node_num.to_be_bytes();
     [b'M', b'T', n[0], n[1], n[2], n[3]]

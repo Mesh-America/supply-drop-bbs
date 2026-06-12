@@ -570,7 +570,7 @@ pub trait Host: Send + Sync {
     /// Check whether a mesh node has a valid stored credential and, if so,
     /// auto-bind the session to that user.
     ///
-    /// `prefix` is the first 6 bytes of the node's Ed25519 public key.
+    /// `pubkey` is the node's full 32-byte Ed25519 public key.
     /// `ttl_days` is the maximum age of a valid credential.
     ///
     /// Returns `Some(username)` on a successful restore (the session is now
@@ -579,10 +579,10 @@ pub trait Host: Send + Sync {
     async fn mesh_node_restore(
         &self,
         session: SessionId,
-        prefix: [u8; 6],
+        pubkey: [u8; 32],
         ttl_days: u32,
     ) -> Result<Option<crate::identity::Username>, HostError> {
-        let _ = (session, prefix, ttl_days);
+        let _ = (session, pubkey, ttl_days);
         Ok(None)
     }
 
@@ -590,16 +590,16 @@ pub trait Host: Send + Sync {
     ///
     /// Called by the mesh transport immediately after it receives
     /// `Response::LoggedIn`.  Idempotent: calling again refreshes `last_auth`.
-    async fn mesh_node_bind(&self, session: SessionId, prefix: [u8; 6]) -> Result<(), HostError> {
-        let _ = (session, prefix);
+    async fn mesh_node_bind(&self, session: SessionId, pubkey: [u8; 32]) -> Result<(), HostError> {
+        let _ = (session, pubkey);
         Ok(())
     }
 
-    /// Remove the stored binding for a node prefix on explicit logout.
+    /// Remove the stored binding for this node on explicit logout.
     ///
     /// Called by the mesh transport when it receives `Response::LoggedOut`.
-    async fn mesh_node_unbind(&self, prefix: [u8; 6]) -> Result<(), HostError> {
-        let _ = prefix;
+    async fn mesh_node_unbind(&self, pubkey: [u8; 32]) -> Result<(), HostError> {
+        let _ = pubkey;
         Ok(())
     }
 }
