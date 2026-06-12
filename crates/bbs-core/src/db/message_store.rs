@@ -389,6 +389,11 @@ impl MessageStore for Database {
     async fn delete(&self, id: MessageId) -> Result<bool, StoreError> {
         let mid = id.as_i64();
 
+        // Both statements run inside a single transaction so a crash between
+        // the UPDATE and the DELETE cannot advance read pointers past a
+        // surviving message (SYN-24).
+        let mut tx = self.write_pool.begin().await?;
+
         // Before deleting, rescue any read pointers that land on this message.
         // Move them to the highest message_id in the same room that is strictly
         // less than `id`.  If no earlier message exists (this was the first),
@@ -413,13 +418,15 @@ impl MessageStore for Database {
             mid,
             mid
         )
-        .execute(&self.write_pool)
+        .execute(&mut *tx)
         .await?;
 
         let rows = sqlx::query!("DELETE FROM messages WHERE id = ?", mid)
-            .execute(&self.write_pool)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+
+        tx.commit().await?;
         Ok(rows > 0)
     }
 

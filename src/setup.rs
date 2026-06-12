@@ -62,10 +62,42 @@ struct Existing {
 }
 
 fn load_existing(out_path: &Path) -> Existing {
-    let toml_raw = fs::read_to_string(out_path).unwrap_or_default();
-    let toml_val: toml::Value = toml_raw
-        .parse()
-        .unwrap_or(toml::Value::Table(Default::default()));
+    let toml_raw = if out_path.exists() {
+        match fs::read_to_string(out_path) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "\nWARNING: Could not read existing config at '{}': {e}",
+                    out_path.display()
+                );
+                eprintln!(
+                    "WARNING: Proceeding with factory defaults. \
+                     Review all settings before writing!\n"
+                );
+                String::new()
+            }
+        }
+    } else {
+        String::new()
+    };
+    let toml_val: toml::Value = if toml_raw.is_empty() {
+        toml::Value::Table(Default::default())
+    } else {
+        match toml_raw.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "\nWARNING: Config file '{}' contains invalid TOML: {e}",
+                    out_path.display()
+                );
+                eprintln!(
+                    "WARNING: Proceeding with factory defaults. \
+                     Review all settings before writing!\n"
+                );
+                toml::Value::Table(Default::default())
+            }
+        }
+    };
 
     // Preserve [[plugins.process]] entries verbatim so reconfigure doesn't
     // wipe process plugins that were added after initial setup.
