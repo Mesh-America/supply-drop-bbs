@@ -4976,8 +4976,8 @@ mod tests {
         let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let ctx = host.permission_ctx(sid).await.unwrap();
-        assert_eq!(ctx.level, PermissionLevel::Unvalidated);
-        assert!(ctx.username.is_none());
+        assert_eq!(ctx.level(), PermissionLevel::Unvalidated);
+        assert!(ctx.username().is_none());
     }
 
     #[tokio::test]
@@ -5071,8 +5071,8 @@ mod tests {
 
         // First registrant is promoted to Sysop automatically.
         let ctx = host.permission_ctx(sid).await.unwrap();
-        assert_eq!(ctx.level, PermissionLevel::Sysop);
-        assert_eq!(ctx.username.as_ref(), Some(&uname));
+        assert_eq!(ctx.level(), PermissionLevel::Sysop);
+        assert_eq!(ctx.username(), Some(&uname));
         let sessions = host.sessions.read().await;
         assert_eq!(sessions[&sid].current_room, LOBBY_ROOM_ID);
     }

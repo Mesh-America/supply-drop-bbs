@@ -404,7 +404,7 @@ async fn push_domain_notification(
                 let Ok(ctx) = host.permission_ctx(sid).await else {
                     continue;
                 };
-                if ctx.username.as_ref() != Some(&user) {
+                if ctx.username() != Some(&user) {
                     continue;
                 }
                 let prefix = state
@@ -442,7 +442,7 @@ async fn push_domain_notification(
                 let Ok(ctx) = host.permission_ctx(sid).await else {
                     continue;
                 };
-                if ctx.level < PermissionLevel::Aide {
+                if ctx.level() < PermissionLevel::Aide {
                     continue;
                 }
                 let prefix = state
@@ -1055,7 +1055,7 @@ async fn dispatch_message(
         && host
             .permission_ctx(session)
             .await
-            .map(|ctx| ctx.username.is_some())
+            .map(|ctx| ctx.username().is_some())
             .unwrap_or(false);
 
     if !already_authenticated {
