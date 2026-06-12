@@ -1866,10 +1866,16 @@ impl BbsHost {
                         let remaining = 3 - new_attempts;
                         let mut sessions = self.sessions.write().await;
                         if let Some(r) = sessions.get_mut(&session) {
-                            r.workflow = Workflow::Login {
-                                username,
-                                attempts: new_attempts,
-                            };
+                            // SYN-61: guard against Cancel/Logout racing with the
+                            // backoff sleep. Only write back if the workflow is still
+                            // in the Login state; otherwise leave whatever state the
+                            // cancel set (Workflow::None or session already removed).
+                            if matches!(r.workflow, Workflow::Login { .. }) {
+                                r.workflow = Workflow::Login {
+                                    username,
+                                    attempts: new_attempts,
+                                };
+                            }
                         }
                         Ok(Response::Prompt {
                             text: format!(
@@ -3502,11 +3508,17 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
-        let page = self
-            .db
-            .list_in_room(room_id, None, MESH_PAGE * 2)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let page = if room_id == MAIL_ROOM_ID {
+            self.db
+                .list_direct(&username, None, MESH_PAGE * 2)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+        } else {
+            self.db
+                .list_in_room(room_id, None, MESH_PAGE * 2)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+        };
 
         let blocked = self
             .db
@@ -3617,6 +3629,17 @@ impl BbsHost {
                         }
                         let body = rest.unwrap_or("").trim();
                         if body.is_empty() {
+                            // SYN-46: set the compose workflow before prompting so the
+                            // next WorkflowReply lands in AwaitingBody, not Workflow::None.
+                            let mut sessions = self.sessions.write().await;
+                            if let Some(r) = sessions.get_mut(&session) {
+                                r.workflow = Workflow::Compose {
+                                    room_id,
+                                    stage: ComposeStage::AwaitingBody {
+                                        recipient: Some(recipient.clone()),
+                                    },
+                                };
+                            }
                             return Ok(Response::Prompt {
                                 text: format!("Enter message for {}:", recipient.as_str()),
                                 hide_input: false,
@@ -3757,7 +3780,7 @@ impl BbsHost {
     }
 
     async fn handle_fast_forward(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
+        let (username, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -3770,11 +3793,21 @@ impl BbsHost {
             ));
         }
 
-        let recent = self
-            .db
-            .list_recent_in_room(room_id, 1)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // SYN-48: DMs live in a separate table; list_recent_in_room always
+        // returns empty for MAIL_ROOM_ID. Branch on the mail room to use the
+        // correct query, mirroring handle_read_new.
+        let recent: Vec<_> = if room_id == MAIL_ROOM_ID {
+            self.db
+                .list_direct(&username, None, 1)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+                .messages
+        } else {
+            self.db
+                .list_recent_in_room(room_id, 1)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+        };
 
         if let Some(latest) = recent.into_iter().next() {
             self.db
@@ -4551,8 +4584,9 @@ impl BbsHost {
             Some(r) => r,
         };
 
-        // Protect the three built-in system rooms.
-        if room.id == LOBBY_ROOM_ID || room.id == MAIL_ROOM_ID || room.id == RoomId::new(3) {
+        // Protect all five built-in system rooms (Lobby=1, Mail=2, Aides=3,
+        // Sysop=4, System=5), consistent with admin_delete_room.
+        if room.id.as_i64() <= 5 {
             return Ok(Response::Error(format!(
                 "Cannot delete system room '{}'.",
                 room.name
