@@ -967,17 +967,32 @@ impl Host for BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        // If banning, kick any live sessions for this user.
-        if matches!(new_status, Some(UserStatus::Banned)) {
-            let mut sessions = self.sessions.write().await;
-            for r in sessions.values_mut() {
-                if r.username.as_ref().map(|u| u.as_str()) == Some(username) {
-                    r.workflow = crate::host::Workflow::None;
+        // If banning or deleting, forcibly remove all live sessions and fire SessionEnded.
+        if matches!(
+            new_status,
+            Some(UserStatus::Banned) | Some(UserStatus::Deleted)
+        ) {
+            let to_end: Vec<SessionId> = {
+                let mut sessions = self.sessions.write().await;
+                let ids: Vec<SessionId> = sessions
+                    .iter()
+                    .filter(|(_, r)| r.username.as_ref().map(|u| u.as_str()) == Some(username))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in &ids {
+                    sessions.remove(id);
                 }
+                ids
+            };
+            for id in to_end {
+                let _ = self.events_tx.send(DomainEvent::SessionEnded {
+                    session: id,
+                    reason: "user banned".into(),
+                });
             }
         }
 
-        // If validating (level change from Unvalidated → something higher), update live sessions.
+        // If the permission level changed, update in-memory session state for live sessions.
         if let Some(level) = new_level {
             let mut sessions = self.sessions.write().await;
             for r in sessions.values_mut() {
@@ -1339,14 +1354,14 @@ impl Host for BbsHost {
     async fn mesh_node_restore(
         &self,
         session: SessionId,
-        prefix: [u8; 6],
+        pubkey: [u8; 32],
         ttl_days: u32,
     ) -> Result<Option<Username>, HostError> {
         // Look up a still-valid binding.
         let user_id = self
             .db
             .node_credentials()
-            .lookup(&prefix, ttl_days)
+            .lookup(&pubkey, ttl_days)
             .await
             .map_err(|e| HostError::Storage(format!("node_credential lookup: {e}")))?;
 
@@ -1381,7 +1396,7 @@ impl Host for BbsHost {
         // Refresh last_auth so the TTL clock resets on each successful auto-login.
         self.db
             .node_credentials()
-            .upsert(&prefix, user_id, Timestamp::now())
+            .upsert(&pubkey, user_id, Timestamp::now())
             .await
             .map_err(|e| HostError::Storage(format!("node_credential upsert: {e}")))?;
 
@@ -1389,7 +1404,7 @@ impl Host for BbsHost {
         Ok(Some(user.username))
     }
 
-    async fn mesh_node_bind(&self, session: SessionId, prefix: [u8; 6]) -> Result<(), HostError> {
+    async fn mesh_node_bind(&self, session: SessionId, pubkey: [u8; 32]) -> Result<(), HostError> {
         let user_id = {
             let sessions = self.sessions.read().await;
             sessions.get(&session).and_then(|r| r.user_id)
@@ -1399,15 +1414,15 @@ impl Host for BbsHost {
         };
         self.db
             .node_credentials()
-            .upsert(&prefix, user_id, Timestamp::now())
+            .upsert(&pubkey, user_id, Timestamp::now())
             .await
             .map_err(|e| HostError::Storage(format!("node_credential upsert: {e}")))
     }
 
-    async fn mesh_node_unbind(&self, prefix: [u8; 6]) -> Result<(), HostError> {
+    async fn mesh_node_unbind(&self, pubkey: [u8; 32]) -> Result<(), HostError> {
         self.db
             .node_credentials()
-            .delete(&prefix)
+            .delete(&pubkey)
             .await
             .map_err(|e| HostError::Storage(format!("node_credential delete: {e}")))
     }
@@ -4040,16 +4055,23 @@ impl BbsHost {
         .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         // Force-end any active sessions for this user.
-        {
+        let to_end: Vec<SessionId> = {
             let mut sessions = self.sessions.write().await;
-            let to_end: Vec<SessionId> = sessions
+            let ids: Vec<SessionId> = sessions
                 .iter()
                 .filter(|(_, r)| r.username.as_ref() == Some(&username))
                 .map(|(id, _)| *id)
                 .collect();
-            for id in to_end {
-                sessions.remove(&id);
+            for id in &ids {
+                sessions.remove(id);
             }
+            ids
+        };
+        for id in to_end {
+            let _ = self.events_tx.send(DomainEvent::SessionEnded {
+                session: id,
+                reason: "user banned".into(),
+            });
         }
 
         if let Err(e) = self
@@ -5802,6 +5824,99 @@ mod tests {
                 "verified user should land in Lobby after login"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn admin_update_user_ban_evicts_live_session() {
+        let (host, _db) = make_host().await;
+        let mut ev_rx = host.events_tx.subscribe();
+
+        // Register + log in "alice".
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "hunter99").await;
+
+        // Confirm the session is authenticated.
+        let ctx = host.permission_ctx(sid).await.unwrap();
+        assert!(ctx.username.is_some(), "alice should be logged in");
+
+        // Drain the SessionCreated + SessionAuthenticated events fired above.
+        while ev_rx.try_recv().is_ok() {}
+
+        // Ban alice via the web-API path.
+        host.admin_update_user("alice", Some(1), None)
+            .await
+            .unwrap();
+
+        // Session must be gone from the map.
+        assert!(
+            host.sessions.read().await.get(&sid).is_none(),
+            "banned user's session must be removed"
+        );
+
+        // SessionEnded event must have been fired.
+        let ended = ev_rx.try_recv().expect("SessionEnded event expected");
+        assert!(
+            matches!(ended, DomainEvent::SessionEnded { session, .. } if session == sid),
+            "expected SessionEnded for alice's session, got {ended:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn ban_command_evicts_live_session_and_fires_event() {
+        let (host, _db) = make_host().await;
+        let mut ev_rx = host.events_tx.subscribe();
+
+        // Register a sysop.
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop, "pass12345678").await;
+        // First registrant auto-gets sysop — verify.
+        assert_eq!(
+            host.permission_ctx(sysop_sid).await.unwrap().level,
+            PermissionLevel::Sysop
+        );
+
+        // Register alice.
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice, "hunter99").await;
+
+        // Drain events so far.
+        while ev_rx.try_recv().is_ok() {}
+
+        // Sysop bans alice via the in-BBS command.
+        let resp = host
+            .process_command(
+                sysop_sid,
+                Command::BanUser {
+                    username: alice.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Text(_)),
+            "ban should return Text, got {resp:?}"
+        );
+
+        // Alice's session must be removed.
+        assert!(
+            host.sessions.read().await.get(&alice_sid).is_none(),
+            "banned alice's session must be removed"
+        );
+
+        // Drain events until we see SessionEnded for alice's session.
+        let found = loop {
+            match ev_rx.try_recv() {
+                Ok(DomainEvent::SessionEnded { session, .. }) if session == alice_sid => {
+                    break true;
+                }
+                Ok(_) => continue,
+                Err(_) => break false,
+            }
+        };
+        assert!(found, "SessionEnded for alice's session was not fired");
     }
 
     // ── Test helper: register + login in one call ─────────────────────────────

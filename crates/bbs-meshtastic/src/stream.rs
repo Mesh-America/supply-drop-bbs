@@ -109,8 +109,8 @@ async fn attempt_tcp_session(
     };
     let _ = stream.set_nodelay(true);
     info!(addr = %config.addr, "meshtastic/tcp: connected");
-    let (mut reader, mut writer) = stream.into_split();
-    run_session(&mut reader, &mut writer, cmd_rx, event_tx).await
+    let (reader, mut writer) = stream.into_split();
+    run_session(reader, &mut writer, cmd_rx, event_tx).await
 }
 
 async fn run_serial_worker(
@@ -157,18 +157,18 @@ async fn attempt_serial_session(
     // sending WantConfig, otherwise the handshake packet is lost and the
     // radio sits silent until reconnect.
     sleep(Duration::from_secs(2)).await;
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    run_session(&mut reader, &mut writer, cmd_rx, event_tx).await
+    let (reader, mut writer) = tokio::io::split(stream);
+    run_session(reader, &mut writer, cmd_rx, event_tx).await
 }
 
 async fn run_session<R, W>(
-    reader: &mut R,
+    reader: R,
     writer: &mut W,
     cmd_rx: &mut mpsc::Receiver<ToRadio>,
     event_tx: &mpsc::Sender<ClientEvent>,
 ) -> SessionOutcome
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
     if event_tx.send(ClientEvent::Connected).await.is_err() {
@@ -179,20 +179,44 @@ where
         return SessionOutcome::IoError(e);
     }
 
+    // read_from_radio calls read_exact multiple times and is not cancel-safe.
+    // Selecting over it directly in the event loop drops it mid-frame when
+    // another branch wins, abandoning partially-consumed bytes and corrupting
+    // all following frames (SYN-37).
+    //
+    // Fix: a dedicated task owns the reader and delivers complete frames on an
+    // mpsc channel.  mpsc::Receiver::recv() IS cancel-safe, so the event loop
+    // can safely select over `frame_rx`.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<io::Result<FromRadio>>(8);
+    tokio::spawn(async move {
+        let mut reader = reader;
+        loop {
+            let frame = read_from_radio(&mut reader).await;
+            let is_err = frame.is_err();
+            if frame_tx.send(frame).await.is_err() {
+                break; // event loop exited; stop reading
+            }
+            if is_err {
+                break; // I/O error forwarded; let the event loop reconnect
+            }
+        }
+    });
+
     let mut heartbeats = interval(Duration::from_secs(30));
     heartbeats.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut heartbeat_nonce = 1u32;
 
     loop {
         tokio::select! {
-            frame = read_from_radio(reader) => match frame {
-                Ok(frame) => {
+            frame = frame_rx.recv() => match frame {
+                Some(Ok(frame)) => {
                     debug!(frame = %describe_from_radio(&frame), "meshtastic: rx FromRadio");
                     if event_tx.send(ClientEvent::FromRadio(frame)).await.is_err() {
                         return SessionOutcome::Shutdown;
                     }
                 }
-                Err(e) => return SessionOutcome::IoError(e),
+                Some(Err(e)) => return SessionOutcome::IoError(e),
+                None => return SessionOutcome::Shutdown,
             },
             cmd = cmd_rx.recv() => match cmd {
                 Some(cmd) => {

@@ -82,7 +82,7 @@ use rss_monitor::RssAlert;
 
 use async_trait::async_trait;
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
@@ -175,7 +175,7 @@ fn default_bind() -> String {
     "127.0.0.1:8080".to_owned()
 }
 fn default_cookie_secure() -> bool {
-    false
+    true
 }
 fn default_config_path() -> Option<String> {
     Some("config.toml".to_owned())
@@ -317,6 +317,15 @@ impl AppState {
             .expect("sessions poisoned")
             .remove(token);
     }
+
+    /// Remove all web sessions for `username` — called after ban or permission change
+    /// so stale cached `permission_level` values cannot be exploited.
+    fn invalidate_sessions_for(&self, username: &str) {
+        self.sessions
+            .lock()
+            .expect("sessions poisoned")
+            .retain(|_, s| s.username != username);
+    }
 }
 
 // ── WebPlugin ─────────────────────────────────────────────────────────────────
@@ -361,6 +370,15 @@ impl Plugin for WebPlugin {
             .map_err(|e| PluginError::StartFailed(format!("web: could not bind {addr}: {e}")))?;
 
         info!(addr = %addr, "web admin: listener bound");
+
+        if !addr.ip().is_loopback() && config.external_origin.is_none() {
+            warn!(
+                bind = %addr,
+                "web admin is exposed on a non-loopback address without \
+                 `web.external_origin` set — CSRF Origin validation is disabled. \
+                 Set `web.external_origin = \"https://your-domain\"` to enable it."
+            );
+        }
 
         let (shutdown_tx, _) = watch::channel(false);
         Ok(Self {
@@ -525,6 +543,42 @@ impl WebPlugin {
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
+/// Fallback CSP used when `web.csp` is not set in config.
+///
+/// Allows same-origin scripts/styles/connections only. `unsafe-inline` is
+/// required for SPA frameworks that inline styles; `data:` for embedded images.
+const DEFAULT_CSP: &str = "default-src 'self'; script-src 'self' 'unsafe-inline'; \
+     style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; \
+     connect-src 'self'; font-src 'self' data:";
+
+async fn security_headers_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let mut response = next.run(req).await;
+    let csp = state.config.csp.as_deref().unwrap_or(DEFAULT_CSP);
+    if let Ok(val) = HeaderValue::from_str(csp) {
+        response
+            .headers_mut()
+            .insert(header::CONTENT_SECURITY_POLICY, val);
+    } else {
+        warn!(
+            csp,
+            "web.csp value is not a valid HTTP header value — skipped"
+        );
+    }
+    // Additional hardening headers that require no configuration.
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response
+}
+
 fn build_router(state: Arc<AppState>) -> Router {
     let protected_api = Router::new()
         .route("/auth/whoami", get(api_whoami))
@@ -606,10 +660,29 @@ fn build_router(state: Arc<AppState>) -> Router {
         .nest("/api/v1", protected_api)
         .nest("/api/v1", public_api)
         .fallback(spa_handler)
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            security_headers_middleware,
+        ))
         .with_state(state)
 }
 
 // ── Auth middleware ───────────────────────────────────────────────────────────
+
+/// Check that the `Origin` header matches the configured `external_origin`.
+///
+/// Returns `false` (reject) when `external_origin` is set and the request
+/// carries an `Origin` that doesn't match it.  Requests with no `Origin`
+/// header (same-origin navigations, server-side fetches) are always allowed.
+fn origin_allowed(state: &AppState, req: &Request) -> bool {
+    let Some(expected) = state.config.external_origin.as_deref() else {
+        return true; // no CSRF origin check configured
+    };
+    let Some(origin) = req.headers().get(header::ORIGIN) else {
+        return true; // no Origin header — not a cross-site request
+    };
+    origin.as_bytes() == expected.trim_end_matches('/').as_bytes()
+}
 
 async fn auth_middleware(
     State(state): State<Arc<AppState>>,
@@ -617,6 +690,14 @@ async fn auth_middleware(
     mut req: Request,
     next: Next,
 ) -> Response {
+    if !origin_allowed(&state, &req) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("origin not allowed")),
+        )
+            .into_response();
+    }
+
     let token = jar
         .get(SESSION_COOKIE)
         .map(|c| c.value().to_owned())
@@ -1178,6 +1259,9 @@ async fn api_update_user(
             .await
         {
             Ok(()) => {
+                // Invalidate web sessions whenever status or permission level changes so
+                // a banned or demoted user cannot continue using a cached web token.
+                state.invalidate_sessions_for(&username);
                 if let Some(s) = body.status {
                     let action = if s == 1 { "ban" } else { "unban" };
                     if let Err(e) = state
@@ -1456,6 +1540,9 @@ async fn api_delete_message(
     Extension(caller): Extension<CurrentUser>,
     Path(id): Path<i64>,
 ) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
     match state.host.admin_delete_message(id).await {
         Ok(true) => {
             let actor_str = format!("web:{}", caller.username);
@@ -3212,7 +3299,13 @@ async fn api_sse_events(
 
 // ── Backups ───────────────────────────────────────────────────────────────────
 
-async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
+async fn api_trigger_backup(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
     use std::io::Write as _;
     use zip::{write::SimpleFileOptions, CompressionMethod};
 
@@ -3311,7 +3404,13 @@ async fn api_trigger_backup(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
-async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
+async fn api_list_backups(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
     let dir = match state.backup_dir() {
         Some(d) => d,
         None => {
@@ -3330,8 +3429,12 @@ async fn api_list_backups(State(state): State<Arc<AppState>>) -> Response {
 
 async fn api_download_backup(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
     Path(filename): Path<String>,
 ) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
     // Path traversal protection.
     if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
         return (
@@ -3375,8 +3478,20 @@ async fn api_download_backup(
 
 async fn api_delete_backup(
     State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
     Path(filename): Path<String>,
 ) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    // Path traversal guard — mirrors the check in api_download_backup (SYN-13).
+    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("invalid filename")),
+        )
+            .into_response();
+    }
     let dir = match state.backup_dir() {
         Some(d) => d,
         None => {
@@ -3517,6 +3632,7 @@ fn registry_err(e: RegistryError) -> Response {
         RegistryError::NotFound(_) => StatusCode::NOT_FOUND,
         RegistryError::AlreadyExists(_) => StatusCode::CONFLICT,
         RegistryError::NotRunning(_) => StatusCode::CONFLICT,
+        RegistryError::InvalidConfig(_) => StatusCode::BAD_REQUEST,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, Json(json_error(&e.to_string()))).into_response()

@@ -36,9 +36,9 @@ use crate::{
         admin_get_lora_config, admin_get_owner, admin_get_security_config, admin_get_session_key,
         admin_message, admin_reboot, admin_remove_fixed_position, admin_set_device_config,
         admin_set_fixed_position, admin_set_lora_config, admin_set_owner, admin_set_time,
-        direct_text_packet, from_radio, mesh_packet, mt_config, node_key, synthetic_pubkey,
-        AdminMessage, Data, LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR,
-        PORT_ADMIN_APP, PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
+        direct_text_packet, from_radio, mesh_packet, mt_config, synthetic_pubkey, AdminMessage,
+        Data, LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP,
+        PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
     },
     session::SessionState,
     stream::{ClientEvent, MeshtasticClient, SerialConfig, TcpConfig},
@@ -1889,7 +1889,11 @@ async fn dispatch_message(
     if is_new {
         let auto_username = if node_credential_ttl_days > 0 {
             match host
-                .mesh_node_restore(session, node_key(node_num), node_credential_ttl_days)
+                .mesh_node_restore(
+                    session,
+                    synthetic_pubkey(node_num),
+                    node_credential_ttl_days,
+                )
                 .await
             {
                 Ok(username) => username,
@@ -1980,7 +1984,7 @@ async fn dispatch_message(
                 .get_or_insert(node_num, fresh);
             if node_credential_ttl_days > 0 {
                 let _ = host
-                    .mesh_node_restore(fresh, node_key(node_num), node_credential_ttl_days)
+                    .mesh_node_restore(fresh, synthetic_pubkey(node_num), node_credential_ttl_days)
                     .await;
             }
             match host.process_command(fresh, cmd).await {
@@ -1994,12 +1998,15 @@ async fn dispatch_message(
     if node_credential_ttl_days > 0 {
         match &response {
             Response::LoggedIn { .. } => {
-                if let Err(e) = host.mesh_node_bind(session, node_key(node_num)).await {
+                if let Err(e) = host
+                    .mesh_node_bind(session, synthetic_pubkey(node_num))
+                    .await
+                {
                     warn!(?session, "meshtastic: node_bind error: {e}");
                 }
             }
             Response::LoggedOut => {
-                if let Err(e) = host.mesh_node_unbind(node_key(node_num)).await {
+                if let Err(e) = host.mesh_node_unbind(synthetic_pubkey(node_num)).await {
                     warn!("meshtastic: node_unbind error: {e}");
                 }
             }
