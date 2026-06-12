@@ -329,6 +329,13 @@ pub fn strip_frame_header(raw: &[u8]) -> Result<&[u8], FrameDecodeError> {
     if len > MAX_PAYLOAD_SIZE {
         return Err(FrameDecodeError::PayloadTooLarge(len));
     }
+    if raw.len() < 3 + len {
+        return Err(FrameDecodeError::BodyTooShort {
+            type_byte: 0,
+            needed: 3 + len,
+            got: raw.len(),
+        });
+    }
     Ok(&raw[3..3 + len])
 }
 
