@@ -82,23 +82,22 @@ impl fmt::Display for PermissionLevel {
 /// pass it back into subsequent host calls. They cannot construct
 /// one with arbitrary authority — only the host can.
 ///
-/// The fields are deliberately public for the host's use; the
-/// `__internal_new` constructor is the documented intent. Plugin
-/// code should not construct these directly.
+/// Fields are intentionally private; use the accessor methods.
+/// `__internal_new` is the only constructor and is reserved for
+/// the host implementation (`bbs-core`) and test fixtures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PermissionCtx {
-    /// The session this authority derives from. Logged in audit
-    /// records.
-    pub session: SessionId,
+    /// The session this authority derives from. Logged in audit records.
+    session: SessionId,
 
     /// The username bound to the session, if any. `None` for
     /// pre-authentication contexts (e.g., during the registration
     /// or login workflows).
-    pub username: Option<Username>,
+    username: Option<Username>,
 
     /// The tier this caller is acting at. For pre-auth contexts,
     /// always `Unvalidated`.
-    pub level: PermissionLevel,
+    level: PermissionLevel,
 }
 
 impl PermissionCtx {
@@ -121,6 +120,24 @@ impl PermissionCtx {
             username,
             level,
         }
+    }
+
+    /// The session this authority derives from.
+    #[must_use]
+    pub fn session(&self) -> SessionId {
+        self.session
+    }
+
+    /// The username bound to this session, if any.
+    #[must_use]
+    pub fn username(&self) -> Option<&Username> {
+        self.username.as_ref()
+    }
+
+    /// The permission tier this context acts at.
+    #[must_use]
+    pub fn level(&self) -> PermissionLevel {
+        self.level
     }
 
     /// Convenience: does this context satisfy the required tier?

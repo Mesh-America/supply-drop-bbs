@@ -269,9 +269,9 @@ mod tests {
         let id = mock.create_session("cli").await.unwrap();
         // session known → permission ctx works
         let ctx = mock.permission_ctx(id).await.unwrap();
-        assert_eq!(ctx.session, id);
-        assert_eq!(ctx.level, PermissionLevel::Unvalidated);
-        assert!(ctx.username.is_none());
+        assert_eq!(ctx.session(), id);
+        assert_eq!(ctx.level(), PermissionLevel::Unvalidated);
+        assert!(ctx.username().is_none());
 
         mock.end_session(id).await.unwrap();
         // session ended → permission ctx errors
@@ -320,8 +320,8 @@ mod tests {
         let user = Username::new("alice").unwrap();
         let id = mock.with_authenticated_session("test", user.clone(), PermissionLevel::Sysop);
         let ctx = mock.permission_ctx(id).await.unwrap();
-        assert_eq!(ctx.username.as_ref(), Some(&user));
-        assert_eq!(ctx.level, PermissionLevel::Sysop);
+        assert_eq!(ctx.username(), Some(&user));
+        assert_eq!(ctx.level(), PermissionLevel::Sysop);
     }
 
     #[tokio::test]

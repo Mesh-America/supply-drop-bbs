@@ -2128,7 +2128,7 @@ async fn push_domain_notification(
                 let Ok(ctx) = host.permission_ctx(sid).await else {
                     continue;
                 };
-                if ctx.username.as_ref() == Some(&user) {
+                if ctx.username() == Some(&user) {
                     send_text(
                         cmd_tx,
                         node_num,
@@ -2147,7 +2147,7 @@ async fn push_domain_notification(
                 let Ok(ctx) = host.permission_ctx(sid).await else {
                     continue;
                 };
-                if ctx.level >= PermissionLevel::Aide {
+                if ctx.level() >= PermissionLevel::Aide {
                     send_text(
                         cmd_tx,
                         node_num,
