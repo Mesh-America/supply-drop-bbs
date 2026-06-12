@@ -308,9 +308,9 @@ async fn attempt_tcp_session(
         warn!("companion/tcp: could not set TCP_NODELAY: {e}");
     }
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
     match run_session(
-        &mut reader,
+        reader,
         &mut writer,
         config.app_target_version,
         cmd_rx,
@@ -389,9 +389,9 @@ async fn attempt_serial_session(
     // Meshtastic serial transport for the same class of devices.
     sleep(Duration::from_secs(2)).await;
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader, mut writer) = tokio::io::split(stream);
     match run_session(
-        &mut reader,
+        reader,
         &mut writer,
         config.app_target_version,
         cmd_rx,
@@ -429,14 +429,14 @@ enum SessionOutcome {
 /// the handshake is considered successful with no `SelfInfo`;
 /// [`ClientEvent::Connected`] carries `None`.
 async fn run_session<R, W>(
-    reader: &mut R,
+    reader: R,
     writer: &mut W,
     app_target_version: u8,
     cmd_rx: &mut mpsc::Receiver<OutboundFrame>,
     event_tx: &mpsc::Sender<ClientEvent>,
 ) -> SessionOutcome
 where
-    R: AsyncRead + Unpin,
+    R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin,
 {
     // ── AppStart handshake ────────────────────────────────────────────────────
@@ -461,10 +461,15 @@ where
     // frames (LogRxData, Advert, etc.) that arrive before the device processes
     // AppStart.  Active nodes relay mesh traffic continuously, so several
     // frames may arrive before SelfInfo is queued in the firmware's TX buffer.
+    //
+    // The handshake loop uses a sequential await inside `timeout`, NOT
+    // `tokio::select!` — so it is cancel-safe as-is.  We borrow reader
+    // mutably here and take ownership for the spawned task after.
+    let mut reader = reader;
     const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
     let self_info: Option<SelfInfo> = match timeout(HANDSHAKE_TIMEOUT, async {
         loop {
-            match read_frame(reader).await {
+            match read_frame(&mut reader).await {
                 Err(e) => return Err(e),
                 Ok(InboundFrame::SelfInfo(info)) => return Ok(Some(info)),
                 // Some devices return UNSUPPORTED_CMD for CMD_APP_START.  Treat
@@ -516,17 +521,41 @@ where
     }
 
     // ── Event loop ────────────────────────────────────────────────────────────
+    //
+    // read_frame calls read_exact multiple times and is not cancel-safe.
+    // When another tokio::select! branch wins, partially-consumed frame bytes
+    // are abandoned, desynchronising the stream and corrupting all subsequent
+    // frames (SYN-38).
+    //
+    // Fix: a dedicated task owns the reader and delivers complete frames over
+    // an mpsc channel.  mpsc::Receiver::recv() IS cancel-safe, so the event
+    // loop can safely select over `frame_rx`.
+    let (frame_tx, mut frame_rx) = mpsc::channel::<io::Result<InboundFrame>>(8);
+    tokio::spawn(async move {
+        loop {
+            let frame = read_frame(&mut reader).await;
+            let is_err = frame.is_err();
+            if frame_tx.send(frame).await.is_err() {
+                break; // event loop exited; stop reading
+            }
+            if is_err {
+                break; // I/O error forwarded; let the event loop reconnect
+            }
+        }
+    });
+
     loop {
         tokio::select! {
-            result = read_frame(reader) => {
+            result = frame_rx.recv() => {
                 match result {
-                    Ok(frame) => {
+                    Some(Ok(frame)) => {
                         trace!("companion: rx {frame:?}");
                         if event_tx.send(ClientEvent::Frame(frame)).await.is_err() {
                             return SessionOutcome::Shutdown;
                         }
                     }
-                    Err(e) => return SessionOutcome::IoError(e, false),
+                    Some(Err(e)) => return SessionOutcome::IoError(e, false),
+                    None => return SessionOutcome::Shutdown,
                 }
             }
 
