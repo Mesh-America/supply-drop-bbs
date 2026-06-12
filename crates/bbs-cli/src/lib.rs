@@ -552,7 +552,7 @@ fn render_notification(notification: &Notification) -> String {
     match notification {
         Notification::Text(t) => t.clone(),
         Notification::MailWaiting { count } => format!(
-            "You have {} unread message{}. Type 'mail' to read.",
+            "You have {} unread message{}. Type 'M' to read.",
             count,
             if *count == 1 { "" } else { "s" }
         ),
