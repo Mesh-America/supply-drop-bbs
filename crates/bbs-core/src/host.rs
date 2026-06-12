@@ -5838,7 +5838,7 @@ mod tests {
 
         // Confirm the session is authenticated.
         let ctx = host.permission_ctx(sid).await.unwrap();
-        assert!(ctx.username.is_some(), "alice should be logged in");
+        assert!(ctx.username().is_some(), "alice should be logged in");
 
         // Drain the SessionCreated + SessionAuthenticated events fired above.
         while ev_rx.try_recv().is_ok() {}
@@ -5873,7 +5873,7 @@ mod tests {
         register_and_login(&host, sysop_sid, &sysop, "pass12345678").await;
         // First registrant auto-gets sysop — verify.
         assert_eq!(
-            host.permission_ctx(sysop_sid).await.unwrap().level,
+            host.permission_ctx(sysop_sid).await.unwrap().level(),
             PermissionLevel::Sysop
         );
 
