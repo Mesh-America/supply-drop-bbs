@@ -61,6 +61,24 @@ fn strip_header_payload_too_large() {
     assert_eq!(err, FrameDecodeError::PayloadTooLarge(300));
 }
 
+#[test]
+fn strip_header_payload_truncated() {
+    // Header says 10 bytes, buffer has only 5 after the 3-byte header.
+    // Must return BodyTooShort rather than panicking (SYN-36).
+    let len: u16 = 10;
+    let mut raw = vec![FRAME_OUTBOUND_PREFIX, (len & 0xFF) as u8, (len >> 8) as u8];
+    raw.extend(vec![0u8; 5]); // only 5 bytes, not 10
+    let err = strip_frame_header(&raw).unwrap_err();
+    assert_eq!(
+        err,
+        FrameDecodeError::BodyTooShort {
+            type_byte: 0,
+            needed: 13,
+            got: 8,
+        }
+    );
+}
+
 // ── decode_inbound — zero-body frames ─────────────────────────────────────────
 
 #[test]
