@@ -576,6 +576,10 @@ async fn security_headers_middleware(
     response
         .headers_mut()
         .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("strict-origin-when-cross-origin"),
+    );
     response
 }
 
