@@ -1047,21 +1047,14 @@ async fn dispatch_message(
         .expect("state mutex poisoned")
         .get_full_pubkey(&sender_prefix);
 
-    // Determine whether this node already has an authenticated BBS session.
-    // We greet unauthenticated nodes every time they contact us so they always
-    // see the welcome message and know how to register/log in — not just the
-    // very first time.
-    let already_authenticated = !is_new
-        && host
-            .permission_ctx(session)
-            .await
-            .map(|ctx| ctx.username().is_some())
-            .unwrap_or(false);
-
-    if !already_authenticated {
-        // Attempt auto-login via stored node credential (new sessions only;
-        // skip when TTL = 0, the session already exists, or full pubkey unknown).
-        let auto_username = if is_new && node_credential_ttl_days > 0 {
+    // Only send the welcome banner on first contact (new session).
+    // Returning unauthenticated nodes get their command response directly;
+    // greeting them on every message causes the banner to precede every
+    // response and masks the actual reply when only one frame is delivered.
+    if is_new {
+        // Attempt auto-login via stored node credential (skip when TTL = 0
+        // or full pubkey unknown).
+        let auto_username = if node_credential_ttl_days > 0 {
             if let Some(pubkey) = full_pubkey {
                 match host
                     .mesh_node_restore(session, pubkey, node_credential_ttl_days)
