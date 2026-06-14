@@ -238,6 +238,17 @@ impl Plugin for MeshTransport {
                                         .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
                                         .await;
                                 }
+                                // Set the advert name before broadcasting too, so manual
+                                // sends carry the configured node name even on devices that
+                                // return no SelfInfo on AppStart (where the on-connect push
+                                // is skipped). Issue #101.
+                                if let Some(node_name) = advert_host.mesh_node_name() {
+                                    if !node_name.is_empty() {
+                                        let _ = advert_cmd_tx
+                                            .send(OutboundFrame::SetAdvertName { name: node_name })
+                                            .await;
+                                    }
+                                }
                                 if advert_cmd_tx
                                     .send(OutboundFrame::SendSelfAdvert { flood })
                                     .await
