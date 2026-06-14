@@ -203,6 +203,11 @@ pub struct BbsHost {
     /// Optional GPS coordinates from `[location]` config section.
     /// Wrapped in a RwLock so the web admin can update it without a restart.
     location: std::sync::RwLock<Option<(f64, f64)>>,
+    /// MeshCore advert node name (the BBS name), pre-truncated to an
+    /// advert-safe length. Set at startup from `bbs.name`; read by the mesh
+    /// transport on connect to push `SetAdvertName` to the radio so the node
+    /// advertises with a human name rather than its key-derived fallback.
+    node_name: std::sync::RwLock<Option<String>>,
     /// Access policy — controls verification and guest-room behaviour.
     /// Wrapped in a `RwLock` so in-BBS sysop commands can update it live.
     access_policy: RwLock<AccessPolicy>,
@@ -255,6 +260,7 @@ impl BbsHost {
             advert_bus: Arc::new(AdvertBus::new()),
             login_failures: tokio::sync::Mutex::new(HashMap::new()),
             location: std::sync::RwLock::new(location),
+            node_name: std::sync::RwLock::new(None),
             access_policy: RwLock::new(policy),
             guest_room_id: std::sync::RwLock::new(None),
             config_path,
@@ -262,6 +268,15 @@ impl BbsHost {
             mesh_key_tx: std::sync::RwLock::new(None),
             meshtastic_admin_tx: std::sync::RwLock::new(None),
         }
+    }
+
+    /// Set the MeshCore advert node name (the BBS name).
+    ///
+    /// Called once at startup from `bbs.name`. The caller is responsible for
+    /// truncating to an advert-safe length (see
+    /// [`bbs_core::mesh_name::truncate_mesh_node_name`](crate::mesh_name::truncate_mesh_node_name)).
+    pub fn set_node_name(&self, name: Option<String>) {
+        *self.node_name.write().unwrap() = name;
     }
 
     /// Ensure the guest room exists in the database (creating it if needed)
@@ -509,6 +524,10 @@ impl Host for BbsHost {
 
     fn set_node_location(&self, location: Option<(f64, f64)>) {
         *self.location.write().unwrap() = location;
+    }
+
+    fn mesh_node_name(&self) -> Option<String> {
+        self.node_name.read().unwrap().clone()
     }
 
     fn set_node_pubkey(&self, pubkey_hex: String) {

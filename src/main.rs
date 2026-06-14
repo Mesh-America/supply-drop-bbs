@@ -674,6 +674,14 @@ async fn cmd_run(cli: &Cli) {
         host_config_path,
     );
 
+    // bbs.name is the MeshCore advert node name. Store an advert-safe
+    // (truncated) copy so the mesh transport can push it to the radio via
+    // SetAdvertName on connect — without this the node advertises with its
+    // key-derived fallback name (issue #101).
+    bbs.set_node_name(Some(
+        bbs_core::mesh_name::truncate_mesh_node_name(&cfg.bbs.name).to_owned(),
+    ));
+
     if let Err(e) = bbs.ensure_guest_room().await {
         error!("guest room setup failed: {e}");
         std::process::exit(1);
