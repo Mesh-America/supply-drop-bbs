@@ -129,6 +129,9 @@ async def run(config: dict) -> None:
     # ── CompanionRadio ─────────────────────────────────────────────────────────
 
     node_name = companion_cfg.get("node_name", "Supply Drop BBS")
+    # adv_type controls what node type is advertised on the mesh.
+    # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor. Default: 3 (Room/BBS).
+    adv_type_val = int(companion_cfg.get("adv_type", 3))
     radio_params = {
         "frequency":        radio_kwargs["frequency"],
         "bandwidth":        radio_kwargs["bandwidth"],
@@ -137,8 +140,11 @@ async def run(config: dict) -> None:
         "tx_power":         radio_kwargs["tx_power"],
     }
     companion = CompanionRadio(
-        radio, identity, node_name=node_name, radio_config=radio_params
+        radio, identity, node_name=node_name, adv_type=adv_type_val,
+        radio_config=radio_params
     )
+    _type_names = {1: "Chat", 2: "Repeater", 3: "Room", 4: "Sensor"}
+    log.info(f"Advertising as adv_type={adv_type_val} ({_type_names.get(adv_type_val, 'unknown')})")
 
     # Auto-add contacts so the BBS sees incoming users without manual approval.
     # 0x01 = overwrite oldest, 0x02 = chat, 0x04 = repeater, 0x08 = room
