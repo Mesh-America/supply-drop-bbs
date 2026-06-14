@@ -1063,14 +1063,38 @@ pub fn run_wizard(config_out: Option<&Path>) {
     };
 
     // ── MeshCore Pi HAT: region + model ──────────────────────────────────────
+    //
+    // When pymc-companion.yaml already exists (reconfigure run) ask before
+    // overwriting it — the user may just be updating an unrelated setting.
+    // Default to "no" so setup is safe to re-run without clobbering the
+    // existing HAT radio configuration.
     if use_mesh && mesh_conn_type == "hat" {
-        hat_params = Some(configure_hat(
-            &theme,
-            &bbs_name,
-            &data_dir,
-            ex.region_idx,
-            ex.hat_idx,
-        ));
+        let yaml_path = companion_yaml_path(&out_path);
+        let reconfigure = if yaml_path.exists() {
+            section("MeshCore Pi HAT — existing configuration");
+            println!(
+                "A HAT configuration already exists at {}.",
+                yaml_path.display()
+            );
+            println!("Say 'no' to keep it unchanged (safe for a routine reconfigure).");
+            Confirm::with_theme(&theme)
+                .with_prompt("Reconfigure HAT radio and GPIO settings?")
+                .default(false)
+                .interact()
+                .unwrap_or_else(|_| cancelled())
+        } else {
+            true
+        };
+
+        if reconfigure {
+            hat_params = Some(configure_hat(
+                &theme,
+                &bbs_name,
+                &data_dir,
+                ex.region_idx,
+                ex.hat_idx,
+            ));
+        }
     }
 
     // ── Confirm & write ───────────────────────────────────────────────────────
