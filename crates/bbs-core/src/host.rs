@@ -445,9 +445,7 @@ impl Host for BbsHost {
                     Ok(Response::Text("Unknown command. Type H for help.".into()))
                 } else {
                     Ok(Response::Text(
-                        "Not recognized. Type 'register <username>' to create an account\n\
-                         or 'login <username>' if you already have one.\n\
-                         Type H for a list of commands."
+                        "Type 'register <username>' or 'login <username>'.\nType H for commands."
                             .into(),
                     ))
                 }
