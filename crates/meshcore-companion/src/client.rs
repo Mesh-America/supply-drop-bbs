@@ -565,7 +565,7 @@ where
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(frame) => {
-                        trace!("companion: tx {frame:?}");
+                        debug!("companion: tx {frame:?}");
                         let wire = encode_outbound(&frame);
                         if let Err(e) = writer.write_all(&wire).await {
                             return SessionOutcome::IoError(e, false);
