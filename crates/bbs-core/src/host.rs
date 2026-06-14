@@ -444,12 +444,7 @@ impl Host for BbsHost {
                 if is_authed {
                     Ok(Response::Text("Unknown command. Type H for help.".into()))
                 } else {
-                    Ok(Response::Text(
-                        "Not recognized. Type 'register <username>' to create an account\n\
-                         or 'login <username>' if you already have one.\n\
-                         Type H for a list of commands."
-                            .into(),
-                    ))
+                    Ok(Response::Text(HELP_QUICK_ANON.into()))
                 }
             }
             _ => Ok(Response::Error("Command not yet supported.".into())),
@@ -5989,8 +5984,9 @@ mod tests {
         let Response::Text(text) = resp else {
             panic!("expected Text, got {resp:?}");
         };
+        let lower = text.to_lowercase();
         assert!(
-            text.contains("register") || text.contains("login"),
+            lower.contains("register") || lower.contains("login"),
             "pre-auth unknown-command response should mention register/login, got: {text:?}"
         );
     }

@@ -1047,20 +1047,29 @@ async fn dispatch_message(
         .expect("state mutex poisoned")
         .get_full_pubkey(&sender_prefix);
 
-    // Determine whether this node already has an authenticated BBS session.
-    // We greet unauthenticated nodes every time they contact us so they always
-    // see the welcome message and know how to register/log in — not just the
-    // very first time.
-    let already_authenticated = !is_new
-        && host
-            .permission_ctx(session)
-            .await
-            .map(|ctx| ctx.username().is_some())
-            .unwrap_or(false);
+    // ── Determine if we're awaiting a workflow reply ──────────────────────────
+    let awaiting_reply = state
+        .lock()
+        .expect("state mutex poisoned")
+        .is_awaiting_reply(&sender_prefix);
 
-    if !already_authenticated {
+    // ── Build greeting for unauthenticated nodes ──────────────────────────────
+    // Show the welcome banner to any unauthenticated node on every message so
+    // they always have context for how to register or log in.  The greeting is
+    // NOT sent as a separate frame here — it is prepended to the first response
+    // frame below so both arrive in a single radio transmission.
+    //
+    // Skip during active workflows: the node is mid-flow (e.g. entering a
+    // password) and seeing the banner again would be confusing.
+    let already_authenticated = host
+        .permission_ctx(session)
+        .await
+        .map(|ctx| ctx.username().is_some())
+        .unwrap_or(false);
+
+    let pending_greeting: Option<String> = if !already_authenticated && !awaiting_reply {
         // Attempt auto-login via stored node credential (new sessions only;
-        // skip when TTL = 0, the session already exists, or full pubkey unknown).
+        // skip when TTL = 0 or full pubkey unknown).
         let auto_username = if is_new && node_credential_ttl_days > 0 {
             if let Some(pubkey) = full_pubkey {
                 match host
@@ -1080,9 +1089,8 @@ async fn dispatch_message(
             None
         };
 
-        // Resolve {name} — prefer the auto-login username, fall back to the
-        // node's advertised display name, and finally an empty string so the
-        // placeholder is always removed from the message.
+        // Resolve {name} — prefer auto-login username, then advertised display
+        // name, then empty so the placeholder is always removed.
         let name = auto_username
             .as_ref()
             .map(|u| u.as_str().to_owned())
@@ -1091,8 +1099,6 @@ async fn dispatch_message(
 
         let welcome = welcome_message.replace("{name}", &name);
 
-        // For auto-login: prepend the welcome message and append the
-        // "Welcome back" line so the user gets both context and confirmation.
         let greeting = match &auto_username {
             Some(username) if !welcome.is_empty() => {
                 format!("{welcome}\nWelcome back, {username}! Type 'H' for commands.")
@@ -1103,40 +1109,14 @@ async fn dispatch_message(
             None => welcome,
         };
 
-        let greeting_empty = greeting.is_empty();
-        let welcome_sent = !greeting_empty
-            && cmd_tx
-                .send(OutboundFrame::SendTxtMsg {
-                    txt_type: TXT_TYPE_PLAIN,
-                    attempt: 0,
-                    timestamp: now_unix_secs(),
-                    pubkey_prefix: sender_prefix,
-                    text: greeting,
-                })
-                .await
-                .is_ok();
-        if !welcome_sent && !greeting_empty {
-            warn!(
-                ?session,
-                "mesh: could not enqueue welcome — cmd channel closed"
-            );
+        if greeting.is_empty() {
+            None
+        } else {
+            Some(greeting)
         }
-        if welcome_sent && flood_after_send {
-            let pubkey = state
-                .lock()
-                .expect("state mutex poisoned")
-                .get_full_pubkey(&sender_prefix);
-            if let Some(pubkey) = pubkey {
-                let _ = cmd_tx.send(OutboundFrame::ResetPath { pubkey }).await;
-            }
-        }
-    }
-
-    // ── Determine if we're awaiting a workflow reply ──────────────────────────
-    let awaiting_reply = state
-        .lock()
-        .expect("state mutex poisoned")
-        .is_awaiting_reply(&sender_prefix);
+    } else {
+        None
+    };
 
     // ── Dedup radio retransmissions of all inbound messages ──────────────────
     // The radio layer retransmits packets; process only the first copy within
@@ -1279,14 +1259,31 @@ async fn dispatch_message(
     // ── Collect frames to send back ───────────────────────────────────────────
     // MultiText delivers each element as a separate radio frame.
     // All other variants produce a single frame via format_response.
-    let frames: Vec<String> = if let Response::MultiText(parts) = &response {
+    //
+    // If a greeting was built above, prepend it to the first frame so the
+    // welcome banner and the command response arrive as one radio transmission
+    // rather than two.  When the response carries no text (format_response
+    // returns None) the greeting is sent on its own.
+    let mut frames: Vec<String> = if let Response::MultiText(parts) = &response {
         parts.clone()
     } else {
         match format_response(&response) {
             Some(t) => vec![t],
-            None => return,
+            None => vec![],
         }
     };
+
+    if let Some(greeting) = pending_greeting {
+        if let Some(first) = frames.first_mut() {
+            *first = format!("{greeting}\n{first}");
+        } else {
+            frames.push(greeting);
+        }
+    }
+
+    if frames.is_empty() {
+        return;
+    }
 
     let frame_count = frames.len();
     for (i, reply_text) in frames.into_iter().enumerate() {
