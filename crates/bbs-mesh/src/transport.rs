@@ -244,6 +244,8 @@ impl Plugin for MeshTransport {
                                     .is_err()
                                 {
                                     warn!("mesh: could not enqueue SendSelfAdvert — cmd channel closed");
+                                } else {
+                                    info!(flood, "mesh: sending self-advert");
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
