@@ -213,7 +213,7 @@ impl AdvertBus {
     pub fn list(&self) -> Vec<AdvertRecord> {
         let records = self.records.lock().expect("advert bus poisoned");
         let mut v: Vec<_> = records.values().cloned().collect();
-        v.sort_by(|a, b| b.last_seen_secs.cmp(&a.last_seen_secs));
+        v.sort_by_key(|r| std::cmp::Reverse(r.last_seen_secs));
         v
     }
 

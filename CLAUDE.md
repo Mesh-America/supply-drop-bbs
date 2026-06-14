@@ -1,14 +1,25 @@
 ﻿# Supply Drop BBS - Claude instructions
 
+## Platform — Linux only (Windows is NOT supported)
+
+This project is **not supported on Windows**. Build, test, run, and commit it on
+**Linux only** — a Linux host or WSL. Do **not** use Windows-native Rust
+toolchains, cargo, rustup, or shells for this project: they produce
+environment-specific failures (toolchain/clippy component breakage, text-encoding
+issues, path quirks) that do not reflect the actual state of the codebase. All
+builds, the pre-commit checks, and CI run on Linux.
+
 ## Pre-commit checklist
 
-Before every `git commit`, run ALL of the following and fix any failures before committing:
+Before every `git commit`, run ALL of the following **on Linux** and fix any
+failures before committing. The Rust version is pinned in `rust-toolchain.toml`,
+so plain `cargo` automatically uses the correct toolchain:
 
 ```
-rustup run 1.88 cargo fmt --all --check
-rustup run 1.88 cargo test --workspace
-rustup run 1.88 cargo clippy --workspace -- -D warnings
-rustup run 1.88 cargo doc --workspace --no-deps --all-features
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace -- -D warnings
+cargo doc --workspace --no-deps --all-features
 ```
 
 Be certain to update documentation, where relevant.
@@ -52,4 +63,8 @@ Rules:
 
 ## Rust toolchain
 
-The pinned toolchain is `1.88` (see `rust-toolchain.toml`). Always prefix cargo commands with `rustup run 1.88`.
+The toolchain is pinned in `rust-toolchain.toml` (currently `1.96`). rustup
+auto-selects it for any `cargo` command run inside the repo, so do not hardcode a
+version in commands. CI (`.github/workflows/ci.yml`) and the release workflow
+(`.github/workflows/release.yml`) pin the same version — keep all three in sync
+when bumping. Build on Linux only (see Platform above).

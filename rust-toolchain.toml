@@ -9,6 +9,6 @@
 # crates (time, serde) bump their MSRV regularly; pinning past
 # their floors is the maintainable path. Bumping past this is
 # fine; CI matches whatever is pinned here.
-channel    = "1.88"
+channel    = "1.96"
 components = ["rustfmt", "clippy"]
 profile    = "minimal"
