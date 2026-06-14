@@ -244,6 +244,7 @@ impl Plugin for MeshTransport {
                                 // is skipped). Issue #101.
                                 if let Some(node_name) = advert_host.mesh_node_name() {
                                     if !node_name.is_empty() {
+                                        info!(node_name = %node_name, "mesh: setting advert name before send");
                                         let _ = advert_cmd_tx
                                             .send(OutboundFrame::SetAdvertName { name: node_name })
                                             .await;
