@@ -24,6 +24,7 @@ use bbs_plugin_api::{
     transport::TransportEngine,
     Host, PermissionLevel, Plugin, Response,
 };
+use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
@@ -37,7 +38,7 @@ use crate::{
         admin_message, admin_reboot, admin_remove_fixed_position, admin_set_device_config,
         admin_set_fixed_position, admin_set_lora_config, admin_set_owner, admin_set_time,
         direct_text_packet, from_radio, mesh_packet, mt_config, synthetic_pubkey, AdminMessage,
-        Data, LoRaConfig, MeshPacket, MtConfig, NodeInfo, BROADCAST_ADDR, PORT_ADMIN_APP,
+        Data, LoRaConfig, MeshPacket, MtConfig, NodeInfo, User, BROADCAST_ADDR, PORT_ADMIN_APP,
         PORT_NODEINFO_APP, PORT_TEXT_MESSAGE_APP,
     },
     session::SessionState,
@@ -1803,10 +1804,33 @@ async fn handle_packet(
 ) {
     if let Some(mesh_packet::PayloadVariant::Decoded(data)) = &packet.payload_variant {
         if data.portnum == PORT_NODEINFO_APP {
-            debug!(
-                from = format_node_id(packet.from),
-                "meshtastic: nodeinfo packet observed"
-            );
+            // NodeInfo packets arrive over the air with the User protobuf as
+            // their payload.  Decode it and record the sender as an advert so
+            // the web UI stays current even after the radio's nodedb is cleared.
+            match User::decode(data.payload.as_slice()) {
+                Ok(user) => {
+                    debug!(
+                        from = format_node_id(packet.from),
+                        name = %user.long_name,
+                        "meshtastic: nodeinfo packet observed"
+                    );
+                    let node = NodeInfo {
+                        num: packet.from,
+                        user: Some(user),
+                        position: None,
+                        snr: packet.rx_snr,
+                        last_heard: packet.rx_time,
+                    };
+                    record_node_advert(host, node);
+                }
+                Err(e) => {
+                    debug!(
+                        from = format_node_id(packet.from),
+                        error = %e,
+                        "meshtastic: nodeinfo packet decode failed"
+                    );
+                }
+            }
             return;
         }
         if data.portnum == PORT_ADMIN_APP {
