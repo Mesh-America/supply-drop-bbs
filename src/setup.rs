@@ -1727,6 +1727,11 @@ fn build_companion_yaml(p: &HatParams) -> String {
     writeln!(s, "  identity_path: {:?}", p.identity_path).unwrap();
     writeln!(s, "  tcp_port: 5000").unwrap();
     writeln!(s, "  bind_address: \"127.0.0.1\"").unwrap();
+    writeln!(
+        s,
+        "  adv_type: 3  # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor"
+    )
+    .unwrap();
     writeln!(s, "  autoadd_config: 0x0F").unwrap();
     writeln!(s).unwrap();
     writeln!(s, "radio:").unwrap();

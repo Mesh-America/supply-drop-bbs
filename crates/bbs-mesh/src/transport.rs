@@ -538,6 +538,7 @@ async fn event_loop(
                             info!(
                                 node = %info.node_name,
                                 freq_khz = info.frequency_khz,
+                                adv_type = info.adv_type,
                                 "mesh: radio bridge connected — draining stale queue"
                             );
                             // Register the BBS node in the advert bus so it appears in
