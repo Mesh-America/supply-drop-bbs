@@ -31,6 +31,7 @@
 pub mod db;
 pub mod host;
 pub mod ids;
+pub mod mesh_name;
 pub mod message;
 pub mod room;
 pub mod timestamp;
