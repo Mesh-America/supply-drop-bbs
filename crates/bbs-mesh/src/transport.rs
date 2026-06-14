@@ -238,6 +238,18 @@ impl Plugin for MeshTransport {
                                         .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
                                         .await;
                                 }
+                                // Set the advert name before broadcasting too, so manual
+                                // sends carry the configured node name even on devices that
+                                // return no SelfInfo on AppStart (where the on-connect push
+                                // is skipped). Issue #101.
+                                if let Some(node_name) = advert_host.mesh_node_name() {
+                                    if !node_name.is_empty() {
+                                        info!(node_name = %node_name, "mesh: setting advert name before send");
+                                        let _ = advert_cmd_tx
+                                            .send(OutboundFrame::SetAdvertName { name: node_name })
+                                            .await;
+                                    }
+                                }
                                 if advert_cmd_tx
                                     .send(OutboundFrame::SendSelfAdvert { flood })
                                     .await
@@ -558,6 +570,19 @@ async fn event_loop(
                             // Publish pubkey to Host so the web UI can display it.
                             let pubkey_hex: String = info.pubkey.iter().map(|b| format!("{b:02x}")).collect();
                             host.set_node_pubkey(pubkey_hex);
+                            // Push the configured node name to the radio so the BBS
+                            // advertises with a human name instead of its key-derived
+                            // fallback (issue #101).  The host has already truncated it
+                            // to a MeshCore-safe length; the frame encoder also caps at
+                            // 31 bytes as a final guard.
+                            if let Some(node_name) = host.mesh_node_name() {
+                                if !node_name.is_empty() {
+                                    info!(node_name = %node_name, "mesh: setting advert name");
+                                    let _ = cmd_tx
+                                        .send(OutboundFrame::SetAdvertName { name: node_name })
+                                        .await;
+                                }
+                            }
                             // Push GPS coordinates to the radio if configured, and
                             // refresh the advert bus entry so the web UI shows
                             // the config GPS.

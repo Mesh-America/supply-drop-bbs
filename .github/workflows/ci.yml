@@ -25,12 +25,12 @@ jobs:
 
       - name: Install Rust toolchain
         # @master + explicit toolchain so we install the exact version
-        # rust-toolchain.toml pins (1.76). Using @stable here would
+        # rust-toolchain.toml pins (1.96). Using @stable here would
         # install the *latest* stable, which then conflicts with
         # rust-toolchain.toml when cargo invokes itself.
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.88"
+          toolchain: "1.96"
           components: rustfmt, clippy
 
       - name: Cargo cache

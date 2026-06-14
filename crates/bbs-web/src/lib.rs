@@ -2253,6 +2253,15 @@ async fn api_patch_config(
         }
     }
 
+    // Validate bbs.name before mutating anything. It doubles as the MeshCore
+    // advert node name, which the firmware caps at 31 bytes — an over-length
+    // name silently fails to advertise on the mesh (see bbs_core::mesh_name).
+    if let Some(ref name) = patch.bbs_name {
+        if let Err(e) = bbs_core::mesh_name::validate_mesh_node_name(name) {
+            return (StatusCode::BAD_REQUEST, Json(json_error(&e.to_string()))).into_response();
+        }
+    }
+
     // Apply patches — only touch keys explicitly present in the request.
     if let Some(v) = patch.bbs_name {
         doc["bbs"]["name"] = toml_edit::value(v);

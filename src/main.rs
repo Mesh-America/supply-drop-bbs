@@ -578,6 +578,22 @@ async fn cmd_run(cli: &Cli) {
         "supply-drop-bbs starting"
     );
 
+    // bbs.name doubles as the MeshCore advert node name. The firmware caps
+    // advert app_data at 32 bytes, so a name over the limit is silently
+    // dropped by every receiver (signature is verified over a clamped 32
+    // bytes). New names are rejected at the setup/web layer; an existing
+    // over-length name still boots, but warn that it is un-advertisable until
+    // shortened. The HAT yaml writer truncates defensively as a fallback.
+    if cfg.bbs.name.len() > bbs_core::mesh_name::MAX_MESH_NODE_NAME_BYTES {
+        warn!(
+            name = %cfg.bbs.name,
+            bytes = cfg.bbs.name.len(),
+            max = bbs_core::mesh_name::MAX_MESH_NODE_NAME_BYTES,
+            "bbs.name exceeds the MeshCore advert limit; mesh adverts will be truncated \
+             and the node may not appear on the mesh — shorten bbs.name to fix"
+        );
+    }
+
     // SYN-3: warn operators whose configs set rate-limit keys that are not yet
     // implemented, so they are not under the false impression these keys provide
     // brute-force protection.
@@ -657,6 +673,14 @@ async fn cmd_run(cli: &Cli) {
         access_policy,
         host_config_path,
     );
+
+    // bbs.name is the MeshCore advert node name. Store an advert-safe
+    // (truncated) copy so the mesh transport can push it to the radio via
+    // SetAdvertName on connect — without this the node advertises with its
+    // key-derived fallback name (issue #101).
+    bbs.set_node_name(Some(
+        bbs_core::mesh_name::truncate_mesh_node_name(&cfg.bbs.name).to_owned(),
+    ));
 
     if let Err(e) = bbs.ensure_guest_room().await {
         error!("guest room setup failed: {e}");

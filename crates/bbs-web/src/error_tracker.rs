@@ -100,7 +100,7 @@ impl ErrorStore {
     /// Return all entries sorted by count descending.
     pub fn list_sorted(&self) -> Vec<ErrorEntry> {
         let mut v = self.entries.clone();
-        v.sort_by(|a, b| b.count.cmp(&a.count));
+        v.sort_by_key(|e| std::cmp::Reverse(e.count));
         v
     }
 }

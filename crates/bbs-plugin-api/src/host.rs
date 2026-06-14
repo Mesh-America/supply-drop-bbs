@@ -461,6 +461,16 @@ pub trait Host: Send + Sync {
     /// The mesh transport reads this on the next reconnect.
     fn set_node_location(&self, _location: Option<(f64, f64)>) {}
 
+    /// Return the node name to advertise on the mesh (the BBS name), already
+    /// truncated to a MeshCore-safe length.
+    ///
+    /// The mesh transport calls this on `Connected` and sends `SetAdvertName`
+    /// to the radio so the node advertises with a human name instead of its
+    /// key-derived fallback. Returns `None` when no name is configured.
+    fn mesh_node_name(&self) -> Option<String> {
+        None
+    }
+
     /// Called by the mesh transport when AppStart SelfInfo is received.
     /// Stores the node's public key hex so it can be displayed in the web UI.
     fn set_node_pubkey(&self, _pubkey_hex: String) {}

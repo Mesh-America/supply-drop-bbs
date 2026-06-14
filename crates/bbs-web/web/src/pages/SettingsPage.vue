@@ -165,8 +165,18 @@ async function loadRooms() {
 function validate(): boolean {
   const errs: Record<string, string> = {}
 
-  if (!form.value.bbs_name.trim())
+  if (!form.value.bbs_name.trim()) {
     errs.bbs_name = 'Name is required.'
+  } else {
+    // bbs.name doubles as the MeshCore advert node name, capped at 31 bytes by
+    // the firmware (an over-length name silently fails to advertise). Count
+    // UTF-8 bytes, not characters — a flag emoji is 8 bytes.
+    const bytes = new TextEncoder().encode(form.value.bbs_name).length
+    if (bytes > 31)
+      errs.bbs_name = `Name is ${bytes} bytes; maximum is 31 (MeshCore advert limit — emoji count as several bytes each).`
+    else if ([...form.value.bbs_name].some((ch) => { const c = ch.codePointAt(0) ?? 0; return c < 0x20 || (c >= 0x7f && c <= 0x9f) }))
+      errs.bbs_name = 'Name must not contain control characters.'
+  }
 
   if (!form.value.bbs_starting_room.trim())
     errs.bbs_starting_room = 'Starting room is required.'
