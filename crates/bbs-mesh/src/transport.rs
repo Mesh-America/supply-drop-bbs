@@ -1279,10 +1279,18 @@ async fn dispatch_message(
 
     // ── Update workflow-reply flag ────────────────────────────────────────────
     let is_prompt = matches!(response, Response::Prompt { .. });
-    state
-        .lock()
-        .expect("state mutex poisoned")
-        .set_awaiting_reply(&sender_prefix, is_prompt);
+    {
+        let mut state = state.lock().expect("state mutex poisoned");
+        state.set_awaiting_reply(&sender_prefix, is_prompt);
+        // A new prompt begins a fresh reply turn, so the user's next message is
+        // genuine input even if it repeats the previous reply verbatim. Clear
+        // the message-dedup baseline so the general retransmission dedup can't
+        // silently drop, for example, the matching password entered again at
+        // "Confirm your password:". (#104)
+        if is_prompt {
+            state.clear_last_message(&sender_prefix);
+        }
+    }
 
     // ── Collect frames to send back ───────────────────────────────────────────
     // MultiText delivers each element as a separate radio frame.
