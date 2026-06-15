@@ -336,15 +336,26 @@ impl Command {
     ///
     /// When `awaiting_reply` is `true` (the previous [`Response`] was a
     /// [`Response::Prompt`]), the entire line becomes a [`Command::WorkflowReply`]
-    /// regardless of content — this lets the host handle password entry, message
-    /// bodies, and other free-form workflow steps without each transport
-    /// re-implementing that state machine.
+    /// (with the sole exception of `CANCEL`/`STOP`, see below) — this lets the
+    /// host handle password entry, message bodies, and other free-form workflow
+    /// steps without each transport re-implementing that state machine.
+    ///
+    /// `CANCEL`/`STOP` (case-insensitive) always abort the current workflow via
+    /// [`Command::Cancel`], on every transport and *before* the awaiting-reply
+    /// passthrough — otherwise the words would be captured as the literal reply
+    /// (e.g. become the new display name). Mirrors the MeshCore parser. (#120)
     ///
     /// This is the canonical parser shared by all transports that forward raw
     /// text lines (CLI, process plugins).  Transports with their own wire
     /// syntax (e.g. MeshCore frames) do their own mapping.
     pub fn parse(line: &str, awaiting_reply: bool) -> Self {
         let text = line.trim();
+
+        // CANCEL / STOP always break out of a workflow, before the awaiting-reply
+        // passthrough, so they can't be swallowed as a literal reply. (#120)
+        if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {
+            return Command::Cancel;
+        }
 
         if awaiting_reply {
             return Command::WorkflowReply {
@@ -615,5 +626,29 @@ mod tests {
             let back: Response = serde_json::from_str(&json).unwrap();
             assert_eq!(r, back);
         }
+    }
+
+    #[test]
+    fn cancel_breaks_out_of_workflow_on_shared_parser() {
+        // CANCEL/STOP abort a workflow instead of being captured as the reply,
+        // matching the MeshCore parser, so the prompt's "CANCEL to abort" advice
+        // holds on the shared (CLI / process) parser too. (#120)
+        for kw in ["cancel", "CANCEL", "Stop", "stop"] {
+            assert_eq!(Command::parse(kw, true), Command::Cancel, "awaiting: {kw}");
+            assert_eq!(Command::parse(kw, false), Command::Cancel, "idle: {kw}");
+        }
+        // A reply that merely contains the word is still captured verbatim.
+        assert_eq!(
+            Command::parse("CancelTheOrder", true),
+            Command::WorkflowReply {
+                reply: "CancelTheOrder".to_owned()
+            }
+        );
+        assert_eq!(
+            Command::parse("Alice", true),
+            Command::WorkflowReply {
+                reply: "Alice".to_owned()
+            }
+        );
     }
 }
