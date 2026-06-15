@@ -4426,7 +4426,7 @@ impl BbsHost {
             }
         }
         Ok(Response::Prompt {
-            text: "Enter your new display name (or '-' to clear, Enter to cancel):".into(),
+            text: "Enter your new display name (- to clear, CANCEL to abort):".into(),
             hide_input: false,
         })
     }
@@ -6670,5 +6670,41 @@ mod tests {
             matches!(&resp, Response::Text(t) if t.contains("Unknown command")),
             "after another command, bare `.` should be Unknown, got: {resp:?}"
         );
+    }
+
+    /// Issue #120: the PROFILE prompt must not tell mesh users to "Enter to
+    /// cancel" (an empty message can't be sent over a radio). It advertises
+    /// CANCEL instead, which aborts the workflow on every transport.
+    #[tokio::test]
+    async fn profile_prompt_is_mesh_friendly_and_cancel_aborts() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+
+        let resp = host
+            .process_command(sid, Command::EditProfile)
+            .await
+            .unwrap();
+        let prompt = match resp {
+            Response::Prompt { text, .. } => text,
+            other => panic!("PROFILE should prompt, got {other:?}"),
+        };
+        assert!(
+            !prompt.to_lowercase().contains("enter to cancel"),
+            "prompt must not instruct 'Enter to cancel', got: {prompt}"
+        );
+        assert!(
+            prompt.contains("CANCEL"),
+            "prompt should advertise CANCEL, got: {prompt}"
+        );
+
+        // CANCEL aborts and clears the workflow.
+        let resp = host.process_command(sid, Command::Cancel).await.unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t.to_lowercase().contains("cancel")),
+            "CANCEL should abort, got: {resp:?}"
+        );
+        let sessions = host.sessions.read().await;
+        assert!(matches!(sessions[&sid].workflow, Workflow::None));
     }
 }
