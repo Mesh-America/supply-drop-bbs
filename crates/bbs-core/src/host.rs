@@ -4670,7 +4670,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "h" | "help" | "?" => {
             if logged_in {
                 "H — show this help\n\
-                 H reading / posting / navigation / account\n\
+                 H M/R/P/U/N/A for topics (mail, reading, posting, users, nav, account)\n\
                  H <cmd> for detail on one command (eg. H N)"
             } else {
                 "H — show this help."
@@ -4698,7 +4698,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "g" if logged_in => "G — go to next room with unread messages",
         "c" if logged_in => "C <name> — change room by name or number",
         "k" if logged_in => "K — list known rooms",
-        "i" if logged_in => "I — ignore this room (toggle)\nIgnored rooms are skipped during navigation.",
+        "i" if logged_in => "I — ignore this room (not yet available)",
         "m" if logged_in => {
             "M — go to Mail (private messages)\n\
              In Mail: E to write, N to read new,\n\
@@ -4782,7 +4782,7 @@ const HELP_QUICK_LOGGED_IN: &str = "\
  M  go to Mail\n\
  W  who's online\n\
  Q  log out\n\
-H all - show all";
+H all - help topics";
 
 const HELP_OVERVIEW: &str = "\
 H M — Mail\n\
@@ -4811,7 +4811,6 @@ const HELP_NAVIGATION: &str = "\
 Navigation:\n\
  C    change room\n\
  G    next unread room\n\
- I    ignore this room\n\
  K    list known rooms\n\
  M    go to Mail";
 
