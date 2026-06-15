@@ -385,7 +385,6 @@ impl Command {
                 target: rest.unwrap_or("").to_owned(),
             },
             "m" => Command::GoMail,
-            "i" => Command::IgnoreRoom,
 
             // ── Message reading ───────────────────────────────────────────────
             "n" => Command::ReadNew,
@@ -569,6 +568,15 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignore_room_keyword_is_unknown() {
+        // `I` (ignore room) is no longer a recognised command. (#123)
+        assert!(matches!(
+            Command::parse("i", false),
+            Command::Unknown { .. }
+        ));
+    }
 
     #[test]
     fn command_serde_roundtrip() {

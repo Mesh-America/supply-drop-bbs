@@ -56,7 +56,6 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             target: rest.unwrap_or("").to_owned(),
         }),
         "m" => Some(Command::GoMail),
-        "i" => Some(Command::IgnoreRoom),
         "n" => Some(Command::ReadNew),
         "f" => Some(Command::ReadForward {
             after: rest.and_then(|s| s.parse::<i64>().ok()),
