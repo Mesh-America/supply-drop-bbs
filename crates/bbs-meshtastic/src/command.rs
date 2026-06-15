@@ -156,6 +156,12 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 raw: text.to_owned(),
             }),
         },
+        ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::SetUserPassword { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
         }),

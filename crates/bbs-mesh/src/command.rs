@@ -253,6 +253,13 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
+        ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::SetUserPassword { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
         }),
@@ -413,6 +420,15 @@ mod tests {
     #[test]
     fn whoami_is_parsed_on_mesh() {
         assert!(matches!(cmd("whoami"), Some(Command::Whoami)));
+    }
+
+    #[test]
+    fn pw_reset_parsed_on_mesh() {
+        // `.PW <user>` (sysop password reset) is now recognised on mesh. (#125)
+        let username = Username::new("bob").unwrap();
+        assert_eq!(cmd(".pw bob"), Some(Command::SetUserPassword { username }));
+        // Missing username → unknown (no silent no-op).
+        assert!(matches!(cmd(".pw"), Some(Command::Unknown { .. })));
     }
 
     #[test]
