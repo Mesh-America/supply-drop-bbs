@@ -214,14 +214,18 @@ Shows the quick command list for your current access level.
 
 ### Help topics
 
+`H all` lists the help topics. Each topic has a single-letter shortcut and a
+full-word form — both work (e.g. `H M` is the same as `H mail`):
+
 ```
-H mail       — private messaging
-H reading    — reading messages in a room
-H posting    — writing and deleting messages
-H nav        — navigating between rooms
-H acct       — your profile and password
-H aide       — moderation commands (Aide+)
-H sysop      — administration commands (Sysop+)
+H M  mail      — private messaging
+H R  reading   — reading messages in a room (incl. .FF fast-forward)
+H P  posting   — writing and deleting messages
+H U  users     — finding and listing user accounts
+H N  nav       — navigating between rooms
+H A  acct      — your profile and password
+H aide         — moderation commands (Aide+)
+H sysop        — administration commands (Sysop+)
 ```
 
 ### Help on a specific command
@@ -897,11 +901,13 @@ account and you can re-register with the same username.
 | Command | Shows |
 |---|---|
 | `H` | Quick command list |
-| `H mail` | Mail / private message commands |
-| `H reading` | All reading commands |
-| `H posting` | Writing and deleting |
-| `H nav` | Room navigation |
-| `H acct` | Profile and password |
+| `H all` | List of help topics |
+| `H M` / `H mail` | Mail / private message commands |
+| `H R` / `H reading` | All reading commands (incl. `.FF`) |
+| `H P` / `H posting` | Writing and deleting |
+| `H U` / `H users` | Finding and listing user accounts |
+| `H N` / `H nav` | Room navigation |
+| `H A` / `H acct` | Profile and password |
 | `H <cmd>` | Detail on one command (e.g. `H N`) |
 
 ### Aide commands
