@@ -48,7 +48,6 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 topic: Some("login".to_owned()),
             }),
         },
-        "logout" => Some(Command::Logout),
         "whoami" => Some(Command::Whoami),
         "k" => Some(Command::ListRooms),
         "g" => Some(Command::GoNextUnread),
@@ -78,7 +77,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 raw: text.to_owned(),
             }),
         },
-        "q" | "quit" | "exit" | "bye" => Some(Command::Quit),
+        // All quit aliases map to one intent (Quit), parallel with the mesh and
+        // canonical parsers. (#124 follow-up)
+        "q" | "quit" | "exit" | "bye" | "logout" => Some(Command::Quit),
         "cancel" | "stop" => Some(Command::Cancel),
         "w" => Some(Command::WhoIsOnline),
         "pending" => Some(Command::ListPending),
