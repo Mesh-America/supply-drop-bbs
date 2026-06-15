@@ -168,13 +168,14 @@ Up to 3 failed attempts on `VerifyOld` before the workflow is cancelled.
 **Trigger:** First `F` or `R` command in a room.  
 **Purpose:** Browse messages one-at-a-time without re-typing the command prefix.
 
-**Entry:** Shows `[Room — Reading] / N message(s) / F - Forward  R - Backward  X - Exit`.
+**Entry:** Shows `[Room — Reading] / N message(s) / F - Forward  R - Backward  H - Help  X - Exit`.
 
 | Reply | Action |
 |---|---|
 | `F` | Fetch next message, advance cursor, stay in workflow |
 | `R` | Fetch previous message, move cursor back, stay in workflow |
 | `E` | Start `Workflow::Compose` replying to current message sender (Mail) or posting to current room |
+| `H` / `?` | Show contextual reading-mode help, stay in workflow |
 | Anything else | Reset cursor and workflow, return to normal mode |
 
 Each message frame ends with a nav hint line:

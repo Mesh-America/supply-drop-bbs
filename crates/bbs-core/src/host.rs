@@ -2376,6 +2376,10 @@ impl BbsHost {
                     "F" => self.handle_read_forward(session, None).await,
                     "R" => self.handle_read_reverse(session).await,
                     "E" => self.handle_reply_from_reading(session).await,
+                    // H is the universal help key; in reading mode it shows
+                    // contextual help and stays in the reading sub-mode rather
+                    // than bouncing the user out (issue #109).
+                    "H" | "?" => Ok(Response::Text(HELP_READING_MODE.into())),
                     _ => {
                         // Any other input exits reading mode.
                         {
@@ -3341,7 +3345,7 @@ impl BbsHost {
 
             return Ok(Response::Prompt {
                 text: format!(
-                    "[{} — Reading]\n{} message(s)\nF - Forward  R - Backward  X - Exit",
+                    "[{} — Reading]\n{} message(s)\nF - Forward  R - Backward  H - Help  X - Exit",
                     room.name, count
                 ),
                 hide_input: false,
@@ -3358,7 +3362,10 @@ impl BbsHost {
         let msg = match msg {
             None => {
                 return Ok(Response::Prompt {
-                    text: format!("No more messages in {}.\nR - Backward  X - Exit", room.name),
+                    text: format!(
+                        "No more messages in {}.\nR - Backward  H - Help  X - Exit",
+                        room.name
+                    ),
                     hide_input: false,
                 })
             }
@@ -3444,7 +3451,7 @@ impl BbsHost {
 
             return Ok(Response::Prompt {
                 text: format!(
-                    "[{} — Reading]\n{} message(s)\nF - Forward  R - Backward  X - Exit",
+                    "[{} — Reading]\n{} message(s)\nF - Forward  R - Backward  H - Help  X - Exit",
                     room.name, count
                 ),
                 hide_input: false,
@@ -3462,7 +3469,7 @@ impl BbsHost {
             None => {
                 return Ok(Response::Prompt {
                     text: format!(
-                        "No previous messages in {}.\nF - Forward  X - Exit",
+                        "No previous messages in {}.\nF - Forward  H - Help  X - Exit",
                         room.name
                     ),
                     hide_input: false,
@@ -4807,6 +4814,16 @@ Reading:\n\
  S    scan message headers\n\
  .FF  fast-forward past unread";
 
+/// Contextual help shown when `H`/`?` is pressed inside the one-at-a-time
+/// reading sub-mode (`Workflow::Reading`). Lists only the keys valid there.
+const HELP_READING_MODE: &str = "\
+Reading mode:\n\
+ F  next message (forward)\n\
+ R  previous message (back)\n\
+ E  reply to this message\n\
+ H  this help\n\
+ X  exit reading";
+
 const HELP_POSTING: &str = "\
 Posting:\n\
  D <#>  delete\n\
@@ -4917,6 +4934,7 @@ mod tests {
             ("HELP_OVERVIEW", HELP_OVERVIEW),
             ("HELP_MAIL", HELP_MAIL),
             ("HELP_READING", HELP_READING),
+            ("HELP_READING_MODE", HELP_READING_MODE),
             ("HELP_POSTING", HELP_POSTING),
             ("HELP_NAVIGATION", HELP_NAVIGATION),
             ("HELP_ACCOUNT", HELP_ACCOUNT),
@@ -6196,6 +6214,69 @@ mod tests {
             after, 0,
             "unread_count must be 0 after the pointed-to message is deleted"
         );
+    }
+
+    /// Issue #109: `H` inside the one-at-a-time reading sub-mode shows
+    /// contextual reading help and stays in reading mode, rather than bouncing
+    /// the user out (which previously cost a second round-trip to get help).
+    #[tokio::test]
+    async fn reading_mode_h_shows_help_and_stays() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // Post a message so the room has something to read.
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("hello".into()),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+
+        // Enter reading mode with F.
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::Reading),
+                "F should enter reading mode"
+            );
+        }
+
+        // H during reading → contextual help, NOT an exit.
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "H".into() })
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::Text(t) => t,
+            other => panic!("expected Text help, got {other:?}"),
+        };
+        assert!(
+            text.to_lowercase().contains("reading mode"),
+            "H should return reading-mode help, got: {text:?}"
+        );
+        assert!(
+            !text.to_lowercase().contains("exited"),
+            "H should not exit reading mode, got: {text:?}"
+        );
+
+        // Still in reading mode after H.
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::Reading),
+                "H should keep the user in reading mode"
+            );
+        }
     }
 
     /// After pointer reset, pressing N should return "No new messages" rather
