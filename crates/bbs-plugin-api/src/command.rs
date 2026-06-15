@@ -502,13 +502,15 @@ impl Command {
                 },
             },
 
+            // Missing/invalid username → show the command's usage rather than a
+            // generic "unknown command". (#127 follow-up)
             ".aide" => match rest.and_then(|s| Username::new(s).ok()) {
                 Some(username) => Command::SetUserLevel {
                     username,
                     level: PermissionLevel::Aide,
                 },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
+                None => Command::Help {
+                    topic: Some(".aide".to_owned()),
                 },
             },
             ".sysop" => match rest.and_then(|s| Username::new(s).ok()) {
@@ -516,8 +518,8 @@ impl Command {
                     username,
                     level: PermissionLevel::Sysop,
                 },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
+                None => Command::Help {
+                    topic: Some(".sysop".to_owned()),
                 },
             },
             ".user" => match rest.and_then(|s| Username::new(s).ok()) {
@@ -525,8 +527,8 @@ impl Command {
                     username,
                     level: PermissionLevel::User,
                 },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
+                None => Command::Help {
+                    topic: Some(".user".to_owned()),
                 },
             },
 

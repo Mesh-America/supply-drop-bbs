@@ -253,9 +253,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
-        ".aide" => Some(parse_set_level(rest, PermissionLevel::Aide, text)),
-        ".sysop" => Some(parse_set_level(rest, PermissionLevel::Sysop, text)),
-        ".user" => Some(parse_set_level(rest, PermissionLevel::User, text)),
+        ".aide" => Some(parse_set_level(rest, PermissionLevel::Aide)),
+        ".sysop" => Some(parse_set_level(rest, PermissionLevel::Sysop)),
+        ".user" => Some(parse_set_level(rest, PermissionLevel::User)),
 
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
@@ -278,12 +278,21 @@ fn split_first_word(s: &str) -> (&str, Option<&str>) {
 }
 
 /// Parse a `.AIDE` / `.SYSOP` / `.USER <user>` set-level command. (#127)
-fn parse_set_level(rest: Option<&str>, level: PermissionLevel, raw: &str) -> Command {
+fn parse_set_level(rest: Option<&str>, level: PermissionLevel) -> Command {
     match rest.and_then(|s| Username::new(s).ok()) {
         Some(username) => Command::SetUserLevel { username, level },
-        None => Command::Unknown {
-            raw: raw.to_owned(),
-        },
+        // Missing/invalid username → show the command's usage rather than a
+        // generic "unknown command". (#127 follow-up)
+        None => {
+            let topic = match level {
+                PermissionLevel::Aide => ".aide",
+                PermissionLevel::Sysop => ".sysop",
+                _ => ".user",
+            };
+            Command::Help {
+                topic: Some(topic.to_owned()),
+            }
+        }
     }
 }
 
@@ -454,8 +463,13 @@ mod tests {
                 level: PermissionLevel::User
             })
         );
-        // Missing username → unknown.
-        assert!(matches!(cmd(".aide"), Some(Command::Unknown { .. })));
+        // Missing username → the command's usage help, not a generic unknown.
+        assert_eq!(
+            cmd(".aide"),
+            Some(Command::Help {
+                topic: Some(".aide".to_owned())
+            })
+        );
     }
 
     #[test]
