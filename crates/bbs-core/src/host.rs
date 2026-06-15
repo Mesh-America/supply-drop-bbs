@@ -2419,73 +2419,26 @@ impl BbsHost {
                         return self.handle_change_to_room(session, target_id).await;
                     }
                 }
-                // Allow "C <name>" to navigate directly while the room list is active,
-                // so users don't need to cancel with X first.
-                {
-                    let lower = trimmed.to_ascii_lowercase();
-                    if let Some(rest) = lower.strip_prefix("c ") {
-                        let rest = rest.trim();
-                        if !rest.is_empty() {
-                            // Preserve original casing from the user's input.
-                            let name = trimmed[2..].trim();
-                            {
-                                let mut sessions = self.sessions.write().await;
-                                if let Some(r) = sessions.get_mut(&session) {
-                                    r.workflow = Workflow::None;
-                                }
-                            }
-                            return self.handle_change_room(session, name).await;
-                        }
-                    }
-                }
-                // Fall back: treat as room name via the normal change-room path.
-                //
-                // Guard against out-of-order mesh delivery: if the user typed a
-                // BBS command (e.g. "N") immediately after "K" and the command
-                // arrived while awaiting_reply was still true, it would land
-                // here as a room-selection reply.  Single-letter or short
-                // alphabetic inputs that look like known command keywords are
-                // almost never intended as room names; cancel the room-selection
-                // workflow and tell the user to re-send their command.
-                let is_cmd_keyword = matches!(
-                    trimmed.to_ascii_lowercase().as_str(),
-                    "c" | "n"
-                        | "f"
-                        | "r"
-                        | "g"
-                        | "k"
-                        | "m"
-                        | "i"
-                        | "e"
-                        | "d"
-                        | "q"
-                        | "w"
-                        | "s"
-                        | "h"
-                        | "?"
-                        | "profile"
-                        | "passwd"
-                        | "pending"
-                        | "whoami"
-                        | ".ff"
-                        | ".c"
-                        | ".dr"
-                        | ".er"
-                );
+                // Anything else: re-parse the input through the canonical
+                // command parser. If the user typed a real command (e.g. "N",
+                // "C Lobby", "G") instead of a room number — often because the
+                // command arrived while the room list was still open on a slow
+                // link — auto-cancel the selection and run it, rather than
+                // discarding it and forcing a wasted re-send round-trip (#108).
+                // Input that isn't a recognised command is treated as a room
+                // name to switch to, preserving the old fall-through behaviour.
                 {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.workflow = Workflow::None;
                     }
                 }
-                if is_cmd_keyword {
-                    return Ok(Response::Text(format!(
-                        "Room selection cancelled (received '{}' while waiting for room number).\n\
-                         Re-send your command, or type K to list rooms again.",
-                        trimmed.to_uppercase()
-                    )));
+                let cmd = Command::parse(trimmed, false);
+                if matches!(cmd, Command::Unknown { .. }) {
+                    self.handle_change_room(session, trimmed).await
+                } else {
+                    Box::pin(self.process_command(session, cmd)).await
                 }
-                self.handle_change_room(session, trimmed).await
             }
 
             // ── Pending-user review queue ─────────────────────────────────────
@@ -6298,13 +6251,15 @@ mod tests {
         );
     }
 
-    // ── Bug-03: Workflow::Rooms cancels cleanly for command keywords ──────────
+    // ── Bug-03 / #108: Workflow::Rooms executes command keywords ──────────────
 
-    /// When a single-letter command keyword (e.g. "N") arrives as a workflow
-    /// reply during room selection, the session should cancel cleanly with a
-    /// helpful message rather than reporting "Room 'N' not found".
+    /// When a command keyword (e.g. "N") arrives as a workflow reply during
+    /// room selection — often because it was sent while the room list was still
+    /// open on a slow link — the BBS should auto-cancel the selection and run
+    /// the command, not discard it with a "re-send" message or treat it as a
+    /// room name ("Room 'N' not found"). See issue #108.
     #[tokio::test]
-    async fn rooms_workflow_cancels_for_command_keywords() {
+    async fn rooms_workflow_executes_command_keyword() {
         let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let uname = Username::new("alice").unwrap();
@@ -6317,28 +6272,36 @@ mod tests {
             "K should enter Workflow::Rooms and return Prompt"
         );
 
-        // "N" arrives as a WorkflowReply (simulating out-of-order mesh delivery).
+        // "N" arrives as a WorkflowReply while the room list is open.
         let resp = host
             .process_command(sid, Command::WorkflowReply { reply: "N".into() })
             .await
             .unwrap();
 
-        let text = match resp {
-            Response::Text(t) => t,
-            Response::Error(e) => e,
-            other => panic!("expected Text or Error, got {other:?}"),
-        };
-        // Should mention "cancelled" rather than "Room 'N' not found".
-        assert!(
-            text.to_lowercase().contains("cancel"),
-            "Workflow::Rooms should cancel for command keywords, got: {text:?}"
-        );
-        // Workflow should be cleared — next N should work as ReadNew.
-        let resp2 = host.process_command(sid, Command::ReadNew).await.unwrap();
-        assert!(
-            !matches!(resp2, Response::Error(_)),
-            "ReadNew after cancelled room-selection should not error, got {resp2:?}"
-        );
+        // It should execute as ReadNew: not an error, and not the old
+        // "cancelled / re-send" message, and not "Room 'N' not found".
+        if let Response::Text(t) = &resp {
+            let lower = t.to_lowercase();
+            assert!(
+                !lower.contains("cancel") && !lower.contains("re-send"),
+                "command should execute, not cancel, got: {t:?}"
+            );
+            assert!(
+                !lower.contains("not found"),
+                "command should not be treated as a room name, got: {t:?}"
+            );
+        } else {
+            panic!("expected Text (ReadNew result), got: {resp:?}");
+        }
+
+        // The room-selection workflow must be cleared.
+        {
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::None),
+                "room selection should be auto-cancelled after running the command"
+            );
+        }
     }
 
     // ── Bug-20: "C <name>" navigation during K room-list workflow ─────────────
@@ -6406,8 +6369,11 @@ mod tests {
 
     /// When the user sends bare "C" (no room name) while in Workflow::Rooms, it
     /// should cancel the workflow with a keyword-cancelled message (not error).
+    /// Bare "C" (no room name) during room selection now runs the ChangeRoom
+    /// command, which returns its usage hint — the selection is auto-cancelled
+    /// either way. (#108)
     #[tokio::test]
-    async fn rooms_workflow_bare_c_cancels_with_keyword_message() {
+    async fn rooms_workflow_bare_c_shows_usage() {
         let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let uname = Username::new("alice").unwrap();
@@ -6420,7 +6386,7 @@ mod tests {
             "K should enter Workflow::Rooms and return Prompt"
         );
 
-        // Send bare "C" — matches is_cmd_keyword and should cancel cleanly.
+        // Send bare "C" — parses to ChangeRoom with no target.
         let resp = host
             .process_command(sid, Command::WorkflowReply { reply: "C".into() })
             .await
@@ -6432,8 +6398,8 @@ mod tests {
             other => panic!("expected Text or Error for bare 'C', got {other:?}"),
         };
         assert!(
-            text.to_lowercase().contains("cancel"),
-            "bare 'C' during room workflow should produce a cancellation message, got: {text:?}"
+            text.to_lowercase().contains("usage"),
+            "bare 'C' should show the ChangeRoom usage hint, got: {text:?}"
         );
 
         // Workflow should be cleared.
