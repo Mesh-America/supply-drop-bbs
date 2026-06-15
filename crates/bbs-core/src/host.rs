@@ -5440,6 +5440,37 @@ mod tests {
         );
     }
 
+    /// Issue #129: the `-` display-name shortcut must ADVANCE to the password
+    /// step (not exit registration). Regression guard for the #105 fix.
+    #[tokio::test]
+    async fn register_dash_advances_to_password() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: Username::new("qatester1").unwrap(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "-".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("password")),
+            "`-` should advance to the password prompt, got: {resp:?}"
+        );
+        // Still mid-registration — not dropped back to the anonymous menu.
+        let sessions = host.sessions.read().await;
+        assert!(
+            matches!(sessions[&sid].workflow, Workflow::Register { .. }),
+            "session should still be in the registration workflow after `-`"
+        );
+    }
+
     /// Issue #105: on a mesh radio you can't send an empty message, so the
     /// `-` sentinel must mean "use my username" (display name left unset),
     /// matching the empty-input behaviour available on CLI/web.
