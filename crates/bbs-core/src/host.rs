@@ -4043,8 +4043,31 @@ impl BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("set level: {e}")))?;
 
-        // Apply the new level to any live sessions for this user immediately.
-        {
+        // Reflect the change in any live sessions. On a *demotion*, end the
+        // user's sessions so they must re-authenticate at the lower level — a
+        // stale elevated session must not outlive a privilege drop (mirrors the
+        // web convention of invalidating a demoted user's token). On a
+        // promotion, raise the level in place. (#127 follow-up)
+        if level < user.permission_level {
+            let ended: Vec<SessionId> = {
+                let mut sessions = self.sessions.write().await;
+                let ids: Vec<SessionId> = sessions
+                    .iter()
+                    .filter(|(_, r)| r.username.as_ref() == Some(&username))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in &ids {
+                    sessions.remove(id);
+                }
+                ids
+            };
+            for id in ended {
+                let _ = self.events_tx.send(DomainEvent::SessionEnded {
+                    session: id,
+                    reason: "permission level lowered".into(),
+                });
+            }
+        } else {
             let mut sessions = self.sessions.write().await;
             for r in sessions.values_mut() {
                 if r.username.as_ref() == Some(&username) {
@@ -4053,9 +4076,12 @@ impl BbsHost {
             }
         }
 
+        // A privilege change must never be silently un-audited: propagate a
+        // failed audit write as an error instead of only logging it, so the
+        // operation is reported failed rather than dropping the audit trail for
+        // an escalation. (#127 follow-up)
         let detail = format!("level -> {level}");
-        if let Err(e) = self
-            .db
+        self.db
             .audit_write(
                 actor.as_str(),
                 "set_level",
@@ -4063,9 +4089,7 @@ impl BbsHost {
                 Some(&detail),
             )
             .await
-        {
-            tracing::warn!("audit write failed: {e}");
-        }
+            .map_err(|e| HostError::Storage(format!("audit log failed: {e}")))?;
 
         info!(%actor, %username, %level, "user level changed");
         Ok(Response::Text(format!(
@@ -5652,6 +5676,67 @@ mod tests {
             matches!(&r, Response::Error(e) if e.to_lowercase().contains("sysop")),
             "non-sysop should be refused, got: {r:?}"
         );
+    }
+
+    /// #127 follow-up: a demotion must end the user's live session(s) so a stale
+    /// elevated session can't outlive the privilege drop; a promotion updates the
+    /// session level in place.
+    #[tokio::test]
+    async fn set_user_level_demotion_ends_session() {
+        let (host, _db) = make_host().await;
+        let mut ev_rx = host.events_tx.subscribe();
+        let sysop = host.create_session("test").await.unwrap();
+        register_and_login(&host, sysop, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // bob: validated, then promoted to Aide, with a live session.
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+        let bob = Username::new("bob").unwrap();
+        host.process_command(
+            sysop,
+            Command::ValidateUser {
+                username: bob.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sysop,
+            Command::SetUserLevel {
+                username: bob.clone(),
+                level: PermissionLevel::Aide,
+            },
+        )
+        .await
+        .unwrap();
+        // Promotion keeps the session alive (level raised in place).
+        assert!(
+            host.sessions.read().await.contains_key(&bob_sid),
+            "promotion should keep the session"
+        );
+        while ev_rx.try_recv().is_ok() {}
+
+        // Demote bob → his live session must be ended.
+        host.process_command(
+            sysop,
+            Command::SetUserLevel {
+                username: bob.clone(),
+                level: PermissionLevel::User,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !host.sessions.read().await.contains_key(&bob_sid),
+            "demotion must end the user's live session"
+        );
+        let mut ended = false;
+        while let Ok(ev) = ev_rx.try_recv() {
+            if matches!(ev, DomainEvent::SessionEnded { session, .. } if session == bob_sid) {
+                ended = true;
+            }
+        }
+        assert!(ended, "demotion should fire SessionEnded for the user");
     }
 
     /// #127: a sysop must not change the level of a banned/deleted account
