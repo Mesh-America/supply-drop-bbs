@@ -6723,4 +6723,46 @@ mod tests {
             "re-sent `.` should re-emit the mail confirmation, got: {resp:?}"
         );
     }
+
+    /// Issue #121 (coverage): the mail-specific confirmation also holds on the
+    /// multi-step compose route (bare `E` → recipient → body → `.`), not just
+    /// the inline `E <user> <text>` form.
+    #[tokio::test]
+    async fn mail_send_confirmation_multistep_is_mail_specific() {
+        let (host, _db) = make_host().await;
+        let alice = host.create_session("test").await.unwrap();
+        register_and_login(&host, alice, &Username::new("alice").unwrap(), "pass1234").await;
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+
+        // Mail, then the bare-E multi-step flow: recipient, body, confirm.
+        host.process_command(alice, Command::GoMail).await.unwrap();
+        host.process_command(alice, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+        host.process_command(
+            alice,
+            Command::WorkflowReply {
+                reply: "bob".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            alice,
+            Command::WorkflowReply {
+                reply: "hi from the prompt flow".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(alice, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t == "Mail sent to bob."),
+            "multi-step mail send should confirm 'Mail sent to bob.', got: {resp:?}"
+        );
+    }
 }
