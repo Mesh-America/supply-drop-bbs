@@ -36,9 +36,11 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         "h" | "help" | "?" => Some(Command::Help {
             topic: rest.map(str::to_owned),
         }),
-        "register" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::Register { username }),
-            None => Some(Command::Help {
+        "register" => match rest {
+            Some(name) if !name.is_empty() => Some(Command::Register {
+                username: name.to_owned(),
+            }),
+            _ => Some(Command::Help {
                 topic: Some("register".to_owned()),
             }),
         },

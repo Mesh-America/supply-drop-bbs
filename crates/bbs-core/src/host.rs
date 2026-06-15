@@ -1518,7 +1518,7 @@ impl BbsHost {
     async fn handle_register(
         &self,
         session: SessionId,
-        username: Username,
+        raw_username: String,
     ) -> Result<Response, HostError> {
         {
             let sessions = self.sessions.read().await;
@@ -1535,6 +1535,14 @@ impl BbsHost {
                 }
             }
         }
+
+        // Validate the requested username against the documented registration
+        // policy and return a specific error up front, so mesh users don't fail
+        // late (after the display-name/password steps). See issue #128.
+        let username = match validate_registration_username(&raw_username) {
+            Ok(u) => u,
+            Err(msg) => return Ok(Response::Error(msg)),
+        };
 
         let existing = self
             .db
@@ -4644,6 +4652,35 @@ fn cmd_label(cmd: &Command) -> &'static str {
     }
 }
 
+// ── Registration policy ────────────────────────────────────────────────────────
+
+/// Validate a requested registration username, returning the normalised
+/// [`Username`] or a user-facing error string.
+///
+/// Enforces the documented policy (3–32 chars; letters, digits, `-`, `_`; not a
+/// reserved name) with a specific message for each failure. This is stricter
+/// than [`Username::new`] (which has no minimum length and permits any
+/// non-control, non-whitespace ASCII), so invalid usernames are rejected at the
+/// `REGISTER` step rather than accepted into the flow. See issue #128.
+fn validate_registration_username(raw: &str) -> Result<Username, String> {
+    let trimmed = raw.trim();
+    // `Username::new` normalises (strips a leading `@`, lowercases) and rejects
+    // empty / too-long (>32) / non-ASCII / control / whitespace / `@` /
+    // leading-or-trailing `-`/`_` / reserved — each with a specific message.
+    let username = Username::new(trimmed).map_err(|e| format!("Can't register: {e}"))?;
+    let s = username.as_str();
+    if s.len() < 3 {
+        return Err("Username must be at least 3 characters.".to_owned());
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Username may only contain letters, digits, - and _.".to_owned());
+    }
+    Ok(username)
+}
+
 // ── Help text ─────────────────────────────────────────────────────────────────
 
 fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
@@ -5068,7 +5105,7 @@ mod tests {
             .process_command(
                 sid,
                 Command::Register {
-                    username: uname.clone(),
+                    username: uname.as_str().to_owned(),
                 },
             )
             .await
@@ -5133,7 +5170,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5184,7 +5221,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5260,9 +5297,14 @@ mod tests {
 
         // Start a registration workflow.
         let uname = Username::new("dave").unwrap();
-        host.process_command(sid, Command::Register { username: uname })
-            .await
-            .unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.as_str().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Cancel it.
         let r = host.process_command(sid, Command::Cancel).await.unwrap();
@@ -5291,7 +5333,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5363,9 +5405,14 @@ mod tests {
     /// Full registration workflow for a username/password pair.
     async fn do_register(host: &BbsHost, sid: SessionId, username: &str, password: &str) {
         let uname = Username::new(username).unwrap();
-        host.process_command(sid, Command::Register { username: uname })
-            .await
-            .unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.as_str().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
         // display name (empty = skip)
         host.process_command(
             sid,
@@ -5440,6 +5487,72 @@ mod tests {
         );
     }
 
+    /// Issue #128: `REGISTER` validates the username up front and returns a
+    /// specific error (too short / invalid chars / reserved) instead of
+    /// accepting invalid names into the flow or showing a generic banner.
+    #[tokio::test]
+    async fn register_enforces_username_rules() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
+        let too_short = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "ab".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&too_short, Response::Error(e) if e.contains("3 character")),
+            "too-short username should be rejected specifically, got: {too_short:?}"
+        );
+
+        let bad_chars = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "bad!name".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&bad_chars, Response::Error(e) if e.to_lowercase().contains("letters, digits")),
+            "invalid-charset username should be rejected specifically, got: {bad_chars:?}"
+        );
+
+        let reserved = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "bbs".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&reserved, Response::Error(e) if e.to_lowercase().contains("reserved")),
+            "reserved username should be rejected specifically, got: {reserved:?}"
+        );
+
+        // A valid username advances to the display-name prompt.
+        let ok = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "alice".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&ok, Response::Prompt { text, .. } if text.to_lowercase().contains("display name")),
+            "valid username should start registration, got: {ok:?}"
+        );
+    }
+
     /// Issue #105: on a mesh radio you can't send an empty message, so the
     /// `-` sentinel must mean "use my username" (display name left unset),
     /// matching the empty-input behaviour available on CLI/web.
@@ -5452,7 +5565,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -6015,7 +6128,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: username.clone(),
+                username: username.as_str().to_owned(),
             },
         )
         .await
