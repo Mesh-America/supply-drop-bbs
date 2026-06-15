@@ -1523,7 +1523,7 @@ impl BbsHost {
             }
         }
         Ok(Response::Prompt {
-            text: "Choose a display name (or press Enter to use your username):".into(),
+            text: "Choose a display name (or send - to use your username):".into(),
             hide_input: false,
         })
     }
@@ -1602,7 +1602,12 @@ impl BbsHost {
                 stage: RegisterStage::DisplayName,
             } => {
                 let trimmed = reply.trim();
-                let display_name = if trimmed.is_empty() {
+                // Empty input or the `-` sentinel both mean "use my username".
+                // Mesh transports can't send an empty message, so `-` (the same
+                // sentinel the PROFILE flow uses to clear a display name) is the
+                // mesh-usable way to accept the default; empty stays valid for
+                // CLI/web. See issue #105.
+                let display_name = if trimmed.is_empty() || trimmed == "-" {
                     None
                 } else {
                     if let Err(e) = crate::user::User::validate_display_name(trimmed) {
@@ -5413,6 +5418,50 @@ mod tests {
             dm.content.to_lowercase().contains("verify")
                 || dm.content.to_lowercase().contains("v newuser"),
             "DM should hint at the verify command"
+        );
+    }
+
+    /// Issue #105: on a mesh radio you can't send an empty message, so the
+    /// `-` sentinel must mean "use my username" (display name left unset),
+    /// matching the empty-input behaviour available on CLI/web.
+    #[tokio::test]
+    async fn register_display_name_dash_sentinel_uses_username() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("dashuser").unwrap();
+
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        // Display name: `-` → use username (the empty-input default is
+        // unreachable over mesh).
+        host.process_command(sid, Command::WorkflowReply { reply: "-".into() })
+            .await
+            .unwrap();
+        // Password, then matching confirmation.
+        for _ in 0..2 {
+            host.process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "abc12345".into(),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let user = UserStore::get_by_username(&host.db, &uname)
+            .await
+            .unwrap()
+            .expect("user should be created");
+        assert_eq!(
+            user.display_name, None,
+            "`-` sentinel should leave the display name unset"
         );
     }
 

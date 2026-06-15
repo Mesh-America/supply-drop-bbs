@@ -81,7 +81,7 @@ REGISTER alice
 The BBS will walk you through three prompts:
 
 ```
-Choose a display name (or press Enter to use your username):
+Choose a display name (or send - to use your username):
 > Alice Wonderland
 
 Choose a password (min 8 characters):
@@ -92,7 +92,8 @@ Confirm your password:
 ```
 
 **Display name** is optional. It is the name shown alongside your messages.
-Press Enter with nothing to use your username as-is. You can change it later
+Send `-` to use your username as-is (on a mesh radio you can't send an empty
+message; on the CLI/web you can also just press Enter). You can change it later
 with `PROFILE`.
 
 **Password** must be at least 8 characters. It is stored as a hashed value —
