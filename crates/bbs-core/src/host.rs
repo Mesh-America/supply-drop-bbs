@@ -160,6 +160,11 @@ struct SessionRecord {
     /// `None` means "not yet started"; F starts at the first message, R at the last.
     /// Reset to `None` when the room changes.
     current_message_id: Option<MessageId>,
+    /// `true` immediately after a message is posted, until the next command.
+    /// Lets a re-sent bare `.` (e.g. when the "Message posted." ack is lost on
+    /// a lossy radio link) re-emit the confirmation idempotently instead of
+    /// returning "Unknown command." See issue #107.
+    posted_idempotent: bool,
 }
 
 // ── Access policy ─────────────────────────────────────────────────────────────
@@ -361,6 +366,17 @@ impl Host for BbsHost {
             });
         }
 
+        // Clear the post-confirm idempotency flag for any command other than a
+        // bare `.` (which the `Command::Unknown` arm handles as a re-confirm).
+        // Once the user does anything else, a stray `.` is no longer a retry. (#107)
+        let is_repost_dot = matches!(&cmd, Command::Unknown { raw } if raw.trim() == ".");
+        if !is_repost_dot {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.posted_idempotent = false;
+            }
+        }
+
         match cmd {
             Command::Help { topic } => {
                 let level = {
@@ -444,7 +460,24 @@ impl Host for BbsHost {
             Command::CloseAccess => self.handle_close_access(session).await,
             Command::SetGuestRoom { name } => self.handle_set_guest_room(session, name).await,
 
-            Command::Unknown { .. } => {
+            Command::Unknown { raw } => {
+                // Idempotent post-confirm (#107): if the previous action was a
+                // successful post and the user re-sends a bare `.` (because the
+                // "Message posted." ack was lost on a lossy link), re-emit the
+                // confirmation rather than "Unknown command." The post is not
+                // repeated — `posted_idempotent` only re-acknowledges.
+                if raw.trim() == "." {
+                    let posted = {
+                        let sessions = self.sessions.read().await;
+                        sessions
+                            .get(&session)
+                            .map(|r| r.posted_idempotent)
+                            .unwrap_or(false)
+                    };
+                    if posted {
+                        return Ok(Response::Text("Message posted.".into()));
+                    }
+                }
                 // Provide a more helpful nudge when the session is not yet
                 // authenticated.  A user who types freeform text like "Hi"
                 // as their very first message after a BBS restart should be
@@ -478,6 +511,7 @@ impl Host for BbsHost {
                 workflow: Workflow::None,
                 current_room: LOBBY_ROOM_ID,
                 current_message_id: None,
+                posted_idempotent: false,
             },
         );
         let _ = self.events_tx.send(DomainEvent::SessionCreated {
@@ -2066,6 +2100,9 @@ impl BbsHost {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.workflow = Workflow::None;
+                        // Arm idempotent re-confirm: a re-sent bare `.` should
+                        // re-emit "Message posted." rather than error (#107).
+                        r.posted_idempotent = true;
                     }
                 }
                 Ok(Response::Text("Message posted.".into()))
@@ -6523,6 +6560,69 @@ mod tests {
         assert!(
             matches!(resp, Response::Text(_)),
             "dot after re-shown preview should post the message, got: {resp:?}"
+        );
+    }
+
+    /// Issue #107: after a post the workflow ends, but a re-sent bare `.`
+    /// (the "Message posted." ack lost on a lossy link) must re-emit the
+    /// confirmation idempotently — not "Unknown command" — and must not
+    /// create a duplicate post. Once the user runs any other command, a stray
+    /// `.` is no longer treated as a retry.
+    #[tokio::test]
+    async fn repost_dot_after_post_is_idempotent() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("carol").unwrap();
+        register_and_login(&host, sid, &uname, "pass5678").await;
+
+        let room = {
+            let s = host.sessions.read().await;
+            s.get(&sid).unwrap().current_room
+        };
+
+        // Compose and confirm a post.
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("idempotency test".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Message posted")),
+            "first `.` should post, got: {resp:?}"
+        );
+        let count_after_post = MessageStore::count_in_room(&host.db, room).await.unwrap();
+
+        // Re-send a bare `.` as a top-level command (workflow already ended).
+        let resp = host
+            .process_command(sid, Command::Unknown { raw: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Message posted")),
+            "re-sent bare `.` should re-confirm idempotently, got: {resp:?}"
+        );
+        let count_after_retry = MessageStore::count_in_room(&host.db, room).await.unwrap();
+        assert_eq!(
+            count_after_post, count_after_retry,
+            "re-sent `.` must not duplicate the post"
+        );
+
+        // After any other command, a stray `.` is no longer a retry.
+        host.process_command(sid, Command::Whoami).await.unwrap();
+        let resp = host
+            .process_command(sid, Command::Unknown { raw: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Unknown command")),
+            "after another command, bare `.` should be Unknown, got: {resp:?}"
         );
     }
 }
