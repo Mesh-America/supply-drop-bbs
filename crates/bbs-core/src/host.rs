@@ -3992,6 +3992,18 @@ impl BbsHost {
             Some(u) => u,
         };
 
+        // Status and permission_level are orthogonal. Refuse to touch the level
+        // of a non-active (banned/deleted) account: the new level would be
+        // pushed into any live session below, re-empowering a user who is still
+        // flagged banned. Re-activate first. (#127)
+        if user.status != UserStatus::Active {
+            return Ok(Response::Error(format!(
+                "'{}' is {} — re-activate the account before changing its level.",
+                username.as_str(),
+                user.status
+            )));
+        }
+
         // Promotion to a role is for already-validated accounts; an unvalidated
         // account must be validated first (V) so it isn't silently activated here.
         if user.permission_level == PermissionLevel::Unvalidated {
@@ -4006,6 +4018,25 @@ impl BbsHost {
                 "'{}' is already {level}.",
                 username.as_str()
             )));
+        }
+
+        // Backstop against removing the last Sysop. The self-change guard above
+        // already prevents a lone sysop from demoting themselves over the mesh,
+        // but enforce the invariant locally so it holds regardless of how this
+        // handler is reached. (#127)
+        if user.permission_level == PermissionLevel::Sysop && level < PermissionLevel::Sysop {
+            let active = UserStore::list(&self.db, Some(UserStatus::Active), 500, 0)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let sysops = active
+                .iter()
+                .filter(|u| u.permission_level == PermissionLevel::Sysop)
+                .count();
+            if sysops <= 1 {
+                return Ok(Response::Error(
+                    "Can't demote the last Sysop — promote another Sysop first.".into(),
+                ));
+            }
         }
 
         UserStore::update(&self.db, user.id, None, None, Some(level), None)
@@ -5620,6 +5651,98 @@ mod tests {
         assert!(
             matches!(&r, Response::Error(e) if e.to_lowercase().contains("sysop")),
             "non-sysop should be refused, got: {r:?}"
+        );
+    }
+
+    /// #127: a sysop must not change the level of a banned/deleted account
+    /// (it would be re-empowered in any live session), and a legitimate
+    /// demotion must still succeed while another Sysop remains.
+    #[tokio::test]
+    async fn set_user_level_guards_banned_and_last_sysop() {
+        let (host, _db) = make_host().await;
+        let sysop = host.create_session("test").await.unwrap();
+        register_and_login(&host, sysop, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // bob: validated (→ User), then banned.
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+        let bob = Username::new("bob").unwrap();
+        host.process_command(
+            sysop,
+            Command::ValidateUser {
+                username: bob.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let bob_id = UserStore::get_by_username(&host.db, &bob)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(&host.db, bob_id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: bob.clone(),
+                    level: PermissionLevel::Aide,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(e)
+                if e.to_lowercase().contains("re-activate") || e.to_lowercase().contains("banned")),
+            "level change on a banned account should be refused, got: {r:?}"
+        );
+        assert_eq!(
+            UserStore::get_by_username(&host.db, &bob)
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_level,
+            PermissionLevel::User,
+            "banned user's level must be unchanged"
+        );
+
+        // carol promoted to Sysop, then demoted — alice remains, so it succeeds.
+        let carol_sid = host.create_session("test").await.unwrap();
+        do_register(&host, carol_sid, "carol", "pass9012").await;
+        let carol = Username::new("carol").unwrap();
+        host.process_command(
+            sysop,
+            Command::ValidateUser {
+                username: carol.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sysop,
+            Command::SetUserLevel {
+                username: carol.clone(),
+                level: PermissionLevel::Sysop,
+            },
+        )
+        .await
+        .unwrap();
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: carol.clone(),
+                    level: PermissionLevel::User,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Text(t) if t.to_lowercase().contains("user")),
+            "demoting a sysop while another remains should succeed, got: {r:?}"
         );
     }
 
