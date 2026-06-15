@@ -3274,9 +3274,21 @@ impl BbsHost {
             return Ok(Response::Text(format!("No new messages in {}.", room.name)));
         }
 
-        let mut parts = vec![format!("[{} — new messages]", room.name)];
-        for msg in &visible {
-            parts.push(format_message(msg));
+        // Merge the "new messages" header into the first message rather than
+        // emitting it as a standalone MultiText element. On mesh each element is
+        // a separate radio frame; a lone header frame can arrive while the body
+        // frame is lost, leaving the user with a header and no content — and `N`
+        // has already advanced the read pointer, so the message no longer counts
+        // as new (room list says "1 new", `G` then finds none, `F` still reads
+        // it). Combining guarantees any delivered header carries a message. (#106)
+        let header = format!("[{} — new messages]", room.name);
+        let mut parts: Vec<String> = Vec::with_capacity(visible.len() + 1);
+        for (i, msg) in visible.iter().enumerate() {
+            if i == 0 {
+                parts.push(format!("{header}\n{}", format_message(msg)));
+            } else {
+                parts.push(format_message(msg));
+            }
         }
         if let Some(cursor) = page.next_cursor {
             parts.push(format!(
@@ -6083,6 +6095,59 @@ mod tests {
         assert!(
             text.to_lowercase().contains("unknown command"),
             "authenticated unknown-command should say 'Unknown command', got: {text:?}"
+        );
+    }
+
+    /// Issue #106: `N` must not emit the "new messages" header as a standalone
+    /// frame. Over a lossy radio link the header frame could arrive while the
+    /// message-body frame is lost, leaving the user with a header and no
+    /// content — even though `N` has already advanced the read pointer, so the
+    /// message no longer shows as new (room list said "1 new", `G` then finds
+    /// none, yet `F` can still read it). The header is merged into the first
+    /// message frame so any delivered header always carries a message.
+    #[tokio::test]
+    async fn read_new_header_merged_with_first_message() {
+        use crate::db::MessageStore as _;
+        use crate::ids::RoomId;
+
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "pass1234").await;
+        let alice_id = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let lobby = RoomId::new(1);
+
+        // Another user posts a message alice hasn't read.
+        let bob = Username::new("bob").unwrap();
+        host.db
+            .post_to_room(lobby, &bob, "hello from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        // The unread accounting (room list / G) reports the message.
+        assert_eq!(host.db.unread_count(alice_id, lobby).await.unwrap(), 1);
+
+        let resp = host.process_command(sid, Command::ReadNew).await.unwrap();
+        let parts = match resp {
+            Response::MultiText(p) => p,
+            other => panic!("expected MultiText, got {other:?}"),
+        };
+
+        // The first frame — the only one guaranteed to arrive together with the
+        // header — must carry BOTH the header and the first message body.
+        assert!(
+            parts[0].contains("new messages") && parts[0].contains("hello from bob"),
+            "first frame must carry header + first message, got: {parts:?}"
+        );
+        // The header must never be a standalone frame.
+        let lone_header = format!("[{} — new messages]", "Lobby");
+        assert!(
+            !parts.iter().any(|p| p.trim() == lone_header),
+            "header must not be a standalone frame, got: {parts:?}"
         );
     }
 
