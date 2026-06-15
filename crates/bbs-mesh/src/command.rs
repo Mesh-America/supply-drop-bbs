@@ -29,7 +29,7 @@
 //! [`render_notification`] converts a [`Notification`] (a host-initiated push)
 //! into the text string delivered via `OutboundFrame::SendTxtMsg`.
 
-use bbs_plugin_api::{event::Notification, identity::Username, Command, Response};
+use bbs_plugin_api::{event::Notification, identity::Username, Command, PermissionLevel, Response};
 
 // ── Command parsing ───────────────────────────────────────────────────────────
 
@@ -253,6 +253,10 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
+        ".aide" => Some(parse_set_level(rest, PermissionLevel::Aide, text)),
+        ".sysop" => Some(parse_set_level(rest, PermissionLevel::Sysop, text)),
+        ".user" => Some(parse_set_level(rest, PermissionLevel::User, text)),
+
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
         }),
@@ -270,6 +274,16 @@ fn split_first_word(s: &str) -> (&str, Option<&str>) {
             let rest = s[i..].trim_start();
             (&s[..i], if rest.is_empty() { None } else { Some(rest) })
         }
+    }
+}
+
+/// Parse a `.AIDE` / `.SYSOP` / `.USER <user>` set-level command. (#127)
+fn parse_set_level(rest: Option<&str>, level: PermissionLevel, raw: &str) -> Command {
+    match rest.and_then(|s| Username::new(s).ok()) {
+        Some(username) => Command::SetUserLevel { username, level },
+        None => Command::Unknown {
+            raw: raw.to_owned(),
+        },
     }
 }
 
@@ -413,6 +427,35 @@ mod tests {
     #[test]
     fn whoami_is_parsed_on_mesh() {
         assert!(matches!(cmd("whoami"), Some(Command::Whoami)));
+    }
+
+    #[test]
+    fn set_level_commands_parsed_on_mesh() {
+        // `.AIDE`/`.SYSOP`/`.USER <user>` promote/demote (sysop-gated by host). (#127)
+        let u = Username::new("bob").unwrap();
+        assert_eq!(
+            cmd(".aide bob"),
+            Some(Command::SetUserLevel {
+                username: u.clone(),
+                level: PermissionLevel::Aide
+            })
+        );
+        assert_eq!(
+            cmd(".sysop bob"),
+            Some(Command::SetUserLevel {
+                username: u.clone(),
+                level: PermissionLevel::Sysop
+            })
+        );
+        assert_eq!(
+            cmd(".user bob"),
+            Some(Command::SetUserLevel {
+                username: u,
+                level: PermissionLevel::User
+            })
+        );
+        // Missing username → unknown.
+        assert!(matches!(cmd(".aide"), Some(Command::Unknown { .. })));
     }
 
     #[test]

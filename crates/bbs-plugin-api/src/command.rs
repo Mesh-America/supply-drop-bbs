@@ -24,6 +24,7 @@
 //! API — leaner dependency graph, clearer boundaries.
 
 use crate::identity::Username;
+use crate::permissions::PermissionLevel;
 use serde::{Deserialize, Serialize};
 
 // ── Parsing helpers (private) ─────────────────────────────────────────────────
@@ -168,6 +169,14 @@ pub enum Command {
     ValidateUser {
         /// The username of the account to validate.
         username: Username,
+    },
+
+    /// Set a user's permission level (Sysop only). (.AIDE / .SYSOP / .USER)
+    SetUserLevel {
+        /// The username whose level is being changed.
+        username: Username,
+        /// The new permission level.
+        level: PermissionLevel,
     },
 
     /// Block or unblock another user — hides their messages from the caller. (B)
@@ -488,6 +497,34 @@ impl Command {
             },
             ".du" => match rest.and_then(|s| Username::new(s).ok()) {
                 Some(username) => Command::DeleteUser { username },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+
+            ".aide" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::SetUserLevel {
+                    username,
+                    level: PermissionLevel::Aide,
+                },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            ".sysop" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::SetUserLevel {
+                    username,
+                    level: PermissionLevel::Sysop,
+                },
+                None => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            ".user" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(username) => Command::SetUserLevel {
+                    username,
+                    level: PermissionLevel::User,
+                },
                 None => Command::Unknown {
                     raw: text.to_owned(),
                 },

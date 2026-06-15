@@ -741,6 +741,24 @@ UNBAN <username>
 
 Restores the account to **Active** status. The user can log in again.
 
+### Setting a user's permission level (Sysop only)
+
+Promote a **validated** user to Aide or Sysop, or demote back to User:
+
+```
+.AIDE <username>     make them an Aide (moderator)
+.SYSOP <username>    make them a Sysop (administrator)
+.USER <username>     demote back to plain User
+```
+
+Notes:
+
+- The account must already be validated (use `V <username>` first).
+- You can't change your own level (prevents accidental self-lockout).
+- The change applies immediately, including to any active session, and is
+  logged in the audit trail.
+- The same control is available in the web admin (Users → permission level).
+
 ### Creating a room (Sysop only)
 
 From within a session:
@@ -923,6 +941,9 @@ account and you can re-register with the same username.
 | Command | Action |
 |---|---|
 | `UNBAN <user>` | Lift a ban |
+| `.AIDE <user>` | Promote a validated user to Aide |
+| `.SYSOP <user>` | Promote a validated user to Sysop |
+| `.USER <user>` | Demote a user back to plain User |
 | `.C <name>` | Create a new room |
 | `.DR <name>` | Delete a room |
 | `.PW <user>` | Reset a user's password (two-step workflow) |

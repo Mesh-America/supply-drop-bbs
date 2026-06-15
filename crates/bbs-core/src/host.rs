@@ -430,6 +430,9 @@ impl Host for BbsHost {
             Command::ValidateUser { username } => {
                 self.handle_validate_user(session, username).await
             }
+            Command::SetUserLevel { username, level } => {
+                self.handle_set_user_level(session, username, level).await
+            }
             Command::BlockUser { target, force } => {
                 self.handle_block_user(session, target, force).await
             }
@@ -3961,6 +3964,85 @@ impl BbsHost {
         )))
     }
 
+    /// Set a user's permission level (Sysop only). Backs `.AIDE`/`.SYSOP`/`.USER`
+    /// over mesh/CLI; the web admin uses `admin_update_user`. See issue #127.
+    async fn handle_set_user_level(
+        &self,
+        session: SessionId,
+        username: Username,
+        level: PermissionLevel,
+    ) -> Result<Response, HostError> {
+        let (actor, _, actor_level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if actor_level < PermissionLevel::Sysop {
+            return Ok(Response::Error("Sysop access required.".into()));
+        }
+        // Guard against self-lockout — a sysop can't change their own level.
+        if actor == username {
+            return Ok(Response::Error("You can't change your own level.".into()));
+        }
+
+        let user = match UserStore::get_by_username(&self.db, &username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+        {
+            None => return Ok(Response::Error("User not found.".into())),
+            Some(u) => u,
+        };
+
+        // Promotion to a role is for already-validated accounts; an unvalidated
+        // account must be validated first (V) so it isn't silently activated here.
+        if user.permission_level == PermissionLevel::Unvalidated {
+            return Ok(Response::Error(format!(
+                "'{}' isn't validated yet — use V {} first.",
+                username.as_str(),
+                username.as_str()
+            )));
+        }
+        if user.permission_level == level {
+            return Ok(Response::Error(format!(
+                "'{}' is already {level}.",
+                username.as_str()
+            )));
+        }
+
+        UserStore::update(&self.db, user.id, None, None, Some(level), None)
+            .await
+            .map_err(|e| HostError::Storage(format!("set level: {e}")))?;
+
+        // Apply the new level to any live sessions for this user immediately.
+        {
+            let mut sessions = self.sessions.write().await;
+            for r in sessions.values_mut() {
+                if r.username.as_ref() == Some(&username) {
+                    r.level = level;
+                }
+            }
+        }
+
+        let detail = format!("level -> {level}");
+        if let Err(e) = self
+            .db
+            .audit_write(
+                actor.as_str(),
+                "set_level",
+                Some(username.as_str()),
+                Some(&detail),
+            )
+            .await
+        {
+            tracing::warn!("audit write failed: {e}");
+        }
+
+        info!(%actor, %username, %level, "user level changed");
+        Ok(Response::Text(format!(
+            "'{}' is now {level}.",
+            username.as_str()
+        )))
+    }
+
     async fn handle_block_user(
         &self,
         session: SessionId,
@@ -4630,6 +4712,7 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::WhoIsOnline => "WhoIsOnline",
         Command::ListPending => "ListPending",
         Command::ValidateUser { .. } => "ValidateUser",
+        Command::SetUserLevel { .. } => "SetUserLevel",
         Command::BlockUser { .. } => "BlockUser",
         Command::BanUser { .. } => "BanUser",
         Command::UnbanUser { .. } => "UnbanUser",
@@ -4751,6 +4834,11 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
 
         // ── Sysop+ only ──────────────────────────────────────────────────
         "unban" if is_sysop => "UNBAN <user> — lift a ban",
+        ".aide" | ".sysop" | ".user" if is_sysop => {
+            ".AIDE/.SYSOP/.USER <user> — set a user's permission level\n\
+             Promote a validated user to Aide or Sysop, or demote to User.\n\
+             Validate pending users with V first."
+        }
         ".c" if is_sysop => ".C — create a new room\nEnters the room creation workflow.",
         ".dr" if is_sysop => ".DR <name> — delete a room",
         ".du" if is_sysop => ".DU <user> — soft-delete a user account\nSets status to deleted and ends active sessions.",
@@ -4875,9 +4963,10 @@ Users:\n\
 
 const HELP_SYSOP: &str = "\
 Sysop:\n\
+ .AIDE/.SYSOP/.USER <u>\n\
  .C .DR .DU .PW rooms/users\n\
- UNBAN <u>   lift a ban\n\
- OPENACCESS  skip verify\n\
+ UNBAN <u> lift a ban\n\
+ OPENACCESS skip verify\n\
  CLOSEACCESS require verify\n\
  GUESTROOM <name>|OFF";
 
@@ -5437,6 +5526,100 @@ mod tests {
             dm.content.to_lowercase().contains("verify")
                 || dm.content.to_lowercase().contains("v newuser"),
             "DM should hint at the verify command"
+        );
+    }
+
+    /// Issue #127: a sysop can promote/demote a validated user's level, with
+    /// guards (validated-first, no self-change, sysop-only).
+    #[tokio::test]
+    async fn set_user_level_promotes_and_guards() {
+        let (host, _db) = make_host().await;
+        let sysop = host.create_session("test").await.unwrap();
+        register_and_login(&host, sysop, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // bob registers (auto-logged-in, Unvalidated).
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+        let bob = Username::new("bob").unwrap();
+
+        // Unvalidated target → directed to validate first.
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: bob.clone(),
+                    level: PermissionLevel::Aide,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(e) if e.to_lowercase().contains("validated")),
+            "unvalidated target should be rejected, got: {r:?}"
+        );
+
+        // Validate bob, then promote to Aide.
+        host.process_command(
+            sysop,
+            Command::ValidateUser {
+                username: bob.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: bob.clone(),
+                    level: PermissionLevel::Aide,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Text(t) if t.to_lowercase().contains("aide")),
+            "promotion should confirm, got: {r:?}"
+        );
+        assert_eq!(
+            UserStore::get_by_username(&host.db, &bob)
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_level,
+            PermissionLevel::Aide
+        );
+
+        // Self-change is refused.
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: Username::new("alice").unwrap(),
+                    level: PermissionLevel::User,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(e) if e.to_lowercase().contains("own level")),
+            "self-change should be refused, got: {r:?}"
+        );
+
+        // Non-sysop (bob, now Aide) cannot set levels.
+        let r = host
+            .process_command(
+                bob_sid,
+                Command::SetUserLevel {
+                    username: Username::new("alice").unwrap(),
+                    level: PermissionLevel::User,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(e) if e.to_lowercase().contains("sysop")),
+            "non-sysop should be refused, got: {r:?}"
         );
     }
 

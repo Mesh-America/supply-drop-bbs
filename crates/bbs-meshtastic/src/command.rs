@@ -1,6 +1,6 @@
 //! Command parsing and response rendering for the Meshtastic transport.
 
-use bbs_plugin_api::{event::Notification, identity::Username, Command, Response};
+use bbs_plugin_api::{event::Notification, identity::Username, Command, PermissionLevel, Response};
 
 pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> Option<Command> {
     let text = text.trim();
@@ -156,6 +156,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 raw: text.to_owned(),
             }),
         },
+        ".aide" => Some(parse_set_level(rest, PermissionLevel::Aide, text)),
+        ".sysop" => Some(parse_set_level(rest, PermissionLevel::Sysop, text)),
+        ".user" => Some(parse_set_level(rest, PermissionLevel::User, text)),
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
         }),
@@ -169,6 +172,16 @@ fn split_first_word(s: &str) -> (&str, Option<&str>) {
             let rest = s[i..].trim_start();
             (&s[..i], if rest.is_empty() { None } else { Some(rest) })
         }
+    }
+}
+
+/// Parse a `.AIDE` / `.SYSOP` / `.USER <user>` set-level command. (#127)
+fn parse_set_level(rest: Option<&str>, level: PermissionLevel, raw: &str) -> Command {
+    match rest.and_then(|s| Username::new(s).ok()) {
+        Some(username) => Command::SetUserLevel { username, level },
+        None => Command::Unknown {
+            raw: raw.to_owned(),
+        },
     }
 }
 
