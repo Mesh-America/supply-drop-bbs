@@ -282,6 +282,58 @@ async fn prompt_sets_workflow_state() {
     transport.stop().await.unwrap();
 }
 
+/// Issue #104: two identical workflow replies in a row (e.g. the password and
+/// its matching confirmation) must BOTH reach the host. The general
+/// retransmission dedup must not silently drop the second one just because its
+/// text equals the first — a new prompt between them starts a fresh reply turn.
+#[tokio::test]
+async fn identical_workflow_replies_after_prompt_both_reach_host() {
+    let host = Arc::new(MockHost::new());
+    // The initial command and every workflow reply return a Prompt, so the
+    // session stays in awaiting-reply mode across all three messages (mirrors
+    // "Choose a password:" → "Confirm your password:").
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::Help { .. }),
+        Response::Prompt {
+            text: "Choose a password:".to_owned(),
+            hide_input: true,
+        },
+    );
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::WorkflowReply { .. }),
+        Response::Prompt {
+            text: "Confirm your password:".to_owned(),
+            hide_input: true,
+        },
+    );
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x33u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    // Password, then the SAME text again as confirmation.
+    bridge.send(&contact_msg_frame(sender, "hunter2pw")).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bridge.send(&contact_msg_frame(sender, "hunter2pw")).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let received = host.commands_received();
+    let reply_count = received
+        .iter()
+        .filter(|(_, c)| matches!(c, Command::WorkflowReply { reply } if reply == "hunter2pw"))
+        .count();
+    assert_eq!(
+        reply_count,
+        2,
+        "both identical confirmations must reach the host, got commands: {:?}",
+        received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+
+    transport.stop().await.unwrap();
+}
+
 /// With a prefix configured, messages without the prefix are silently ignored.
 #[tokio::test]
 async fn prefix_filters_non_prefixed_messages() {

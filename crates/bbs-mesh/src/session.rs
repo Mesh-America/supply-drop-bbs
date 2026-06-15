@@ -183,6 +183,22 @@ impl SessionState {
         self.by_prefix.get(prefix)?.full_pubkey
     }
 
+    /// Clear the message-dedup baseline for `prefix` so the next inbound
+    /// message is never treated as a retransmission, even if its text matches
+    /// the one just processed.  No-op if the prefix has no session.
+    ///
+    /// Called when the host issues a new `Response::Prompt`: a prompt starts a
+    /// fresh reply turn, so the user's next message is genuine new input — most
+    /// importantly when it legitimately repeats the previous reply (e.g. typing
+    /// the same password again at "Confirm your password:"). Without this, the
+    /// general dedup in [`Self::dedup_message`] would silently drop the matching
+    /// confirmation. See issue #104.
+    pub fn clear_last_message(&mut self, prefix: &[u8; 6]) {
+        if let Some(entry) = self.by_prefix.get_mut(prefix) {
+            entry.last_message = None;
+        }
+    }
+
     /// Return `true` if `text` matches the last processed message for `prefix`
     /// within the deduplication window.  If it does not match, record `text`
     /// as the new last message and return `false`.
@@ -198,5 +214,55 @@ impl SessionState {
             entry.last_message = Some((text.to_owned(), Instant::now()));
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bbs_plugin_api::SessionId;
+
+    const PREFIX: [u8; 6] = [1, 2, 3, 4, 5, 6];
+
+    fn state_with_session() -> SessionState {
+        let mut st = SessionState::default();
+        st.get_or_insert(PREFIX, SessionId::__internal_new(1));
+        st
+    }
+
+    #[test]
+    fn dedup_drops_immediate_retransmission() {
+        let mut st = state_with_session();
+        assert!(!st.dedup_message(&PREFIX, "pw"), "first copy is processed");
+        assert!(
+            st.dedup_message(&PREFIX, "pw"),
+            "an identical retransmission within the window is dropped"
+        );
+    }
+
+    /// Issue #104: the password and its confirmation are the same text. After
+    /// the host prompts "Confirm your password:" the transport clears the dedup
+    /// baseline, so the matching confirmation is processed rather than dropped
+    /// as a retransmission.
+    #[test]
+    fn clear_last_message_allows_identical_reply_after_prompt() {
+        let mut st = state_with_session();
+        assert!(
+            !st.dedup_message(&PREFIX, "pw"),
+            "password entry is processed"
+        );
+
+        // Host returned a Prompt → a fresh reply turn begins.
+        st.clear_last_message(&PREFIX);
+        assert!(
+            !st.dedup_message(&PREFIX, "pw"),
+            "the matching confirmation must NOT be dropped after a fresh prompt"
+        );
+
+        // A genuine retransmission of the confirmation is still dropped.
+        assert!(
+            st.dedup_message(&PREFIX, "pw"),
+            "a retransmission of the confirmation is still deduped"
+        );
     }
 }
