@@ -1059,9 +1059,9 @@ impl Host for BbsHost {
         password: &str,
         permission_level: u8,
     ) -> Result<(), HostError> {
-        let uname = Username::new(username).map_err(|_| {
-            HostError::PreconditionFailed(format!("invalid username: {username:?}"))
-        })?;
+        // Apply the same creation policy as REGISTER so radio/CLI and the web
+        // admin agree on what a valid new username is. (#128)
+        let uname = validate_new_username(username).map_err(HostError::PreconditionFailed)?;
 
         let level = match permission_level {
             0 => PermissionLevel::Unvalidated,
@@ -1539,7 +1539,7 @@ impl BbsHost {
         // Validate the requested username against the documented registration
         // policy and return a specific error up front, so mesh users don't fail
         // late (after the display-name/password steps). See issue #128.
-        let username = match validate_registration_username(&raw_username) {
+        let username = match validate_new_username(&raw_username) {
             Ok(u) => u,
             Err(msg) => return Ok(Response::Error(msg)),
         };
@@ -4652,33 +4652,49 @@ fn cmd_label(cmd: &Command) -> &'static str {
     }
 }
 
-// ── Registration policy ────────────────────────────────────────────────────────
+// ── Username creation policy ────────────────────────────────────────────────────
 
-/// Validate a requested registration username, returning the normalised
-/// [`Username`] or a user-facing error string.
+/// The single source of truth for **new-username policy**, shared by the
+/// `REGISTER` flow and admin user creation.
 ///
-/// Enforces the documented policy (3–32 chars; letters, digits, `-`, `_`; not a
-/// reserved name) with a specific message for each failure. This is stricter
-/// than [`Username::new`] (which has no minimum length and permits any
-/// non-control, non-whitespace ASCII), so invalid usernames are rejected at the
-/// `REGISTER` step rather than accepted into the flow. See issue #128.
-fn validate_registration_username(raw: &str) -> Result<Username, String> {
+/// This is deliberately stricter than [`Username::new`]: the [`Username`] type is
+/// the *storage* invariant (it must keep accepting every name already persisted,
+/// so it stays lenient), whereas this is the *creation* policy — at least 3
+/// characters, letters/digits/`-`/`_`, no leading or trailing `-`/`_`, not a
+/// reserved name, within the type's length limit. Checks run most-specific-first
+/// so the error names the rule that actually failed (e.g. a short name that also
+/// starts with `-` reports "too short", not "bad character"). The upper-length
+/// and reserved-name checks are delegated to [`Username::new`]. See issue #128.
+fn validate_new_username(raw: &str) -> Result<Username, String> {
+    // Mirror Username::new's normalisation (trim, strip one leading `@`,
+    // lowercase) so length and charset are judged on the stored form.
     let trimmed = raw.trim();
-    // `Username::new` normalises (strips a leading `@`, lowercases) and rejects
-    // empty / too-long (>32) / non-ASCII / control / whitespace / `@` /
-    // leading-or-trailing `-`/`_` / reserved — each with a specific message.
-    let username = Username::new(trimmed).map_err(|e| format!("Can't register: {e}"))?;
-    let s = username.as_str();
-    if s.len() < 3 {
+    let normalized = trimmed
+        .strip_prefix('@')
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return Err("Username can't be empty.".to_owned());
+    }
+    if normalized.chars().count() < 3 {
         return Err("Username must be at least 3 characters.".to_owned());
     }
-    if !s
+    if !normalized
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         return Err("Username may only contain letters, digits, - and _.".to_owned());
     }
-    Ok(username)
+    let bytes = normalized.as_bytes();
+    if matches!(bytes[0], b'-' | b'_') || matches!(bytes[bytes.len() - 1], b'-' | b'_') {
+        return Err("Username can't start or end with - or _.".to_owned());
+    }
+
+    // Delegate the reserved-name and upper-length checks to the type, and use it
+    // to construct the validated value. Any remaining failure carries its own
+    // specific message.
+    Username::new(normalized).map_err(|e| e.to_string())
 }
 
 // ── Help text ─────────────────────────────────────────────────────────────────
@@ -5551,6 +5567,32 @@ mod tests {
             matches!(&ok, Response::Prompt { text, .. } if text.to_lowercase().contains("display name")),
             "valid username should start registration, got: {ok:?}"
         );
+    }
+
+    /// Issue #128: the shared creation policy reports the most specific failure
+    /// (so callers don't get a misleading reason) and normalises like the type.
+    #[test]
+    fn validate_new_username_policy_and_error_order() {
+        // Too short wins over the leading-dash rule.
+        assert!(validate_new_username("-a")
+            .unwrap_err()
+            .contains("3 character"));
+        // Leading/trailing -/_ on a long-enough name has its own message.
+        assert!(validate_new_username("-abc")
+            .unwrap_err()
+            .contains("start or end"));
+        // Charset violations are specific.
+        assert!(validate_new_username("bad!name")
+            .unwrap_err()
+            .to_lowercase()
+            .contains("letters, digits"));
+        // Reserved names are rejected as reserved.
+        assert!(validate_new_username("bbs")
+            .unwrap_err()
+            .to_lowercase()
+            .contains("reserved"));
+        // Normalisation matches Username::new (strip leading `@`, lowercase).
+        assert_eq!(validate_new_username("@Alice").unwrap().as_str(), "alice");
     }
 
     /// Issue #105: on a mesh radio you can't send an empty message, so the
