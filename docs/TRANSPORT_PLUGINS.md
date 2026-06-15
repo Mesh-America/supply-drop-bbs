@@ -475,7 +475,6 @@ pub enum Command {
     GoNextUnread,
     ChangeRoom  { target: String },   // name or numeric ID
     GoMail,
-    IgnoreRoom,
 
     // Message reading
     ReadNew,

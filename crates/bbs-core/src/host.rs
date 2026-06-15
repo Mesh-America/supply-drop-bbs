@@ -4618,7 +4618,6 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::GoNextUnread => "GoNextUnread",
         Command::ChangeRoom { .. } => "ChangeRoom",
         Command::GoMail => "GoMail",
-        Command::IgnoreRoom => "IgnoreRoom",
         Command::ReadNew => "ReadNew",
         Command::ReadForward { .. } => "ReadForward",
         Command::ReadReverse => "ReadReverse",

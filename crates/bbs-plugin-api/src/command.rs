@@ -101,9 +101,6 @@ pub enum Command {
     /// Navigate directly to the Mail room. (M)
     GoMail,
 
-    /// Toggle ignore on the current room. (I)
-    IgnoreRoom,
-
     // ── Message reading ───────────────────────────────────────────────
     /// Read unread messages in the current room (from the last-read
     /// pointer). (N)
