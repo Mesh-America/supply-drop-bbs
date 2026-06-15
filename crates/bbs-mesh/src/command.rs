@@ -154,7 +154,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         },
 
         // ── Session control ──────────────────────────────────────────────────
-        "q" => Some(Command::Quit),
+        // Accept the obvious words for "log out" too — a real user reached for
+        // `logout` and got "Unknown command." (#124)
+        "q" | "logout" | "quit" | "exit" | "bye" => Some(Command::Quit),
 
         "cancel" | "stop" => Some(Command::Cancel),
 
@@ -406,8 +408,13 @@ mod tests {
     }
 
     #[test]
-    fn logout_is_unknown_on_mesh() {
-        assert!(matches!(cmd("logout"), Some(Command::Unknown { .. })));
+    fn logout_aliases_quit_on_mesh() {
+        // `logout` (and exit/bye/quit) now log out like `Q`. (#124)
+        assert_eq!(cmd("logout"), Some(Command::Quit));
+        assert_eq!(cmd("LOGOUT"), Some(Command::Quit));
+        assert_eq!(cmd("quit"), Some(Command::Quit));
+        assert_eq!(cmd("exit"), Some(Command::Quit));
+        assert_eq!(cmd("bye"), Some(Command::Quit));
     }
 
     #[test]

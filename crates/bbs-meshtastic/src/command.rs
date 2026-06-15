@@ -78,7 +78,7 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 raw: text.to_owned(),
             }),
         },
-        "q" => Some(Command::Quit),
+        "q" | "quit" | "exit" | "bye" => Some(Command::Quit),
         "cancel" | "stop" => Some(Command::Cancel),
         "w" => Some(Command::WhoIsOnline),
         "pending" => Some(Command::ListPending),
