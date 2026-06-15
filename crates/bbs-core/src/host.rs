@@ -160,11 +160,11 @@ struct SessionRecord {
     /// `None` means "not yet started"; F starts at the first message, R at the last.
     /// Reset to `None` when the room changes.
     current_message_id: Option<MessageId>,
-    /// `true` immediately after a message is posted, until the next command.
-    /// Lets a re-sent bare `.` (e.g. when the "Message posted." ack is lost on
-    /// a lossy radio link) re-emit the confirmation idempotently instead of
-    /// returning "Unknown command." See issue #107.
-    posted_idempotent: bool,
+    /// The confirmation shown for the most recent post, kept until the next
+    /// command. Lets a re-sent bare `.` (e.g. when the confirmation was lost on
+    /// a lossy radio link) re-emit the *same* confirmation idempotently instead
+    /// of returning "Unknown command." See issues #107 and #121.
+    last_post_confirmation: Option<String>,
 }
 
 // ── Access policy ─────────────────────────────────────────────────────────────
@@ -366,14 +366,14 @@ impl Host for BbsHost {
             });
         }
 
-        // Clear the post-confirm idempotency flag for any command other than a
+        // Clear the post-confirm idempotency state for any command other than a
         // bare `.` (which the `Command::Unknown` arm handles as a re-confirm).
         // Once the user does anything else, a stray `.` is no longer a retry. (#107)
         let is_repost_dot = matches!(&cmd, Command::Unknown { raw } if raw.trim() == ".");
         if !is_repost_dot {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
-                r.posted_idempotent = false;
+                r.last_post_confirmation = None;
             }
         }
 
@@ -463,19 +463,18 @@ impl Host for BbsHost {
             Command::Unknown { raw } => {
                 // Idempotent post-confirm (#107): if the previous action was a
                 // successful post and the user re-sends a bare `.` (because the
-                // "Message posted." ack was lost on a lossy link), re-emit the
+                // confirmation was lost on a lossy link), re-emit the *same*
                 // confirmation rather than "Unknown command." The post is not
-                // repeated — `posted_idempotent` only re-acknowledges.
+                // repeated — this only re-acknowledges (#121: mail vs room).
                 if raw.trim() == "." {
-                    let posted = {
+                    let confirmation = {
                         let sessions = self.sessions.read().await;
                         sessions
                             .get(&session)
-                            .map(|r| r.posted_idempotent)
-                            .unwrap_or(false)
+                            .and_then(|r| r.last_post_confirmation.clone())
                     };
-                    if posted {
-                        return Ok(Response::Text("Message posted.".into()));
+                    if let Some(confirmation) = confirmation {
+                        return Ok(Response::Text(confirmation));
                     }
                 }
                 // Provide a more helpful nudge when the session is not yet
@@ -511,7 +510,7 @@ impl Host for BbsHost {
                 workflow: Workflow::None,
                 current_room: LOBBY_ROOM_ID,
                 current_message_id: None,
-                posted_idempotent: false,
+                last_post_confirmation: None,
             },
         );
         let _ = self.events_tx.send(DomainEvent::SessionCreated {
@@ -2076,20 +2075,31 @@ impl BbsHost {
                         .ok_or(HostError::NotAuthenticated)?
                 };
                 let now = Timestamp::now();
-                let (msg_id, event_recipient) = if let Some(ref rcpt) = recipient {
+                // Mail (a direct recipient) gets a mail-specific confirmation so
+                // the sender knows they used the private-mail path, not a public
+                // room (#121); room posts keep "Message posted."
+                let (msg_id, event_recipient, confirmation) = if let Some(ref rcpt) = recipient {
                     let mid = self
                         .db
                         .post_direct(&sender, rcpt, &body, now)
                         .await
                         .map_err(|e| HostError::Storage(format!("post_direct: {e}")))?;
-                    (mid, MessageRecipient::Direct(rcpt.clone()))
+                    (
+                        mid,
+                        MessageRecipient::Direct(rcpt.clone()),
+                        format!("Mail sent to {}.", rcpt.as_str()),
+                    )
                 } else {
                     let mid = self
                         .db
                         .post_to_room(room_id, &sender, &body, now)
                         .await
                         .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))?;
-                    (mid, MessageRecipient::Room(room_id.as_i64().to_string()))
+                    (
+                        mid,
+                        MessageRecipient::Room(room_id.as_i64().to_string()),
+                        "Message posted.".to_owned(),
+                    )
                 };
                 let _ = self.events_tx.send(DomainEvent::MessagePosted {
                     sender,
@@ -2100,12 +2110,12 @@ impl BbsHost {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.workflow = Workflow::None;
-                        // Arm idempotent re-confirm: a re-sent bare `.` should
-                        // re-emit "Message posted." rather than error (#107).
-                        r.posted_idempotent = true;
+                        // Arm idempotent re-confirm: a re-sent bare `.` re-emits
+                        // this same confirmation rather than erroring (#107).
+                        r.last_post_confirmation = Some(confirmation.clone());
                     }
                 }
-                Ok(Response::Text("Message posted.".into()))
+                Ok(Response::Text(confirmation))
             }
 
             // ── Profile edit ─────────────────────────────────────────────────
@@ -6669,6 +6679,48 @@ mod tests {
         assert!(
             matches!(&resp, Response::Text(t) if t.contains("Unknown command")),
             "after another command, bare `.` should be Unknown, got: {resp:?}"
+        );
+    }
+
+    /// Issue #121: sending mail confirms with a mail-specific message
+    /// ("Mail sent to <user>.") rather than the room-post "Message posted.",
+    /// and a re-sent bare `.` re-emits that same confirmation (idempotent).
+    #[tokio::test]
+    async fn mail_send_confirmation_is_mail_specific() {
+        let (host, _db) = make_host().await;
+        let alice = host.create_session("test").await.unwrap();
+        register_and_login(&host, alice, &Username::new("alice").unwrap(), "pass1234").await;
+        // Recipient must exist.
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+
+        // alice goes to Mail and sends an inline DM to bob.
+        host.process_command(alice, Command::GoMail).await.unwrap();
+        host.process_command(
+            alice,
+            Command::EnterMessage {
+                body: Some("bob hi there".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(alice, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t == "Mail sent to bob."),
+            "mail send should confirm 'Mail sent to bob.', got: {resp:?}"
+        );
+
+        // Re-sent bare `.` re-emits the same mail confirmation, not "Message posted."
+        let resp = host
+            .process_command(alice, Command::Unknown { raw: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t == "Mail sent to bob."),
+            "re-sent `.` should re-emit the mail confirmation, got: {resp:?}"
         );
     }
 }
