@@ -448,7 +448,12 @@ impl Host for BbsHost {
                 // level = None: unknown session; Some(None): not logged in;
                 // Some(Some(lvl)): logged in at lvl.
                 let auth_level = level.flatten();
-                Ok(Response::Text(help_text(topic.as_deref(), auth_level)))
+                let on_radio = self.session_on_radio(session).await;
+                Ok(Response::Text(help_text(
+                    topic.as_deref(),
+                    auth_level,
+                    on_radio,
+                )))
             }
 
             Command::Whoami => self.handle_whoami(session).await,
@@ -555,6 +560,8 @@ impl Host for BbsHost {
                 };
                 if is_authed {
                     Ok(Response::Text("Unknown command. Type H for help.".into()))
+                } else if self.session_on_radio(session).await {
+                    Ok(Response::Text(HELP_QUICK_ANON_RADIO.into()))
                 } else {
                     Ok(Response::Text(HELP_QUICK_ANON.into()))
                 }
@@ -2017,6 +2024,17 @@ impl BbsHost {
             text: prompt,
             hide_input: true,
         })
+    }
+
+    /// Whether `session` is on a radio transport (MeshCore / Meshtastic). One-shot
+    /// auth and its help are offered only on radio, where avoiding a prompt
+    /// round-trip matters; the CLI keeps the interactive (hidden-input) flow.
+    async fn session_on_radio(&self, session: SessionId) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(&session)
+            .map(|r| matches!(r.transport.as_str(), "meshcore" | "meshtastic"))
+            .unwrap_or(false)
     }
 
     /// Clear any in-progress workflow for `session` (best-effort; a missing
@@ -5107,7 +5125,7 @@ fn validate_new_username(raw: &str) -> Result<Username, String> {
 
 // ── Help text ─────────────────────────────────────────────────────────────────
 
-fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
+fn help_text(topic: Option<&str>, level: Option<PermissionLevel>, on_radio: bool) -> String {
     let logged_in = level.is_some();
     let is_aide = level >= Some(PermissionLevel::Aide);
     let is_sysop = level >= Some(PermissionLevel::Sysop);
@@ -5116,6 +5134,9 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
         None => {
             if logged_in {
                 HELP_QUICK_LOGGED_IN.to_owned()
+            } else if on_radio {
+                // Radio transports advertise one-shot auth (fewer round-trips).
+                HELP_QUICK_ANON_RADIO.to_owned()
             } else {
                 HELP_QUICK_ANON.to_owned()
             }
@@ -5170,12 +5191,12 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
             }
         }
         "register" => {
-            "REGISTER <user> <password> — create an account and log in.\n\
-             One message, no prompts. Omit the password to be prompted instead."
+            "REGISTER <user> — create an account (you'll be prompted for a password).\n\
+             On a radio you can also do it in one message: REGISTER <user> <password>."
         }
         "login" => {
-            "LOGIN <user> <password> — log in.\n\
-             One message, no prompts. Omit the password to be prompted instead."
+            "LOGIN <user> — log in (you'll be prompted for a password).\n\
+             On a radio, one message works too: LOGIN <user> <password>."
         }
         "cancel" => "CANCEL — cancel the current workflow",
 
@@ -5265,6 +5286,12 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
 }
 
 const HELP_QUICK_ANON: &str = "\
+REGISTER <user>  create an account\n\
+LOGIN <user>     log in to your account";
+
+/// Anonymous help shown on radio transports, where one-shot auth
+/// (`REGISTER/LOGIN <user> <password>`) avoids a lossy prompt round-trip.
+const HELP_QUICK_ANON_RADIO: &str = "\
 REGISTER <user> <password>\n\
 LOGIN <user> <password>\n\
 (omit password to be prompted)";
@@ -5413,6 +5440,7 @@ mod tests {
         const MESH_MAX: usize = 156;
         let cases = [
             ("HELP_QUICK_ANON", HELP_QUICK_ANON),
+            ("HELP_QUICK_ANON_RADIO", HELP_QUICK_ANON_RADIO),
             ("HELP_QUICK_LOGGED_IN", HELP_QUICK_LOGGED_IN),
             ("HELP_OVERVIEW", HELP_OVERVIEW),
             ("HELP_MAIL", HELP_MAIL),
@@ -5438,13 +5466,13 @@ mod tests {
     /// those levels so operators can discover their admin toolset in-app.
     #[test]
     fn help_all_lists_admin_topics_by_level() {
-        let user = help_text(Some("all"), Some(PermissionLevel::User));
+        let user = help_text(Some("all"), Some(PermissionLevel::User), false);
         assert!(
             !user.contains("AIDE") && !user.contains("SYSOP"),
             "a plain User should not see admin topics: {user}"
         );
 
-        let aide = help_text(Some("all"), Some(PermissionLevel::Aide));
+        let aide = help_text(Some("all"), Some(PermissionLevel::Aide), false);
         assert!(
             aide.contains("H AIDE"),
             "aide should see the AIDE topic: {aide}"
@@ -5454,7 +5482,7 @@ mod tests {
             "an aide should not see the SYSOP topic: {aide}"
         );
 
-        let sysop = help_text(Some("all"), Some(PermissionLevel::Sysop));
+        let sysop = help_text(Some("all"), Some(PermissionLevel::Sysop), false);
         assert!(
             sysop.contains("H AIDE") && sysop.contains("H SYSOP"),
             "sysop should see both admin topics: {sysop}"

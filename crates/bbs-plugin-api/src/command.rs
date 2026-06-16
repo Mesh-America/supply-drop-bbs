@@ -408,46 +408,21 @@ impl Command {
             "h" | "help" | "?" => Command::Help {
                 topic: rest.map(str::to_owned),
             },
-            // `register <user>` → interactive; `register <user> <password>` →
-            // one-shot (account created + logged in from one message). The host
-            // validates the username (#128) and password.
+            // One-shot auth (`register <user> <password>`) is a *radio-transport*
+            // feature for lossy multi-hop links; the canonical/CLI parser keeps
+            // the interactive flow (input is hidden at the prompt over the CLI).
             "register" => match rest {
-                Some(r) => {
-                    let (name, password) = split_first_word(r);
-                    if name.is_empty() {
-                        Command::Help {
-                            topic: Some("register".to_owned()),
-                        }
-                    } else if let Some(password) = password {
-                        Command::RegisterOneShot {
-                            username: name.to_owned(),
-                            password: password.to_owned(),
-                        }
-                    } else {
-                        Command::Register {
-                            username: name.to_owned(),
-                        }
-                    }
-                }
-                None => Command::Help {
+                // Pass the raw username through; the host validates it and
+                // reports a specific error (#128). Bare `register` → help.
+                Some(name) if !name.is_empty() => Command::Register {
+                    username: name.to_owned(),
+                },
+                _ => Command::Help {
                     topic: Some("register".to_owned()),
                 },
             },
-            // `login <user>` → interactive; `login <user> <password>` → one-shot.
-            "login" => match rest {
-                Some(r) => {
-                    let (name, password) = split_first_word(r);
-                    match (Username::new(name).ok(), password) {
-                        (Some(u), Some(password)) => Command::LoginOneShot {
-                            username: u,
-                            password: password.to_owned(),
-                        },
-                        (Some(u), None) => Command::Login { username: u },
-                        (None, _) => Command::Help {
-                            topic: Some("login".to_owned()),
-                        },
-                    }
-                }
+            "login" => match rest.and_then(|s| Username::new(s).ok()) {
+                Some(u) => Command::Login { username: u },
                 None => Command::Help {
                     topic: Some("login".to_owned()),
                 },
@@ -681,6 +656,22 @@ mod tests {
         assert!(matches!(
             Command::parse("i", false),
             Command::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn canonical_parser_does_not_one_shot() {
+        // One-shot auth (`register <user> <password>`) is a radio-transport
+        // feature; the canonical/CLI parser keeps the interactive flow. The
+        // remainder is forwarded as a (host-rejected) raw username, never a
+        // RegisterOneShot/LoginOneShot.
+        assert!(matches!(
+            Command::parse("register alice hunter2pass", false),
+            Command::Register { .. }
+        ));
+        assert!(matches!(
+            Command::parse("login alice hunter2pass", false),
+            Command::Login { .. } | Command::Help { .. }
         ));
     }
 

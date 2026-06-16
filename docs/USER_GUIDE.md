@@ -78,9 +78,10 @@ REGISTER alice
 - Case-insensitive at login (stored exactly as typed)
 - The names `bbs` and `system` are reserved and cannot be registered
 
-### One message (recommended on radio)
+### One message (radio only)
 
-Register in a **single message** by including a password after the username:
+On a **radio transport** (MeshCore or Meshtastic) you can register in a **single
+message** by including a password after the username:
 
 ```
 REGISTER alice hunter2pass
@@ -90,6 +91,9 @@ This creates the account and logs you straight in — no back-and-forth prompts.
 On a multi-hop mesh link every extra round-trip is another chance for a message
 to be lost, so the one-message form is far more reliable over radio. The password
 is everything after the username, so it may contain spaces (a passphrase works).
+
+This one-message form is offered only on the radio transports. Over the CLI
+socket, use the step-by-step flow below (where password input is hidden).
 
 > **Heads-up:** the password travels in that message, so it is visible over the
 > air (and in your client's sent history) — the same as typing a password at a
@@ -143,10 +147,10 @@ messages or read rooms.
 
 ### Logging in
 
-Like registration, login works in **one message** (recommended on radio) or
+Like registration, login works in **one message** (radio transports only) or
 step by step.
 
-**One message:**
+**One message (radio only):**
 
 ```
 LOGIN alice hunter2pass
