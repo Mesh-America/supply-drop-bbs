@@ -67,6 +67,30 @@ pub enum Command {
         username: Username,
     },
 
+    /// One-shot registration from a single message (`REGISTER <user> <password>`):
+    /// create the account and log in with no password prompt or confirmation
+    /// round-trips. Prototype for lossy multi-hop links, where each extra
+    /// round-trip sharply lowers end-to-end success. The password is taken
+    /// verbatim (may contain spaces); the host validates the username and
+    /// password length.
+    RegisterOneShot {
+        /// Desired username, as typed (raw); validated by the host.
+        username: String,
+        /// Chosen password, verbatim.
+        password: String,
+    },
+
+    /// One-shot login from a single message (`LOGIN <user> <password>`): no
+    /// password prompt. If the account was reset to a temporary password and
+    /// must change it, login still drops into the interactive change-password
+    /// prompt (that step can't be collapsed).
+    LoginOneShot {
+        /// The username being logged into.
+        username: Username,
+        /// Supplied password, verbatim.
+        password: String,
+    },
+
     /// End the session.
     Logout,
 
@@ -384,18 +408,46 @@ impl Command {
             "h" | "help" | "?" => Command::Help {
                 topic: rest.map(str::to_owned),
             },
+            // `register <user>` → interactive; `register <user> <password>` →
+            // one-shot (account created + logged in from one message). The host
+            // validates the username (#128) and password.
             "register" => match rest {
-                // Pass the raw username through; the host validates it and
-                // reports a specific error (#128). Bare `register` → help.
-                Some(name) if !name.is_empty() => Command::Register {
-                    username: name.to_owned(),
-                },
-                _ => Command::Help {
+                Some(r) => {
+                    let (name, password) = split_first_word(r);
+                    if name.is_empty() {
+                        Command::Help {
+                            topic: Some("register".to_owned()),
+                        }
+                    } else if let Some(password) = password {
+                        Command::RegisterOneShot {
+                            username: name.to_owned(),
+                            password: password.to_owned(),
+                        }
+                    } else {
+                        Command::Register {
+                            username: name.to_owned(),
+                        }
+                    }
+                }
+                None => Command::Help {
                     topic: Some("register".to_owned()),
                 },
             },
-            "login" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(u) => Command::Login { username: u },
+            // `login <user>` → interactive; `login <user> <password>` → one-shot.
+            "login" => match rest {
+                Some(r) => {
+                    let (name, password) = split_first_word(r);
+                    match (Username::new(name).ok(), password) {
+                        (Some(u), Some(password)) => Command::LoginOneShot {
+                            username: u,
+                            password: password.to_owned(),
+                        },
+                        (Some(u), None) => Command::Login { username: u },
+                        (None, _) => Command::Help {
+                            topic: Some("login".to_owned()),
+                        },
+                    }
+                }
                 None => Command::Help {
                     topic: Some("login".to_owned()),
                 },

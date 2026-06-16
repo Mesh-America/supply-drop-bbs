@@ -131,8 +131,15 @@ enum RegisterStage {
 /// it can restart that flow instead of being captured as a field value.
 #[derive(Debug, PartialEq, Eq)]
 enum AuthEscape {
-    Register(String),
-    Login(Username),
+    Register {
+        username: String,
+        /// One-shot password if the user typed `REGISTER <user> <password>`.
+        password: Option<String>,
+    },
+    Login {
+        username: Username,
+        password: Option<String>,
+    },
 }
 
 /// Detect a REGISTER/LOGIN command in raw workflow-reply text.
@@ -143,7 +150,8 @@ enum AuthEscape {
 /// account. Other words are intentionally NOT treated as commands here, because
 /// they may be a legitimate password. A keyword with no argument is left to the
 /// workflow (e.g. a bare "register" is too short to be a password and simply
-/// re-prompts). Matching is case-insensitive.
+/// re-prompts). A trailing word after the username is taken as a one-shot
+/// password. Matching is case-insensitive.
 fn auth_escape(reply: &str) -> Option<AuthEscape> {
     let trimmed = reply.trim();
     let (word, rest) = match trimmed.split_once(char::is_whitespace) {
@@ -153,9 +161,23 @@ fn auth_escape(reply: &str) -> Option<AuthEscape> {
     if rest.is_empty() {
         return None;
     }
+    // Split the remainder into the username and an optional one-shot password.
+    let (name, password) = match rest.split_once(char::is_whitespace) {
+        Some((n, p)) => {
+            let p = p.trim();
+            (n, (!p.is_empty()).then(|| p.to_owned()))
+        }
+        None => (rest, None),
+    };
     match word.to_ascii_lowercase().as_str() {
-        "register" => Some(AuthEscape::Register(rest.to_owned())),
-        "login" => Username::new(rest).ok().map(AuthEscape::Login),
+        "register" => Some(AuthEscape::Register {
+            username: name.to_owned(),
+            password,
+        }),
+        "login" => Username::new(name).ok().map(|u| AuthEscape::Login {
+            username: u,
+            password,
+        }),
         _ => None,
     }
 }
@@ -437,6 +459,13 @@ impl Host for BbsHost {
 
             Command::Register { username } => self.handle_register(session, username).await,
             Command::Login { username } => self.handle_login(session, username).await,
+            Command::RegisterOneShot { username, password } => {
+                self.handle_register_oneshot(session, username, password)
+                    .await
+            }
+            Command::LoginOneShot { username, password } => {
+                self.handle_login_oneshot(session, username, password).await
+            }
             Command::WorkflowReply { reply } => self.handle_workflow_reply(session, reply).await,
             Command::Cancel => self.handle_cancel(session).await,
 
@@ -1668,6 +1697,275 @@ impl BbsHost {
         }
     }
 
+    /// Record a failed login for `username` and return the backoff delay (secs)
+    /// the caller should sleep before responding. The counter is global per
+    /// username so parallel sessions can't bypass the delay; entries reset after
+    /// 10 minutes idle and the map is hard-capped. Shared by the interactive
+    /// login workflow and the one-shot login path.
+    async fn record_login_failure(&self, username: &str) -> u64 {
+        let mut map = self.login_failures.lock().await;
+        // Evict stale entries before inserting to bound map size — keeps memory
+        // O(active_usernames). Hard cap prevents unbounded growth even if
+        // eviction somehow misses entries.
+        const MAX_FAILURE_ENTRIES: usize = 1_000;
+        if map.len() >= MAX_FAILURE_ENTRIES {
+            map.retain(|_, (_, t)| t.elapsed().as_secs() <= 600);
+            if map.len() >= MAX_FAILURE_ENTRIES {
+                map.clear();
+            }
+        }
+        let entry = map
+            .entry(username.to_owned())
+            .or_insert((0, Instant::now()));
+        // Stale entries (>10 min) reset the counter.
+        if entry.1.elapsed().as_secs() > 600 {
+            *entry = (0, Instant::now());
+        }
+        entry.0 += 1;
+        entry.1 = Instant::now();
+        let failures = entry.0;
+        // Exponential backoff: 2, 4, 8, 16, 30 s (capped).
+        u64::min(2u64.saturating_pow(failures), 30)
+    }
+
+    /// Create `username` with `password`, attach the new account to `session`,
+    /// log them in, and fire the registration side-effects (first-user → Sysop,
+    /// sysop notification DMs). Shared by the interactive Confirm step and the
+    /// one-shot `REGISTER <user> <password>` path. The caller must have already
+    /// validated the username and confirmed it is currently free.
+    async fn create_user_and_login(
+        &self,
+        session: SessionId,
+        username: &Username,
+        password: &str,
+    ) -> Result<Response, HostError> {
+        let now = Timestamp::now();
+        // Promote the very first registrant to Sysop so the system isn't stuck
+        // with no one able to validate new users.
+        let is_first = UserStore::list(&self.db, None, 1, 0)
+            .await
+            .map_err(|e| HostError::Storage(format!("list users: {e}")))?
+            .is_empty();
+        let initial_level = if is_first {
+            PermissionLevel::Sysop
+        } else {
+            PermissionLevel::Unvalidated
+        };
+        // Display name defaults to the username (stored as NULL); set via PROFILE.
+        let user_id = match UserStore::create(&self.db, username, None, initial_level, now).await {
+            Ok(id) => id,
+            Err(crate::db::StoreError::Conflict(_)) => {
+                self.clear_workflow(session).await;
+                return Ok(Response::Error(format!(
+                    "'{username}' was just taken. Try: register <different_username>"
+                )));
+            }
+            Err(e) => return Err(HostError::Storage(format!("create user: {e}"))),
+        };
+        self.db
+            .credentials()
+            .set_password(user_id, password, now)
+            .await
+            .map_err(|e| HostError::Storage(format!("set password: {e}")))?;
+
+        {
+            // Unvalidated users land in the guest room (if configured); sysop /
+            // first-user lands in Lobby as usual.
+            let initial_room = if initial_level < PermissionLevel::User {
+                self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
+            } else {
+                LOBBY_ROOM_ID
+            };
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.username = Some(username.clone());
+                r.user_id = Some(user_id);
+                r.level = initial_level;
+                r.workflow = Workflow::None;
+                r.current_room = initial_room;
+            }
+        }
+        let _ = self.events_tx.send(DomainEvent::UserCreated {
+            user: username.clone(),
+        });
+        if is_first {
+            info!(%session, %username, "first registration — promoted to Sysop");
+        } else {
+            info!(%session, %username, "registration complete — awaiting validation");
+
+            // DM every active sysop so they know there's a new user waiting to
+            // be validated (or banned).
+            let sysops: Vec<crate::user::User> = UserStore::list(&self.db, None, 200, 0)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|u| {
+                    u.permission_level == PermissionLevel::Sysop
+                        && u.status == crate::user::UserStatus::Active
+                })
+                .collect();
+
+            if !sysops.is_empty() {
+                let dm_ts = Timestamp::now();
+                let dm_body = format!(
+                    "New user registered: {username}\nV {username} to verify, B {username} to ban."
+                );
+                let bbs_sender = Username::__internal_system("bbs");
+                for sysop in sysops {
+                    let _ = MessageStore::post_direct(
+                        &self.db,
+                        &bbs_sender,
+                        &sysop.username,
+                        &dm_body,
+                        dm_ts,
+                    )
+                    .await;
+                }
+            }
+        }
+        Ok(Response::LoggedIn {
+            user: username.clone(),
+        })
+    }
+
+    /// One-shot registration: validate, create, and log in from a single
+    /// `REGISTER <user> <password>` message — no password prompt/confirmation.
+    /// Fewer round-trips dramatically improves success on lossy multi-hop links.
+    async fn handle_register_oneshot(
+        &self,
+        session: SessionId,
+        raw_username: String,
+        password: String,
+    ) -> Result<Response, HostError> {
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(r) = sessions.get(&session) {
+                if r.username.is_some() {
+                    return Ok(Response::Error(
+                        "Already logged in. Use 'logout' first.".into(),
+                    ));
+                }
+                if !matches!(r.workflow, Workflow::None) {
+                    return Ok(Response::Error(
+                        "A workflow is already in progress. Type 'cancel' first.".into(),
+                    ));
+                }
+            }
+        }
+
+        let username = match validate_new_username(&raw_username) {
+            Ok(u) => u,
+            Err(msg) => return Ok(Response::Error(msg)),
+        };
+        // Password rule mirrors the interactive flow (min 8). No confirmation
+        // step: the single message can't be typo-confirmed, and re-prompting
+        // would reintroduce the round-trip this path exists to avoid.
+        if password.chars().count() < 8 {
+            return Ok(Response::Error(
+                "Password must be at least 8 characters. Not registered.".into(),
+            ));
+        }
+        let existing = self
+            .db
+            .get_by_username(&username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        if existing.is_some() {
+            return Ok(Response::Error(format!(
+                "'{username}' is taken. Try: login {username} <password>"
+            )));
+        }
+
+        self.create_user_and_login(session, &username, &password)
+            .await
+    }
+
+    /// One-shot login: authenticate and log in from a single
+    /// `LOGIN <user> <password>` message — no password prompt. A temp-password
+    /// account (sysop `.PW` reset) still drops into the forced change-password
+    /// prompt, which can't be collapsed into one message.
+    async fn handle_login_oneshot(
+        &self,
+        session: SessionId,
+        username: Username,
+        password: String,
+    ) -> Result<Response, HostError> {
+        {
+            let sessions = self.sessions.read().await;
+            if let Some(r) = sessions.get(&session) {
+                if r.username.is_some() {
+                    return Ok(Response::Error(
+                        "Already logged in. Use 'logout' first.".into(),
+                    ));
+                }
+                if !matches!(r.workflow, Workflow::None) {
+                    return Ok(Response::Error(
+                        "A workflow is already in progress. Type 'cancel' first.".into(),
+                    ));
+                }
+            }
+        }
+
+        let user = self
+            .db
+            .get_by_username(&username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let user = match user {
+            Some(u) if u.status == UserStatus::Active => u,
+            // Don't reveal whether the account exists; same generic failure.
+            _ => return Ok(Response::Error("Login failed.".into())),
+        };
+
+        let ok = self
+            .db
+            .credentials()
+            .verify_password(user.id, &password, Timestamp::now())
+            .await
+            .map_err(|e| HostError::Storage(format!("verify password: {e}")))?;
+
+        if !ok {
+            let delay_secs = self.record_login_failure(username.as_str()).await;
+            warn!(%session, %username, delay_secs, "one-shot login failed: wrong password");
+            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            return Ok(Response::Error("Login failed.".into()));
+        }
+
+        // Success: clear failures, stamp last_login.
+        self.login_failures.lock().await.remove(username.as_str());
+        UserStore::update(&self.db, user.id, None, None, None, Some(Timestamp::now()))
+            .await
+            .map_err(|e| HostError::Storage(format!("update last_login: {e}")))?;
+
+        // Temp-password accounts must choose a new password before completing —
+        // that step is inherently interactive, so drop into the prompt. (#134)
+        let must_change = self
+            .db
+            .credentials()
+            .must_change_password(user.id)
+            .await
+            .map_err(|e| HostError::Storage(format!("must_change lookup: {e}")))?;
+        if must_change {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::ForceChangePassword {
+                    username: username.clone(),
+                    user_id: user.id,
+                    stage: ForcePwdStage::EnterNew,
+                };
+            }
+            return Ok(Response::Prompt {
+                text: "Your password was reset by an operator. \
+                       Choose a new password (min 8 characters):"
+                    .into(),
+                hide_input: true,
+            });
+        }
+
+        info!(%session, %username, "one-shot login successful");
+        Ok(self.finalize_login(session, &user).await)
+    }
+
     async fn handle_login(
         &self,
         session: SessionId,
@@ -1753,13 +2051,19 @@ impl BbsHost {
         // upstream in the transport parser.
         if matches!(workflow, Workflow::Register { .. } | Workflow::Login { .. }) {
             match auth_escape(&reply) {
-                Some(AuthEscape::Register(name)) => {
+                Some(AuthEscape::Register { username, password }) => {
                     self.clear_workflow(session).await;
-                    return self.handle_register(session, name).await;
+                    return match password {
+                        Some(pw) => self.handle_register_oneshot(session, username, pw).await,
+                        None => self.handle_register(session, username).await,
+                    };
                 }
-                Some(AuthEscape::Login(name)) => {
+                Some(AuthEscape::Login { username, password }) => {
                     self.clear_workflow(session).await;
-                    return self.handle_login(session, name).await;
+                    return match password {
+                        Some(pw) => self.handle_login_oneshot(session, username, pw).await,
+                        None => self.handle_login(session, username).await,
+                    };
                 }
                 None => {}
             }
@@ -1814,96 +2118,8 @@ impl BbsHost {
                         hide_input: true,
                     });
                 }
-                let now = Timestamp::now();
-                // Promote the very first registrant to Sysop so the system
-                // isn't stuck with no one able to validate new users.
-                let is_first = UserStore::list(&self.db, None, 1, 0)
+                self.create_user_and_login(session, &username, &password)
                     .await
-                    .map_err(|e| HostError::Storage(format!("list users: {e}")))?
-                    .is_empty();
-                let initial_level = if is_first {
-                    PermissionLevel::Sysop
-                } else {
-                    PermissionLevel::Unvalidated
-                };
-                // Display name defaults to the username (stored as NULL); the user
-                // sets it later with PROFILE. See RegisterStage docs.
-                let user_id =
-                    match UserStore::create(&self.db, &username, None, initial_level, now).await {
-                        Ok(id) => id,
-                        Err(crate::db::StoreError::Conflict(_)) => {
-                            let mut sessions = self.sessions.write().await;
-                            if let Some(r) = sessions.get_mut(&session) {
-                                r.workflow = Workflow::None;
-                            }
-                            return Ok(Response::Error(format!(
-                                "'{username}' was just taken. Try: register <different_username>"
-                            )));
-                        }
-                        Err(e) => return Err(HostError::Storage(format!("create user: {e}"))),
-                    };
-                self.db
-                    .credentials()
-                    .set_password(user_id, &password, now)
-                    .await
-                    .map_err(|e| HostError::Storage(format!("set password: {e}")))?;
-
-                {
-                    // Unvalidated users land in the guest room (if configured);
-                    // sysop / first-user lands in Lobby as usual.
-                    let initial_room = if initial_level < PermissionLevel::User {
-                        self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
-                    } else {
-                        LOBBY_ROOM_ID
-                    };
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.username = Some(username.clone());
-                        r.user_id = Some(user_id);
-                        r.level = initial_level;
-                        r.workflow = Workflow::None;
-                        r.current_room = initial_room;
-                    }
-                }
-                let _ = self.events_tx.send(DomainEvent::UserCreated {
-                    user: username.clone(),
-                });
-                if is_first {
-                    info!(%session, %username, "first registration — promoted to Sysop");
-                } else {
-                    info!(%session, %username, "registration complete — awaiting validation");
-
-                    // DM every active sysop so they know there's a new
-                    // user waiting to be validated (or banned).
-                    let sysops: Vec<crate::user::User> = UserStore::list(&self.db, None, 200, 0)
-                        .await
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|u| {
-                            u.permission_level == PermissionLevel::Sysop
-                                && u.status == crate::user::UserStatus::Active
-                        })
-                        .collect();
-
-                    if !sysops.is_empty() {
-                        let dm_ts = Timestamp::now();
-                        let dm_body = format!(
-                            "New user registered: {username}\nV {username} to verify, B {username} to ban."
-                        );
-                        let bbs_sender = Username::__internal_system("bbs");
-                        for sysop in sysops {
-                            let _ = MessageStore::post_direct(
-                                &self.db,
-                                &bbs_sender,
-                                &sysop.username,
-                                &dm_body,
-                                dm_ts,
-                            )
-                            .await;
-                        }
-                    }
-                }
-                Ok(Response::LoggedIn { user: username })
             }
 
             // ── Login ────────────────────────────────────────────────────────
@@ -1966,37 +2182,7 @@ impl BbsHost {
                     info!(%session, %username, "login successful");
                     Ok(self.finalize_login(session, &user).await)
                 } else {
-                    // Global per-username failure tracking — parallel sessions share this
-                    // counter so they can't bypass the delay by opening fresh connections.
-                    let delay_secs = {
-                        let mut map = self.login_failures.lock().await;
-                        // Evict stale entries before inserting to bound map size.
-                        // On a busy node this keeps memory O(active_usernames) rather
-                        // than O(all_usernames_ever). Hard cap prevents unbounded growth
-                        // even if eviction somehow misses entries.
-                        const MAX_FAILURE_ENTRIES: usize = 1_000;
-                        if map.len() >= MAX_FAILURE_ENTRIES {
-                            map.retain(|_, (_, t)| t.elapsed().as_secs() <= 600);
-                            // If still over cap after eviction, clear entirely — this
-                            // should never happen in practice (1 000 simultaneous unique
-                            // attackers is not a realistic mesh scenario).
-                            if map.len() >= MAX_FAILURE_ENTRIES {
-                                map.clear();
-                            }
-                        }
-                        let entry = map
-                            .entry(username.as_str().to_owned())
-                            .or_insert((0, Instant::now()));
-                        // Stale entries (>10 min) reset the counter.
-                        if entry.1.elapsed().as_secs() > 600 {
-                            *entry = (0, Instant::now());
-                        }
-                        entry.0 += 1;
-                        entry.1 = Instant::now();
-                        let failures = entry.0;
-                        // Exponential backoff: 2, 4, 8, 16, 30 s (capped).
-                        u64::min(2u64.saturating_pow(failures), 30)
-                    };
+                    let delay_secs = self.record_login_failure(username.as_str()).await;
                     warn!(%session, %username, delay_secs, "login failed: wrong password");
                     tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
 
@@ -4839,6 +5025,8 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::Help { .. } => "Help",
         Command::Login { .. } => "Login",
         Command::Register { .. } => "Register",
+        Command::RegisterOneShot { .. } => "RegisterOneShot",
+        Command::LoginOneShot { .. } => "LoginOneShot",
         Command::WorkflowReply { .. } => "WorkflowReply",
         Command::Cancel => "Cancel",
         Command::Logout | Command::Quit => "Logout",
@@ -4981,8 +5169,14 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
                 "Q — quit"
             }
         }
-        "register" => "REGISTER <user> — create an account",
-        "login" => "LOGIN <user> — log in to your account",
+        "register" => {
+            "REGISTER <user> <password> — create an account and log in.\n\
+             One message, no prompts. Omit the password to be prompted instead."
+        }
+        "login" => {
+            "LOGIN <user> <password> — log in.\n\
+             One message, no prompts. Omit the password to be prompted instead."
+        }
         "cancel" => "CANCEL — cancel the current workflow",
 
         // ── Logged-in only ───────────────────────────────────────────────
@@ -5071,8 +5265,9 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
 }
 
 const HELP_QUICK_ANON: &str = "\
-REGISTER <user>  create an account\n\
-LOGIN <user>     log in to your account";
+REGISTER <user> <password>\n\
+LOGIN <user> <password>\n\
+(omit password to be prompted)";
 
 // 156 bytes — must stay ≤ MAX_REPLY_BYTES (MAX_FRAME_SIZE(172) - 16 bytes overhead).
 const HELP_QUICK_LOGGED_IN: &str = "\
@@ -5933,19 +6128,215 @@ mod tests {
         );
     }
 
+    // ── One-shot auth (REGISTER/LOGIN <user> <password>) ──────────────────────
+
+    /// `REGISTER <user> <password>` creates the account and logs in from a single
+    /// message — no prompts. Far fewer round-trips on lossy multi-hop links.
+    #[tokio::test]
+    async fn register_oneshot_creates_and_logs_in() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::RegisterOneShot {
+                    username: "alice".into(),
+                    password: "hunter2!".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::LoggedIn { .. }),
+            "one-shot register should log in immediately, got: {resp:?}"
+        );
+
+        let user = host
+            .db
+            .get_by_username(&Username::new("alice").unwrap())
+            .await
+            .unwrap()
+            .expect("account created");
+        assert_eq!(user.display_name, None, "display name defaults to username");
+        let ctx = host.permission_ctx(sid).await.unwrap();
+        assert_eq!(ctx.username(), Some(&Username::new("alice").unwrap()));
+        assert_eq!(
+            ctx.level(),
+            PermissionLevel::Sysop,
+            "first registrant is promoted to Sysop"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_oneshot_rejects_short_password() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::RegisterOneShot {
+                    username: "alice".into(),
+                    password: "short".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Error(e) if e.to_lowercase().contains("8 characters")),
+            "short password should be rejected, got: {resp:?}"
+        );
+        assert!(
+            host.db
+                .get_by_username(&Username::new("alice").unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "no account should be created on a rejected one-shot register"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_oneshot_succeeds_with_correct_password() {
+        let (host, _db) = make_host().await;
+        let s0 = host.create_session("test").await.unwrap();
+        do_register(&host, s0, "alice", "s3cr3t!!").await;
+
+        let sid = host.create_session("test").await.unwrap();
+        let resp = host
+            .process_command(
+                sid,
+                Command::LoginOneShot {
+                    username: Username::new("alice").unwrap(),
+                    password: "s3cr3t!!".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::LoggedIn { .. }),
+            "one-shot login should authenticate, got: {resp:?}"
+        );
+        let ctx = host.permission_ctx(sid).await.unwrap();
+        assert_eq!(ctx.username(), Some(&Username::new("alice").unwrap()));
+    }
+
+    #[tokio::test]
+    async fn login_oneshot_wrong_password_fails() {
+        let (host, _db) = make_host().await;
+        let s0 = host.create_session("test").await.unwrap();
+        do_register(&host, s0, "alice", "s3cr3t!!").await;
+
+        let sid = host.create_session("test").await.unwrap();
+        let resp = host
+            .process_command(
+                sid,
+                Command::LoginOneShot {
+                    username: Username::new("alice").unwrap(),
+                    password: "wrongpass".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Error(e) if e.contains("Login failed")),
+            "wrong one-shot password should fail, got: {resp:?}"
+        );
+        let ctx = host.permission_ctx(sid).await.unwrap();
+        assert_eq!(
+            ctx.username(),
+            None,
+            "must not be authenticated after a bad password"
+        );
+    }
+
+    /// A re-sent `REGISTER <user> <password>` mid-registration escapes the
+    /// interactive flow and completes one-shot — the lost-prompt recovery path,
+    /// now collapsed to a single message.
+    #[tokio::test]
+    async fn workflow_reply_register_with_password_escapes_to_one_shot() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
+        host.process_command(
+            sid,
+            Command::Register {
+                username: "aaa".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "register bob hunter2!".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::LoggedIn { .. }),
+            "one-shot escape should create + log in 'bob', got: {resp:?}"
+        );
+        assert!(
+            host.db
+                .get_by_username(&Username::new("bob").unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "'bob' should have been created"
+        );
+        assert!(
+            host.db
+                .get_by_username(&Username::new("aaa").unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "the abandoned 'aaa' registration must not have created an account"
+        );
+        let ctx = host.permission_ctx(sid).await.unwrap();
+        assert_eq!(ctx.username(), Some(&Username::new("bob").unwrap()));
+    }
+
     #[test]
     fn auth_escape_recognizes_register_and_login_only() {
         assert_eq!(
             auth_escape("REGISTER tcm1"),
-            Some(AuthEscape::Register("tcm1".into()))
+            Some(AuthEscape::Register {
+                username: "tcm1".into(),
+                password: None
+            })
         );
         assert_eq!(
             auth_escape("  register   TCF  "),
-            Some(AuthEscape::Register("TCF".into()))
+            Some(AuthEscape::Register {
+                username: "TCF".into(),
+                password: None
+            })
         );
         assert_eq!(
             auth_escape("login alice"),
-            Some(AuthEscape::Login(Username::new("alice").unwrap()))
+            Some(AuthEscape::Login {
+                username: Username::new("alice").unwrap(),
+                password: None
+            })
+        );
+        // A trailing word is taken as a one-shot password.
+        assert_eq!(
+            auth_escape("register bob hunter2!"),
+            Some(AuthEscape::Register {
+                username: "bob".into(),
+                password: Some("hunter2!".into())
+            })
+        );
+        assert_eq!(
+            auth_escape("login alice s3cr3tpw"),
+            Some(AuthEscape::Login {
+                username: Username::new("alice").unwrap(),
+                password: Some("s3cr3tpw".into())
+            })
         );
         // No argument → not an escape (a bare keyword is left to the workflow).
         assert_eq!(auth_escape("register"), None);
