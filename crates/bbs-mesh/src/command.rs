@@ -29,7 +29,7 @@
 //! [`render_notification`] converts a [`Notification`] (a host-initiated push)
 //! into the text string delivered via `OutboundFrame::SendTxtMsg`.
 
-use bbs_plugin_api::{event::Notification, identity::Username, Command, Response};
+use bbs_plugin_api::{event::Notification, identity::Username, Command, PermissionLevel, Response};
 
 // ── Command parsing ───────────────────────────────────────────────────────────
 
@@ -257,6 +257,17 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
+        ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::SetUserPassword { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+
+        ".aide" => Some(parse_set_level(rest, PermissionLevel::Aide)),
+        ".sysop" => Some(parse_set_level(rest, PermissionLevel::Sysop)),
+        ".user" => Some(parse_set_level(rest, PermissionLevel::User)),
+
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
         }),
@@ -273,6 +284,25 @@ fn split_first_word(s: &str) -> (&str, Option<&str>) {
         Some(i) => {
             let rest = s[i..].trim_start();
             (&s[..i], if rest.is_empty() { None } else { Some(rest) })
+        }
+    }
+}
+
+/// Parse a `.AIDE` / `.SYSOP` / `.USER <user>` set-level command. (#127)
+fn parse_set_level(rest: Option<&str>, level: PermissionLevel) -> Command {
+    match rest.and_then(|s| Username::new(s).ok()) {
+        Some(username) => Command::SetUserLevel { username, level },
+        // Missing/invalid username → show the command's usage rather than a
+        // generic "unknown command". (#127 follow-up)
+        None => {
+            let topic = match level {
+                PermissionLevel::Aide => ".aide",
+                PermissionLevel::Sysop => ".sysop",
+                _ => ".user",
+            };
+            Command::Help {
+                topic: Some(topic.to_owned()),
+            }
         }
     }
 }
@@ -434,6 +464,49 @@ mod tests {
         // `I` (ignore room) was an unimplemented stub; it now falls through to
         // the standard unknown-command path. (#123)
         assert!(matches!(cmd("i"), Some(Command::Unknown { .. })));
+    }
+
+    #[test]
+    fn pw_reset_parsed_on_mesh() {
+        // `.PW <user>` (sysop password reset) is now recognised on mesh. (#125)
+        let username = Username::new("bob").unwrap();
+        assert_eq!(cmd(".pw bob"), Some(Command::SetUserPassword { username }));
+        // Missing username → unknown (no silent no-op).
+        assert!(matches!(cmd(".pw"), Some(Command::Unknown { .. })));
+    }
+
+    #[test]
+    fn set_level_commands_parsed_on_mesh() {
+        // `.AIDE`/`.SYSOP`/`.USER <user>` promote/demote (sysop-gated by host). (#127)
+        let u = Username::new("bob").unwrap();
+        assert_eq!(
+            cmd(".aide bob"),
+            Some(Command::SetUserLevel {
+                username: u.clone(),
+                level: PermissionLevel::Aide
+            })
+        );
+        assert_eq!(
+            cmd(".sysop bob"),
+            Some(Command::SetUserLevel {
+                username: u.clone(),
+                level: PermissionLevel::Sysop
+            })
+        );
+        assert_eq!(
+            cmd(".user bob"),
+            Some(Command::SetUserLevel {
+                username: u,
+                level: PermissionLevel::User
+            })
+        );
+        // Missing username → the command's usage help, not a generic unknown.
+        assert_eq!(
+            cmd(".aide"),
+            Some(Command::Help {
+                topic: Some(".aide".to_owned())
+            })
+        );
     }
 
     #[test]

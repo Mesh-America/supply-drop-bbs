@@ -431,6 +431,9 @@ impl Host for BbsHost {
             Command::ValidateUser { username } => {
                 self.handle_validate_user(session, username).await
             }
+            Command::SetUserLevel { username, level } => {
+                self.handle_set_user_level(session, username, level).await
+            }
             Command::BlockUser { target, force } => {
                 self.handle_block_user(session, target, force).await
             }
@@ -4026,6 +4029,140 @@ impl BbsHost {
         )))
     }
 
+    /// Set a user's permission level (Sysop only). Backs `.AIDE`/`.SYSOP`/`.USER`
+    /// over mesh/CLI; the web admin uses `admin_update_user`. See issue #127.
+    async fn handle_set_user_level(
+        &self,
+        session: SessionId,
+        username: Username,
+        level: PermissionLevel,
+    ) -> Result<Response, HostError> {
+        let (actor, _, actor_level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if actor_level < PermissionLevel::Sysop {
+            return Ok(Response::Error("Sysop access required.".into()));
+        }
+        // Guard against self-lockout — a sysop can't change their own level.
+        if actor == username {
+            return Ok(Response::Error("You can't change your own level.".into()));
+        }
+
+        let user = match UserStore::get_by_username(&self.db, &username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+        {
+            None => return Ok(Response::Error("User not found.".into())),
+            Some(u) => u,
+        };
+
+        // Status and permission_level are orthogonal. Refuse to touch the level
+        // of a non-active (banned/deleted) account: the new level would be
+        // pushed into any live session below, re-empowering a user who is still
+        // flagged banned. Re-activate first. (#127)
+        if user.status != UserStatus::Active {
+            return Ok(Response::Error(format!(
+                "'{}' is {} — re-activate the account before changing its level.",
+                username.as_str(),
+                user.status
+            )));
+        }
+
+        // Promotion to a role is for already-validated accounts; an unvalidated
+        // account must be validated first (V) so it isn't silently activated here.
+        if user.permission_level == PermissionLevel::Unvalidated {
+            return Ok(Response::Error(format!(
+                "'{}' isn't validated yet — use V {} first.",
+                username.as_str(),
+                username.as_str()
+            )));
+        }
+        if user.permission_level == level {
+            return Ok(Response::Error(format!(
+                "'{}' is already {level}.",
+                username.as_str()
+            )));
+        }
+
+        // Backstop against removing the last Sysop. The self-change guard above
+        // already prevents a lone sysop from demoting themselves over the mesh,
+        // but enforce the invariant locally so it holds regardless of how this
+        // handler is reached. (#127)
+        if user.permission_level == PermissionLevel::Sysop && level < PermissionLevel::Sysop {
+            let active = UserStore::list(&self.db, Some(UserStatus::Active), 500, 0)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let sysops = active
+                .iter()
+                .filter(|u| u.permission_level == PermissionLevel::Sysop)
+                .count();
+            if sysops <= 1 {
+                return Ok(Response::Error(
+                    "Can't demote the last Sysop — promote another Sysop first.".into(),
+                ));
+            }
+        }
+
+        UserStore::update(&self.db, user.id, None, None, Some(level), None)
+            .await
+            .map_err(|e| HostError::Storage(format!("set level: {e}")))?;
+
+        // Reflect the change in any live sessions. On a *demotion*, end the
+        // user's sessions so they must re-authenticate at the lower level — a
+        // stale elevated session must not outlive a privilege drop (mirrors the
+        // web convention of invalidating a demoted user's token). On a
+        // promotion, raise the level in place. (#127 follow-up)
+        if level < user.permission_level {
+            let ended: Vec<SessionId> = {
+                let mut sessions = self.sessions.write().await;
+                let ids: Vec<SessionId> = sessions
+                    .iter()
+                    .filter(|(_, r)| r.username.as_ref() == Some(&username))
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in &ids {
+                    sessions.remove(id);
+                }
+                ids
+            };
+            for id in ended {
+                let _ = self.events_tx.send(DomainEvent::SessionEnded {
+                    session: id,
+                    reason: "permission level lowered".into(),
+                });
+            }
+        } else {
+            let mut sessions = self.sessions.write().await;
+            for r in sessions.values_mut() {
+                if r.username.as_ref() == Some(&username) {
+                    r.level = level;
+                }
+            }
+        }
+
+        // A privilege change must never be silently un-audited: propagate a
+        // failed audit write as an error instead of only logging it, so the
+        // operation is reported failed rather than dropping the audit trail for
+        // an escalation. (#127 follow-up)
+        let detail = format!("level -> {level}");
+        self.db
+            .audit_write(
+                actor.as_str(),
+                "set_level",
+                Some(username.as_str()),
+                Some(&detail),
+            )
+            .await
+            .map_err(|e| HostError::Storage(format!("audit log failed: {e}")))?;
+
+        info!(%actor, %username, %level, "user level changed");
+        Ok(Response::Text(format!(
+            "'{}' is now {level}.",
+            username.as_str()
+        )))
+    }
+
     async fn handle_block_user(
         &self,
         session: SessionId,
@@ -4704,6 +4841,7 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::WhoIsOnline => "WhoIsOnline",
         Command::ListPending => "ListPending",
         Command::ValidateUser { .. } => "ValidateUser",
+        Command::SetUserLevel { .. } => "SetUserLevel",
         Command::BlockUser { .. } => "BlockUser",
         Command::BanUser { .. } => "BanUser",
         Command::UnbanUser { .. } => "UnbanUser",
@@ -4880,6 +5018,11 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
 
         // ── Sysop+ only ──────────────────────────────────────────────────
         "unban" if is_sysop => "UNBAN <user> — lift a ban",
+        ".aide" | ".sysop" | ".user" if is_sysop => {
+            ".AIDE/.SYSOP/.USER <user> — set a user's permission level\n\
+             Promote a validated user to Aide or Sysop, or demote to User.\n\
+             Validate pending users with V first."
+        }
         ".c" if is_sysop => ".C — create a new room\nEnters the room creation workflow.",
         ".dr" if is_sysop => ".DR <name> — delete a room",
         ".du" if is_sysop => ".DU <user> — soft-delete a user account\nSets status to deleted and ends active sessions.",
@@ -5004,9 +5147,10 @@ Users:\n\
 
 const HELP_SYSOP: &str = "\
 Sysop:\n\
+ .AIDE/.SYSOP/.USER <u>\n\
  .C .DR .DU .PW rooms/users\n\
- UNBAN <u>   lift a ban\n\
- OPENACCESS  skip verify\n\
+ UNBAN <u> lift a ban\n\
+ OPENACCESS skip verify\n\
  CLOSEACCESS require verify\n\
  GUESTROOM <name>|OFF";
 
@@ -5613,6 +5757,37 @@ mod tests {
         );
     }
 
+    /// Issue #129: the `-` display-name shortcut must ADVANCE to the password
+    /// step (not exit registration). Regression guard for the #105 fix.
+    #[tokio::test]
+    async fn register_dash_advances_to_password() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: "qatester1".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "-".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("password")),
+            "`-` should advance to the password prompt, got: {resp:?}"
+        );
+        // Still mid-registration — not dropped back to the anonymous menu.
+        let sessions = host.sessions.read().await;
+        assert!(
+            matches!(sessions[&sid].workflow, Workflow::Register { .. }),
+            "session should still be in the registration workflow after `-`"
+        );
+    }
+
     /// Issue #128: `REGISTER` validates the username up front and returns a
     /// specific error (too short / invalid chars / reserved) instead of
     /// accepting invalid names into the flow or showing a generic banner.
@@ -5679,6 +5854,100 @@ mod tests {
         );
     }
 
+    /// Issue #127: a sysop can promote/demote a validated user's level, with
+    /// guards (validated-first, no self-change, sysop-only).
+    #[tokio::test]
+    async fn set_user_level_promotes_and_guards() {
+        let (host, _db) = make_host().await;
+        let sysop = host.create_session("test").await.unwrap();
+        register_and_login(&host, sysop, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // bob registers (auto-logged-in, Unvalidated).
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+        let bob = Username::new("bob").unwrap();
+
+        // Unvalidated target → directed to validate first.
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: bob.clone(),
+                    level: PermissionLevel::Aide,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(e) if e.to_lowercase().contains("validated")),
+            "unvalidated target should be rejected, got: {r:?}"
+        );
+
+        // Validate bob, then promote to Aide.
+        host.process_command(
+            sysop,
+            Command::ValidateUser {
+                username: bob.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: bob.clone(),
+                    level: PermissionLevel::Aide,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Text(t) if t.to_lowercase().contains("aide")),
+            "promotion should confirm, got: {r:?}"
+        );
+        assert_eq!(
+            UserStore::get_by_username(&host.db, &bob)
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_level,
+            PermissionLevel::Aide
+        );
+
+        // Self-change is refused.
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: Username::new("alice").unwrap(),
+                    level: PermissionLevel::User,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(e) if e.to_lowercase().contains("own level")),
+            "self-change should be refused, got: {r:?}"
+        );
+
+        // Non-sysop (bob, now Aide) cannot set levels.
+        let r = host
+            .process_command(
+                bob_sid,
+                Command::SetUserLevel {
+                    username: Username::new("alice").unwrap(),
+                    level: PermissionLevel::User,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(e) if e.to_lowercase().contains("sysop")),
+            "non-sysop should be refused, got: {r:?}"
+        );
+    }
+
     /// Issue #128: the shared creation policy reports the most specific failure
     /// (so callers don't get a misleading reason) and normalises like the type.
     #[test]
@@ -5705,34 +5974,156 @@ mod tests {
         assert_eq!(validate_new_username("@Alice").unwrap().as_str(), "alice");
     }
 
-    /// Issue #129: the `-` display-name shortcut must ADVANCE to the password
-    /// step (not exit registration). Regression guard for the #105 fix.
+    /// #127 follow-up: a demotion must end the user's live session(s) so a stale
+    /// elevated session can't outlive the privilege drop; a promotion updates the
+    /// session level in place.
     #[tokio::test]
-    async fn register_dash_advances_to_password() {
+    async fn set_user_level_demotion_ends_session() {
         let (host, _db) = make_host().await;
-        let sid = host.create_session("test").await.unwrap();
+        let mut ev_rx = host.events_tx.subscribe();
+        let sysop = host.create_session("test").await.unwrap();
+        register_and_login(&host, sysop, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // bob: validated, then promoted to Aide, with a live session.
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+        let bob = Username::new("bob").unwrap();
         host.process_command(
-            sid,
-            Command::Register {
-                username: "qatester1".to_owned(),
+            sysop,
+            Command::ValidateUser {
+                username: bob.clone(),
             },
         )
         .await
         .unwrap();
+        host.process_command(
+            sysop,
+            Command::SetUserLevel {
+                username: bob.clone(),
+                level: PermissionLevel::Aide,
+            },
+        )
+        .await
+        .unwrap();
+        // Promotion keeps the session alive (level raised in place).
+        assert!(
+            host.sessions.read().await.contains_key(&bob_sid),
+            "promotion should keep the session"
+        );
+        while ev_rx.try_recv().is_ok() {}
 
-        let resp = host
-            .process_command(sid, Command::WorkflowReply { reply: "-".into() })
+        // Demote bob → his live session must be ended.
+        host.process_command(
+            sysop,
+            Command::SetUserLevel {
+                username: bob.clone(),
+                level: PermissionLevel::User,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !host.sessions.read().await.contains_key(&bob_sid),
+            "demotion must end the user's live session"
+        );
+        let mut ended = false;
+        while let Ok(ev) = ev_rx.try_recv() {
+            if matches!(ev, DomainEvent::SessionEnded { session, .. } if session == bob_sid) {
+                ended = true;
+            }
+        }
+        assert!(ended, "demotion should fire SessionEnded for the user");
+    }
+
+    /// #127: a sysop must not change the level of a banned/deleted account
+    /// (it would be re-empowered in any live session), and a legitimate
+    /// demotion must still succeed while another Sysop remains.
+    #[tokio::test]
+    async fn set_user_level_guards_banned_and_last_sysop() {
+        let (host, _db) = make_host().await;
+        let sysop = host.create_session("test").await.unwrap();
+        register_and_login(&host, sysop, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // bob: validated (→ User), then banned.
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+        let bob = Username::new("bob").unwrap();
+        host.process_command(
+            sysop,
+            Command::ValidateUser {
+                username: bob.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let bob_id = UserStore::get_by_username(&host.db, &bob)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(&host.db, bob_id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: bob.clone(),
+                    level: PermissionLevel::Aide,
+                },
+            )
             .await
             .unwrap();
         assert!(
-            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("password")),
-            "`-` should advance to the password prompt, got: {resp:?}"
+            matches!(&r, Response::Error(e)
+                if e.to_lowercase().contains("re-activate") || e.to_lowercase().contains("banned")),
+            "level change on a banned account should be refused, got: {r:?}"
         );
-        // Still mid-registration — not dropped back to the anonymous menu.
-        let sessions = host.sessions.read().await;
+        assert_eq!(
+            UserStore::get_by_username(&host.db, &bob)
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_level,
+            PermissionLevel::User,
+            "banned user's level must be unchanged"
+        );
+
+        // carol promoted to Sysop, then demoted — alice remains, so it succeeds.
+        let carol_sid = host.create_session("test").await.unwrap();
+        do_register(&host, carol_sid, "carol", "pass9012").await;
+        let carol = Username::new("carol").unwrap();
+        host.process_command(
+            sysop,
+            Command::ValidateUser {
+                username: carol.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sysop,
+            Command::SetUserLevel {
+                username: carol.clone(),
+                level: PermissionLevel::Sysop,
+            },
+        )
+        .await
+        .unwrap();
+        let r = host
+            .process_command(
+                sysop,
+                Command::SetUserLevel {
+                    username: carol.clone(),
+                    level: PermissionLevel::User,
+                },
+            )
+            .await
+            .unwrap();
         assert!(
-            matches!(sessions[&sid].workflow, Workflow::Register { .. }),
-            "session should still be in the registration workflow after `-`"
+            matches!(&r, Response::Text(t) if t.to_lowercase().contains("user")),
+            "demoting a sysop while another remains should succeed, got: {r:?}"
         );
     }
 
