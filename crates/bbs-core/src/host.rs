@@ -74,10 +74,12 @@ enum Workflow {
     ChangePassword {
         stage: ChangePwdStage,
     },
-    /// Resetting another user's password (.PW command, Sysop+).
-    SetUserPassword {
-        target: Username,
-        stage: SetUserPwdStage,
+    /// Forcing a new password at login after a sysop `.PW` reset to a temporary
+    /// password. The login is held until the user chooses a new password. (#134)
+    ForceChangePassword {
+        username: Username,
+        user_id: UserId,
+        stage: ForcePwdStage,
     },
     /// Browsing messages one-at-a-time with F/R navigation.
     /// E replies to the current message; any other input exits.
@@ -107,7 +109,7 @@ enum ChangePwdStage {
 }
 
 #[derive(Clone, Debug)]
-enum SetUserPwdStage {
+enum ForcePwdStage {
     /// Waiting for the new password.
     EnterNew,
     /// New password entered; waiting for confirmation.
@@ -160,11 +162,11 @@ struct SessionRecord {
     /// `None` means "not yet started"; F starts at the first message, R at the last.
     /// Reset to `None` when the room changes.
     current_message_id: Option<MessageId>,
-    /// `true` immediately after a message is posted, until the next command.
-    /// Lets a re-sent bare `.` (e.g. when the "Message posted." ack is lost on
-    /// a lossy radio link) re-emit the confirmation idempotently instead of
-    /// returning "Unknown command." See issue #107.
-    posted_idempotent: bool,
+    /// The confirmation shown for the most recent post, kept until the next
+    /// command. Lets a re-sent bare `.` (e.g. when the confirmation was lost on
+    /// a lossy radio link) re-emit the *same* confirmation idempotently instead
+    /// of returning "Unknown command." See issues #107 and #121.
+    last_post_confirmation: Option<String>,
 }
 
 // ── Access policy ─────────────────────────────────────────────────────────────
@@ -366,14 +368,14 @@ impl Host for BbsHost {
             });
         }
 
-        // Clear the post-confirm idempotency flag for any command other than a
+        // Clear the post-confirm idempotency state for any command other than a
         // bare `.` (which the `Command::Unknown` arm handles as a re-confirm).
         // Once the user does anything else, a stray `.` is no longer a retry. (#107)
         let is_repost_dot = matches!(&cmd, Command::Unknown { raw } if raw.trim() == ".");
         if !is_repost_dot {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
-                r.posted_idempotent = false;
+                r.last_post_confirmation = None;
             }
         }
 
@@ -411,7 +413,6 @@ impl Host for BbsHost {
             Command::GoNextUnread => self.handle_go_next_unread(session).await,
             Command::ChangeRoom { target } => self.handle_change_room(session, &target).await,
             Command::GoMail => self.handle_change_to_room(session, MAIL_ROOM_ID).await,
-            Command::IgnoreRoom => Ok(Response::Text("Room ignore is not yet implemented.".into())),
 
             // Message reading
             Command::ReadNew => self.handle_read_new(session).await,
@@ -463,19 +464,18 @@ impl Host for BbsHost {
             Command::Unknown { raw } => {
                 // Idempotent post-confirm (#107): if the previous action was a
                 // successful post and the user re-sends a bare `.` (because the
-                // "Message posted." ack was lost on a lossy link), re-emit the
+                // confirmation was lost on a lossy link), re-emit the *same*
                 // confirmation rather than "Unknown command." The post is not
-                // repeated — `posted_idempotent` only re-acknowledges.
+                // repeated — this only re-acknowledges (#121: mail vs room).
                 if raw.trim() == "." {
-                    let posted = {
+                    let confirmation = {
                         let sessions = self.sessions.read().await;
                         sessions
                             .get(&session)
-                            .map(|r| r.posted_idempotent)
-                            .unwrap_or(false)
+                            .and_then(|r| r.last_post_confirmation.clone())
                     };
-                    if posted {
-                        return Ok(Response::Text("Message posted.".into()));
+                    if let Some(confirmation) = confirmation {
+                        return Ok(Response::Text(confirmation));
                     }
                 }
                 // Provide a more helpful nudge when the session is not yet
@@ -511,7 +511,7 @@ impl Host for BbsHost {
                 workflow: Workflow::None,
                 current_room: LOBBY_ROOM_ID,
                 current_message_id: None,
-                posted_idempotent: false,
+                last_post_confirmation: None,
             },
         );
         let _ = self.events_tx.send(DomainEvent::SessionCreated {
@@ -1011,6 +1011,39 @@ impl Host for BbsHost {
             }
         };
 
+        // Status and permission level are orthogonal. Refuse to set a level on an
+        // account that is (and stays) non-active: the level would be applied to a
+        // banned/deleted account and take effect on re-login. Re-activate first.
+        if new_level.is_some() {
+            let effective_status = new_status.unwrap_or(user.status);
+            if effective_status != UserStatus::Active {
+                return Err(HostError::PreconditionFailed(format!(
+                    "cannot change permission level of a {effective_status} account; \
+                     re-activate it first"
+                )));
+            }
+        }
+
+        // Backstop against removing the last active Sysop (admin lockout). Mirror
+        // the count check in handle_set_user_level so the invariant holds on the
+        // web/admin path too.
+        if user.permission_level == PermissionLevel::Sysop
+            && matches!(new_level, Some(l) if l < PermissionLevel::Sysop)
+        {
+            let active = UserStore::list(&self.db, Some(UserStatus::Active), 500, 0)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let sysops = active
+                .iter()
+                .filter(|u| u.permission_level == PermissionLevel::Sysop)
+                .count();
+            if sysops <= 1 {
+                return Err(HostError::PreconditionFailed(
+                    "cannot demote the last active Sysop; promote another Sysop first".into(),
+                ));
+            }
+        }
+
         UserStore::update(&self.db, user.id, None, new_status, new_level, None)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
@@ -1059,9 +1092,9 @@ impl Host for BbsHost {
         password: &str,
         permission_level: u8,
     ) -> Result<(), HostError> {
-        let uname = Username::new(username).map_err(|_| {
-            HostError::PreconditionFailed(format!("invalid username: {username:?}"))
-        })?;
+        // Apply the same creation policy as REGISTER so radio/CLI and the web
+        // admin agree on what a valid new username is. (#128)
+        let uname = validate_new_username(username).map_err(HostError::PreconditionFailed)?;
 
         let level = match permission_level {
             0 => PermissionLevel::Unvalidated,
@@ -1518,7 +1551,7 @@ impl BbsHost {
     async fn handle_register(
         &self,
         session: SessionId,
-        username: Username,
+        raw_username: String,
     ) -> Result<Response, HostError> {
         {
             let sessions = self.sessions.read().await;
@@ -1535,6 +1568,14 @@ impl BbsHost {
                 }
             }
         }
+
+        // Validate the requested username against the documented registration
+        // policy and return a specific error up front, so mesh users don't fail
+        // late (after the display-name/password steps). See issue #128.
+        let username = match validate_new_username(&raw_username) {
+            Ok(u) => u,
+            Err(msg) => return Ok(Response::Error(msg)),
+        };
 
         let existing = self
             .db
@@ -1560,6 +1601,35 @@ impl BbsHost {
             text: "Choose a display name (or send - to use your username):".into(),
             hide_input: false,
         })
+    }
+
+    /// Authenticate `session` as `user`: set the session identity/level/room,
+    /// fire `SessionAuthenticated`, and return the `LoggedIn` response. Shared by
+    /// the normal login path and the forced-password-change completion. (#134)
+    async fn finalize_login(&self, session: SessionId, user: &crate::user::User) -> Response {
+        // Unverified users land in the guest room (if configured).
+        let initial_room = if user.permission_level < PermissionLevel::User {
+            self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
+        } else {
+            LOBBY_ROOM_ID
+        };
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.username = Some(user.username.clone());
+                r.user_id = Some(user.id);
+                r.level = user.permission_level;
+                r.workflow = Workflow::None;
+                r.current_room = initial_room;
+            }
+        }
+        let _ = self.events_tx.send(DomainEvent::SessionAuthenticated {
+            session,
+            user: user.username.clone(),
+        });
+        Response::LoggedIn {
+            user: user.username.clone(),
+        }
     }
 
     async fn handle_login(
@@ -1848,28 +1918,34 @@ impl BbsHost {
                     UserStore::update(&self.db, user.id, None, None, None, Some(Timestamp::now()))
                         .await
                         .map_err(|e| HostError::Storage(format!("update last_login: {e}")))?;
-                    {
-                        // Unverified users land in the guest room (if configured).
-                        let initial_room = if user.permission_level < PermissionLevel::User {
-                            self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
-                        } else {
-                            LOBBY_ROOM_ID
-                        };
+
+                    // If a sysop reset this account to a temporary password, hold
+                    // the login and require a new password before completing. (#134)
+                    let must_change = self
+                        .db
+                        .credentials()
+                        .must_change_password(user.id)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("must_change lookup: {e}")))?;
+                    if must_change {
                         let mut sessions = self.sessions.write().await;
                         if let Some(r) = sessions.get_mut(&session) {
-                            r.username = Some(username.clone());
-                            r.user_id = Some(user.id);
-                            r.level = user.permission_level;
-                            r.workflow = Workflow::None;
-                            r.current_room = initial_room;
+                            r.workflow = Workflow::ForceChangePassword {
+                                username: username.clone(),
+                                user_id: user.id,
+                                stage: ForcePwdStage::EnterNew,
+                            };
                         }
+                        return Ok(Response::Prompt {
+                            text: "Your password was reset by an operator. \
+                                   Choose a new password (min 8 characters):"
+                                .into(),
+                            hide_input: true,
+                        });
                     }
-                    let _ = self.events_tx.send(DomainEvent::SessionAuthenticated {
-                        session,
-                        user: username.clone(),
-                    });
+
                     info!(%session, %username, "login successful");
-                    Ok(Response::LoggedIn { user: username })
+                    Ok(self.finalize_login(session, &user).await)
                 } else {
                     // Global per-username failure tracking — parallel sessions share this
                     // counter so they can't bypass the delay by opening fresh connections.
@@ -2076,20 +2152,31 @@ impl BbsHost {
                         .ok_or(HostError::NotAuthenticated)?
                 };
                 let now = Timestamp::now();
-                let (msg_id, event_recipient) = if let Some(ref rcpt) = recipient {
+                // Mail (a direct recipient) gets a mail-specific confirmation so
+                // the sender knows they used the private-mail path, not a public
+                // room (#121); room posts keep "Message posted."
+                let (msg_id, event_recipient, confirmation) = if let Some(ref rcpt) = recipient {
                     let mid = self
                         .db
                         .post_direct(&sender, rcpt, &body, now)
                         .await
                         .map_err(|e| HostError::Storage(format!("post_direct: {e}")))?;
-                    (mid, MessageRecipient::Direct(rcpt.clone()))
+                    (
+                        mid,
+                        MessageRecipient::Direct(rcpt.clone()),
+                        format!("Mail sent to {}.", rcpt.as_str()),
+                    )
                 } else {
                     let mid = self
                         .db
                         .post_to_room(room_id, &sender, &body, now)
                         .await
                         .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))?;
-                    (mid, MessageRecipient::Room(room_id.as_i64().to_string()))
+                    (
+                        mid,
+                        MessageRecipient::Room(room_id.as_i64().to_string()),
+                        "Message posted.".to_owned(),
+                    )
                 };
                 let _ = self.events_tx.send(DomainEvent::MessagePosted {
                     sender,
@@ -2100,12 +2187,12 @@ impl BbsHost {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.workflow = Workflow::None;
-                        // Arm idempotent re-confirm: a re-sent bare `.` should
-                        // re-emit "Message posted." rather than error (#107).
-                        r.posted_idempotent = true;
+                        // Arm idempotent re-confirm: a re-sent bare `.` re-emits
+                        // this same confirmation rather than erroring (#107).
+                        r.last_post_confirmation = Some(confirmation.clone());
                     }
                 }
-                Ok(Response::Text("Message posted.".into()))
+                Ok(Response::Text(confirmation))
             }
 
             // ── Profile edit ─────────────────────────────────────────────────
@@ -2270,22 +2357,24 @@ impl BbsHost {
                 Ok(Response::Text("Password changed successfully.".into()))
             }
 
-            // ── Set another user's password (Sysop+) ────────────────────────
-            Workflow::SetUserPassword {
-                target,
-                stage: SetUserPwdStage::EnterNew,
+            // ── Forced password change at login after a sysop reset (#134) ──────
+            Workflow::ForceChangePassword {
+                username,
+                user_id,
+                stage: ForcePwdStage::EnterNew,
             } => {
                 if reply.chars().count() < 8 {
                     return Ok(Response::Prompt {
-                        text: "Too short (min 8 characters). New password:".into(),
+                        text: "Too short (min 8 characters). Choose a new password:".into(),
                         hide_input: true,
                     });
                 }
                 let mut sessions = self.sessions.write().await;
                 if let Some(r) = sessions.get_mut(&session) {
-                    r.workflow = Workflow::SetUserPassword {
-                        target,
-                        stage: SetUserPwdStage::ConfirmNew {
+                    r.workflow = Workflow::ForceChangePassword {
+                        username,
+                        user_id,
+                        stage: ForcePwdStage::ConfirmNew {
                             new_password: reply,
                         },
                     };
@@ -2296,78 +2385,54 @@ impl BbsHost {
                 })
             }
 
-            Workflow::SetUserPassword {
-                target,
-                stage: SetUserPwdStage::ConfirmNew { new_password },
+            Workflow::ForceChangePassword {
+                username,
+                user_id,
+                stage: ForcePwdStage::ConfirmNew { new_password },
             } => {
                 if reply != new_password {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::SetUserPassword {
-                            target,
-                            stage: SetUserPwdStage::EnterNew,
+                        r.workflow = Workflow::ForceChangePassword {
+                            username,
+                            user_id,
+                            stage: ForcePwdStage::EnterNew,
                         };
                     }
                     return Ok(Response::Prompt {
-                        text: "Passwords don't match. New password:".into(),
+                        text: "Passwords don't match. Choose a new password:".into(),
                         hide_input: true,
                     });
                 }
-                let (actor, _, level, _) = match self.session_auth_user(session).await {
-                    Ok(t) => t,
-                    Err(r) => return Ok(r),
-                };
-                if level < PermissionLevel::Sysop {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::None;
-                    }
-                    return Ok(Response::Error("Sysop access required.".into()));
-                }
-                let user = UserStore::get_by_username(&self.db, &target)
+
+                // Set the user's own password and clear the must-change flag.
+                self.db
+                    .credentials()
+                    .set_password(user_id, &new_password, Timestamp::now())
                     .await
-                    .map_err(|e| HostError::Storage(format!("{e}")))?;
-                let user = match user {
+                    .map_err(|e| HostError::Storage(format!("set_password: {e}")))?;
+                self.db
+                    .credentials()
+                    .clear_must_change(user_id)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("clear must_change: {e}")))?;
+
+                // Complete the login that was held pending the password change.
+                let user = match UserStore::get_by_username(&self.db, &username)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("{e}")))?
+                {
                     Some(u) => u,
                     None => {
                         let mut sessions = self.sessions.write().await;
                         if let Some(r) = sessions.get_mut(&session) {
                             r.workflow = Workflow::None;
                         }
-                        return Ok(Response::Error(format!(
-                            "User '{}' not found.",
-                            target.as_str()
-                        )));
+                        return Ok(Response::Error("Account no longer exists.".into()));
                     }
                 };
-                self.db
-                    .credentials()
-                    .set_password(user.id, &new_password, Timestamp::now())
-                    .await
-                    .map_err(|e| HostError::Storage(format!("set_password: {e}")))?;
-                {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::None;
-                    }
-                }
-                if let Err(e) = self
-                    .db
-                    .audit_write(
-                        actor.as_str(),
-                        "set_user_password",
-                        Some(target.as_str()),
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!("audit write failed: {e}");
-                }
-                info!(%actor, %target, "sysop reset user password");
-                Ok(Response::Text(format!(
-                    "Password for '{}' updated.",
-                    target.as_str()
-                )))
+                info!(%username, "forced password change complete; login finalised");
+                Ok(self.finalize_login(session, &user).await)
             }
 
             // ── Message reading ──────────────────────────────────────────────
@@ -4465,45 +4530,55 @@ impl BbsHost {
         session: SessionId,
         target: Username,
     ) -> Result<Response, HostError> {
-        let (_, _, level, _) = match self.session_auth_user(session).await {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
         if level < PermissionLevel::Sysop {
             return Ok(Response::Error("Sysop access required.".into()));
         }
-        let user = UserStore::get_by_username(&self.db, &target)
+        let user = match UserStore::get_by_username(&self.db, &target)
             .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-        if user.is_none() {
-            return Ok(Response::Error(format!(
-                "User '{}' not found.",
-                target.as_str()
-            )));
-        }
+            .map_err(|e| HostError::Storage(format!("{e}")))?
         {
-            let sessions = self.sessions.read().await;
-            if let Some(r) = sessions.get(&session) {
-                if !matches!(r.workflow, Workflow::None) {
-                    return Ok(Response::Error(
-                        "A workflow is already in progress. Type 'cancel' first.".into(),
-                    ));
-                }
+            Some(u) => u,
+            None => {
+                return Ok(Response::Error(format!(
+                    "User '{}' not found.",
+                    target.as_str()
+                )))
             }
-        }
+        };
+
+        // Generate a single-use temporary password server-side (never chosen
+        // over the air) and flag the account so the user must pick a new one at
+        // their next login. The temp value is returned to the sysop to convey
+        // out-of-band. (#134)
+        let temp = self
+            .db
+            .credentials()
+            .reset_to_temp_password(user.id, Timestamp::now())
+            .await
+            .map_err(|e| HostError::Storage(format!("reset password: {e}")))?;
+
+        if let Err(e) = self
+            .db
+            .audit_write(
+                actor.as_str(),
+                "set_user_password",
+                Some(target.as_str()),
+                None,
+            )
+            .await
         {
-            let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.workflow = Workflow::SetUserPassword {
-                    target: target.clone(),
-                    stage: SetUserPwdStage::EnterNew,
-                };
-            }
+            tracing::warn!("audit write failed: {e}");
         }
-        Ok(Response::Prompt {
-            text: format!("New password for {}:", target.as_str()),
-            hide_input: true,
-        })
+        info!(%actor, %target, "sysop reset user to a temporary password");
+        Ok(Response::Text(format!(
+            "Temporary password for '{}': {temp}\n\
+             They must change it at next login. Share it securely — it is visible on-air.",
+            target.as_str()
+        )))
     }
 
     async fn handle_create_room(
@@ -4619,7 +4694,6 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::GoNextUnread => "GoNextUnread",
         Command::ChangeRoom { .. } => "ChangeRoom",
         Command::GoMail => "GoMail",
-        Command::IgnoreRoom => "IgnoreRoom",
         Command::ReadNew => "ReadNew",
         Command::ReadForward { .. } => "ReadForward",
         Command::ReadReverse => "ReadReverse",
@@ -4644,6 +4718,51 @@ fn cmd_label(cmd: &Command) -> &'static str {
     }
 }
 
+// ── Username creation policy ────────────────────────────────────────────────────
+
+/// The single source of truth for **new-username policy**, shared by the
+/// `REGISTER` flow and admin user creation.
+///
+/// This is deliberately stricter than [`Username::new`]: the [`Username`] type is
+/// the *storage* invariant (it must keep accepting every name already persisted,
+/// so it stays lenient), whereas this is the *creation* policy — at least 3
+/// characters, letters/digits/`-`/`_`, no leading or trailing `-`/`_`, not a
+/// reserved name, within the type's length limit. Checks run most-specific-first
+/// so the error names the rule that actually failed (e.g. a short name that also
+/// starts with `-` reports "too short", not "bad character"). The upper-length
+/// and reserved-name checks are delegated to [`Username::new`]. See issue #128.
+fn validate_new_username(raw: &str) -> Result<Username, String> {
+    // Mirror Username::new's normalisation (trim, strip one leading `@`,
+    // lowercase) so length and charset are judged on the stored form.
+    let trimmed = raw.trim();
+    let normalized = trimmed
+        .strip_prefix('@')
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return Err("Username can't be empty.".to_owned());
+    }
+    if normalized.chars().count() < 3 {
+        return Err("Username must be at least 3 characters.".to_owned());
+    }
+    if !normalized
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Username may only contain letters, digits, - and _.".to_owned());
+    }
+    let bytes = normalized.as_bytes();
+    if matches!(bytes[0], b'-' | b'_') || matches!(bytes[bytes.len() - 1], b'-' | b'_') {
+        return Err("Username can't start or end with - or _.".to_owned());
+    }
+
+    // Delegate the reserved-name and upper-length checks to the type, and use it
+    // to construct the validated value. Any remaining failure carries its own
+    // specific message.
+    Username::new(normalized).map_err(|e| e.to_string())
+}
+
 // ── Help text ─────────────────────────────────────────────────────────────────
 
 fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
@@ -4660,7 +4779,18 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             }
         }
         Some(t) => match t.to_ascii_lowercase().as_str() {
-            "all" if logged_in => HELP_OVERVIEW.to_owned(),
+            "all" if logged_in => {
+                // Operators must be able to discover their own toolset from
+                // in-app help, so list the Aide/Sysop topics for those levels. (#126)
+                let mut overview = HELP_OVERVIEW.to_owned();
+                if is_aide {
+                    overview.push_str("\nH AIDE — Moderation");
+                }
+                if is_sysop {
+                    overview.push_str("\nH SYSOP — Admin");
+                }
+                overview
+            }
             "m" | "mail" if logged_in => HELP_MAIL.to_owned(),
             "r" | "read" | "reading" if logged_in => HELP_READING.to_owned(),
             "p" | "post" | "posting" if logged_in => HELP_POSTING.to_owned(),
@@ -4712,7 +4842,6 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "g" if logged_in => "G — go to next room with unread messages",
         "c" if logged_in => "C <name> — change room by name or number",
         "k" if logged_in => "K — list known rooms",
-        "i" if logged_in => "I — ignore this room (not yet available)",
         "m" if logged_in => {
             "M — go to Mail (private messages)\n\
              In Mail: E to write, N to read new,\n\
@@ -4754,7 +4883,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".c" if is_sysop => ".C — create a new room\nEnters the room creation workflow.",
         ".dr" if is_sysop => ".DR <name> — delete a room",
         ".du" if is_sysop => ".DU <user> — soft-delete a user account\nSets status to deleted and ends active sessions.",
-        ".pw" if is_sysop => ".PW <user> — reset another user's password\nDoes not require knowing their current password.",
+        ".pw" if is_sysop => ".PW <user> — reset a user to a single-use temp password\nReturns a temp password to share; they must change it at next login.",
         "openaccess" if is_sysop => {
             "OPENACCESS — disable verification requirement (SHTF mode)\n\
              All registrations immediately receive User-level access.\n\
@@ -4950,6 +5079,40 @@ mod tests {
         }
     }
 
+    /// Issue #126: `H all` must list the Aide/Sysop help topics for users at
+    /// those levels so operators can discover their admin toolset in-app.
+    #[test]
+    fn help_all_lists_admin_topics_by_level() {
+        let user = help_text(Some("all"), Some(PermissionLevel::User));
+        assert!(
+            !user.contains("AIDE") && !user.contains("SYSOP"),
+            "a plain User should not see admin topics: {user}"
+        );
+
+        let aide = help_text(Some("all"), Some(PermissionLevel::Aide));
+        assert!(
+            aide.contains("H AIDE"),
+            "aide should see the AIDE topic: {aide}"
+        );
+        assert!(
+            !aide.contains("H SYSOP"),
+            "an aide should not see the SYSOP topic: {aide}"
+        );
+
+        let sysop = help_text(Some("all"), Some(PermissionLevel::Sysop));
+        assert!(
+            sysop.contains("H AIDE") && sysop.contains("H SYSOP"),
+            "sysop should see both admin topics: {sysop}"
+        );
+        // Must still fit one MeshCore frame.
+        const MESH_MAX: usize = 156;
+        assert!(
+            sysop.len() <= MESH_MAX,
+            "sysop `H all` is {} bytes — exceeds {MESH_MAX}",
+            sysop.len()
+        );
+    }
+
     async fn make_host() -> (Arc<BbsHost>, NamedTempFile) {
         let f = NamedTempFile::new().unwrap();
         let db = Database::open(&f.path().to_string_lossy())
@@ -5068,7 +5231,7 @@ mod tests {
             .process_command(
                 sid,
                 Command::Register {
-                    username: uname.clone(),
+                    username: uname.as_str().to_owned(),
                 },
             )
             .await
@@ -5133,7 +5296,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5184,7 +5347,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5260,9 +5423,14 @@ mod tests {
 
         // Start a registration workflow.
         let uname = Username::new("dave").unwrap();
-        host.process_command(sid, Command::Register { username: uname })
-            .await
-            .unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.as_str().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Cancel it.
         let r = host.process_command(sid, Command::Cancel).await.unwrap();
@@ -5291,7 +5459,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5363,9 +5531,14 @@ mod tests {
     /// Full registration workflow for a username/password pair.
     async fn do_register(host: &BbsHost, sid: SessionId, username: &str, password: &str) {
         let uname = Username::new(username).unwrap();
-        host.process_command(sid, Command::Register { username: uname })
-            .await
-            .unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.as_str().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
         // display name (empty = skip)
         host.process_command(
             sid,
@@ -5440,6 +5613,129 @@ mod tests {
         );
     }
 
+    /// Issue #128: `REGISTER` validates the username up front and returns a
+    /// specific error (too short / invalid chars / reserved) instead of
+    /// accepting invalid names into the flow or showing a generic banner.
+    #[tokio::test]
+    async fn register_enforces_username_rules() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
+        let too_short = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "ab".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&too_short, Response::Error(e) if e.contains("3 character")),
+            "too-short username should be rejected specifically, got: {too_short:?}"
+        );
+
+        let bad_chars = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "bad!name".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&bad_chars, Response::Error(e) if e.to_lowercase().contains("letters, digits")),
+            "invalid-charset username should be rejected specifically, got: {bad_chars:?}"
+        );
+
+        let reserved = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "bbs".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&reserved, Response::Error(e) if e.to_lowercase().contains("reserved")),
+            "reserved username should be rejected specifically, got: {reserved:?}"
+        );
+
+        // A valid username advances to the display-name prompt.
+        let ok = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "alice".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&ok, Response::Prompt { text, .. } if text.to_lowercase().contains("display name")),
+            "valid username should start registration, got: {ok:?}"
+        );
+    }
+
+    /// Issue #128: the shared creation policy reports the most specific failure
+    /// (so callers don't get a misleading reason) and normalises like the type.
+    #[test]
+    fn validate_new_username_policy_and_error_order() {
+        // Too short wins over the leading-dash rule.
+        assert!(validate_new_username("-a")
+            .unwrap_err()
+            .contains("3 character"));
+        // Leading/trailing -/_ on a long-enough name has its own message.
+        assert!(validate_new_username("-abc")
+            .unwrap_err()
+            .contains("start or end"));
+        // Charset violations are specific.
+        assert!(validate_new_username("bad!name")
+            .unwrap_err()
+            .to_lowercase()
+            .contains("letters, digits"));
+        // Reserved names are rejected as reserved.
+        assert!(validate_new_username("bbs")
+            .unwrap_err()
+            .to_lowercase()
+            .contains("reserved"));
+        // Normalisation matches Username::new (strip leading `@`, lowercase).
+        assert_eq!(validate_new_username("@Alice").unwrap().as_str(), "alice");
+    }
+
+    /// Issue #129: the `-` display-name shortcut must ADVANCE to the password
+    /// step (not exit registration). Regression guard for the #105 fix.
+    #[tokio::test]
+    async fn register_dash_advances_to_password() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: "qatester1".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "-".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("password")),
+            "`-` should advance to the password prompt, got: {resp:?}"
+        );
+        // Still mid-registration — not dropped back to the anonymous menu.
+        let sessions = host.sessions.read().await;
+        assert!(
+            matches!(sessions[&sid].workflow, Workflow::Register { .. }),
+            "session should still be in the registration workflow after `-`"
+        );
+    }
+
     /// Issue #105: on a mesh radio you can't send an empty message, so the
     /// `-` sentinel must mean "use my username" (display name left unset),
     /// matching the empty-input behaviour available on CLI/web.
@@ -5452,7 +5748,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5481,6 +5777,110 @@ mod tests {
         assert_eq!(
             user.display_name, None,
             "`-` sentinel should leave the display name unset"
+        );
+    }
+
+    /// Issue #134: `.PW` generates a single-use temp password (returned to the
+    /// sysop, not chosen over-air); the user is forced to set a new password
+    /// before their next login completes, and the temp stops working afterwards.
+    #[tokio::test]
+    async fn sysop_temp_password_reset_and_forced_change() {
+        let (host, _db) = make_host().await;
+        let sysop = host.create_session("test").await.unwrap();
+        register_and_login(&host, sysop, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // bob registers (auto-logged-in).
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "oldpass1").await;
+        let bob = || Username::new("bob").unwrap();
+
+        // Sysop resets bob → a temporary password is returned (not entered over-air).
+        let resp = host
+            .process_command(sysop, Command::SetUserPassword { username: bob() })
+            .await
+            .unwrap();
+        let temp = match &resp {
+            Response::Text(t) => {
+                assert!(
+                    t.to_lowercase().contains("temporary password"),
+                    "reset should return a temp password, got: {t}"
+                );
+                t.lines()
+                    .next()
+                    .unwrap()
+                    .rsplit(": ")
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            }
+            other => panic!("expected Text, got {other:?}"),
+        };
+        assert!(temp.len() >= 8, "temp password too short: {temp:?}");
+
+        // bob logs in with the temp → forced to choose a new password, NOT yet in.
+        let s = host.create_session("test").await.unwrap();
+        host.process_command(s, Command::Login { username: bob() })
+            .await
+            .unwrap();
+        let resp = host
+            .process_command(
+                s,
+                Command::WorkflowReply {
+                    reply: temp.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("new password")),
+            "temp login should force a password change, got: {resp:?}"
+        );
+        assert!(
+            host.permission_ctx(s).await.unwrap().username().is_none(),
+            "login must not complete until the password is changed"
+        );
+
+        // Choose + confirm a new password → login completes.
+        host.process_command(
+            s,
+            Command::WorkflowReply {
+                reply: "newpass1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(
+                s,
+                Command::WorkflowReply {
+                    reply: "newpass1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::LoggedIn { .. }),
+            "login should complete after the forced change, got: {resp:?}"
+        );
+        assert!(host.permission_ctx(s).await.unwrap().username().is_some());
+
+        // The new password logs in directly (no forced change).
+        let s2 = host.create_session("test").await.unwrap();
+        host.process_command(s2, Command::Login { username: bob() })
+            .await
+            .unwrap();
+        let resp = host
+            .process_command(
+                s2,
+                Command::WorkflowReply {
+                    reply: "newpass1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::LoggedIn { .. }),
+            "new password should log in directly, got: {resp:?}"
         );
     }
 
@@ -5944,6 +6344,70 @@ mod tests {
         );
     }
 
+    /// Web/admin guards: `admin_update_user` refuses to set a level on a
+    /// non-active account (re-empower) and refuses to demote the last active
+    /// Sysop (admin lockout). A legitimate re-activate+level and a demotion with
+    /// another Sysop remaining both succeed.
+    #[tokio::test]
+    async fn admin_update_user_level_guards() {
+        let (host, _db) = make_host().await;
+
+        // alice = sole sysop (first registrant).
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // Demoting the last active Sysop is refused.
+        let r = host.admin_update_user("alice", None, Some(10)).await;
+        assert!(
+            matches!(&r, Err(HostError::PreconditionFailed(m)) if m.to_lowercase().contains("last active sysop")),
+            "last-sysop demotion should be refused, got: {r:?}"
+        );
+
+        // bob registers (Unvalidated, active), then is banned.
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+        host.admin_update_user("bob", Some(1), None).await.unwrap();
+
+        // Setting a level on the banned account is refused.
+        let r = host.admin_update_user("bob", None, Some(50)).await;
+        assert!(
+            matches!(&r, Err(HostError::PreconditionFailed(m)) if m.to_lowercase().contains("re-activate")),
+            "level change on a banned account should be refused, got: {r:?}"
+        );
+        assert_eq!(
+            UserStore::get_by_username(&host.db, &Username::new("bob").unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_level,
+            PermissionLevel::Unvalidated,
+            "banned user's level must be unchanged"
+        );
+
+        // Re-activate and set the level in one call: allowed.
+        host.admin_update_user("bob", Some(0), Some(50))
+            .await
+            .unwrap();
+        assert_eq!(
+            UserStore::get_by_username(&host.db, &Username::new("bob").unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_level,
+            PermissionLevel::Aide
+        );
+
+        // With a second Sysop present, demoting one is allowed.
+        let carol_sid = host.create_session("test").await.unwrap();
+        do_register(&host, carol_sid, "carol", "pass9012").await;
+        host.admin_update_user("carol", None, Some(100))
+            .await
+            .unwrap();
+        host.admin_update_user("carol", None, Some(10))
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn ban_command_evicts_live_session_and_fires_event() {
         let (host, _db) = make_host().await;
@@ -6015,7 +6479,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: username.clone(),
+                username: username.as_str().to_owned(),
             },
         )
         .await
@@ -6706,5 +7170,89 @@ mod tests {
         );
         let sessions = host.sessions.read().await;
         assert!(matches!(sessions[&sid].workflow, Workflow::None));
+    }
+
+    /// Issue #121: sending mail confirms with a mail-specific message
+    /// ("Mail sent to <user>.") rather than the room-post "Message posted.",
+    /// and a re-sent bare `.` re-emits that same confirmation (idempotent).
+    #[tokio::test]
+    async fn mail_send_confirmation_is_mail_specific() {
+        let (host, _db) = make_host().await;
+        let alice = host.create_session("test").await.unwrap();
+        register_and_login(&host, alice, &Username::new("alice").unwrap(), "pass1234").await;
+        // Recipient must exist.
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+
+        // alice goes to Mail and sends an inline DM to bob.
+        host.process_command(alice, Command::GoMail).await.unwrap();
+        host.process_command(
+            alice,
+            Command::EnterMessage {
+                body: Some("bob hi there".to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(alice, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t == "Mail sent to bob."),
+            "mail send should confirm 'Mail sent to bob.', got: {resp:?}"
+        );
+
+        // Re-sent bare `.` re-emits the same mail confirmation, not "Message posted."
+        let resp = host
+            .process_command(alice, Command::Unknown { raw: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t == "Mail sent to bob."),
+            "re-sent `.` should re-emit the mail confirmation, got: {resp:?}"
+        );
+    }
+
+    /// Issue #121 (coverage): the mail-specific confirmation also holds on the
+    /// multi-step compose route (bare `E` → recipient → body → `.`), not just
+    /// the inline `E <user> <text>` form.
+    #[tokio::test]
+    async fn mail_send_confirmation_multistep_is_mail_specific() {
+        let (host, _db) = make_host().await;
+        let alice = host.create_session("test").await.unwrap();
+        register_and_login(&host, alice, &Username::new("alice").unwrap(), "pass1234").await;
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+
+        // Mail, then the bare-E multi-step flow: recipient, body, confirm.
+        host.process_command(alice, Command::GoMail).await.unwrap();
+        host.process_command(alice, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+        host.process_command(
+            alice,
+            Command::WorkflowReply {
+                reply: "bob".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            alice,
+            Command::WorkflowReply {
+                reply: "hi from the prompt flow".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(alice, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t == "Mail sent to bob."),
+            "multi-step mail send should confirm 'Mail sent to bob.', got: {resp:?}"
+        );
     }
 }

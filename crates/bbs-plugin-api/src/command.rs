@@ -53,8 +53,11 @@ pub enum Command {
 
     /// Begin (or continue) the registration workflow.
     Register {
-        /// Desired username.
-        username: Username,
+        /// Desired username, as typed (raw). The host validates it against the
+        /// registration policy so it can return a specific error (too short,
+        /// invalid characters, reserved, taken) rather than failing at parse
+        /// time with generic help. See issue #128.
+        username: String,
     },
 
     /// Begin (or continue) the login workflow.
@@ -100,9 +103,6 @@ pub enum Command {
 
     /// Navigate directly to the Mail room. (M)
     GoMail,
-
-    /// Toggle ignore on the current room. (I)
-    IgnoreRoom,
 
     // ── Message reading ───────────────────────────────────────────────
     /// Read unread messages in the current room (from the last-read
@@ -375,9 +375,13 @@ impl Command {
             "h" | "help" | "?" => Command::Help {
                 topic: rest.map(str::to_owned),
             },
-            "register" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(u) => Command::Register { username: u },
-                None => Command::Help {
+            "register" => match rest {
+                // Pass the raw username through; the host validates it and
+                // reports a specific error (#128). Bare `register` → help.
+                Some(name) if !name.is_empty() => Command::Register {
+                    username: name.to_owned(),
+                },
+                _ => Command::Help {
                     topic: Some("register".to_owned()),
                 },
             },
@@ -387,7 +391,7 @@ impl Command {
                     topic: Some("login".to_owned()),
                 },
             },
-            "logout" | "q" | "quit" => Command::Quit,
+            "logout" | "q" | "quit" | "exit" | "bye" => Command::Quit,
 
             // ── Room navigation ───────────────────────────────────────────────
             "k" => Command::ListRooms,
@@ -396,7 +400,6 @@ impl Command {
                 target: rest.unwrap_or("").to_owned(),
             },
             "m" => Command::GoMail,
-            "i" => Command::IgnoreRoom,
 
             // ── Message reading ───────────────────────────────────────────────
             "n" => Command::ReadNew,
@@ -582,6 +585,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ignore_room_keyword_is_unknown() {
+        // `I` (ignore room) is no longer a recognised command. (#123)
+        assert!(matches!(
+            Command::parse("i", false),
+            Command::Unknown { .. }
+        ));
+    }
+
+    #[test]
     fn command_serde_roundtrip() {
         let cmds = [
             Command::Help { topic: None },
@@ -589,7 +601,7 @@ mod tests {
                 topic: Some("rooms".to_owned()),
             },
             Command::Register {
-                username: Username::new("alice").unwrap(),
+                username: "alice".to_owned(),
             },
             Command::WorkflowReply {
                 reply: "blue".to_owned(),

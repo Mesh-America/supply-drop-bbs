@@ -95,9 +95,13 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             topic: rest.map(str::to_owned),
         }),
 
-        "register" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::Register { username }),
-            None => Some(Command::Help {
+        "register" => match rest {
+            // Pass the raw username through; the host validates it and reports a
+            // specific error (#128). Bare `register` → help.
+            Some(name) if !name.is_empty() => Some(Command::Register {
+                username: name.to_owned(),
+            }),
+            _ => Some(Command::Help {
                 topic: Some("register".to_owned()),
             }),
         },
@@ -119,8 +123,6 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         }),
 
         "m" => Some(Command::GoMail),
-
-        "i" => Some(Command::IgnoreRoom),
 
         // ── Message reading ──────────────────────────────────────────────────
         "n" => Some(Command::ReadNew),
@@ -154,7 +156,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         },
 
         // ── Session control ──────────────────────────────────────────────────
-        "q" => Some(Command::Quit),
+        // Accept the obvious words for "log out" too — a real user reached for
+        // `logout` and got "Unknown command." (#124)
+        "q" | "logout" | "quit" | "exit" | "bye" => Some(Command::Quit),
 
         "cancel" | "stop" => Some(Command::Cancel),
 
@@ -368,8 +372,12 @@ mod tests {
 
     #[test]
     fn register_valid_username() {
-        let username = Username::new("alice").unwrap();
-        assert_eq!(cmd("register alice"), Some(Command::Register { username }));
+        assert_eq!(
+            cmd("register alice"),
+            Some(Command::Register {
+                username: "alice".to_owned()
+            })
+        );
     }
 
     #[test]
@@ -383,12 +391,13 @@ mod tests {
     }
 
     #[test]
-    fn register_invalid_username_shows_help() {
-        // Usernames can't have spaces; "register alice bob" → help for register.
+    fn register_passes_raw_username_to_host() {
+        // The parser no longer rejects invalid usernames — it forwards the raw
+        // text so the host can return a specific error (#128).
         assert_eq!(
             cmd("register alice bob"),
-            Some(Command::Help {
-                topic: Some("register".to_owned())
+            Some(Command::Register {
+                username: "alice bob".to_owned()
             })
         );
     }
@@ -406,13 +415,25 @@ mod tests {
     }
 
     #[test]
-    fn logout_is_unknown_on_mesh() {
-        assert!(matches!(cmd("logout"), Some(Command::Unknown { .. })));
+    fn logout_aliases_quit_on_mesh() {
+        // `logout` (and exit/bye/quit) now log out like `Q`. (#124)
+        assert_eq!(cmd("logout"), Some(Command::Quit));
+        assert_eq!(cmd("LOGOUT"), Some(Command::Quit));
+        assert_eq!(cmd("quit"), Some(Command::Quit));
+        assert_eq!(cmd("exit"), Some(Command::Quit));
+        assert_eq!(cmd("bye"), Some(Command::Quit));
     }
 
     #[test]
     fn whoami_is_parsed_on_mesh() {
         assert!(matches!(cmd("whoami"), Some(Command::Whoami)));
+    }
+
+    #[test]
+    fn ignore_room_is_unknown_on_mesh() {
+        // `I` (ignore room) was an unimplemented stub; it now falls through to
+        // the standard unknown-command path. (#123)
+        assert!(matches!(cmd("i"), Some(Command::Unknown { .. })));
     }
 
     #[test]
