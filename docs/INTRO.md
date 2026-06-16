@@ -57,7 +57,7 @@ because radio frames are small. Most things are a single letter:
 
 ```
 N    read new messages
-P    post a message
+E    post a message
 M    go to mail
 H    help
 ```
@@ -85,7 +85,7 @@ another node, it can talk to the BBS.
    LOGIN callsign
    ```
 
-5. **Read the rooms.** Type `R` to list rooms, then a room name to enter it.
+5. **Read the rooms.** Type `K` to list rooms, then a room name to enter it.
    Type `N` to read new messages.
 
 That's it. The [full user guide](USER_GUIDE.md) covers every command in detail,

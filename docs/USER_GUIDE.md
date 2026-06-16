@@ -18,7 +18,7 @@ system.
 8. [Reading messages](#8-reading-messages)
 9. [Writing messages](#9-writing-messages)
 10. [Mail (private messages)](#10-mail-private-messages)
-11. [Who's online](#11-whos-online)
+11. [Who's online and finding users](#11-whos-online-and-finding-users)
 12. [Your profile](#12-your-profile)
 13. [Blocking users](#13-blocking-users)
 14. [System administration](#14-system-administration)
@@ -558,7 +558,9 @@ You have 2 unread messages. Reply 'mail' to read.
 
 ---
 
-## 11. Who's online
+## 11. Who's online and finding users
+
+### Who's online
 
 ```
 W
@@ -576,6 +578,52 @@ carol [user]
 
 The `(+n unauthenticated)` line shows sessions that have connected but not
 yet logged in or registered.
+
+### Listing user accounts
+
+`W` shows who is connected *right now*; `U` shows the account directory —
+everyone who has registered, online or not.
+
+```
+U          — list active accounts
+U banned   — list banned accounts
+U all      — list every account, any status (Sysop only)
+```
+
+### Searching for a user
+
+```
+S <query>
+```
+
+Finds accounts whose username contains `<query>` (substring match). Handy when
+you remember part of a callsign but not the whole thing.
+
+> **Note:** `S` on its own (with no query) scans message headers in your current
+> room — see [section 8](#8-reading-messages). `S <query>` searches users.
+
+### User details
+
+```
+WHOIS <username>
+```
+
+Shows account details for one user: permission level, status, display name,
+join date, last login, and how many sessions they currently have active.
+
+```
+WHOIS alice
+User: alice
+Level: sysop  Status: active
+Name: Alice Wonderland
+Joined: 2026-05-01
+Last login: 2026-06-15
+Online (1 session)
+```
+
+(The `Name`, `Last login`, and `Online` lines appear only when applicable.)
+
+These commands are also grouped under `H U` (the **Users** help topic).
 
 ---
 
@@ -810,6 +858,56 @@ completes; the temporary password then stops working.
 > equivalent CLI command (`supply-drop-bbs user set-password`, section 15) sets
 > a password directly without going over the air.
 
+### Editing the current room (Aide+)
+
+```
+.ER
+```
+
+Opens a workflow to edit the room you are currently in — its name, description,
+read-only flag, or minimum permission level.
+
+### Editing a user (Aide+)
+
+```
+.EU <username>
+```
+
+Edit another user's profile or permissions. Aides can use this but **cannot
+promote anyone to Sysop** — only a Sysop can do that (with `.SYSOP`, above).
+
+### Deleting a user (Sysop only)
+
+```
+.DU <username>
+```
+
+Soft-deletes the account: its status is set to **deleted** and any active
+sessions are ended immediately. The record is retained (not purged) so the
+username stays reserved and audit history is preserved.
+
+### Verification controls (Sysop only)
+
+By default, new accounts are **Unvalidated** until an aide or sysop approves
+them (see [section 5](#5-your-account-status)). A sysop can change that policy
+on the fly. All three settings take effect immediately and persist to
+`config.toml`.
+
+```
+OPENACCESS            — disable the verification requirement ("SHTF mode")
+CLOSEACCESS           — restore the verification requirement
+GUESTROOM <name>      — send unverified users to a guest room (created if needed)
+GUESTROOM OFF         — disable the guest room
+```
+
+- **`OPENACCESS`** drops the gate: every new registration immediately receives
+  **User** access with no approval step. Useful during an emergency when you
+  need people on the air fast.
+- **`CLOSEACCESS`** puts the gate back: new accounts must again be validated.
+- **`GUESTROOM <name>`** places unverified users in a single guest room they
+  cannot leave until they are validated — a middle ground that lets newcomers
+  participate in one room without full access. `GUESTROOM OFF` turns it off.
+
 ### Web admin panel
 
 If the web admin is enabled, sysops can manage users, rooms, messages, and
@@ -880,7 +978,6 @@ account and you can re-register with the same username.
 | `C <number>` | Change to room by number |
 | `G` | Jump to next room with unread messages |
 | `M` | Go to Mail (private messages) |
-| `.FF` | Fast-forward past unread (mark all read) |
 
 ### Logged in — reading
 
@@ -891,6 +988,7 @@ account and you can re-register with the same username.
 | `F <id>` | Forward read starting after message #id |
 | `R` | Reverse read (newest first) |
 | `S` | Scan message headers |
+| `.FF` | Fast-forward past unread (mark all read) |
 
 ### Logged in — writing
 
@@ -916,6 +1014,16 @@ account and you can re-register with the same username.
 | `CANCEL` | Cancel the current workflow |
 | `Q` | Log out |
 
+### Logged in — finding users
+
+| Command | Action |
+|---|---|
+| `U` | List active accounts |
+| `U banned` | List banned accounts |
+| `U all` | List every account (Sysop only) |
+| `S <query>` | Search users by username (substring) |
+| `WHOIS <user>` | Show one user's account details |
+
 ### Help topics
 
 | Command | Shows |
@@ -937,6 +1045,8 @@ account and you can re-register with the same username.
 | `PENDING` | List unvalidated accounts |
 | `V <user>` | Validate (approve) an account |
 | `BAN <user>` | Ban a user |
+| `.ER` | Edit the current room |
+| `.EU <user>` | Edit a user's profile / permissions (not to Sysop) |
 
 ### Sysop commands
 
@@ -948,7 +1058,11 @@ account and you can re-register with the same username.
 | `.USER <user>` | Demote a user back to plain User |
 | `.C <name>` | Create a new room |
 | `.DR <name>` | Delete a room |
+| `.DU <user>` | Delete (soft) a user account |
 | `.PW <user>` | Reset a user to a single-use temp password |
+| `OPENACCESS` | Disable the verification requirement |
+| `CLOSEACCESS` | Restore the verification requirement |
+| `GUESTROOM <name>` \| `OFF` | Set / disable the guest room for unverified users |
 
 ---
 
