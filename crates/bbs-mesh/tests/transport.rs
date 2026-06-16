@@ -71,6 +71,23 @@ fn contact_msg_frame(sender_prefix: [u8; 6], text: &str) -> Vec<u8> {
     radio_frame(&payload)
 }
 
+/// RESP_CODE_SENT: the device's reply to a send. `send_type` 0=failed, 1=flood,
+/// 2=direct; `crc` is the expected-ack identifier; `timeout_ms` the delivery hint.
+fn sent_frame(send_type: u8, crc: u32, timeout_ms: u32) -> Vec<u8> {
+    let mut payload = vec![RESP_CODE_SENT, send_type];
+    payload.extend_from_slice(&crc.to_le_bytes());
+    payload.extend_from_slice(&timeout_ms.to_le_bytes());
+    radio_frame(&payload)
+}
+
+/// PUSH_CODE_SEND_CONFIRMED: destination acknowledged receipt of `crc`.
+fn send_confirmed_frame(crc: u32) -> Vec<u8> {
+    let mut payload = vec![PUSH_CODE_SEND_CONFIRMED];
+    payload.extend_from_slice(&crc.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    radio_frame(&payload)
+}
+
 // ── Test harness ──────────────────────────────────────────────────────────────
 
 struct Bridge {
@@ -167,6 +184,17 @@ impl Bridge {
         assert_eq!(header[0], FRAME_INBOUND_PREFIX);
         let len = u16::from_le_bytes([header[1], header[2]]) as usize;
         self.recv_n(len).await
+    }
+
+    /// Read outbound frames until a text send (`CMD_SEND_TXT_MSG`) appears,
+    /// skipping path resets and other bookkeeping frames. Returns its payload.
+    async fn read_text_send(&mut self) -> Vec<u8> {
+        loop {
+            let cmd = self.read_command().await;
+            if cmd[0] == CMD_SEND_TXT_MSG {
+                return cmd;
+            }
+        }
     }
 }
 
@@ -540,6 +568,75 @@ async fn unsupported_app_start_with_successful_drain_processes_messages() {
         .await
         .expect("timed out waiting for reply");
     assert_eq!(cmd_payload[0], CMD_SEND_TXT_MSG);
+
+    transport.stop().await.unwrap();
+}
+
+/// A reply that is accepted by the device (RESP_CODE_SENT with a CRC) but never
+/// confirmed (no PUSH_CODE_SEND_CONFIRMED) is retransmitted after the ack-wait
+/// floor — this is the core reply-reliability fix for the lossy return path.
+#[tokio::test]
+async fn unacked_reply_is_retransmitted() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi there".to_owned()));
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x55u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+
+    // First transmission of the reply (wire attempt 0).
+    let first = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("first reply not sent");
+    assert_eq!(first[0], CMD_SEND_TXT_MSG);
+    assert_eq!(first[2], 0, "first send is attempt 0");
+    assert_eq!(std::str::from_utf8(&first[13..]).unwrap(), "hi there");
+
+    // Device accepts it (assigns CRC) but the destination never acknowledges.
+    bridge.send(&sent_frame(2, 0xDEAD_BEEF, 100)).await;
+
+    // After the ack-wait floor the BBS retransmits the same text (wire attempt 1).
+    let retry = tokio::time::timeout(Duration::from_secs(8), bridge.read_text_send())
+        .await
+        .expect("reply was not retransmitted");
+    assert_eq!(retry[0], CMD_SEND_TXT_MSG);
+    assert_eq!(std::str::from_utf8(&retry[13..]).unwrap(), "hi there");
+    assert_eq!(retry[2], 1, "retransmission is attempt 1 (0-based wire)");
+
+    transport.stop().await.unwrap();
+}
+
+/// A reply that is confirmed delivered (PUSH_CODE_SEND_CONFIRMED) is NOT
+/// retransmitted — delivery is at-least-once, not blindly duplicated.
+#[tokio::test]
+async fn confirmed_reply_is_not_retransmitted() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi there".to_owned()));
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x56u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+
+    let first = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("first reply not sent");
+    assert_eq!(first[0], CMD_SEND_TXT_MSG);
+
+    // Device accepts AND the destination confirms delivery.
+    let crc = 0xAABB_CCDD;
+    bridge.send(&sent_frame(2, crc, 100)).await;
+    bridge.send(&send_confirmed_frame(crc)).await;
+
+    // Past the ack-wait floor there must be no second text send.
+    let retry = tokio::time::timeout(Duration::from_secs(6), bridge.read_text_send()).await;
+    assert!(
+        retry.is_err(),
+        "confirmed reply must not be retransmitted (got a duplicate send)"
+    );
 
     transport.stop().await.unwrap();
 }
