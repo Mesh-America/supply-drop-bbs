@@ -413,7 +413,6 @@ impl Host for BbsHost {
             Command::GoNextUnread => self.handle_go_next_unread(session).await,
             Command::ChangeRoom { target } => self.handle_change_room(session, &target).await,
             Command::GoMail => self.handle_change_to_room(session, MAIL_ROOM_ID).await,
-            Command::IgnoreRoom => Ok(Response::Text("Room ignore is not yet implemented.".into())),
 
             // Message reading
             Command::ReadNew => self.handle_read_new(session).await,
@@ -4687,7 +4686,6 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::GoNextUnread => "GoNextUnread",
         Command::ChangeRoom { .. } => "ChangeRoom",
         Command::GoMail => "GoMail",
-        Command::IgnoreRoom => "IgnoreRoom",
         Command::ReadNew => "ReadNew",
         Command::ReadForward { .. } => "ReadForward",
         Command::ReadReverse => "ReadReverse",
@@ -4780,7 +4778,6 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "g" if logged_in => "G — go to next room with unread messages",
         "c" if logged_in => "C <name> — change room by name or number",
         "k" if logged_in => "K — list known rooms",
-        "i" if logged_in => "I — ignore this room (not yet available)",
         "m" if logged_in => {
             "M — go to Mail (private messages)\n\
              In Mail: E to write, N to read new,\n\

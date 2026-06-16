@@ -120,8 +120,6 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "m" => Some(Command::GoMail),
 
-        "i" => Some(Command::IgnoreRoom),
-
         // ── Message reading ──────────────────────────────────────────────────
         "n" => Some(Command::ReadNew),
 
@@ -413,6 +411,13 @@ mod tests {
     #[test]
     fn whoami_is_parsed_on_mesh() {
         assert!(matches!(cmd("whoami"), Some(Command::Whoami)));
+    }
+
+    #[test]
+    fn ignore_room_is_unknown_on_mesh() {
+        // `I` (ignore room) was an unimplemented stub; it now falls through to
+        // the standard unknown-command path. (#123)
+        assert!(matches!(cmd("i"), Some(Command::Unknown { .. })));
     }
 
     #[test]
