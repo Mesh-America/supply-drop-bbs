@@ -95,9 +95,13 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             topic: rest.map(str::to_owned),
         }),
 
-        "register" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::Register { username }),
-            None => Some(Command::Help {
+        "register" => match rest {
+            // Pass the raw username through; the host validates it and reports a
+            // specific error (#128). Bare `register` → help.
+            Some(name) if !name.is_empty() => Some(Command::Register {
+                username: name.to_owned(),
+            }),
+            _ => Some(Command::Help {
                 topic: Some("register".to_owned()),
             }),
         },
@@ -368,8 +372,12 @@ mod tests {
 
     #[test]
     fn register_valid_username() {
-        let username = Username::new("alice").unwrap();
-        assert_eq!(cmd("register alice"), Some(Command::Register { username }));
+        assert_eq!(
+            cmd("register alice"),
+            Some(Command::Register {
+                username: "alice".to_owned()
+            })
+        );
     }
 
     #[test]
@@ -383,12 +391,13 @@ mod tests {
     }
 
     #[test]
-    fn register_invalid_username_shows_help() {
-        // Usernames can't have spaces; "register alice bob" → help for register.
+    fn register_passes_raw_username_to_host() {
+        // The parser no longer rejects invalid usernames — it forwards the raw
+        // text so the host can return a specific error (#128).
         assert_eq!(
             cmd("register alice bob"),
-            Some(Command::Help {
-                topic: Some("register".to_owned())
+            Some(Command::Register {
+                username: "alice bob".to_owned()
             })
         );
     }

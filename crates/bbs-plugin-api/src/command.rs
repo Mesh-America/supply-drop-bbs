@@ -53,8 +53,11 @@ pub enum Command {
 
     /// Begin (or continue) the registration workflow.
     Register {
-        /// Desired username.
-        username: Username,
+        /// Desired username, as typed (raw). The host validates it against the
+        /// registration policy so it can return a specific error (too short,
+        /// invalid characters, reserved, taken) rather than failing at parse
+        /// time with generic help. See issue #128.
+        username: String,
     },
 
     /// Begin (or continue) the login workflow.
@@ -361,9 +364,13 @@ impl Command {
             "h" | "help" | "?" => Command::Help {
                 topic: rest.map(str::to_owned),
             },
-            "register" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(u) => Command::Register { username: u },
-                None => Command::Help {
+            "register" => match rest {
+                // Pass the raw username through; the host validates it and
+                // reports a specific error (#128). Bare `register` → help.
+                Some(name) if !name.is_empty() => Command::Register {
+                    username: name.to_owned(),
+                },
+                _ => Command::Help {
                     topic: Some("register".to_owned()),
                 },
             },
@@ -583,7 +590,7 @@ mod tests {
                 topic: Some("rooms".to_owned()),
             },
             Command::Register {
-                username: Username::new("alice").unwrap(),
+                username: "alice".to_owned(),
             },
             Command::WorkflowReply {
                 reply: "blue".to_owned(),

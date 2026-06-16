@@ -1092,9 +1092,9 @@ impl Host for BbsHost {
         password: &str,
         permission_level: u8,
     ) -> Result<(), HostError> {
-        let uname = Username::new(username).map_err(|_| {
-            HostError::PreconditionFailed(format!("invalid username: {username:?}"))
-        })?;
+        // Apply the same creation policy as REGISTER so radio/CLI and the web
+        // admin agree on what a valid new username is. (#128)
+        let uname = validate_new_username(username).map_err(HostError::PreconditionFailed)?;
 
         let level = match permission_level {
             0 => PermissionLevel::Unvalidated,
@@ -1551,7 +1551,7 @@ impl BbsHost {
     async fn handle_register(
         &self,
         session: SessionId,
-        username: Username,
+        raw_username: String,
     ) -> Result<Response, HostError> {
         {
             let sessions = self.sessions.read().await;
@@ -1568,6 +1568,14 @@ impl BbsHost {
                 }
             }
         }
+
+        // Validate the requested username against the documented registration
+        // policy and return a specific error up front, so mesh users don't fail
+        // late (after the display-name/password steps). See issue #128.
+        let username = match validate_new_username(&raw_username) {
+            Ok(u) => u,
+            Err(msg) => return Ok(Response::Error(msg)),
+        };
 
         let existing = self
             .db
@@ -4710,6 +4718,51 @@ fn cmd_label(cmd: &Command) -> &'static str {
     }
 }
 
+// ── Username creation policy ────────────────────────────────────────────────────
+
+/// The single source of truth for **new-username policy**, shared by the
+/// `REGISTER` flow and admin user creation.
+///
+/// This is deliberately stricter than [`Username::new`]: the [`Username`] type is
+/// the *storage* invariant (it must keep accepting every name already persisted,
+/// so it stays lenient), whereas this is the *creation* policy — at least 3
+/// characters, letters/digits/`-`/`_`, no leading or trailing `-`/`_`, not a
+/// reserved name, within the type's length limit. Checks run most-specific-first
+/// so the error names the rule that actually failed (e.g. a short name that also
+/// starts with `-` reports "too short", not "bad character"). The upper-length
+/// and reserved-name checks are delegated to [`Username::new`]. See issue #128.
+fn validate_new_username(raw: &str) -> Result<Username, String> {
+    // Mirror Username::new's normalisation (trim, strip one leading `@`,
+    // lowercase) so length and charset are judged on the stored form.
+    let trimmed = raw.trim();
+    let normalized = trimmed
+        .strip_prefix('@')
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return Err("Username can't be empty.".to_owned());
+    }
+    if normalized.chars().count() < 3 {
+        return Err("Username must be at least 3 characters.".to_owned());
+    }
+    if !normalized
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err("Username may only contain letters, digits, - and _.".to_owned());
+    }
+    let bytes = normalized.as_bytes();
+    if matches!(bytes[0], b'-' | b'_') || matches!(bytes[bytes.len() - 1], b'-' | b'_') {
+        return Err("Username can't start or end with - or _.".to_owned());
+    }
+
+    // Delegate the reserved-name and upper-length checks to the type, and use it
+    // to construct the validated value. Any remaining failure carries its own
+    // specific message.
+    Username::new(normalized).map_err(|e| e.to_string())
+}
+
 // ── Help text ─────────────────────────────────────────────────────────────────
 
 fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
@@ -5178,7 +5231,7 @@ mod tests {
             .process_command(
                 sid,
                 Command::Register {
-                    username: uname.clone(),
+                    username: uname.as_str().to_owned(),
                 },
             )
             .await
@@ -5243,7 +5296,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5294,7 +5347,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5370,9 +5423,14 @@ mod tests {
 
         // Start a registration workflow.
         let uname = Username::new("dave").unwrap();
-        host.process_command(sid, Command::Register { username: uname })
-            .await
-            .unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.as_str().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
 
         // Cancel it.
         let r = host.process_command(sid, Command::Cancel).await.unwrap();
@@ -5401,7 +5459,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -5473,9 +5531,14 @@ mod tests {
     /// Full registration workflow for a username/password pair.
     async fn do_register(host: &BbsHost, sid: SessionId, username: &str, password: &str) {
         let uname = Username::new(username).unwrap();
-        host.process_command(sid, Command::Register { username: uname })
-            .await
-            .unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.as_str().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
         // display name (empty = skip)
         host.process_command(
             sid,
@@ -5550,6 +5613,98 @@ mod tests {
         );
     }
 
+    /// Issue #128: `REGISTER` validates the username up front and returns a
+    /// specific error (too short / invalid chars / reserved) instead of
+    /// accepting invalid names into the flow or showing a generic banner.
+    #[tokio::test]
+    async fn register_enforces_username_rules() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
+        let too_short = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "ab".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&too_short, Response::Error(e) if e.contains("3 character")),
+            "too-short username should be rejected specifically, got: {too_short:?}"
+        );
+
+        let bad_chars = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "bad!name".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&bad_chars, Response::Error(e) if e.to_lowercase().contains("letters, digits")),
+            "invalid-charset username should be rejected specifically, got: {bad_chars:?}"
+        );
+
+        let reserved = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "bbs".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&reserved, Response::Error(e) if e.to_lowercase().contains("reserved")),
+            "reserved username should be rejected specifically, got: {reserved:?}"
+        );
+
+        // A valid username advances to the display-name prompt.
+        let ok = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "alice".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&ok, Response::Prompt { text, .. } if text.to_lowercase().contains("display name")),
+            "valid username should start registration, got: {ok:?}"
+        );
+    }
+
+    /// Issue #128: the shared creation policy reports the most specific failure
+    /// (so callers don't get a misleading reason) and normalises like the type.
+    #[test]
+    fn validate_new_username_policy_and_error_order() {
+        // Too short wins over the leading-dash rule.
+        assert!(validate_new_username("-a")
+            .unwrap_err()
+            .contains("3 character"));
+        // Leading/trailing -/_ on a long-enough name has its own message.
+        assert!(validate_new_username("-abc")
+            .unwrap_err()
+            .contains("start or end"));
+        // Charset violations are specific.
+        assert!(validate_new_username("bad!name")
+            .unwrap_err()
+            .to_lowercase()
+            .contains("letters, digits"));
+        // Reserved names are rejected as reserved.
+        assert!(validate_new_username("bbs")
+            .unwrap_err()
+            .to_lowercase()
+            .contains("reserved"));
+        // Normalisation matches Username::new (strip leading `@`, lowercase).
+        assert_eq!(validate_new_username("@Alice").unwrap().as_str(), "alice");
+    }
+
     /// Issue #129: the `-` display-name shortcut must ADVANCE to the password
     /// step (not exit registration). Regression guard for the #105 fix.
     #[tokio::test]
@@ -5559,7 +5714,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: Username::new("qatester1").unwrap(),
+                username: "qatester1".to_owned(),
             },
         )
         .await
@@ -5593,7 +5748,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: uname.clone(),
+                username: uname.as_str().to_owned(),
             },
         )
         .await
@@ -6324,7 +6479,7 @@ mod tests {
         host.process_command(
             sid,
             Command::Register {
-                username: username.clone(),
+                username: username.as_str().to_owned(),
             },
         )
         .await
