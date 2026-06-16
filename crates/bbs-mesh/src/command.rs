@@ -109,7 +109,7 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 } else if let Some(password) = password {
                     Some(Command::RegisterOneShot {
                         username: name.to_owned(),
-                        password: password.to_owned(),
+                        password: password.into(),
                     })
                 } else {
                     Some(Command::Register {
@@ -129,7 +129,7 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 match (Username::new(name).ok(), password) {
                     (Some(username), Some(password)) => Some(Command::LoginOneShot {
                         username,
-                        password: password.to_owned(),
+                        password: password.into(),
                     }),
                     (Some(username), None) => Some(Command::Login { username }),
                     (None, _) => Some(Command::Help {
@@ -467,7 +467,7 @@ mod tests {
             cmd("register alice hunter2!"),
             Some(Command::RegisterOneShot {
                 username: "alice".to_owned(),
-                password: "hunter2!".to_owned(),
+                password: "hunter2!".into(),
             })
         );
         // Password may contain spaces (passphrase-friendly).
@@ -475,7 +475,7 @@ mod tests {
             cmd("register alice my pass phrase"),
             Some(Command::RegisterOneShot {
                 username: "alice".to_owned(),
-                password: "my pass phrase".to_owned(),
+                password: "my pass phrase".into(),
             })
         );
     }
@@ -486,7 +486,7 @@ mod tests {
             cmd("login bob s3cr3tpw"),
             Some(Command::LoginOneShot {
                 username: Username::new("bob").unwrap(),
-                password: "s3cr3tpw".to_owned(),
+                password: "s3cr3tpw".into(),
             })
         );
         // Bare login still starts the interactive flow.

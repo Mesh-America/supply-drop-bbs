@@ -47,7 +47,7 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 } else if let Some(password) = password {
                     Some(Command::RegisterOneShot {
                         username: name.to_owned(),
-                        password: password.to_owned(),
+                        password: password.into(),
                     })
                 } else {
                     Some(Command::Register {
@@ -66,7 +66,7 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 match (Username::new(name).ok(), password) {
                     (Some(username), Some(password)) => Some(Command::LoginOneShot {
                         username,
-                        password: password.to_owned(),
+                        password: password.into(),
                     }),
                     (Some(username), None) => Some(Command::Login { username }),
                     (None, _) => Some(Command::Help {

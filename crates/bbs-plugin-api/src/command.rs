@@ -27,6 +27,45 @@ use crate::identity::Username;
 use crate::permissions::PermissionLevel;
 use serde::{Deserialize, Serialize};
 
+/// A secret string carried inside a [`Command`] (currently a one-shot password).
+///
+/// `Command` derives `Debug` and is logged at `debug` level on the hot path, so
+/// a one-shot password must **not** be a plain `String`. `Secret`'s `Debug`
+/// prints `<redacted>`, so the plaintext can never reach a log via `?cmd`.
+///
+/// `Serialize`/`Deserialize` are transparent (the wire form is the raw string)
+/// so the enum still round-trips across the process transport; only `Debug` is
+/// redacted. Call [`Secret::expose`] only where the plaintext is genuinely
+/// required (hashing/verifying) and never log the result.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(String);
+
+impl Secret {
+    /// Borrow the plaintext. Use only for hashing/verification; never log it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl From<String> for Secret {
+    fn from(s: String) -> Self {
+        Secret(s)
+    }
+}
+
+impl From<&str> for Secret {
+    fn from(s: &str) -> Self {
+        Secret(s.to_owned())
+    }
+}
+
 // ── Parsing helpers (private) ─────────────────────────────────────────────────
 
 fn split_first_word(s: &str) -> (&str, Option<&str>) {
@@ -76,8 +115,8 @@ pub enum Command {
     RegisterOneShot {
         /// Desired username, as typed (raw); validated by the host.
         username: String,
-        /// Chosen password, verbatim.
-        password: String,
+        /// Chosen password, verbatim (redacted in `Debug`/logs).
+        password: Secret,
     },
 
     /// One-shot login from a single message (`LOGIN <user> <password>`): no
@@ -87,8 +126,8 @@ pub enum Command {
     LoginOneShot {
         /// The username being logged into.
         username: Username,
-        /// Supplied password, verbatim.
-        password: String,
+        /// Supplied password, verbatim (redacted in `Debug`/logs).
+        password: Secret,
     },
 
     /// End the session.
@@ -657,6 +696,34 @@ mod tests {
             Command::parse("i", false),
             Command::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn one_shot_password_is_redacted_in_debug() {
+        // Command derives Debug and is logged at debug level on the hot path, so
+        // a one-shot password must never appear in its Debug output.
+        let login = Command::LoginOneShot {
+            username: Username::new("alice").unwrap(),
+            password: "supersecretpw".into(),
+        };
+        let dbg = format!("{login:?}");
+        assert!(
+            !dbg.contains("supersecretpw"),
+            "password leaked into Debug: {dbg}"
+        );
+        assert!(
+            dbg.contains("redacted"),
+            "expected a redaction marker: {dbg}"
+        );
+
+        let register = Command::RegisterOneShot {
+            username: "bob".into(),
+            password: "hunter2pass".into(),
+        };
+        assert!(
+            !format!("{register:?}").contains("hunter2pass"),
+            "register password leaked into Debug"
+        );
     }
 
     #[test]

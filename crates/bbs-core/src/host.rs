@@ -30,7 +30,7 @@ use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
     AdminAccessPolicy, AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo,
     AdminStats, AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient, PermissionCtx,
-    PermissionLevel, Response, SessionId, Username,
+    PermissionLevel, Response, Secret, SessionId, Username,
 };
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -1704,11 +1704,24 @@ impl BbsHost {
         }
     }
 
-    /// Record a failed login for `username` and return the backoff delay (secs)
-    /// the caller should sleep before responding. The counter is global per
-    /// username so parallel sessions can't bypass the delay; entries reset after
-    /// 10 minutes idle and the map is hard-capped. Shared by the interactive
-    /// login workflow and the one-shot login path.
+    /// If `username` is within its login-backoff window, return the seconds
+    /// remaining; otherwise `None`. Lets callers reject immediately instead of
+    /// sleeping on the hot path (see `handle_login_oneshot`). Reads the same
+    /// counter `record_login_failure` writes.
+    async fn check_login_throttle(&self, username: &str) -> Option<u64> {
+        let map = self.login_failures.lock().await;
+        let (count, last) = map.get(username)?;
+        // Same backoff curve as record_login_failure: 2,4,8,16,30 s (capped).
+        let backoff = u64::min(2u64.saturating_pow(*count), 30);
+        let elapsed = last.elapsed().as_secs();
+        (elapsed < backoff).then_some(backoff - elapsed)
+    }
+
+    /// Record a failed login for `username` and return the resulting backoff
+    /// window (secs). The counter is global per username so parallel sessions
+    /// can't bypass it; entries reset after 10 minutes idle and the map is
+    /// hard-capped. Shared by the interactive login workflow and the one-shot
+    /// login path (see `check_login_throttle`).
     async fn record_login_failure(&self, username: &str) -> u64 {
         let mut map = self.login_failures.lock().await;
         // Evict stale entries before inserting to bound map size — keeps memory
@@ -1762,6 +1775,8 @@ impl BbsHost {
         let user_id = match UserStore::create(&self.db, username, None, initial_level, now).await {
             Ok(id) => id,
             Err(crate::db::StoreError::Conflict(_)) => {
+                // Clears the Register workflow on the interactive Confirm path;
+                // a no-op on the one-shot path (no workflow is active there).
                 self.clear_workflow(session).await;
                 return Ok(Response::Error(format!(
                     "'{username}' was just taken. Try: register <different_username>"
@@ -1842,7 +1857,7 @@ impl BbsHost {
         &self,
         session: SessionId,
         raw_username: String,
-        password: String,
+        password: Secret,
     ) -> Result<Response, HostError> {
         {
             let sessions = self.sessions.read().await;
@@ -1867,7 +1882,7 @@ impl BbsHost {
         // Password rule mirrors the interactive flow (min 8). No confirmation
         // step: the single message can't be typo-confirmed, and re-prompting
         // would reintroduce the round-trip this path exists to avoid.
-        if password.chars().count() < 8 {
+        if password.expose().chars().count() < 8 {
             return Ok(Response::Error(
                 "Password must be at least 8 characters. Not registered.".into(),
             ));
@@ -1883,7 +1898,7 @@ impl BbsHost {
             )));
         }
 
-        self.create_user_and_login(session, &username, &password)
+        self.create_user_and_login(session, &username, password.expose())
             .await
     }
 
@@ -1895,7 +1910,7 @@ impl BbsHost {
         &self,
         session: SessionId,
         username: Username,
-        password: String,
+        password: Secret,
     ) -> Result<Response, HostError> {
         {
             let sessions = self.sessions.read().await;
@@ -1913,6 +1928,17 @@ impl BbsHost {
             }
         }
 
+        // Throttle BEFORE verifying, and reject *immediately* rather than sleeping
+        // on the hot path: the mesh event loop awaits process_command serially, so
+        // a blocking sleep here would stall all traffic on the node — and one-shot
+        // login is a single stateless message, trivially scripted. The backoff
+        // window is shared with the interactive flow via `record_login_failure`.
+        if let Some(wait) = self.check_login_throttle(username.as_str()).await {
+            return Ok(Response::Error(format!(
+                "Too many login attempts. Try again in {wait}s."
+            )));
+        }
+
         let user = self
             .db
             .get_by_username(&username)
@@ -1927,14 +1953,13 @@ impl BbsHost {
         let ok = self
             .db
             .credentials()
-            .verify_password(user.id, &password, Timestamp::now())
+            .verify_password(user.id, password.expose(), Timestamp::now())
             .await
             .map_err(|e| HostError::Storage(format!("verify password: {e}")))?;
 
         if !ok {
-            let delay_secs = self.record_login_failure(username.as_str()).await;
-            warn!(%session, %username, delay_secs, "one-shot login failed: wrong password");
-            tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+            let backoff = self.record_login_failure(username.as_str()).await;
+            warn!(%session, %username, backoff, "one-shot login failed: wrong password");
             return Ok(Response::Error("Login failed.".into()));
         }
 
@@ -2072,14 +2097,20 @@ impl BbsHost {
                 Some(AuthEscape::Register { username, password }) => {
                     self.clear_workflow(session).await;
                     return match password {
-                        Some(pw) => self.handle_register_oneshot(session, username, pw).await,
+                        Some(pw) => {
+                            self.handle_register_oneshot(session, username, pw.into())
+                                .await
+                        }
                         None => self.handle_register(session, username).await,
                     };
                 }
                 Some(AuthEscape::Login { username, password }) => {
                     self.clear_workflow(session).await;
                     return match password {
-                        Some(pw) => self.handle_login_oneshot(session, username, pw).await,
+                        Some(pw) => {
+                            self.handle_login_oneshot(session, username, pw.into())
+                                .await
+                        }
                         None => self.handle_login(session, username).await,
                     };
                 }
@@ -6276,6 +6307,35 @@ mod tests {
             ctx.username(),
             None,
             "must not be authenticated after a bad password"
+        );
+    }
+
+    /// A failed one-shot login must NOT sleep on the event loop; instead the next
+    /// rapid attempt is rejected immediately by the shared backoff throttle. This
+    /// is what stops one-shot login from being a scriptable event-loop-stall DoS.
+    #[tokio::test]
+    async fn login_oneshot_throttles_rapid_failures() {
+        let (host, _db) = make_host().await;
+        let s0 = host.create_session("test").await.unwrap();
+        do_register(&host, s0, "alice", "s3cr3t!!").await;
+
+        let sid = host.create_session("test").await.unwrap();
+        let bad = |pw: &str| Command::LoginOneShot {
+            username: Username::new("alice").unwrap(),
+            password: pw.into(),
+        };
+
+        // First wrong attempt: generic failure, records a backoff window.
+        let r1 = host.process_command(sid, bad("wrongone")).await.unwrap();
+        assert!(
+            matches!(&r1, Response::Error(e) if e.contains("Login failed")),
+            "first failure should be a generic Login failed, got: {r1:?}"
+        );
+        // Immediate second attempt is throttled (rejected fast, not slept on).
+        let r2 = host.process_command(sid, bad("wrongtwo")).await.unwrap();
+        assert!(
+            matches!(&r2, Response::Error(e) if e.to_lowercase().contains("too many")),
+            "rapid second attempt should be throttled, got: {r2:?}"
         );
     }
 
