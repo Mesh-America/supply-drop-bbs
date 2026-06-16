@@ -54,8 +54,11 @@ pub enum Command {
 
     /// Begin (or continue) the registration workflow.
     Register {
-        /// Desired username.
-        username: Username,
+        /// Desired username, as typed (raw). The host validates it against the
+        /// registration policy so it can return a specific error (too short,
+        /// invalid characters, reserved, taken) rather than failing at parse
+        /// time with generic help. See issue #128.
+        username: String,
     },
 
     /// Begin (or continue) the login workflow.
@@ -101,9 +104,6 @@ pub enum Command {
 
     /// Navigate directly to the Mail room. (M)
     GoMail,
-
-    /// Toggle ignore on the current room. (I)
-    IgnoreRoom,
 
     // ── Message reading ───────────────────────────────────────────────
     /// Read unread messages in the current room (from the last-read
@@ -345,15 +345,26 @@ impl Command {
     ///
     /// When `awaiting_reply` is `true` (the previous [`Response`] was a
     /// [`Response::Prompt`]), the entire line becomes a [`Command::WorkflowReply`]
-    /// regardless of content — this lets the host handle password entry, message
-    /// bodies, and other free-form workflow steps without each transport
-    /// re-implementing that state machine.
+    /// (with the sole exception of `CANCEL`/`STOP`, see below) — this lets the
+    /// host handle password entry, message bodies, and other free-form workflow
+    /// steps without each transport re-implementing that state machine.
+    ///
+    /// `CANCEL`/`STOP` (case-insensitive) always abort the current workflow via
+    /// [`Command::Cancel`], on every transport and *before* the awaiting-reply
+    /// passthrough — otherwise the words would be captured as the literal reply
+    /// (e.g. become the new display name). Mirrors the MeshCore parser. (#120)
     ///
     /// This is the canonical parser shared by all transports that forward raw
     /// text lines (CLI, process plugins).  Transports with their own wire
     /// syntax (e.g. MeshCore frames) do their own mapping.
     pub fn parse(line: &str, awaiting_reply: bool) -> Self {
         let text = line.trim();
+
+        // CANCEL / STOP always break out of a workflow, before the awaiting-reply
+        // passthrough, so they can't be swallowed as a literal reply. (#120)
+        if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {
+            return Command::Cancel;
+        }
 
         if awaiting_reply {
             return Command::WorkflowReply {
@@ -373,9 +384,13 @@ impl Command {
             "h" | "help" | "?" => Command::Help {
                 topic: rest.map(str::to_owned),
             },
-            "register" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(u) => Command::Register { username: u },
-                None => Command::Help {
+            "register" => match rest {
+                // Pass the raw username through; the host validates it and
+                // reports a specific error (#128). Bare `register` → help.
+                Some(name) if !name.is_empty() => Command::Register {
+                    username: name.to_owned(),
+                },
+                _ => Command::Help {
                     topic: Some("register".to_owned()),
                 },
             },
@@ -385,7 +400,7 @@ impl Command {
                     topic: Some("login".to_owned()),
                 },
             },
-            "logout" | "q" | "quit" => Command::Quit,
+            "logout" | "q" | "quit" | "exit" | "bye" => Command::Quit,
 
             // ── Room navigation ───────────────────────────────────────────────
             "k" => Command::ListRooms,
@@ -394,7 +409,6 @@ impl Command {
                 target: rest.unwrap_or("").to_owned(),
             },
             "m" => Command::GoMail,
-            "i" => Command::IgnoreRoom,
 
             // ── Message reading ───────────────────────────────────────────────
             "n" => Command::ReadNew,
@@ -610,6 +624,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ignore_room_keyword_is_unknown() {
+        // `I` (ignore room) is no longer a recognised command. (#123)
+        assert!(matches!(
+            Command::parse("i", false),
+            Command::Unknown { .. }
+        ));
+    }
+
+    #[test]
     fn command_serde_roundtrip() {
         let cmds = [
             Command::Help { topic: None },
@@ -617,7 +640,7 @@ mod tests {
                 topic: Some("rooms".to_owned()),
             },
             Command::Register {
-                username: Username::new("alice").unwrap(),
+                username: "alice".to_owned(),
             },
             Command::WorkflowReply {
                 reply: "blue".to_owned(),
@@ -654,5 +677,29 @@ mod tests {
             let back: Response = serde_json::from_str(&json).unwrap();
             assert_eq!(r, back);
         }
+    }
+
+    #[test]
+    fn cancel_breaks_out_of_workflow_on_shared_parser() {
+        // CANCEL/STOP abort a workflow instead of being captured as the reply,
+        // matching the MeshCore parser, so the prompt's "CANCEL to abort" advice
+        // holds on the shared (CLI / process) parser too. (#120)
+        for kw in ["cancel", "CANCEL", "Stop", "stop"] {
+            assert_eq!(Command::parse(kw, true), Command::Cancel, "awaiting: {kw}");
+            assert_eq!(Command::parse(kw, false), Command::Cancel, "idle: {kw}");
+        }
+        // A reply that merely contains the word is still captured verbatim.
+        assert_eq!(
+            Command::parse("CancelTheOrder", true),
+            Command::WorkflowReply {
+                reply: "CancelTheOrder".to_owned()
+            }
+        );
+        assert_eq!(
+            Command::parse("Alice", true),
+            Command::WorkflowReply {
+                reply: "Alice".to_owned()
+            }
+        );
     }
 }

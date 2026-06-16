@@ -36,9 +36,11 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         "h" | "help" | "?" => Some(Command::Help {
             topic: rest.map(str::to_owned),
         }),
-        "register" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::Register { username }),
-            None => Some(Command::Help {
+        "register" => match rest {
+            Some(name) if !name.is_empty() => Some(Command::Register {
+                username: name.to_owned(),
+            }),
+            _ => Some(Command::Help {
                 topic: Some("register".to_owned()),
             }),
         },
@@ -48,7 +50,6 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 topic: Some("login".to_owned()),
             }),
         },
-        "logout" => Some(Command::Logout),
         "whoami" => Some(Command::Whoami),
         "k" => Some(Command::ListRooms),
         "g" => Some(Command::GoNextUnread),
@@ -56,7 +57,6 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             target: rest.unwrap_or("").to_owned(),
         }),
         "m" => Some(Command::GoMail),
-        "i" => Some(Command::IgnoreRoom),
         "n" => Some(Command::ReadNew),
         "f" => Some(Command::ReadForward {
             after: rest.and_then(|s| s.parse::<i64>().ok()),
@@ -78,7 +78,9 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
                 raw: text.to_owned(),
             }),
         },
-        "q" => Some(Command::Quit),
+        // All quit aliases map to one intent (Quit), parallel with the mesh and
+        // canonical parsers. (#124 follow-up)
+        "q" | "quit" | "exit" | "bye" | "logout" => Some(Command::Quit),
         "cancel" | "stop" => Some(Command::Cancel),
         "w" => Some(Command::WhoIsOnline),
         "pending" => Some(Command::ListPending),
@@ -152,6 +154,12 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         },
         ".du" => match rest.and_then(|s| Username::new(s).ok()) {
             Some(username) => Some(Command::DeleteUser { username }),
+            None => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
+        ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Some(Command::SetUserPassword { username }),
             None => Some(Command::Unknown {
                 raw: text.to_owned(),
             }),
