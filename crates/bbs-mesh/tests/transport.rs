@@ -640,3 +640,130 @@ async fn confirmed_reply_is_not_retransmitted() {
 
     transport.stop().await.unwrap();
 }
+
+/// Reproduction harness: drive a **real** `BbsHost` (temp DB) through the bridge,
+/// so transport `awaiting_reply` ↔ host workflow ↔ session interactions are
+/// exercised end-to-end (MockHost can't model them). Regression for the QA bug
+/// where the first reply to the interactive "choose a password" prompt was
+/// dropped to the anonymous banner.
+#[tokio::test]
+async fn real_host_interactive_register_prompt_reply_advances() {
+    let dbfile = tempfile::NamedTempFile::new().unwrap();
+    let db = bbs_core::Database::open(&dbfile.path().to_string_lossy())
+        .await
+        .unwrap();
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(bbs_core::BbsHost::new(db));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = MeshConfig {
+        addr,
+        command_prefix: None,
+        welcome_message: String::new(),
+        reconnect_delay_initial_ms: 20,
+        reconnect_delay_max_ms: 50,
+        reply_max_attempts: 1, // disable retransmission noise for this test
+        ..MeshConfig::default()
+    };
+    let transport = MeshTransport::init(config, host).await.unwrap();
+    transport.start().await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut bridge = Bridge { stream };
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x77u8; 6];
+
+    // First contact from a brand-new node: interactive register.
+    bridge
+        .send(&contact_msg_frame(sender, "register alice2"))
+        .await;
+    let prompt = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("register reply not sent");
+    let prompt_text = String::from_utf8_lossy(&prompt[13..]).to_string();
+    assert!(
+        prompt_text.to_lowercase().contains("password"),
+        "expected a password prompt, got: {prompt_text}"
+    );
+
+    // Reply with the password — must advance to "Confirm", NOT fall back to the
+    // anonymous banner.
+    bridge.send(&contact_msg_frame(sender, "secretpw1")).await;
+    let reply = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("password-reply response not sent");
+    let reply_text = String::from_utf8_lossy(&reply[13..]).to_string();
+    assert!(
+        !reply_text.contains("omit password to be prompted"),
+        "BUG: first password reply was dropped to the anonymous banner: {reply_text}"
+    );
+    assert!(
+        reply_text.to_lowercase().contains("confirm"),
+        "expected a confirm-password prompt, got: {reply_text}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// QA noted the MeshCore client re-sends messages (flaky automation). Reproduce
+/// the interactive register flow where the triggering command arrives TWICE
+/// before the password, exercising the dedup / awaiting / auth_escape path on a
+/// real host — the first password reply must still reach the Confirm step.
+#[tokio::test]
+async fn real_host_register_double_send_then_password() {
+    let dbfile = tempfile::NamedTempFile::new().unwrap();
+    let db = bbs_core::Database::open(&dbfile.path().to_string_lossy())
+        .await
+        .unwrap();
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(bbs_core::BbsHost::new(db));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = MeshConfig {
+        addr,
+        command_prefix: None,
+        welcome_message: String::new(),
+        reconnect_delay_initial_ms: 20,
+        reconnect_delay_max_ms: 50,
+        reply_max_attempts: 1,
+        ..MeshConfig::default()
+    };
+    let transport = MeshTransport::init(config, host).await.unwrap();
+    transport.start().await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut bridge = Bridge { stream };
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x88u8; 6];
+
+    // The flaky client sends REGISTER twice in quick succession.
+    bridge
+        .send(&contact_msg_frame(sender, "register dupe"))
+        .await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("first register reply");
+    bridge
+        .send(&contact_msg_frame(sender, "register dupe"))
+        .await;
+    // Second copy may or may not produce a frame depending on dedup; drain with a
+    // short timeout so we don't block.
+    let _ = tokio::time::timeout(Duration::from_millis(300), bridge.read_text_send()).await;
+
+    // Now the password.
+    bridge.send(&contact_msg_frame(sender, "secretpw1")).await;
+    let reply = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("password-reply response");
+    let reply_text = String::from_utf8_lossy(&reply[13..]).to_string();
+    assert!(
+        !reply_text.contains("omit password to be prompted"),
+        "BUG: password reply dropped to the anonymous banner after double-send: {reply_text}"
+    );
+    assert!(
+        reply_text.to_lowercase().contains("confirm"),
+        "expected confirm-password prompt, got: {reply_text}"
+    );
+
+    transport.stop().await.unwrap();
+}

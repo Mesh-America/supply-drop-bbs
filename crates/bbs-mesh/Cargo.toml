@@ -20,5 +20,10 @@ tracing.workspace     = true
 # sync (Mutex, watch) + rt (spawn) are the only extras we need on top of workspace defaults.
 tokio = { workspace = true, features = ["sync", "rt"] }
 
+[dev-dependencies]
+# Drive a real BbsHost through the bridge in integration tests (reproduce
+# transport↔host session/workflow interactions that MockHost can't model).
+tempfile.workspace = true
+
 [lints]
 workspace = true
