@@ -334,6 +334,52 @@ async fn identical_workflow_replies_after_prompt_both_reach_host() {
     transport.stop().await.unwrap();
 }
 
+/// Issue #129: after the registration prompt, the `-` display-name shortcut must
+/// reach the host as a `WorkflowReply` — it must NOT be parsed as a standalone
+/// command (which would drop the user out of registration). This is the mesh
+/// parse-layer half of the `-`-uses-username behaviour (the host half is covered
+/// by `register_display_name_dash_sentinel_uses_username` in bbs-core).
+#[tokio::test]
+async fn dash_shortcut_after_prompt_is_workflow_reply() {
+    let host = Arc::new(MockHost::new());
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::Register { .. }),
+        Response::Prompt {
+            text: "Choose a display name (or send - to use your username):".to_owned(),
+            hide_input: false,
+        },
+    );
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::WorkflowReply { .. }),
+        Response::Prompt {
+            text: "Choose a password (min 8 characters):".to_owned(),
+            hide_input: true,
+        },
+    );
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x44u8; 6];
+    bridge
+        .send(&contact_msg_frame(sender, "register qatester1"))
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bridge.send(&contact_msg_frame(sender, "-")).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let received = host.commands_received();
+    assert!(
+        received
+            .iter()
+            .any(|(_, c)| matches!(c, Command::WorkflowReply { reply } if reply == "-")),
+        "`-` after the registration prompt must reach the host as a WorkflowReply, got: {:?}",
+        received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+
+    transport.stop().await.unwrap();
+}
+
 /// With a prefix configured, messages without the prefix are silently ignored.
 #[tokio::test]
 async fn prefix_filters_non_prefixed_messages() {
