@@ -74,10 +74,12 @@ enum Workflow {
     ChangePassword {
         stage: ChangePwdStage,
     },
-    /// Resetting another user's password (.PW command, Sysop+).
-    SetUserPassword {
-        target: Username,
-        stage: SetUserPwdStage,
+    /// Forcing a new password at login after a sysop `.PW` reset to a temporary
+    /// password. The login is held until the user chooses a new password. (#134)
+    ForceChangePassword {
+        username: Username,
+        user_id: UserId,
+        stage: ForcePwdStage,
     },
     /// Browsing messages one-at-a-time with F/R navigation.
     /// E replies to the current message; any other input exits.
@@ -107,7 +109,7 @@ enum ChangePwdStage {
 }
 
 #[derive(Clone, Debug)]
-enum SetUserPwdStage {
+enum ForcePwdStage {
     /// Waiting for the new password.
     EnterNew,
     /// New password entered; waiting for confirmation.
@@ -1595,6 +1597,35 @@ impl BbsHost {
         })
     }
 
+    /// Authenticate `session` as `user`: set the session identity/level/room,
+    /// fire `SessionAuthenticated`, and return the `LoggedIn` response. Shared by
+    /// the normal login path and the forced-password-change completion. (#134)
+    async fn finalize_login(&self, session: SessionId, user: &crate::user::User) -> Response {
+        // Unverified users land in the guest room (if configured).
+        let initial_room = if user.permission_level < PermissionLevel::User {
+            self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
+        } else {
+            LOBBY_ROOM_ID
+        };
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.username = Some(user.username.clone());
+                r.user_id = Some(user.id);
+                r.level = user.permission_level;
+                r.workflow = Workflow::None;
+                r.current_room = initial_room;
+            }
+        }
+        let _ = self.events_tx.send(DomainEvent::SessionAuthenticated {
+            session,
+            user: user.username.clone(),
+        });
+        Response::LoggedIn {
+            user: user.username.clone(),
+        }
+    }
+
     async fn handle_login(
         &self,
         session: SessionId,
@@ -1881,28 +1912,34 @@ impl BbsHost {
                     UserStore::update(&self.db, user.id, None, None, None, Some(Timestamp::now()))
                         .await
                         .map_err(|e| HostError::Storage(format!("update last_login: {e}")))?;
-                    {
-                        // Unverified users land in the guest room (if configured).
-                        let initial_room = if user.permission_level < PermissionLevel::User {
-                            self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
-                        } else {
-                            LOBBY_ROOM_ID
-                        };
+
+                    // If a sysop reset this account to a temporary password, hold
+                    // the login and require a new password before completing. (#134)
+                    let must_change = self
+                        .db
+                        .credentials()
+                        .must_change_password(user.id)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("must_change lookup: {e}")))?;
+                    if must_change {
                         let mut sessions = self.sessions.write().await;
                         if let Some(r) = sessions.get_mut(&session) {
-                            r.username = Some(username.clone());
-                            r.user_id = Some(user.id);
-                            r.level = user.permission_level;
-                            r.workflow = Workflow::None;
-                            r.current_room = initial_room;
+                            r.workflow = Workflow::ForceChangePassword {
+                                username: username.clone(),
+                                user_id: user.id,
+                                stage: ForcePwdStage::EnterNew,
+                            };
                         }
+                        return Ok(Response::Prompt {
+                            text: "Your password was reset by an operator. \
+                                   Choose a new password (min 8 characters):"
+                                .into(),
+                            hide_input: true,
+                        });
                     }
-                    let _ = self.events_tx.send(DomainEvent::SessionAuthenticated {
-                        session,
-                        user: username.clone(),
-                    });
+
                     info!(%session, %username, "login successful");
-                    Ok(Response::LoggedIn { user: username })
+                    Ok(self.finalize_login(session, &user).await)
                 } else {
                     // Global per-username failure tracking — parallel sessions share this
                     // counter so they can't bypass the delay by opening fresh connections.
@@ -2303,22 +2340,24 @@ impl BbsHost {
                 Ok(Response::Text("Password changed successfully.".into()))
             }
 
-            // ── Set another user's password (Sysop+) ────────────────────────
-            Workflow::SetUserPassword {
-                target,
-                stage: SetUserPwdStage::EnterNew,
+            // ── Forced password change at login after a sysop reset (#134) ──────
+            Workflow::ForceChangePassword {
+                username,
+                user_id,
+                stage: ForcePwdStage::EnterNew,
             } => {
                 if reply.chars().count() < 8 {
                     return Ok(Response::Prompt {
-                        text: "Too short (min 8 characters). New password:".into(),
+                        text: "Too short (min 8 characters). Choose a new password:".into(),
                         hide_input: true,
                     });
                 }
                 let mut sessions = self.sessions.write().await;
                 if let Some(r) = sessions.get_mut(&session) {
-                    r.workflow = Workflow::SetUserPassword {
-                        target,
-                        stage: SetUserPwdStage::ConfirmNew {
+                    r.workflow = Workflow::ForceChangePassword {
+                        username,
+                        user_id,
+                        stage: ForcePwdStage::ConfirmNew {
                             new_password: reply,
                         },
                     };
@@ -2329,78 +2368,54 @@ impl BbsHost {
                 })
             }
 
-            Workflow::SetUserPassword {
-                target,
-                stage: SetUserPwdStage::ConfirmNew { new_password },
+            Workflow::ForceChangePassword {
+                username,
+                user_id,
+                stage: ForcePwdStage::ConfirmNew { new_password },
             } => {
                 if reply != new_password {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::SetUserPassword {
-                            target,
-                            stage: SetUserPwdStage::EnterNew,
+                        r.workflow = Workflow::ForceChangePassword {
+                            username,
+                            user_id,
+                            stage: ForcePwdStage::EnterNew,
                         };
                     }
                     return Ok(Response::Prompt {
-                        text: "Passwords don't match. New password:".into(),
+                        text: "Passwords don't match. Choose a new password:".into(),
                         hide_input: true,
                     });
                 }
-                let (actor, _, level, _) = match self.session_auth_user(session).await {
-                    Ok(t) => t,
-                    Err(r) => return Ok(r),
-                };
-                if level < PermissionLevel::Sysop {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::None;
-                    }
-                    return Ok(Response::Error("Sysop access required.".into()));
-                }
-                let user = UserStore::get_by_username(&self.db, &target)
+
+                // Set the user's own password and clear the must-change flag.
+                self.db
+                    .credentials()
+                    .set_password(user_id, &new_password, Timestamp::now())
                     .await
-                    .map_err(|e| HostError::Storage(format!("{e}")))?;
-                let user = match user {
+                    .map_err(|e| HostError::Storage(format!("set_password: {e}")))?;
+                self.db
+                    .credentials()
+                    .clear_must_change(user_id)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("clear must_change: {e}")))?;
+
+                // Complete the login that was held pending the password change.
+                let user = match UserStore::get_by_username(&self.db, &username)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("{e}")))?
+                {
                     Some(u) => u,
                     None => {
                         let mut sessions = self.sessions.write().await;
                         if let Some(r) = sessions.get_mut(&session) {
                             r.workflow = Workflow::None;
                         }
-                        return Ok(Response::Error(format!(
-                            "User '{}' not found.",
-                            target.as_str()
-                        )));
+                        return Ok(Response::Error("Account no longer exists.".into()));
                     }
                 };
-                self.db
-                    .credentials()
-                    .set_password(user.id, &new_password, Timestamp::now())
-                    .await
-                    .map_err(|e| HostError::Storage(format!("set_password: {e}")))?;
-                {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::None;
-                    }
-                }
-                if let Err(e) = self
-                    .db
-                    .audit_write(
-                        actor.as_str(),
-                        "set_user_password",
-                        Some(target.as_str()),
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!("audit write failed: {e}");
-                }
-                info!(%actor, %target, "sysop reset user password");
-                Ok(Response::Text(format!(
-                    "Password for '{}' updated.",
-                    target.as_str()
-                )))
+                info!(%username, "forced password change complete; login finalised");
+                Ok(self.finalize_login(session, &user).await)
             }
 
             // ── Message reading ──────────────────────────────────────────────
@@ -4498,45 +4513,55 @@ impl BbsHost {
         session: SessionId,
         target: Username,
     ) -> Result<Response, HostError> {
-        let (_, _, level, _) = match self.session_auth_user(session).await {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
         if level < PermissionLevel::Sysop {
             return Ok(Response::Error("Sysop access required.".into()));
         }
-        let user = UserStore::get_by_username(&self.db, &target)
+        let user = match UserStore::get_by_username(&self.db, &target)
             .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-        if user.is_none() {
-            return Ok(Response::Error(format!(
-                "User '{}' not found.",
-                target.as_str()
-            )));
-        }
+            .map_err(|e| HostError::Storage(format!("{e}")))?
         {
-            let sessions = self.sessions.read().await;
-            if let Some(r) = sessions.get(&session) {
-                if !matches!(r.workflow, Workflow::None) {
-                    return Ok(Response::Error(
-                        "A workflow is already in progress. Type 'cancel' first.".into(),
-                    ));
-                }
+            Some(u) => u,
+            None => {
+                return Ok(Response::Error(format!(
+                    "User '{}' not found.",
+                    target.as_str()
+                )))
             }
-        }
+        };
+
+        // Generate a single-use temporary password server-side (never chosen
+        // over the air) and flag the account so the user must pick a new one at
+        // their next login. The temp value is returned to the sysop to convey
+        // out-of-band. (#134)
+        let temp = self
+            .db
+            .credentials()
+            .reset_to_temp_password(user.id, Timestamp::now())
+            .await
+            .map_err(|e| HostError::Storage(format!("reset password: {e}")))?;
+
+        if let Err(e) = self
+            .db
+            .audit_write(
+                actor.as_str(),
+                "set_user_password",
+                Some(target.as_str()),
+                None,
+            )
+            .await
         {
-            let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.workflow = Workflow::SetUserPassword {
-                    target: target.clone(),
-                    stage: SetUserPwdStage::EnterNew,
-                };
-            }
+            tracing::warn!("audit write failed: {e}");
         }
-        Ok(Response::Prompt {
-            text: format!("New password for {}:", target.as_str()),
-            hide_input: true,
-        })
+        info!(%actor, %target, "sysop reset user to a temporary password");
+        Ok(Response::Text(format!(
+            "Temporary password for '{}': {temp}\n\
+             They must change it at next login. Share it securely — it is visible on-air.",
+            target.as_str()
+        )))
     }
 
     async fn handle_create_room(
@@ -4787,7 +4812,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".c" if is_sysop => ".C — create a new room\nEnters the room creation workflow.",
         ".dr" if is_sysop => ".DR <name> — delete a room",
         ".du" if is_sysop => ".DU <user> — soft-delete a user account\nSets status to deleted and ends active sessions.",
-        ".pw" if is_sysop => ".PW <user> — reset another user's password\nDoes not require knowing their current password.",
+        ".pw" if is_sysop => ".PW <user> — reset a user to a single-use temp password\nReturns a temp password to share; they must change it at next login.",
         "openaccess" if is_sysop => {
             "OPENACCESS — disable verification requirement (SHTF mode)\n\
              All registrations immediately receive User-level access.\n\
@@ -5514,6 +5539,110 @@ mod tests {
         assert_eq!(
             user.display_name, None,
             "`-` sentinel should leave the display name unset"
+        );
+    }
+
+    /// Issue #134: `.PW` generates a single-use temp password (returned to the
+    /// sysop, not chosen over-air); the user is forced to set a new password
+    /// before their next login completes, and the temp stops working afterwards.
+    #[tokio::test]
+    async fn sysop_temp_password_reset_and_forced_change() {
+        let (host, _db) = make_host().await;
+        let sysop = host.create_session("test").await.unwrap();
+        register_and_login(&host, sysop, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // bob registers (auto-logged-in).
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "oldpass1").await;
+        let bob = || Username::new("bob").unwrap();
+
+        // Sysop resets bob → a temporary password is returned (not entered over-air).
+        let resp = host
+            .process_command(sysop, Command::SetUserPassword { username: bob() })
+            .await
+            .unwrap();
+        let temp = match &resp {
+            Response::Text(t) => {
+                assert!(
+                    t.to_lowercase().contains("temporary password"),
+                    "reset should return a temp password, got: {t}"
+                );
+                t.lines()
+                    .next()
+                    .unwrap()
+                    .rsplit(": ")
+                    .next()
+                    .unwrap()
+                    .to_owned()
+            }
+            other => panic!("expected Text, got {other:?}"),
+        };
+        assert!(temp.len() >= 8, "temp password too short: {temp:?}");
+
+        // bob logs in with the temp → forced to choose a new password, NOT yet in.
+        let s = host.create_session("test").await.unwrap();
+        host.process_command(s, Command::Login { username: bob() })
+            .await
+            .unwrap();
+        let resp = host
+            .process_command(
+                s,
+                Command::WorkflowReply {
+                    reply: temp.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("new password")),
+            "temp login should force a password change, got: {resp:?}"
+        );
+        assert!(
+            host.permission_ctx(s).await.unwrap().username().is_none(),
+            "login must not complete until the password is changed"
+        );
+
+        // Choose + confirm a new password → login completes.
+        host.process_command(
+            s,
+            Command::WorkflowReply {
+                reply: "newpass1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(
+                s,
+                Command::WorkflowReply {
+                    reply: "newpass1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::LoggedIn { .. }),
+            "login should complete after the forced change, got: {resp:?}"
+        );
+        assert!(host.permission_ctx(s).await.unwrap().username().is_some());
+
+        // The new password logs in directly (no forced change).
+        let s2 = host.create_session("test").await.unwrap();
+        host.process_command(s2, Command::Login { username: bob() })
+            .await
+            .unwrap();
+        let resp = host
+            .process_command(
+                s2,
+                Command::WorkflowReply {
+                    reply: "newpass1".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::LoggedIn { .. }),
+            "new password should log in directly, got: {resp:?}"
         );
     }
 

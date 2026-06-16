@@ -770,25 +770,23 @@ The five built-in rooms (Lobby, Mail, Aides, Sysop, System) cannot be deleted.
 .PW <username>
 ```
 
-Starts a two-step workflow to set a new password for any account without
-needing to know their current password:
+Generates a single-use **temporary password** for the account and returns it to
+you — you never type a real password over the air:
 
 ```
-New password for alice (min 8 chars):
-> ••••••••
-
-Confirm new password:
-> ••••••••
-
-Password updated for alice.
+Temporary password for 'alice': Kp7mQ2rtVx9d
+They must change it at next login. Share it securely — it is visible on-air.
 ```
 
-If the confirmation doesn't match you are asked to try again. Use `CANCEL`
-to abort without changing anything.
+Convey that temporary password to the user out-of-band. The next time they log
+in with it, the BBS forces them to choose a new password before the session
+completes; the temporary password then stops working.
 
-This is the quickest path for password resets — no CLI access to the server
-required. The equivalent CLI command (`supply-drop-bbs user set-password`) is
-also available and documented in section 15.
+> **On-air note.** The temporary password is shown in your session, which on a
+> radio link is itself visible over the air — it is *single-use* and must be
+> changed immediately, which limits exposure, but treat it as sensitive. The
+> equivalent CLI command (`supply-drop-bbs user set-password`, section 15) sets
+> a password directly without going over the air.
 
 ### Web admin panel
 
@@ -817,7 +815,7 @@ accounts waiting for approval.
 Tell the sysop your username. They can reset your password in three ways,
 from most to least convenient:
 
-1. **In-session** — while connected to the BBS, the sysop types `.PW <username>` and follows the two prompts. No server access needed.
+1. **In-session** — while connected to the BBS, the sysop types `.PW <username>`; the BBS returns a single-use temporary password for them to pass to you, and you set your own password at next login. No server access needed.
 2. **Web admin** — log into the **web admin panel** → Users → find your account → reset password.
 3. **CLI** — on the server, run:
    ```bash
@@ -925,7 +923,7 @@ account and you can re-register with the same username.
 | `UNBAN <user>` | Lift a ban |
 | `.C <name>` | Create a new room |
 | `.DR <name>` | Delete a room |
-| `.PW <user>` | Reset a user's password (two-step workflow) |
+| `.PW <user>` | Reset a user to a single-use temp password |
 
 ---
 
