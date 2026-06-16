@@ -4726,7 +4726,18 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>) -> String {
             }
         }
         Some(t) => match t.to_ascii_lowercase().as_str() {
-            "all" if logged_in => HELP_OVERVIEW.to_owned(),
+            "all" if logged_in => {
+                // Operators must be able to discover their own toolset from
+                // in-app help, so list the Aide/Sysop topics for those levels. (#126)
+                let mut overview = HELP_OVERVIEW.to_owned();
+                if is_aide {
+                    overview.push_str("\nH AIDE — Moderation");
+                }
+                if is_sysop {
+                    overview.push_str("\nH SYSOP — Admin");
+                }
+                overview
+            }
             "m" | "mail" if logged_in => HELP_MAIL.to_owned(),
             "r" | "read" | "reading" if logged_in => HELP_READING.to_owned(),
             "p" | "post" | "posting" if logged_in => HELP_POSTING.to_owned(),
@@ -5013,6 +5024,40 @@ mod tests {
                 s.len()
             );
         }
+    }
+
+    /// Issue #126: `H all` must list the Aide/Sysop help topics for users at
+    /// those levels so operators can discover their admin toolset in-app.
+    #[test]
+    fn help_all_lists_admin_topics_by_level() {
+        let user = help_text(Some("all"), Some(PermissionLevel::User));
+        assert!(
+            !user.contains("AIDE") && !user.contains("SYSOP"),
+            "a plain User should not see admin topics: {user}"
+        );
+
+        let aide = help_text(Some("all"), Some(PermissionLevel::Aide));
+        assert!(
+            aide.contains("H AIDE"),
+            "aide should see the AIDE topic: {aide}"
+        );
+        assert!(
+            !aide.contains("H SYSOP"),
+            "an aide should not see the SYSOP topic: {aide}"
+        );
+
+        let sysop = help_text(Some("all"), Some(PermissionLevel::Sysop));
+        assert!(
+            sysop.contains("H AIDE") && sysop.contains("H SYSOP"),
+            "sysop should see both admin topics: {sysop}"
+        );
+        // Must still fit one MeshCore frame.
+        const MESH_MAX: usize = 156;
+        assert!(
+            sysop.len() <= MESH_MAX,
+            "sysop `H all` is {} bytes — exceeds {MESH_MAX}",
+            sysop.len()
+        );
     }
 
     async fn make_host() -> (Arc<BbsHost>, NamedTempFile) {
