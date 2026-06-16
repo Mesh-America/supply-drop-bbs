@@ -334,25 +334,25 @@ async fn identical_workflow_replies_after_prompt_both_reach_host() {
     transport.stop().await.unwrap();
 }
 
-/// Issue #129: after the registration prompt, the `-` display-name shortcut must
-/// reach the host as a `WorkflowReply` — it must NOT be parsed as a standalone
-/// command (which would drop the user out of registration). This is the mesh
-/// parse-layer half of the `-`-uses-username behaviour (the host half is covered
-/// by `register_display_name_dash_sentinel_uses_username` in bbs-core).
+/// After a prompt, the next message must reach the host as a `WorkflowReply` —
+/// it must NOT be re-parsed as a standalone command at the transport layer. The
+/// host owns the decision of how to interpret a reply (including whether a
+/// REGISTER/LOGIN reply should escape the workflow); the transport must deliver
+/// the text verbatim so that decision is possible.
 #[tokio::test]
-async fn dash_shortcut_after_prompt_is_workflow_reply() {
+async fn reply_after_prompt_reaches_host_as_workflow_reply() {
     let host = Arc::new(MockHost::new());
     host.set_response_for(
         |cmd| matches!(cmd, Command::Register { .. }),
         Response::Prompt {
-            text: "Choose a display name (or send - to use your username):".to_owned(),
-            hide_input: false,
+            text: "Registering 'qatester1'. Choose a password (min 8 characters):".to_owned(),
+            hide_input: true,
         },
     );
     host.set_response_for(
         |cmd| matches!(cmd, Command::WorkflowReply { .. }),
         Response::Prompt {
-            text: "Choose a password (min 8 characters):".to_owned(),
+            text: "Confirm the password for 'qatester1':".to_owned(),
             hide_input: true,
         },
     );
@@ -365,15 +365,19 @@ async fn dash_shortcut_after_prompt_is_workflow_reply() {
         .send(&contact_msg_frame(sender, "register qatester1"))
         .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    bridge.send(&contact_msg_frame(sender, "-")).await;
+    // A reply that happens to look like a command keyword must still be delivered
+    // as a WorkflowReply (the host decides whether it escapes the workflow).
+    bridge
+        .send(&contact_msg_frame(sender, "register qatester2"))
+        .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let received = host.commands_received();
     assert!(
-        received
-            .iter()
-            .any(|(_, c)| matches!(c, Command::WorkflowReply { reply } if reply == "-")),
-        "`-` after the registration prompt must reach the host as a WorkflowReply, got: {:?}",
+        received.iter().any(
+            |(_, c)| matches!(c, Command::WorkflowReply { reply } if reply == "register qatester2")
+        ),
+        "input after a prompt must reach the host as a WorkflowReply, got: {:?}",
         received.iter().map(|(_, c)| c).collect::<Vec<_>>()
     );
 
