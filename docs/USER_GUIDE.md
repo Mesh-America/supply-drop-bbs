@@ -591,9 +591,13 @@ Your display name is shown next to your messages. It can be anything up to
 the system limit. To remove your display name and show only your username:
 
 ```
-Enter your new display name (or '-' to clear, Enter to cancel):
+Enter your new display name (- to clear, CANCEL to abort):
 > -
 ```
+
+Send `-` to clear your display name, type a new one to change it, or send
+`CANCEL` to leave it unchanged. (On the CLI/web an empty line also leaves it
+unchanged, but mesh radios can't send an empty message — use `CANCEL`.)
 
 ### Change your password
 
