@@ -1262,6 +1262,20 @@ async fn api_update_user(
         }
     }
 
+    // A sysop must not lock themselves out by changing their own status or
+    // permission level. (Resetting one's own password is still allowed.)
+    if (body.status.is_some() || body.permission_level.is_some())
+        && caller.username.eq_ignore_ascii_case(&username)
+    {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error(
+                "you can't change your own status or permission level",
+            )),
+        )
+            .into_response();
+    }
+
     let actor_str = format!("web:{}", caller.username);
 
     if body.status.is_some() || body.permission_level.is_some() {
