@@ -373,7 +373,7 @@ impl Command {
                     topic: Some("login".to_owned()),
                 },
             },
-            "logout" | "q" | "quit" => Command::Quit,
+            "logout" | "q" | "quit" | "exit" | "bye" => Command::Quit,
 
             // ── Room navigation ───────────────────────────────────────────────
             "k" => Command::ListRooms,
