@@ -202,6 +202,20 @@ pub struct MeshConfig {
     #[serde(default = "default_flood_after_send")]
     pub flood_after_send: bool,
 
+    /// Total transmissions for an outbound reply, including the first.
+    ///
+    /// On a multi-hop mesh the return path is lossy, so a reply (or its
+    /// end-to-end ACK) is routinely dropped and the BBS appears unresponsive.
+    /// When this is greater than `1`, the transport tracks each reply's delivery
+    /// (via the device's `RESP_CODE_SENT` CRC and `PUSH_CODE_SEND_CONFIRMED`)
+    /// and retransmits if no confirmation arrives before the device's timeout
+    /// hint. `1` disables retransmission (record-and-forget). Defaults to `3`.
+    ///
+    /// Trade-off: delivery becomes at-least-once, so a confirmation lost on the
+    /// return path can produce a duplicate reply — preferable to silence.
+    #[serde(default = "default_reply_max_attempts")]
+    pub reply_max_attempts: u8,
+
     /// Radio parameter configuration.
     ///
     /// Stored here for reference and applied on demand via
@@ -244,6 +258,7 @@ impl Default for MeshConfig {
             reconnect_delay_max_ms: default_reconnect_max_ms(),
             node_credential_ttl_days: default_node_credential_ttl_days(),
             flood_after_send: default_flood_after_send(),
+            reply_max_attempts: default_reply_max_attempts(),
             radio: None,
         }
     }
@@ -281,6 +296,10 @@ fn default_node_credential_ttl_days() -> u32 {
 
 fn default_flood_after_send() -> bool {
     true
+}
+
+fn default_reply_max_attempts() -> u8 {
+    3
 }
 
 fn default_true() -> bool {

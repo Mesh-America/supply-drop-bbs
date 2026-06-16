@@ -118,14 +118,46 @@ enum ForcePwdStage {
 
 #[derive(Clone, Debug)]
 enum RegisterStage {
-    DisplayName,
-    Password {
-        display_name: Option<String>,
-    },
-    Confirm {
-        display_name: Option<String>,
-        password: String,
-    },
+    /// Waiting for the password. (The display name is no longer collected during
+    /// registration — it defaults to the username and is set later via PROFILE.
+    /// Dropping the prompt removes a lossy round-trip on mesh and the failure
+    /// mode where a re-sent `REGISTER <x>` was captured as the display name.)
+    Password,
+    /// Password entered; waiting for confirmation.
+    Confirm { password: String },
+}
+
+/// A REGISTER/LOGIN command recognised inside an active pre-auth workflow, so
+/// it can restart that flow instead of being captured as a field value.
+#[derive(Debug, PartialEq, Eq)]
+enum AuthEscape {
+    Register(String),
+    Login(Username),
+}
+
+/// Detect a REGISTER/LOGIN command in raw workflow-reply text.
+///
+/// Only these two commands escape an active register/login workflow: a lost
+/// prompt on a lossy mesh link leads users to retype the command, and capturing
+/// that as a password (or, previously, a display name) silently corrupts the
+/// account. Other words are intentionally NOT treated as commands here, because
+/// they may be a legitimate password. A keyword with no argument is left to the
+/// workflow (e.g. a bare "register" is too short to be a password and simply
+/// re-prompts). Matching is case-insensitive.
+fn auth_escape(reply: &str) -> Option<AuthEscape> {
+    let trimmed = reply.trim();
+    let (word, rest) = match trimmed.split_once(char::is_whitespace) {
+        Some((w, r)) => (w, r.trim()),
+        None => (trimmed, ""),
+    };
+    if rest.is_empty() {
+        return None;
+    }
+    match word.to_ascii_lowercase().as_str() {
+        "register" => Some(AuthEscape::Register(rest.to_owned())),
+        "login" => Username::new(rest).ok().map(AuthEscape::Login),
+        _ => None,
+    }
 }
 
 #[allow(clippy::enum_variant_names)]
@@ -1591,18 +1623,19 @@ impl BbsHost {
             )));
         }
 
+        let prompt = format!("Registering '{username}'. Choose a password (min 8 characters):");
         {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
                 r.workflow = Workflow::Register {
                     username,
-                    stage: RegisterStage::DisplayName,
+                    stage: RegisterStage::Password,
                 };
             }
         }
         Ok(Response::Prompt {
-            text: "Choose a display name (or send - to use your username):".into(),
-            hide_input: false,
+            text: prompt,
+            hide_input: true,
         })
     }
 
@@ -1666,6 +1699,7 @@ impl BbsHost {
             _ => return Ok(Response::Error("Login failed.".into())),
         }
 
+        let prompt = format!("Enter the password for '{username}':");
         {
             let mut sessions = self.sessions.write().await;
             match sessions.get_mut(&session) {
@@ -1682,9 +1716,18 @@ impl BbsHost {
             }
         }
         Ok(Response::Prompt {
-            text: "Enter your password:".into(),
+            text: prompt,
             hide_input: true,
         })
+    }
+
+    /// Clear any in-progress workflow for `session` (best-effort; a missing
+    /// session is a no-op). Used when a command escapes an active workflow.
+    async fn clear_workflow(&self, session: SessionId) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(r) = sessions.get_mut(&session) {
+            r.workflow = Workflow::None;
+        }
     }
 
     async fn handle_workflow_reply(
@@ -1700,99 +1743,77 @@ impl BbsHost {
             }
         };
 
+        // While registering or logging in, a re-sent REGISTER/LOGIN command must
+        // restart that flow rather than be captured as a field value (e.g. a
+        // password). On a lossy mesh link a prompt is easily lost, so a confused
+        // user retypes the command — and previously it was silently swallowed,
+        // corrupting the account (username vs display name, garbage password).
+        // Deliberately limited to REGISTER/LOGIN: other words may be a legitimate
+        // password and must not be reinterpreted. CANCEL/STOP already break out
+        // upstream in the transport parser.
+        if matches!(workflow, Workflow::Register { .. } | Workflow::Login { .. }) {
+            match auth_escape(&reply) {
+                Some(AuthEscape::Register(name)) => {
+                    self.clear_workflow(session).await;
+                    return self.handle_register(session, name).await;
+                }
+                Some(AuthEscape::Login(name)) => {
+                    self.clear_workflow(session).await;
+                    return self.handle_login(session, name).await;
+                }
+                None => {}
+            }
+        }
+
         match workflow {
             Workflow::None => Ok(Response::Error("No active workflow. Type 'H'.".into())),
 
             // ── Registration ─────────────────────────────────────────────────
             Workflow::Register {
                 username,
-                stage: RegisterStage::DisplayName,
-            } => {
-                let trimmed = reply.trim();
-                // Empty input or the `-` sentinel both mean "use my username".
-                // Mesh transports can't send an empty message, so `-` (the same
-                // sentinel the PROFILE flow uses to clear a display name) is the
-                // mesh-usable way to accept the default; empty stays valid for
-                // CLI/web. See issue #105.
-                let display_name = if trimmed.is_empty() || trimmed == "-" {
-                    None
-                } else {
-                    if let Err(e) = crate::user::User::validate_display_name(trimmed) {
-                        return Ok(Response::Prompt {
-                            text: format!("Invalid display name: {e}. Try again:"),
-                            hide_input: false,
-                        });
-                    }
-                    Some(trimmed.to_owned())
-                };
-                let mut sessions = self.sessions.write().await;
-                if let Some(r) = sessions.get_mut(&session) {
-                    r.workflow = Workflow::Register {
-                        username,
-                        stage: RegisterStage::Password { display_name },
-                    };
-                }
-                Ok(Response::Prompt {
-                    text: "Choose a password (min 8 characters):".into(),
-                    hide_input: true,
-                })
-            }
-
-            Workflow::Register {
-                username,
-                stage: RegisterStage::Password { display_name },
+                stage: RegisterStage::Password,
             } => {
                 if reply.chars().count() < 8 {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::Register {
-                            username,
-                            stage: RegisterStage::Password { display_name },
-                        };
-                    }
                     return Ok(Response::Prompt {
-                        text: "Password must be at least 8 characters. Try again:".into(),
+                        text: format!(
+                            "Password for '{username}' must be at least 8 characters. Try again:"
+                        ),
                         hide_input: true,
                     });
                 }
+                let prompt = format!("Confirm the password for '{username}':");
                 let mut sessions = self.sessions.write().await;
                 if let Some(r) = sessions.get_mut(&session) {
                     r.workflow = Workflow::Register {
                         username,
-                        stage: RegisterStage::Confirm {
-                            display_name,
-                            password: reply,
-                        },
+                        stage: RegisterStage::Confirm { password: reply },
                     };
                 }
                 Ok(Response::Prompt {
-                    text: "Confirm your password:".into(),
+                    text: prompt,
                     hide_input: true,
                 })
             }
 
             Workflow::Register {
                 username,
-                stage:
-                    RegisterStage::Confirm {
-                        display_name,
-                        password,
-                    },
+                stage: RegisterStage::Confirm { password },
             } => {
                 if reply != password {
+                    let prompt =
+                        format!("Passwords didn't match. Choose a password for '{username}':");
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
                         r.workflow = Workflow::Register {
                             username,
-                            stage: RegisterStage::Password { display_name },
+                            stage: RegisterStage::Password,
                         };
                     }
                     return Ok(Response::Prompt {
-                        text: "Passwords don't match. Choose a password:".into(),
+                        text: prompt,
                         hide_input: true,
                     });
                 }
-
                 let now = Timestamp::now();
                 // Promote the very first registrant to Sysop so the system
                 // isn't stuck with no one able to validate new users.
@@ -1805,27 +1826,22 @@ impl BbsHost {
                 } else {
                     PermissionLevel::Unvalidated
                 };
-                let user_id = match UserStore::create(
-                    &self.db,
-                    &username,
-                    display_name.as_deref(),
-                    initial_level,
-                    now,
-                )
-                .await
-                {
-                    Ok(id) => id,
-                    Err(crate::db::StoreError::Conflict(_)) => {
-                        let mut sessions = self.sessions.write().await;
-                        if let Some(r) = sessions.get_mut(&session) {
-                            r.workflow = Workflow::None;
+                // Display name defaults to the username (stored as NULL); the user
+                // sets it later with PROFILE. See RegisterStage docs.
+                let user_id =
+                    match UserStore::create(&self.db, &username, None, initial_level, now).await {
+                        Ok(id) => id,
+                        Err(crate::db::StoreError::Conflict(_)) => {
+                            let mut sessions = self.sessions.write().await;
+                            if let Some(r) = sessions.get_mut(&session) {
+                                r.workflow = Workflow::None;
+                            }
+                            return Ok(Response::Error(format!(
+                                "'{username}' was just taken. Try: register <different_username>"
+                            )));
                         }
-                        return Ok(Response::Error(format!(
-                            "'{username}' was just taken. Try: register <different_username>"
-                        )));
-                    }
-                    Err(e) => return Err(HostError::Storage(format!("create user: {e}"))),
-                };
+                        Err(e) => return Err(HostError::Storage(format!("create user: {e}"))),
+                    };
                 self.db
                     .credentials()
                     .set_password(user_id, &password, now)
@@ -5380,16 +5396,14 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(matches!(r, Response::Prompt { .. }));
+        // Registration goes straight to a self-describing password prompt — no
+        // display-name step (it defaults to the username; set later via PROFILE).
+        assert!(
+            matches!(&r, Response::Prompt { text, .. }
+                if text.to_lowercase().contains("password") && text.contains("alice")),
+            "expected a self-describing password prompt, got: {r:?}"
+        );
 
-        host.process_command(
-            sid,
-            Command::WorkflowReply {
-                reply: "Alice".into(),
-            },
-        )
-        .await
-        .unwrap();
         host.process_command(
             sid,
             Command::WorkflowReply {
@@ -5448,14 +5462,6 @@ mod tests {
         host.process_command(
             sid,
             Command::WorkflowReply {
-                reply: String::new(),
-            },
-        )
-        .await
-        .unwrap();
-        host.process_command(
-            sid,
-            Command::WorkflowReply {
                 reply: "password1".into(),
             },
         )
@@ -5492,14 +5498,6 @@ mod tests {
             sid,
             Command::Register {
                 username: uname.as_str().to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-        host.process_command(
-            sid,
-            Command::WorkflowReply {
-                reply: String::new(),
             },
         )
         .await
@@ -5611,14 +5609,6 @@ mod tests {
         host.process_command(
             sid,
             Command::WorkflowReply {
-                reply: String::new(),
-            },
-        )
-        .await
-        .unwrap();
-        host.process_command(
-            sid,
-            Command::WorkflowReply {
                 reply: "password1".into(),
             },
         )
@@ -5679,15 +5669,6 @@ mod tests {
             sid,
             Command::Register {
                 username: uname.as_str().to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-        // display name (empty = skip)
-        host.process_command(
-            sid,
-            Command::WorkflowReply {
-                reply: String::new(),
             },
         )
         .await
@@ -5757,35 +5738,222 @@ mod tests {
         );
     }
 
-    /// Issue #129: the `-` display-name shortcut must ADVANCE to the password
-    /// step (not exit registration). Regression guard for the #105 fix.
+    /// Registration no longer has a display-name step: REGISTER advances straight
+    /// to a password prompt, and the account is created with no display name (it
+    /// shows the username until changed via PROFILE). This removes the lossy
+    /// round-trip and the failure mode where a re-sent command was captured as
+    /// the display name.
     #[tokio::test]
-    async fn register_dash_advances_to_password() {
+    async fn register_skips_display_name_step() {
         let (host, _db) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "qatester1".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        // First prompt is the password (self-describing), not a display-name ask.
+        match &resp {
+            Response::Prompt { text, .. } => {
+                let t = text.to_lowercase();
+                assert!(t.contains("password"), "expected password prompt: {text}");
+                assert!(
+                    !t.contains("display name"),
+                    "registration must not ask for a display name: {text}"
+                );
+                assert!(
+                    text.contains("qatester1"),
+                    "prompt should name the user: {text}"
+                );
+            }
+            other => panic!("expected a prompt, got {other:?}"),
+        }
+        let stage_is_password = {
+            let sessions = host.sessions.read().await;
+            matches!(
+                sessions[&sid].workflow,
+                Workflow::Register {
+                    stage: RegisterStage::Password,
+                    ..
+                }
+            )
+        };
+        assert!(stage_is_password, "should be at the password stage");
+
+        // Complete registration; the account has no display name.
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: "hunter2!".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let done = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "hunter2!".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(done, Response::LoggedIn { .. }));
+        let user = host
+            .db
+            .get_by_username(&Username::new("qatester1").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            user.display_name, None,
+            "display name should default to None"
+        );
+    }
+
+    /// A re-sent REGISTER while mid-registration restarts registration with the
+    /// new username instead of being captured as a password — the core fix for
+    /// the lost-prompt corruption (a "Failed" REGISTER set the username, the next
+    /// REGISTER became the display name, and chat text became the password).
+    #[tokio::test]
+    async fn register_command_escapes_active_registration() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+
         host.process_command(
             sid,
             Command::Register {
-                username: "qatester1".to_owned(),
+                username: "tcf".to_owned(),
             },
         )
         .await
         .unwrap();
 
+        // User didn't see the prompt and retypes the command with a new name.
         let resp = host
-            .process_command(sid, Command::WorkflowReply { reply: "-".into() })
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "REGISTER tcm1".into(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // It restarts registration as 'tcm1' (a fresh password prompt for tcm1),
+        // NOT captured as tcf's password.
+        match &resp {
+            Response::Prompt { text, .. } => {
+                assert!(text.contains("tcm1"), "should restart as tcm1: {text}");
+                assert!(
+                    text.to_lowercase().contains("password"),
+                    "should prompt for password: {text}"
+                );
+            }
+            other => panic!("expected a prompt, got {other:?}"),
+        }
+        let registering_tcm1 = {
+            let sessions = host.sessions.read().await;
+            matches!(
+                &sessions[&sid].workflow,
+                Workflow::Register { username, .. } if username.as_str() == "tcm1"
+            )
+        };
+        assert!(registering_tcm1, "workflow should now be registering tcm1");
+    }
+
+    /// A LOGIN command escapes an active registration (switches flows), and a
+    /// REGISTER escapes an active login. Passwords are never reinterpreted.
+    #[tokio::test]
+    async fn login_register_escape_each_other() {
+        let (host, _db) = make_host().await;
+
+        // Seed an existing account to log into.
+        let setup = host.create_session("test").await.unwrap();
+        do_register(&host, setup, "alice", "s3cr3t!!").await;
+
+        // Mid-registration, LOGIN switches to the login flow.
+        let sid = host.create_session("test").await.unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: "bob".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: "login alice".into(),
+                },
+            )
             .await
             .unwrap();
         assert!(
-            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("password")),
-            "`-` should advance to the password prompt, got: {resp:?}"
+            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("password") && text.contains("alice")),
+            "LOGIN should switch to login for alice, got: {resp:?}"
         );
-        // Still mid-registration — not dropped back to the anonymous menu.
-        let sessions = host.sessions.read().await;
+        let logging_in = {
+            let sessions = host.sessions.read().await;
+            matches!(&sessions[&sid].workflow, Workflow::Login { username, .. } if username.as_str() == "alice")
+        };
+        assert!(logging_in, "should be in the login workflow for alice");
+
+        // A password that merely *looks* like normal text is NOT reinterpreted:
+        // an ordinary password is accepted as the password.
+        let s2 = host.create_session("test").await.unwrap();
+        host.process_command(
+            s2,
+            Command::Register {
+                username: "carol".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = host
+            .process_command(
+                s2,
+                Command::WorkflowReply {
+                    reply: "hello world pw".into(),
+                },
+            )
+            .await
+            .unwrap();
+        // Advanced to confirm — the text was taken as the password, not a command.
         assert!(
-            matches!(sessions[&sid].workflow, Workflow::Register { .. }),
-            "session should still be in the registration workflow after `-`"
+            matches!(&resp, Response::Prompt { text, .. } if text.to_lowercase().contains("confirm")),
+            "ordinary text should be taken as the password, got: {resp:?}"
         );
+    }
+
+    #[test]
+    fn auth_escape_recognizes_register_and_login_only() {
+        assert_eq!(
+            auth_escape("REGISTER tcm1"),
+            Some(AuthEscape::Register("tcm1".into()))
+        );
+        assert_eq!(
+            auth_escape("  register   TCF  "),
+            Some(AuthEscape::Register("TCF".into()))
+        );
+        assert_eq!(
+            auth_escape("login alice"),
+            Some(AuthEscape::Login(Username::new("alice").unwrap()))
+        );
+        // No argument → not an escape (a bare keyword is left to the workflow).
+        assert_eq!(auth_escape("register"), None);
+        assert_eq!(auth_escape("login"), None);
+        // Other words are never escapes — they may be a legitimate password.
+        assert_eq!(auth_escape("hello there friend"), None);
+        assert_eq!(auth_escape("help"), None);
+        assert_eq!(auth_escape("s3cr3t!!"), None);
     }
 
     /// Issue #128: `REGISTER` validates the username up front and returns a
@@ -5838,7 +6006,7 @@ mod tests {
             "reserved username should be rejected specifically, got: {reserved:?}"
         );
 
-        // A valid username advances to the display-name prompt.
+        // A valid username advances straight to the password prompt.
         let ok = host
             .process_command(
                 sid,
@@ -5849,7 +6017,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(&ok, Response::Prompt { text, .. } if text.to_lowercase().contains("display name")),
+            matches!(&ok, Response::Prompt { text, .. } if text.to_lowercase().contains("password")),
             "valid username should start registration, got: {ok:?}"
         );
     }
@@ -6124,50 +6292,6 @@ mod tests {
         assert!(
             matches!(&r, Response::Text(t) if t.to_lowercase().contains("user")),
             "demoting a sysop while another remains should succeed, got: {r:?}"
-        );
-    }
-
-    /// Issue #105: on a mesh radio you can't send an empty message, so the
-    /// `-` sentinel must mean "use my username" (display name left unset),
-    /// matching the empty-input behaviour available on CLI/web.
-    #[tokio::test]
-    async fn register_display_name_dash_sentinel_uses_username() {
-        let (host, _db) = make_host().await;
-        let sid = host.create_session("test").await.unwrap();
-        let uname = Username::new("dashuser").unwrap();
-
-        host.process_command(
-            sid,
-            Command::Register {
-                username: uname.as_str().to_owned(),
-            },
-        )
-        .await
-        .unwrap();
-        // Display name: `-` → use username (the empty-input default is
-        // unreachable over mesh).
-        host.process_command(sid, Command::WorkflowReply { reply: "-".into() })
-            .await
-            .unwrap();
-        // Password, then matching confirmation.
-        for _ in 0..2 {
-            host.process_command(
-                sid,
-                Command::WorkflowReply {
-                    reply: "abc12345".into(),
-                },
-            )
-            .await
-            .unwrap();
-        }
-
-        let user = UserStore::get_by_username(&host.db, &uname)
-            .await
-            .unwrap()
-            .expect("user should be created");
-        assert_eq!(
-            user.display_name, None,
-            "`-` sentinel should leave the display name unset"
         );
     }
 
@@ -6875,16 +6999,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // Step 2: skip optional display name.
-        host.process_command(
-            sid,
-            Command::WorkflowReply {
-                reply: String::new(),
-            },
-        )
-        .await
-        .unwrap();
-        // Step 3: enter password.
+        // Step 2: enter password.
         host.process_command(
             sid,
             Command::WorkflowReply {
@@ -6893,7 +7008,7 @@ mod tests {
         )
         .await
         .unwrap();
-        // Step 4: confirm password — should log in.
+        // Step 3: confirm password — should log in.
         let resp = host
             .process_command(
                 sid,

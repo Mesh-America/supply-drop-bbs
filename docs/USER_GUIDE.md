@@ -78,26 +78,29 @@ REGISTER alice
 - Case-insensitive at login (stored exactly as typed)
 - The names `bbs` and `system` are reserved and cannot be registered
 
-The BBS will walk you through three prompts:
+The BBS then prompts for a password and a confirmation — two short steps,
+each naming the account so you always know where you are:
 
 ```
-Choose a display name (or send - to use your username):
-> Alice Wonderland
-
-Choose a password (min 8 characters):
+Registering 'alice'. Choose a password (min 8 characters):
 > ••••••••
 
-Confirm your password:
+Confirm the password for 'alice':
 > ••••••••
 ```
 
-**Display name** is optional. It is the name shown alongside your messages.
-Send `-` to use your username as-is (on a mesh radio you can't send an empty
-message; on the CLI/web you can also just press Enter). You can change it later
-with `PROFILE`.
+**Display name.** New accounts use your username as the display name. Set a
+separate display name at any time with `PROFILE` (see [section 12](#12-your-profile)).
+Registration deliberately has no display-name step: on a mesh radio a lost
+prompt could otherwise capture the wrong message as your name (or password).
 
 **Password** must be at least 8 characters. It is stored as a hashed value —
 the BBS never stores your password in plain text.
+
+> **Retyping a command mid-registration is safe.** If a prompt is lost over the
+> air and you resend `REGISTER <name>` (or `LOGIN <name>`), the BBS restarts that
+> flow instead of treating your command as a password. To abort entirely, send
+> `CANCEL`.
 
 After confirmation you are immediately logged in:
 
@@ -125,7 +128,7 @@ LOGIN alice
 You'll be prompted for your password (input is hidden on supporting clients):
 
 ```
-Enter your password:
+Enter the password for 'alice':
 > ••••••••
 ```
 

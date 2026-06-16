@@ -259,6 +259,23 @@ no-silent-overrides rule.
 | `connection_type`  | enum   | `"serial"` | no       | How to reach the radio: `"serial"`, `"tcp"`, or `"hat"`. See [ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md). |
 | `command_prefix`   | string | `""`       | no       | Optional single-character prefix for BBS commands (e.g., `"!"`). Empty string means no prefix - every message is treated as a command. |
 
+### Reply delivery
+
+On a multi-hop mesh the return path is lossy, so a reply can be dropped even
+though the BBS processed the command. These keys make replies more likely to
+arrive.
+
+| Key                 | Type    | Default | Required | Description                                     |
+|---------------------|---------|---------|----------|-------------------------------------------------|
+| `flood_after_send`  | bool    | `true`  | no       | Reset the node's stored path after each send so the next message floods (hop-by-hop) rather than using a possibly-stale direct route. |
+| `reply_max_attempts`| integer | `3`     | no       | Total transmissions per reply, including the first. When > 1, the transport tracks each reply's delivery via the device's send-result CRC and delivery confirmation and retransmits if no confirmation arrives in time. `1` disables retransmission. |
+
+> **At-least-once delivery.** With `reply_max_attempts > 1`, a delivery
+> confirmation lost on the return path can cause the BBS to retransmit a reply
+> the user already received — a duplicate message is preferable to silence, and
+> inbound commands are deduplicated separately. The per-attempt wait is the
+> device's own timeout hint, clamped to the 4–30 s range.
+
 ### Serial mode (`connection_type = "serial"`)
 
 Used for USB-native MeshCore devices (Heltec V3, T-Beam, etc.) that
