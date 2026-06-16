@@ -1011,6 +1011,39 @@ impl Host for BbsHost {
             }
         };
 
+        // Status and permission level are orthogonal. Refuse to set a level on an
+        // account that is (and stays) non-active: the level would be applied to a
+        // banned/deleted account and take effect on re-login. Re-activate first.
+        if new_level.is_some() {
+            let effective_status = new_status.unwrap_or(user.status);
+            if effective_status != UserStatus::Active {
+                return Err(HostError::PreconditionFailed(format!(
+                    "cannot change permission level of a {effective_status} account; \
+                     re-activate it first"
+                )));
+            }
+        }
+
+        // Backstop against removing the last active Sysop (admin lockout). Mirror
+        // the count check in handle_set_user_level so the invariant holds on the
+        // web/admin path too.
+        if user.permission_level == PermissionLevel::Sysop
+            && matches!(new_level, Some(l) if l < PermissionLevel::Sysop)
+        {
+            let active = UserStore::list(&self.db, Some(UserStatus::Active), 500, 0)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let sysops = active
+                .iter()
+                .filter(|u| u.permission_level == PermissionLevel::Sysop)
+                .count();
+            if sysops <= 1 {
+                return Err(HostError::PreconditionFailed(
+                    "cannot demote the last active Sysop; promote another Sysop first".into(),
+                ));
+            }
+        }
+
         UserStore::update(&self.db, user.id, None, new_status, new_level, None)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
@@ -5942,6 +5975,70 @@ mod tests {
             matches!(ended, DomainEvent::SessionEnded { session, .. } if session == sid),
             "expected SessionEnded for alice's session, got {ended:?}"
         );
+    }
+
+    /// Web/admin guards: `admin_update_user` refuses to set a level on a
+    /// non-active account (re-empower) and refuses to demote the last active
+    /// Sysop (admin lockout). A legitimate re-activate+level and a demotion with
+    /// another Sysop remaining both succeed.
+    #[tokio::test]
+    async fn admin_update_user_level_guards() {
+        let (host, _db) = make_host().await;
+
+        // alice = sole sysop (first registrant).
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+
+        // Demoting the last active Sysop is refused.
+        let r = host.admin_update_user("alice", None, Some(10)).await;
+        assert!(
+            matches!(&r, Err(HostError::PreconditionFailed(m)) if m.to_lowercase().contains("last active sysop")),
+            "last-sysop demotion should be refused, got: {r:?}"
+        );
+
+        // bob registers (Unvalidated, active), then is banned.
+        let bob_sid = host.create_session("test").await.unwrap();
+        do_register(&host, bob_sid, "bob", "pass5678").await;
+        host.admin_update_user("bob", Some(1), None).await.unwrap();
+
+        // Setting a level on the banned account is refused.
+        let r = host.admin_update_user("bob", None, Some(50)).await;
+        assert!(
+            matches!(&r, Err(HostError::PreconditionFailed(m)) if m.to_lowercase().contains("re-activate")),
+            "level change on a banned account should be refused, got: {r:?}"
+        );
+        assert_eq!(
+            UserStore::get_by_username(&host.db, &Username::new("bob").unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_level,
+            PermissionLevel::Unvalidated,
+            "banned user's level must be unchanged"
+        );
+
+        // Re-activate and set the level in one call: allowed.
+        host.admin_update_user("bob", Some(0), Some(50))
+            .await
+            .unwrap();
+        assert_eq!(
+            UserStore::get_by_username(&host.db, &Username::new("bob").unwrap())
+                .await
+                .unwrap()
+                .unwrap()
+                .permission_level,
+            PermissionLevel::Aide
+        );
+
+        // With a second Sysop present, demoting one is allowed.
+        let carol_sid = host.create_session("test").await.unwrap();
+        do_register(&host, carol_sid, "carol", "pass9012").await;
+        host.admin_update_user("carol", None, Some(100))
+            .await
+            .unwrap();
+        host.admin_update_user("carol", None, Some(10))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
