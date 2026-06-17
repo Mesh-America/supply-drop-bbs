@@ -79,8 +79,9 @@ pub(crate) struct PendingSend {
 /// Outcome of an `on_sent` correlation.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SentOutcome {
-    /// Device accepted the message; now awaiting end-to-end confirmation.
-    Accepted,
+    /// Device accepted the message; now awaiting end-to-end confirmation. Carries
+    /// the destination prefix so the caller can attribute the accept per node.
+    Accepted([u8; 6]),
     /// Device reported `MSG_SEND_FAILED` (CRC 0). The record is returned so the
     /// caller can retransmit immediately if attempts remain.
     Failed(PendingSend),
@@ -141,9 +142,10 @@ impl SendTracker {
             return SentOutcome::Failed(rec);
         }
         rec.deadline = now + self.cfg.ack_wait(timeout_ms);
+        let prefix = rec.prefix;
         // A CRC collision (same message retransmitted) simply refreshes the entry.
         self.awaiting_ack.insert(crc, rec);
-        SentOutcome::Accepted
+        SentOutcome::Accepted(prefix)
     }
 
     /// Mark a message delivered (`SendConfirmed`). Returns the tracked record
@@ -212,7 +214,10 @@ mod tests {
         let now = Instant::now();
         let mut t = SendTracker::new(cfg(3));
         rec(&mut t, "hi", 1, now);
-        assert_eq!(t.on_sent(0xABCD, 5_000, now), SentOutcome::Accepted);
+        assert_eq!(
+            t.on_sent(0xABCD, 5_000, now),
+            SentOutcome::Accepted([1, 2, 3, 4, 5, 6])
+        );
         assert!(t.on_confirmed(0xABCD).is_some());
         // Past the deadline, nothing is due — it was delivered.
         let due = t.collect_due(now + Duration::from_secs(60));

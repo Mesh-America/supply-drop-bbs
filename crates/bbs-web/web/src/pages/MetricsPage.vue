@@ -31,6 +31,17 @@ interface MetricsSnapshot {
   sampled_at: number
 }
 
+interface NodeRow {
+  prefix: string
+  sends: number
+  accepted: number
+  failed_no_route: number
+  confirmed: number
+  gave_up: number
+  confirm_rate: number | null
+  avg_latency_ms: number | null
+}
+
 interface DeliveryStats {
   sends_total: number
   retransmits: number
@@ -45,10 +56,18 @@ interface DeliveryStats {
   avg_latency_ms: number | null
   min_latency_ms: number | null
   max_latency_ms: number | null
+  nodes_tracked: number
+  per_node: NodeRow[]
+}
+
+interface Advert {
+  pubkey: string
+  name: string
 }
 
 const snap = ref<MetricsSnapshot | null>(null)
 const delivery = ref<DeliveryStats | null>(null)
+const nodeNames = ref<Record<string, string>>({})
 const loading = ref(false)
 const error = ref<string | null>(null)
 
@@ -69,6 +88,25 @@ async function load() {
   } catch {
     delivery.value = null
   }
+  // Best-effort node-name lookup so the per-node table reads in node names
+  // rather than key prefixes. The per-node prefix is the first 12 hex chars
+  // (6 bytes) of the advert pubkey.
+  if (delivery.value && delivery.value.per_node.length > 0) {
+    try {
+      const adverts = await api.get<Advert[]>('/api/v1/adverts')
+      const map: Record<string, string> = {}
+      for (const a of adverts) {
+        if (a.name) map[a.pubkey.slice(0, 12).toLowerCase()] = a.name
+      }
+      nodeNames.value = map
+    } catch {
+      nodeNames.value = {}
+    }
+  }
+}
+
+function nodeLabel(prefix: string): string {
+  return nodeNames.value[prefix.toLowerCase()] ?? prefix
 }
 
 function ratePct(r: number | null): string {
@@ -231,6 +269,42 @@ onUnmounted(() => {
           <div class="big-num">{{ fmtMs(delivery.avg_latency_ms) }}</div>
           <div class="card-sub muted">min {{ fmtMs(delivery.min_latency_ms) }} / max {{ fmtMs(delivery.max_latency_ms) }}</div>
         </div>
+      </div>
+    </section>
+
+    <!-- Per-node link health -->
+    <section v-if="delivery && delivery.per_node.length > 0" class="section">
+      <h2 class="section-title">Per-node link health — worst first ({{ delivery.nodes_tracked }} node{{ delivery.nodes_tracked === 1 ? '' : 's' }} tracked)</h2>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>node</th>
+              <th style="min-width:130px">confirm rate</th>
+              <th>sends</th>
+              <th>no route</th>
+              <th>confirmed</th>
+              <th>gave up</th>
+              <th>avg rtt</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="n in delivery.per_node" :key="n.prefix">
+              <td><span :class="{ mono: nodeLabel(n.prefix) === n.prefix }">{{ nodeLabel(n.prefix) }}</span></td>
+              <td>
+                <div class="bar-track inline">
+                  <div class="bar-fill" :style="{ width: rateWidth(n.confirm_rate) + '%' }" :class="confirmBarClass(n.confirm_rate)"></div>
+                </div>
+                <span class="muted pct-label">{{ ratePct(n.confirm_rate) }}</span>
+              </td>
+              <td>{{ n.sends }}</td>
+              <td>{{ n.failed_no_route }}</td>
+              <td>{{ n.confirmed }} / {{ n.accepted }}</td>
+              <td>{{ n.gave_up }}</td>
+              <td>{{ fmtMs(n.avg_latency_ms) }}</td>
+            </tr>
+          </tbody>
+        </table>
       </div>
     </section>
 

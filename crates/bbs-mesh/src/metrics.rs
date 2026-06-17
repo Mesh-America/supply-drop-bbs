@@ -21,15 +21,62 @@
 //! persisted time-series for trend analysis is a separate, later layer — this
 //! module is the live snapshot only.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Instant;
 
 use bbs_plugin_api::TransportStats;
 use serde::Serialize;
 use serde_json::Value;
 
+/// Cap on the number of per-node delivery records kept in memory. When the map
+/// is full and a new node appears, the least-recently-active record is evicted —
+/// the operator cares about nodes currently exchanging traffic, not stale ones.
+const MAX_TRACKED_NODES: usize = 256;
+
+/// Cap on how many per-node records are serialised in a snapshot (worst-first).
+const MAX_NODES_IN_SNAPSHOT: usize = 50;
+
+/// Per-node delivery counters. Plain integers — guarded by the `nodes` mutex,
+/// not atomics, since they are only touched under that lock.
+#[derive(Debug, Default, Clone)]
+struct NodeCounters {
+    sends: u64,
+    accepted: u64,
+    failed_no_route: u64,
+    confirmed: u64,
+    gave_up: u64,
+    latency_count: u64,
+    latency_sum_ms: u64,
+    latency_min_ms: u64,
+    latency_max_ms: u64,
+}
+
+impl NodeCounters {
+    fn record_latency(&mut self, ms: u64) {
+        if self.latency_count == 0 || ms < self.latency_min_ms {
+            self.latency_min_ms = ms;
+        }
+        if ms > self.latency_max_ms {
+            self.latency_max_ms = ms;
+        }
+        self.latency_count += 1;
+        self.latency_sum_ms += ms;
+    }
+}
+
+/// A per-node record plus the last time it was touched (for stale eviction).
+#[derive(Debug)]
+struct NodeEntry {
+    counters: NodeCounters,
+    last_update: Instant,
+}
+
 /// Cumulative reply-delivery counters, updated from the transport's send path
-/// and inbound-frame handlers. Shared via `Arc`; all methods take `&self`
-/// (atomic, lock-free) so they can be called from any task without coordination.
+/// and inbound-frame handlers. Shared via `Arc`. The global counters are
+/// lock-free atomics; the per-node map is behind a short-lived mutex (mesh
+/// traffic is low-frequency, so contention is negligible).
 #[derive(Debug)]
 pub struct DeliveryStats {
     /// Outbound text frames handed to the companion client (first sends and
@@ -64,6 +111,9 @@ pub struct DeliveryStats {
     latency_min_ms: AtomicU64,
     /// Largest round-trip latency seen, in milliseconds.
     latency_max_ms: AtomicU64,
+    /// Per-destination delivery counters, keyed by 6-byte pubkey prefix. Bounded
+    /// at [`MAX_TRACKED_NODES`]; the stalest entry is evicted when full.
+    nodes: Mutex<HashMap<[u8; 6], NodeEntry>>,
 }
 
 impl Default for DeliveryStats {
@@ -81,19 +131,42 @@ impl Default for DeliveryStats {
             // Sentinel so the first recorded sample becomes the minimum.
             latency_min_ms: AtomicU64::new(u64::MAX),
             latency_max_ms: AtomicU64::new(0),
+            nodes: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl DeliveryStats {
-    /// Record an outbound text frame accepted by the command channel.
-    /// `attempt` is the 1-based transmission count (1 = first send); anything
-    /// greater is a retransmission.
-    pub fn on_send(&self, attempt: u8) {
+    /// Update one node's counters under the map lock, evicting the stalest entry
+    /// first if the map is full and this node is new.
+    fn with_node<F: FnOnce(&mut NodeCounters)>(&self, prefix: [u8; 6], f: F) {
+        let mut map = self.nodes.lock().expect("nodes mutex poisoned");
+        if !map.contains_key(&prefix) && map.len() >= MAX_TRACKED_NODES {
+            if let Some(stalest) = map
+                .iter()
+                .min_by_key(|(_, e)| e.last_update)
+                .map(|(k, _)| *k)
+            {
+                map.remove(&stalest);
+            }
+        }
+        let entry = map.entry(prefix).or_insert_with(|| NodeEntry {
+            counters: NodeCounters::default(),
+            last_update: Instant::now(),
+        });
+        f(&mut entry.counters);
+        entry.last_update = Instant::now();
+    }
+
+    /// Record an outbound text frame accepted by the command channel, addressed
+    /// to `prefix`. `attempt` is the 1-based transmission count (1 = first send);
+    /// anything greater is a retransmission.
+    pub fn on_send(&self, prefix: [u8; 6], attempt: u8) {
         self.sends_total.fetch_add(1, Ordering::Relaxed);
         if attempt > 1 {
             self.retransmits.fetch_add(1, Ordering::Relaxed);
         }
+        self.with_node(prefix, |c| c.sends += 1);
     }
 
     /// Record an outbound text frame dropped before the wire (channel full/closed).
@@ -101,8 +174,8 @@ impl DeliveryStats {
         self.dropped.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record the device's `RESP_CODE_SENT` outcome: `accepted = true` when the
-    /// device queued the message, `false` for `MSG_SEND_FAILED` (no route).
+    /// Record the device's `RESP_CODE_SENT` outcome (global): `accepted = true`
+    /// when the device queued the message, `false` for `MSG_SEND_FAILED`.
     pub fn on_sent_result(&self, accepted: bool) {
         if accepted {
             self.accepted.fetch_add(1, Ordering::Relaxed);
@@ -111,14 +184,40 @@ impl DeliveryStats {
         }
     }
 
-    /// Record an end-to-end delivery confirmation.
+    /// Attribute a `RESP_CODE_SENT` outcome to a specific node. Driven by the
+    /// retransmission tracker's correlation, so it is only called when retries
+    /// are enabled (the global [`Self::on_sent_result`] is always called).
+    pub fn on_node_sent_result(&self, prefix: [u8; 6], accepted: bool) {
+        self.with_node(prefix, |c| {
+            if accepted {
+                c.accepted += 1;
+            } else {
+                c.failed_no_route += 1;
+            }
+        });
+    }
+
+    /// Record an end-to-end delivery confirmation (global).
     pub fn on_confirmed(&self) {
         self.confirmed.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a reply abandoned after exhausting its retransmission budget.
+    /// Attribute a confirmation and its round-trip latency to a specific node.
+    pub fn on_node_confirmed(&self, prefix: [u8; 6], latency_ms: u64) {
+        self.with_node(prefix, |c| {
+            c.confirmed += 1;
+            c.record_latency(latency_ms);
+        });
+    }
+
+    /// Record a reply abandoned after exhausting its retransmission budget (global).
     pub fn on_gave_up(&self) {
         self.gave_up.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Attribute a give-up to a specific node.
+    pub fn on_node_gave_up(&self, prefix: [u8; 6]) {
+        self.with_node(prefix, |c| c.gave_up += 1);
     }
 
     /// Record a round-trip latency sample (send → end-to-end confirmation), in
@@ -163,6 +262,8 @@ impl DeliveryStats {
         let max_latency_ms =
             (latency_count > 0).then(|| self.latency_max_ms.load(Ordering::Relaxed));
 
+        let (per_node, nodes_tracked) = self.node_snapshots();
+
         DeliveryStatsSnapshot {
             sends_total,
             retransmits,
@@ -177,7 +278,47 @@ impl DeliveryStats {
             avg_latency_ms,
             min_latency_ms,
             max_latency_ms,
+            nodes_tracked,
+            per_node,
         }
+    }
+
+    /// Build the per-node snapshot list, sorted worst-first (lowest confirm rate,
+    /// then highest volume) and capped at [`MAX_NODES_IN_SNAPSHOT`]. Returns the
+    /// capped list and the total number of nodes tracked.
+    fn node_snapshots(&self) -> (Vec<NodeDeliverySnapshot>, usize) {
+        let map = self.nodes.lock().expect("nodes mutex poisoned");
+        let total = map.len();
+        let mut rows: Vec<NodeDeliverySnapshot> = map
+            .iter()
+            .map(|(prefix, e)| {
+                let c = &e.counters;
+                let prefix_hex = prefix.iter().map(|b| format!("{b:02x}")).collect();
+                let avg_latency_ms =
+                    (c.latency_count > 0).then(|| c.latency_sum_ms as f64 / c.latency_count as f64);
+                NodeDeliverySnapshot {
+                    prefix: prefix_hex,
+                    sends: c.sends,
+                    accepted: c.accepted,
+                    failed_no_route: c.failed_no_route,
+                    confirmed: c.confirmed,
+                    gave_up: c.gave_up,
+                    confirm_rate: ratio(c.confirmed, c.accepted),
+                    avg_latency_ms,
+                }
+            })
+            .collect();
+        // Worst link first: lowest confirm rate (a node with no confirmations
+        // sorts as 0.0), then highest send volume so busy bad links lead.
+        rows.sort_by(|a, b| {
+            let ra = a.confirm_rate.unwrap_or(0.0);
+            let rb = b.confirm_rate.unwrap_or(0.0);
+            ra.partial_cmp(&rb)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.sends.cmp(&a.sends))
+        });
+        rows.truncate(MAX_NODES_IN_SNAPSHOT);
+        (rows, total)
     }
 }
 
@@ -218,6 +359,34 @@ pub struct DeliveryStatsSnapshot {
     pub min_latency_ms: Option<u64>,
     /// Slowest round-trip in milliseconds, or `null` when there are no samples.
     pub max_latency_ms: Option<u64>,
+    /// Total number of nodes currently tracked (may exceed `per_node.len()`,
+    /// which is capped).
+    pub nodes_tracked: usize,
+    /// Per-node delivery breakdown, worst link first, capped at the 50 worst.
+    /// Populated from the retransmission tracker, so it reflects reply traffic
+    /// when `reply_max_attempts > 1`.
+    pub per_node: Vec<NodeDeliverySnapshot>,
+}
+
+/// Per-destination delivery view: how well one node's replies are getting through.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct NodeDeliverySnapshot {
+    /// Destination pubkey prefix, 12 hex chars (the first 6 bytes).
+    pub prefix: String,
+    /// Outbound frames addressed to this node (first sends + retransmissions).
+    pub sends: u64,
+    /// Sends the device accepted for delivery to this node.
+    pub accepted: u64,
+    /// Sends to this node the device could not route.
+    pub failed_no_route: u64,
+    /// End-to-end confirmations from this node.
+    pub confirmed: u64,
+    /// Replies to this node abandoned after exhausting retransmissions.
+    pub gave_up: u64,
+    /// `confirmed / accepted` for this node, or `null` when nothing accepted yet.
+    pub confirm_rate: Option<f64>,
+    /// Mean round-trip to this node in milliseconds, or `null` with no samples.
+    pub avg_latency_ms: Option<f64>,
 }
 
 impl TransportStats for DeliveryStats {
@@ -232,12 +401,15 @@ impl TransportStats for DeliveryStats {
 mod tests {
     use super::*;
 
+    const P1: [u8; 6] = [1, 1, 1, 1, 1, 1];
+    const P2: [u8; 6] = [2, 2, 2, 2, 2, 2];
+
     #[test]
     fn counts_sends_and_retransmits() {
         let s = DeliveryStats::default();
-        s.on_send(1); // first send
-        s.on_send(2); // retransmission
-        s.on_send(3); // retransmission
+        s.on_send(P1, 1); // first send
+        s.on_send(P1, 2); // retransmission
+        s.on_send(P1, 3); // retransmission
         let snap = s.snapshot();
         assert_eq!(snap.sends_total, 3);
         assert_eq!(snap.retransmits, 2);
@@ -298,9 +470,50 @@ mod tests {
     #[test]
     fn transport_stats_trait_emits_object() {
         let s = DeliveryStats::default();
-        s.on_send(1);
+        s.on_send(P1, 1);
         let v = TransportStats::snapshot(&s);
         assert_eq!(v["sends_total"], 1);
         assert!(v["confirm_rate"].is_null());
+    }
+
+    #[test]
+    fn per_node_breakdown_sorts_worst_first() {
+        let s = DeliveryStats::default();
+        // Node 1: healthy — 4 accepted, 4 confirmed.
+        for _ in 0..4 {
+            s.on_send(P1, 1);
+            s.on_node_sent_result(P1, true);
+            s.on_node_confirmed(P1, 150);
+        }
+        // Node 2: bad — 4 accepted, only 1 confirmed.
+        for _ in 0..4 {
+            s.on_send(P2, 1);
+            s.on_node_sent_result(P2, true);
+        }
+        s.on_node_confirmed(P2, 900);
+
+        let snap = s.snapshot();
+        assert_eq!(snap.nodes_tracked, 2);
+        assert_eq!(snap.per_node.len(), 2);
+        // Worst (lowest confirm rate) is listed first.
+        assert_eq!(snap.per_node[0].prefix, "020202020202");
+        assert_eq!(snap.per_node[0].confirm_rate, Some(0.25));
+        assert_eq!(snap.per_node[0].avg_latency_ms, Some(900.0));
+        assert_eq!(snap.per_node[1].prefix, "010101010101");
+        assert_eq!(snap.per_node[1].confirm_rate, Some(1.0));
+    }
+
+    #[test]
+    fn per_node_map_is_bounded_and_evicts_stalest() {
+        let s = DeliveryStats::default();
+        // Insert more than the cap; the map must not grow without bound.
+        for i in 0..(MAX_TRACKED_NODES + 10) {
+            let b = (i % 256) as u8;
+            let b2 = (i / 256) as u8;
+            s.on_send([b, b2, 0, 0, 0, 0], 1);
+        }
+        let snap = s.snapshot();
+        assert_eq!(snap.nodes_tracked, MAX_TRACKED_NODES);
+        assert!(snap.per_node.len() <= MAX_NODES_IN_SNAPSHOT);
     }
 }

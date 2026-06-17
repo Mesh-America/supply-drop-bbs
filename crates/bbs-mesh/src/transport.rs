@@ -101,7 +101,7 @@ fn enqueue_text(
         Ok(()) => {
             // Count every frame that reaches the wire, independent of whether
             // retransmission (and hence the tracker's record) is enabled.
-            stats.on_send(attempt);
+            stats.on_send(prefix, attempt);
             if t.retries_enabled() {
                 t.record(prefix, text, TXT_TYPE_PLAIN, attempt, Instant::now());
             }
@@ -133,6 +133,7 @@ fn retransmit_due_replies(
     };
     for rec in due.gave_up {
         stats.on_gave_up();
+        stats.on_node_gave_up(rec.prefix);
         warn!(
             attempts = rec.attempt,
             "mesh: reply undelivered after all retries — giving up"
@@ -1080,8 +1081,18 @@ async fn handle_frame(
                 .lock()
                 .expect("send tracker mutex poisoned")
                 .on_sent(result.expected_ack, result.timeout_ms, Instant::now());
-            if matches!(outcome, SentOutcome::Spurious) {
-                debug!("mesh: Sent frame with no tracked send (retries off or already resolved)");
+            // Attribute the device verdict to the destination node (best-effort:
+            // requires the tracker to have correlated a record, i.e. retries on).
+            match outcome {
+                SentOutcome::Accepted(prefix) => delivery_stats.on_node_sent_result(prefix, true),
+                SentOutcome::Failed(ref rec) => {
+                    delivery_stats.on_node_sent_result(rec.prefix, false)
+                }
+                SentOutcome::Spurious => {
+                    debug!(
+                        "mesh: Sent frame with no tracked send (retries off or already resolved)"
+                    );
+                }
             }
         }
 
@@ -1100,6 +1111,7 @@ async fn handle_frame(
                 let latency = Instant::now().saturating_duration_since(rec.sent_at);
                 let latency_ms = latency.as_millis() as u64;
                 delivery_stats.record_latency(latency_ms);
+                delivery_stats.on_node_confirmed(rec.prefix, latency_ms);
                 debug!(crc, latency_ms, "mesh: reply delivery confirmed");
             }
         }
