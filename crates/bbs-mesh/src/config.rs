@@ -204,15 +204,26 @@ pub struct MeshConfig {
 
     /// Total transmissions for an outbound reply, including the first.
     ///
-    /// On a multi-hop mesh the return path is lossy, so a reply (or its
-    /// end-to-end ACK) is routinely dropped and the BBS appears unresponsive.
-    /// When this is greater than `1`, the transport tracks each reply's delivery
-    /// (via the device's `RESP_CODE_SENT` CRC and `PUSH_CODE_SEND_CONFIRMED`)
-    /// and retransmits if no confirmation arrives before the device's timeout
-    /// hint. `1` disables retransmission (record-and-forget). Defaults to `3`.
+    /// Defaults to `1` (retransmission disabled — record-and-forget). When set
+    /// greater than `1`, the transport tracks each reply's delivery (via the
+    /// device's `RESP_CODE_SENT` CRC and `PUSH_CODE_SEND_CONFIRMED`) and
+    /// retransmits — up to this many attempts — if no end-to-end confirmation
+    /// arrives before the device's timeout hint. On a multi-hop mesh the return
+    /// path is lossy, so a reply (or its ACK) can be dropped and the BBS appears
+    /// unresponsive; retransmission recovers those cases on links that actually
+    /// confirm delivery.
     ///
-    /// Trade-off: delivery becomes at-least-once, so a confirmation lost on the
-    /// return path can produce a duplicate reply — preferable to silence.
+    /// ⚠️ Only raise this above `1` on a link whose confirm rate is non-zero
+    /// (check the mesh "link health" metrics first). Retransmission depends on
+    /// the radio returning `PUSH_CODE_SEND_CONFIRMED`; a link that never does —
+    /// some multi-hop / bridge setups never surface one — cannot tell a
+    /// delivered reply from a lost one, so it retransmits *every* reply to
+    /// exhaustion, duplicating it `reply_max_attempts` times. That is why the
+    /// default is `1`.
+    ///
+    /// Even on a healthy link delivery is at-least-once: a confirmation lost on
+    /// the return path can produce one duplicate reply — preferable to silence,
+    /// and inbound commands are deduplicated separately.
     #[serde(default = "default_reply_max_attempts")]
     pub reply_max_attempts: u8,
 
@@ -299,9 +310,26 @@ fn default_flood_after_send() -> bool {
 }
 
 fn default_reply_max_attempts() -> u8 {
-    3
+    1
 }
 
 fn default_true() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reply retransmission is opt-in: the default must stay `1` so a link that
+    /// never returns an end-to-end delivery confirmation can't duplicate every
+    /// reply (see the `reply_max_attempts` field docs). Regression guard.
+    #[test]
+    fn reply_retransmission_is_off_by_default() {
+        assert_eq!(MeshConfig::default().reply_max_attempts, 1);
+
+        // An omitted key must resolve to the off default via the serde wiring.
+        let cfg: MeshConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.reply_max_attempts, 1);
+    }
 }

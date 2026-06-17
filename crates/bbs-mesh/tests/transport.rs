@@ -202,17 +202,27 @@ impl Bridge {
 ///
 /// `host` is an `Arc<MockHost>` so the caller can keep a clone for inspection.
 async fn make_transport(host: Arc<MockHost>, prefix: Option<char>) -> (MeshTransport, Bridge) {
+    make_transport_with(host, |cfg| cfg.command_prefix = prefix).await
+}
+
+/// Like [`make_transport`] but lets the caller tweak the `MeshConfig` before the
+/// transport starts — e.g. to enable reply retransmission
+/// (`reply_max_attempts > 1`), which is off by default.
+async fn make_transport_with(
+    host: Arc<MockHost>,
+    customize: impl FnOnce(&mut MeshConfig),
+) -> (MeshTransport, Bridge) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let config = MeshConfig {
+    let mut config = MeshConfig {
         addr,
-        command_prefix: prefix,
         welcome_message: String::new(), // suppressed in tests
         reconnect_delay_initial_ms: 20,
         reconnect_delay_max_ms: 50,
         ..MeshConfig::default()
     };
+    customize(&mut config);
 
     // Arc<MockHost> coerces to Arc<dyn Host>.
     let transport = MeshTransport::init(config, host).await.unwrap();
@@ -580,7 +590,9 @@ async fn unacked_reply_is_retransmitted() {
     let host = Arc::new(MockHost::new());
     host.set_default_response(Response::Text("hi there".to_owned()));
 
-    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    // Retransmission is opt-in (default 1); this test exercises it.
+    let (transport, mut bridge) =
+        make_transport_with(Arc::clone(&host), |cfg| cfg.reply_max_attempts = 3).await;
     bridge.complete_handshake("Node").await;
 
     let sender = [0x55u8; 6];
@@ -615,7 +627,10 @@ async fn confirmed_reply_is_not_retransmitted() {
     let host = Arc::new(MockHost::new());
     host.set_default_response(Response::Text("hi there".to_owned()));
 
-    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    // Retransmission is opt-in (default 1); enable it so "confirmed ⇒ no retry"
+    // is actually under test.
+    let (transport, mut bridge) =
+        make_transport_with(Arc::clone(&host), |cfg| cfg.reply_max_attempts = 3).await;
     bridge.complete_handshake("Node").await;
 
     let sender = [0x56u8; 6];

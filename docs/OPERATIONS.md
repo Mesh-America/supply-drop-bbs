@@ -751,7 +751,8 @@ GET /api/v1/transports/meshcore/history   # recent ~8h of samples
 ```
 
 Latency and the per-node breakdown are populated only when reply retransmission
-is active (`reply_max_attempts > 1`, the default — see
+is active (`reply_max_attempts > 1`). Retransmission is **off by default** —
+enable it only on a link with a non-zero confirm rate (see
 [CONFIG.md](CONFIG.md)). Samples are persisted in the database and pruned after
 7 days, so the trend survives a service restart or upgrade rather than resetting.
 

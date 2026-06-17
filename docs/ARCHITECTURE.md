@@ -529,7 +529,7 @@ binary via `rust-embed`. Speaks a JSON API documented as OpenAPI.
   (about once a minute, pruned after 7 days) and re-seeds the trend
   from it on startup so it survives a restart. Latency and the per-node
   breakdown populate only when reply retransmission is on
-  (`reply_max_attempts > 1`, the default).
+  (`reply_max_attempts > 1`; off by default).
 - Manage backups: list, trigger manual backup, download.
 - View logs: tail the structured-log feed live.
 - View audit log: read-only, append-only history of sysop actions.
