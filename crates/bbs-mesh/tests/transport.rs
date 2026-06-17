@@ -767,3 +767,85 @@ async fn real_host_register_double_send_then_password() {
 
     transport.stop().await.unwrap();
 }
+
+/// Regression for the QA "logout-then-register" bug. A node logs out with `Q`,
+/// which ends its BBS session, but the transport still held the prefix →
+/// (now-dead) session mapping. The next `register` landed on the dead session,
+/// where `handle_register` fabricated a "choose a password" prompt WITHOUT
+/// storing the workflow (the session write silently no-opped on the missing
+/// session). The first password reply then hit `UnknownSession`, was reparsed
+/// with `awaiting_reply = false`, and fell through to the anonymous banner —
+/// exactly the over-the-air symptom QA reported. `handle_register` now returns
+/// `UnknownSession` on a missing session (mirroring `handle_login`, which is why
+/// interactive *login* never reproduced this), so the transport mints a fresh
+/// session, replays `REGISTER`, and the register→confirm flow survives the
+/// logout.
+#[tokio::test]
+async fn real_host_logout_then_register_prompt_reply_advances() {
+    let dbfile = tempfile::NamedTempFile::new().unwrap();
+    let db = bbs_core::Database::open(&dbfile.path().to_string_lossy())
+        .await
+        .unwrap();
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(bbs_core::BbsHost::new(db));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = MeshConfig {
+        addr,
+        command_prefix: None,
+        welcome_message: String::new(),
+        reconnect_delay_initial_ms: 20,
+        reconnect_delay_max_ms: 50,
+        reply_max_attempts: 1,
+        ..MeshConfig::default()
+    };
+    let transport = MeshTransport::init(config, host).await.unwrap();
+    transport.start().await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut bridge = Bridge { stream };
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x99u8; 6];
+
+    // First contact establishes a session; `Q` immediately ends it. The host
+    // drops the session while the transport keeps the prefix → session mapping.
+    bridge.send(&contact_msg_frame(sender, "Q")).await;
+    let bye = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("logout reply not sent");
+    let bye_text = String::from_utf8_lossy(&bye[13..]).to_string();
+    assert!(
+        bye_text.to_lowercase().contains("ended") || bye_text.to_lowercase().contains("goodbye"),
+        "expected a logout acknowledgement, got: {bye_text}"
+    );
+
+    // Register a new account on the SAME node after logout.
+    bridge
+        .send(&contact_msg_frame(sender, "register postlogout"))
+        .await;
+    let prompt = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("register reply not sent");
+    let prompt_text = String::from_utf8_lossy(&prompt[13..]).to_string();
+    assert!(
+        prompt_text.to_lowercase().contains("password"),
+        "expected a password prompt after logout-then-register, got: {prompt_text}"
+    );
+
+    // The first password reply must advance to "Confirm", NOT the anonymous banner.
+    bridge.send(&contact_msg_frame(sender, "secretpw1")).await;
+    let reply = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("password-reply response not sent");
+    let reply_text = String::from_utf8_lossy(&reply[13..]).to_string();
+    assert!(
+        !reply_text.contains("omit password to be prompted"),
+        "BUG: first password reply after logout dropped to the anonymous banner: {reply_text}"
+    );
+    assert!(
+        reply_text.to_lowercase().contains("confirm"),
+        "expected a confirm-password prompt, got: {reply_text}"
+    );
+
+    transport.stop().await.unwrap();
+}

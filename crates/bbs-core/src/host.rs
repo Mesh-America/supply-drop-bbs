@@ -1662,11 +1662,21 @@ impl BbsHost {
         let prompt = format!("Registering '{username}'. Choose a password (min 8 characters):");
         {
             let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.workflow = Workflow::Register {
-                    username,
-                    stage: RegisterStage::Password,
-                };
+            match sessions.get_mut(&session) {
+                Some(r) => {
+                    r.workflow = Workflow::Register {
+                        username,
+                        stage: RegisterStage::Password,
+                    };
+                }
+                // Session unknown — likely a stale ID held by the transport after
+                // a logout or server restart. Surface the error so the transport
+                // can mint a fresh session and replay REGISTER. Mirrors
+                // handle_login. Without this the prompt was returned while the
+                // workflow write silently no-opped, so the user's first password
+                // reply landed on a dead session and fell through to the
+                // anonymous banner (the logout-then-register QA bug).
+                None => return Err(HostError::UnknownSession(session)),
             }
         }
         Ok(Response::Prompt {
@@ -5624,6 +5634,79 @@ mod tests {
         let resp = host.process_command(sid, Command::Logout).await.unwrap();
         assert_eq!(resp, Response::LoggedOut);
         assert_eq!(host.sessions.read().await.len(), 0);
+    }
+
+    /// Regression: REGISTER against a session the host no longer has must surface
+    /// `UnknownSession` — so the mesh transport refreshes and replays it — rather
+    /// than fabricate a "choose a password" prompt while silently dropping the
+    /// workflow write. `handle_login` already did this; `handle_register` did
+    /// not, which is why a logout-then-register dropped the first password reply
+    /// to the anonymous banner (the over-the-air QA bug).
+    #[tokio::test]
+    async fn register_on_ended_session_errors() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("meshcore").await.unwrap();
+        host.end_session(sid).await.unwrap();
+        let resp = host
+            .process_command(
+                sid,
+                Command::Register {
+                    username: "ghost".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(resp, Err(HostError::UnknownSession(_))),
+            "REGISTER on an ended session must surface UnknownSession, got: {resp:?}"
+        );
+    }
+
+    /// `handle_login` has surfaced `UnknownSession` on a missing session all
+    /// along — this pins that parity so the two auth entry points can't drift.
+    #[tokio::test]
+    async fn login_on_ended_session_errors() {
+        let (host, _db) = make_host().await;
+        let uname = Username::new("ghostl").unwrap();
+
+        // Register + validate a real user so LOGIN gets past the username lookup
+        // and reaches the session write (where the missing-session check lives).
+        let sid = host.create_session("meshcore").await.unwrap();
+        host.process_command(
+            sid,
+            Command::Register {
+                username: uname.as_str().to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: "password1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: "password1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        force_validate(&host, &uname).await;
+
+        // Now LOGIN on a session the host has ended.
+        let sid2 = host.create_session("meshcore").await.unwrap();
+        host.end_session(sid2).await.unwrap();
+        let resp = host
+            .process_command(sid2, Command::Login { username: uname })
+            .await;
+        assert!(
+            matches!(resp, Err(HostError::UnknownSession(_))),
+            "LOGIN on an ended session must surface UnknownSession, got: {resp:?}"
+        );
     }
 
     #[tokio::test]
