@@ -16,6 +16,7 @@
 //! │  │  GET  /api/v1/status               (auth)       │    │
 //! │  │  GET  /api/v1/transports           (auth)       │    │
 //! │  │  GET  /api/v1/transports/:name/stats (auth)     │    │
+//! │  │  GET  /api/v1/transports/:name/history (auth)   │    │
 //! │  │  GET  /api/v1/native-plugins       (auth)       │    │
 //! │  │  PATCH /api/v1/native-plugins/:name (auth)      │    │
 //! │  │  GET  /api/v1/adverts              (auth)       │    │
@@ -614,6 +615,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/status", get(api_status))
         .route("/transports", get(api_active_transports))
         .route("/transports/:name/stats", get(api_transport_stats))
+        .route("/transports/:name/history", get(api_transport_history))
         .route("/native-plugins", get(api_list_native_plugins))
         .route("/native-plugins/:name", patch(api_update_native_plugin))
         .route("/adverts", get(api_adverts))
@@ -881,6 +883,31 @@ async fn api_transport_stats(
     };
     match stats {
         Some(stats) => Json(stats.snapshot()).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json_error(&format!("no metrics for transport '{name}'"))),
+        )
+            .into_response(),
+    }
+}
+
+/// Historical metric samples for a transport, oldest first, for trend display.
+///
+/// Returns a JSON array (possibly empty if the transport keeps no history).
+/// 404 if the named transport did not register a metrics source.
+async fn api_transport_history(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let stats = {
+        let map = state
+            .transport_stats
+            .lock()
+            .expect("transport_stats poisoned");
+        map.get(&name).cloned()
+    };
+    match stats {
+        Some(stats) => Json(stats.history()).into_response(),
         None => (
             StatusCode::NOT_FOUND,
             Json(json_error(&format!("no metrics for transport '{name}'"))),

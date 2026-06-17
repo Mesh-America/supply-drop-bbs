@@ -57,4 +57,12 @@ pub trait TransportStats: Send + Sync + 'static {
     /// Called on demand when the admin UI polls; implementations should make
     /// this cheap (read a handful of atomics) and must not block.
     fn snapshot(&self) -> serde_json::Value;
+
+    /// A JSON array of historical samples for trend display, oldest first.
+    ///
+    /// Optional — defaults to an empty array for transports that keep no
+    /// history. Served at `GET /api/v1/transports/:name/history`.
+    fn history(&self) -> serde_json::Value {
+        serde_json::Value::Array(Vec::new())
+    }
 }

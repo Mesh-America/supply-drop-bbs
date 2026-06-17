@@ -21,7 +21,7 @@
 //! persisted time-series for trend analysis is a separate, later layer — this
 //! module is the live snapshot only.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -37,6 +37,12 @@ const MAX_TRACKED_NODES: usize = 256;
 
 /// Cap on how many per-node records are serialised in a snapshot (worst-first).
 const MAX_NODES_IN_SNAPSHOT: usize = 50;
+
+/// Cap on retained history samples. At one sample per minute this is 8 hours of
+/// trend — enough to watch reliability change while tuning a link, without the
+/// memory or payload of a full day. History is in-memory only and resets on
+/// restart; durable persistence is a separate layer.
+const MAX_HISTORY_SAMPLES: usize = 480;
 
 /// Per-node delivery counters. Plain integers — guarded by the `nodes` mutex,
 /// not atomics, since they are only touched under that lock.
@@ -114,6 +120,10 @@ pub struct DeliveryStats {
     /// Per-destination delivery counters, keyed by 6-byte pubkey prefix. Bounded
     /// at [`MAX_TRACKED_NODES`]; the stalest entry is evicted when full.
     nodes: Mutex<HashMap<[u8; 6], NodeEntry>>,
+    /// Rolling history of cumulative-counter snapshots, appended on a timer.
+    /// Bounded at [`MAX_HISTORY_SAMPLES`]; consumers derive per-interval rates
+    /// from the deltas between consecutive samples.
+    history: Mutex<VecDeque<DeliverySample>>,
 }
 
 impl Default for DeliveryStats {
@@ -132,6 +142,7 @@ impl Default for DeliveryStats {
             latency_min_ms: AtomicU64::new(u64::MAX),
             latency_max_ms: AtomicU64::new(0),
             nodes: Mutex::new(HashMap::new()),
+            history: Mutex::new(VecDeque::new()),
         }
     }
 }
@@ -218,6 +229,36 @@ impl DeliveryStats {
     /// Attribute a give-up to a specific node.
     pub fn on_node_gave_up(&self, prefix: [u8; 6]) {
         self.with_node(prefix, |c| c.gave_up += 1);
+    }
+
+    /// Append a history sample of the current cumulative counters, stamped with
+    /// `ts` (Unix seconds). Called on a timer; the oldest sample is dropped once
+    /// the buffer is full. Consumers diff consecutive samples for interval rates.
+    pub fn sample(&self, ts: u64) {
+        let s = DeliverySample {
+            ts,
+            sends_total: self.sends_total.load(Ordering::Relaxed),
+            accepted: self.accepted.load(Ordering::Relaxed),
+            failed_no_route: self.failed_no_route.load(Ordering::Relaxed),
+            confirmed: self.confirmed.load(Ordering::Relaxed),
+            latency_count: self.latency_count.load(Ordering::Relaxed),
+            latency_sum_ms: self.latency_sum_ms.load(Ordering::Relaxed),
+        };
+        let mut h = self.history.lock().expect("history mutex poisoned");
+        if h.len() >= MAX_HISTORY_SAMPLES {
+            h.pop_front();
+        }
+        h.push_back(s);
+    }
+
+    /// The retained history samples, oldest first.
+    pub fn history(&self) -> Vec<DeliverySample> {
+        self.history
+            .lock()
+            .expect("history mutex poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Record a round-trip latency sample (send → end-to-end confirmation), in
@@ -389,11 +430,36 @@ pub struct NodeDeliverySnapshot {
     pub avg_latency_ms: Option<f64>,
 }
 
+/// One point in the delivery history: cumulative counters at a moment in time.
+/// Consumers derive per-interval rates from the deltas between samples.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct DeliverySample {
+    /// Unix timestamp (seconds) the sample was taken.
+    pub ts: u64,
+    /// Cumulative frames sent at this point.
+    pub sends_total: u64,
+    /// Cumulative device-accepted sends.
+    pub accepted: u64,
+    /// Cumulative no-route failures.
+    pub failed_no_route: u64,
+    /// Cumulative end-to-end confirmations.
+    pub confirmed: u64,
+    /// Cumulative latency sample count (for deriving interval average latency).
+    pub latency_count: u64,
+    /// Cumulative latency sum in milliseconds.
+    pub latency_sum_ms: u64,
+}
+
 impl TransportStats for DeliveryStats {
     fn snapshot(&self) -> Value {
         // Snapshot is a flat struct of plain numbers; serialisation cannot fail.
         serde_json::to_value(DeliveryStats::snapshot(self))
             .unwrap_or_else(|_| Value::Object(Default::default()))
+    }
+
+    fn history(&self) -> Value {
+        serde_json::to_value(DeliveryStats::history(self))
+            .unwrap_or_else(|_| Value::Array(Vec::new()))
     }
 }
 
@@ -501,6 +567,30 @@ mod tests {
         assert_eq!(snap.per_node[0].avg_latency_ms, Some(900.0));
         assert_eq!(snap.per_node[1].prefix, "010101010101");
         assert_eq!(snap.per_node[1].confirm_rate, Some(1.0));
+    }
+
+    #[test]
+    fn history_samples_accumulate_and_are_bounded() {
+        let s = DeliveryStats::default();
+        s.on_send(P1, 1);
+        s.sample(100);
+        s.on_send(P1, 1);
+        s.sample(160);
+        let h = s.history();
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].ts, 100);
+        assert_eq!(h[0].sends_total, 1);
+        assert_eq!(h[1].ts, 160);
+        assert_eq!(h[1].sends_total, 2);
+
+        // Buffer is bounded: pushing past the cap drops the oldest.
+        for i in 0..(MAX_HISTORY_SAMPLES + 5) {
+            s.sample(1000 + i as u64);
+        }
+        let h = s.history();
+        assert_eq!(h.len(), MAX_HISTORY_SAMPLES);
+        // Oldest retained sample is newer than the very first ones we pushed.
+        assert!(h.first().unwrap().ts > 100);
     }
 
     #[test]

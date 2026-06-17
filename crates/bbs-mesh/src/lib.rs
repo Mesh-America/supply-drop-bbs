@@ -55,6 +55,6 @@ pub mod session;
 pub mod transport;
 
 pub use config::{ConnectionType, MeshConfig};
-pub use metrics::{DeliveryStats, DeliveryStatsSnapshot};
+pub use metrics::{DeliverySample, DeliveryStats, DeliveryStatsSnapshot, NodeDeliverySnapshot};
 pub use session::{SessionEntry, SessionState};
 pub use transport::MeshTransport;

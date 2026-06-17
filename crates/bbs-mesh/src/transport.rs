@@ -70,6 +70,8 @@ const REPLY_ACK_MIN_WAIT: Duration = Duration::from_secs(4);
 const REPLY_ACK_MAX_WAIT: Duration = Duration::from_secs(30);
 /// How often the event loop checks for replies that timed out awaiting an ACK.
 const RETRY_TICK: Duration = Duration::from_millis(500);
+/// How often the event loop appends a delivery-history sample for trend display.
+const SAMPLE_TICK: Duration = Duration::from_secs(60);
 
 /// Enqueue a plain-text reply to the companion client and, when retransmission
 /// is enabled, record it in `tracker` for delivery tracking.
@@ -667,6 +669,10 @@ async fn event_loop(
     let mut retry_tick = tokio::time::interval(RETRY_TICK);
     retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Periodically snapshot the delivery counters into the trend history.
+    let mut sample_tick = tokio::time::interval(SAMPLE_TICK);
+    sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
     loop {
         tokio::select! {
             event = client.recv() => {
@@ -849,6 +855,9 @@ async fn event_loop(
             }
             _ = retry_tick.tick() => {
                 retransmit_due_replies(&cmd_tx, &state, &send_tracker, &delivery_stats, flood_after_send);
+            }
+            _ = sample_tick.tick() => {
+                delivery_stats.sample(now_unix_secs() as u64);
             }
             Some(req) = key_rx.recv() => {
                 use bbs_plugin_api::MeshKeyRequest;
