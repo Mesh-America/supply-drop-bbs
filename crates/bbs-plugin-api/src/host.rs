@@ -99,8 +99,8 @@ pub enum MeshtasticAdminRequest {
 
 use crate::admin::{
     AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports,
-    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, MeshRadioParams,
-    MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
+    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, DeliverySampleRecord,
+    MeshRadioParams, MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -313,6 +313,30 @@ pub trait Host: Send + Sync {
     /// Return analytics reports: top senders, top rooms, daily volume, stale rooms.
     async fn admin_reports(&self) -> Result<AdminReports, HostError> {
         Err(HostError::NotSupported("admin_reports".into()))
+    }
+
+    /// Persist one delivery-metrics sample for a transport (keyed by transport
+    /// name). Used to retain reply-delivery trends across restarts. Hosts that
+    /// keep no durable metrics may leave the default (a no-op success).
+    async fn record_delivery_sample(
+        &self,
+        transport: &str,
+        sample: DeliverySampleRecord,
+    ) -> Result<(), HostError> {
+        let _ = (transport, sample);
+        Ok(())
+    }
+
+    /// Return persisted delivery samples for a transport with `ts >= since`
+    /// (Unix seconds), oldest first. Defaults to empty for hosts without durable
+    /// metrics storage.
+    async fn delivery_samples(
+        &self,
+        transport: &str,
+        since: u64,
+    ) -> Result<Vec<DeliverySampleRecord>, HostError> {
+        let _ = (transport, since);
+        Ok(Vec::new())
     }
 
     /// Trigger a `VACUUM INTO` backup written to `backup_dir`.

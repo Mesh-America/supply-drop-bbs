@@ -12,6 +12,7 @@ mod admin_queries;
 mod audit_store;
 mod block_store;
 mod credential_store;
+mod delivery_store;
 mod error;
 mod invariants;
 mod message_store;

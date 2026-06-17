@@ -234,7 +234,9 @@ impl DeliveryStats {
     /// Append a history sample of the current cumulative counters, stamped with
     /// `ts` (Unix seconds). Called on a timer; the oldest sample is dropped once
     /// the buffer is full. Consumers diff consecutive samples for interval rates.
-    pub fn sample(&self, ts: u64) {
+    ///
+    /// Returns the sample so the caller can also persist it durably.
+    pub fn sample(&self, ts: u64) -> DeliverySample {
         let s = DeliverySample {
             ts,
             sends_total: self.sends_total.load(Ordering::Relaxed),
@@ -248,7 +250,18 @@ impl DeliveryStats {
         if h.len() >= MAX_HISTORY_SAMPLES {
             h.pop_front();
         }
-        h.push_back(s);
+        h.push_back(s.clone());
+        s
+    }
+
+    /// Seed the in-memory history from persisted samples (oldest first), e.g. on
+    /// startup so the trend survives a restart. Keeps only the most recent
+    /// [`MAX_HISTORY_SAMPLES`]. Replaces any existing in-memory history.
+    pub fn load_history(&self, samples: Vec<DeliverySample>) {
+        let mut h = self.history.lock().expect("history mutex poisoned");
+        h.clear();
+        let skip = samples.len().saturating_sub(MAX_HISTORY_SAMPLES);
+        h.extend(samples.into_iter().skip(skip));
     }
 
     /// The retained history samples, oldest first.
@@ -432,23 +445,11 @@ pub struct NodeDeliverySnapshot {
 
 /// One point in the delivery history: cumulative counters at a moment in time.
 /// Consumers derive per-interval rates from the deltas between samples.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-pub struct DeliverySample {
-    /// Unix timestamp (seconds) the sample was taken.
-    pub ts: u64,
-    /// Cumulative frames sent at this point.
-    pub sends_total: u64,
-    /// Cumulative device-accepted sends.
-    pub accepted: u64,
-    /// Cumulative no-route failures.
-    pub failed_no_route: u64,
-    /// Cumulative end-to-end confirmations.
-    pub confirmed: u64,
-    /// Cumulative latency sample count (for deriving interval average latency).
-    pub latency_count: u64,
-    /// Cumulative latency sum in milliseconds.
-    pub latency_sum_ms: u64,
-}
+///
+/// This is the host-boundary [`DeliverySampleRecord`] so the same value flows
+/// from the in-memory ring to durable storage and the `/history` endpoint
+/// without conversion.
+pub use bbs_plugin_api::DeliverySampleRecord as DeliverySample;
 
 impl TransportStats for DeliveryStats {
     fn snapshot(&self) -> Value {

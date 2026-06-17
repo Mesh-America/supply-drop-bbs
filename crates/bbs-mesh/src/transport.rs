@@ -72,6 +72,9 @@ const REPLY_ACK_MAX_WAIT: Duration = Duration::from_secs(30);
 const RETRY_TICK: Duration = Duration::from_millis(500);
 /// How often the event loop appends a delivery-history sample for trend display.
 const SAMPLE_TICK: Duration = Duration::from_secs(60);
+/// How far back to seed the in-memory trend from persisted samples on startup
+/// (matches the in-memory ring's ~8h capacity).
+const HISTORY_SEED_SECS: u64 = 8 * 60 * 60;
 
 /// Enqueue a plain-text reply to the companion client and, when retransmission
 /// is enabled, record it in `tracker` for delivery tracking.
@@ -673,6 +676,21 @@ async fn event_loop(
     let mut sample_tick = tokio::time::interval(SAMPLE_TICK);
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Seed the in-memory trend from persisted samples so the confirm-rate chart
+    // survives a restart. Best-effort: an empty/erroring store just starts fresh.
+    let since = (now_unix_secs() as u64).saturating_sub(HISTORY_SEED_SECS);
+    match host.delivery_samples(TRANSPORT_NAME, since).await {
+        Ok(samples) if !samples.is_empty() => {
+            info!(
+                count = samples.len(),
+                "mesh: seeded delivery trend from storage"
+            );
+            delivery_stats.load_history(samples);
+        }
+        Ok(_) => {}
+        Err(e) => debug!("mesh: loading delivery history failed: {e}"),
+    }
+
     loop {
         tokio::select! {
             event = client.recv() => {
@@ -857,7 +875,13 @@ async fn event_loop(
                 retransmit_due_replies(&cmd_tx, &state, &send_tracker, &delivery_stats, flood_after_send);
             }
             _ = sample_tick.tick() => {
-                delivery_stats.sample(now_unix_secs() as u64);
+                let s = delivery_stats.sample(now_unix_secs() as u64);
+                // Persist durably so the trend survives a restart. Best-effort:
+                // a host without metrics storage just no-ops, and a write error
+                // must not disturb the event loop.
+                if let Err(e) = host.record_delivery_sample(TRANSPORT_NAME, s).await {
+                    debug!("mesh: persisting delivery sample failed: {e}");
+                }
             }
             Some(req) = key_rx.recv() => {
                 use bbs_plugin_api::MeshKeyRequest;
