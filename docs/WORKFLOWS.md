@@ -102,11 +102,20 @@ workflow state from carrying across rooms.
 
 | Stage | Prompt shown | Expected reply |
 |---|---|---|
-| `DisplayName` | "Enter your display name (or . to skip):" | Any text or `.` |
-| `Password { display_name }` | "Choose a password (min 8 chars):" | Password text |
-| `Confirm { display_name, password }` | "Confirm password:" | Same password again |
+| `Password` | "Registering '\<user>'. Choose a password (min 8 characters):" | Password text |
+| `Confirm { password }` | "Confirm the password for '\<user>':" | Same password again |
+
+There is **no display-name step**: a new account defaults its display name to the
+username (the user sets one later via `PROFILE`). Dropping the prompt removes a
+lossy round-trip on mesh and the failure mode where a re-sent command was
+captured as the display name.
 
 On success: account created, user is logged in, workflow set to `None`.
+
+**Command escape:** while this workflow (or [`Workflow::Login`](#workflowlogin))
+is active, a re-sent `REGISTER <name>` / `LOGIN <name>` *restarts* that flow
+instead of being captured as a field value (e.g. a password). Limited to those
+two commands so a real password is never reinterpreted; `CANCEL` / `STOP` abort.
 
 ---
 
@@ -117,7 +126,7 @@ On success: account created, user is logged in, workflow set to `None`.
 
 | Stage | Prompt shown | Expected reply |
 |---|---|---|
-| *(single stage)* | "Password:" | Password text |
+| *(single stage)* | "Enter the password for '\<user>':" | Password text |
 
 Up to 3 failed attempts; after the third the workflow exits with an error.
 
