@@ -842,6 +842,11 @@ async fn cmd_run(cli: &Cli) {
                 compiled_cli: cfg!(feature = "transport-cli"),
             });
         }
+        // Expose mesh reply-delivery counters at /api/v1/transports/meshcore/stats.
+        #[cfg(feature = "transport-mesh")]
+        if let (Some(ref plugin), Some(ref transport)) = (&wp, &mesh_transport) {
+            plugin.register_transport_stats("meshcore", transport.delivery_stats());
+        }
         wp
     };
 

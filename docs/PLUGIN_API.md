@@ -142,9 +142,12 @@ traits:
 | `EventConsumer`      | Subscribe to domain events                    | React to messages posted, users validated, etc.|
 | `MetricsContributor` | Add metrics to the Prometheus exporter        | Plugin tracks something operators want to see  |
 | `HealthCheck`        | Contribute to the `/health` endpoint           | Plugin has a meaningful health state          |
+| `TransportStats`     | Expose operational metrics as JSON (`snapshot` + `history`) | Transport tracks link/delivery health operators want to see |
 
 A plugin can implement any combination. The mesh transport
-implements `TransportEngine`. The web admin plugin implements
+implements `TransportEngine` and `TransportStats` (the latter exposes
+its reply-delivery "link health" — confirm rate, per-node breakdown,
+latency, and a trend). The web admin plugin implements
 `TransportEngine` (the HTTP socket itself), `RouteContributor` (its
 own admin endpoints), `StaticFileMount` (the Vue bundle), and
 `HealthCheck`.
@@ -230,6 +233,31 @@ pub trait Host: Send + Sync {
         before: Option<serde_json::Value>,
         after: Option<serde_json::Value>,
     ) -> Result<(), HostError>;
+
+    // ── Transport metrics ───────────────────────────────────────
+    //
+    // Durable storage for a transport's `TransportStats` samples.
+    // Both have default implementations (no-op / empty), so existing
+    // Host impls and plugins that don't track delivery metrics are
+    // unaffected.
+
+    /// Persist one delivery-metrics sample for `transport`. Called
+    /// periodically (about once a minute) by transports that track
+    /// reply-delivery link health.
+    async fn record_delivery_sample(
+        &self,
+        transport: &str,
+        sample: DeliverySampleRecord,
+    ) -> Result<(), HostError> { Ok(()) }
+
+    /// Read back persisted delivery samples for `transport` with
+    /// `ts >= since` (Unix seconds), oldest first — used to seed the
+    /// in-memory trend after a restart.
+    async fn delivery_samples(
+        &self,
+        transport: &str,
+        since: u64,
+    ) -> Result<Vec<DeliverySampleRecord>, HostError> { Ok(Vec::new()) }
 }
 ```
 
@@ -520,6 +548,17 @@ canonical reference.
 
 Each release section below lists whether it requires code changes
 in existing out-of-tree plugins. No entry means no action needed.
+
+#### v0.10.0
+
+**Additive API change — no code changes required for existing
+plugins.** A new optional capability trait `TransportStats` lets a
+transport expose operational metrics (`snapshot()` + `history()`), and
+two new *defaulted* `Host` methods — `record_delivery_sample` and
+`delivery_samples`, backed by the new `DeliverySampleRecord` type —
+provide durable storage for those samples. The trait is opt-in and the
+Host methods have default implementations, so out-of-tree plugins
+compile unchanged; recompile against `0.10.0` to pick them up.
 
 #### v0.6.0
 

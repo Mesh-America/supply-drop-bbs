@@ -1323,6 +1323,28 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    async fn record_delivery_sample(
+        &self,
+        transport: &str,
+        sample: bbs_plugin_api::DeliverySampleRecord,
+    ) -> Result<(), HostError> {
+        self.db
+            .delivery_sample_write(transport, &sample)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn delivery_samples(
+        &self,
+        transport: &str,
+        since: u64,
+    ) -> Result<Vec<bbs_plugin_api::DeliverySampleRecord>, HostError> {
+        self.db
+            .delivery_samples_query(transport, since)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
     async fn admin_trigger_backup(&self, backup_dir: &str) -> Result<AdminBackupRecord, HostError> {
         use time::format_description::well_known::Rfc3339;
 

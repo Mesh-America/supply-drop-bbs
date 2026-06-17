@@ -59,6 +59,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     command::{format_response, parse_command, render_notification},
     config::{ConnectionType, MeshConfig},
+    metrics::DeliveryStats,
     send_tracker::{RetryConfig, SendTracker, SentOutcome},
     session::SessionState,
 };
@@ -69,6 +70,11 @@ const REPLY_ACK_MIN_WAIT: Duration = Duration::from_secs(4);
 const REPLY_ACK_MAX_WAIT: Duration = Duration::from_secs(30);
 /// How often the event loop checks for replies that timed out awaiting an ACK.
 const RETRY_TICK: Duration = Duration::from_millis(500);
+/// How often the event loop appends a delivery-history sample for trend display.
+const SAMPLE_TICK: Duration = Duration::from_secs(60);
+/// How far back to seed the in-memory trend from persisted samples on startup
+/// (matches the in-memory ring's ~8h capacity).
+const HISTORY_SEED_SECS: u64 = 8 * 60 * 60;
 
 /// Enqueue a plain-text reply to the companion client and, when retransmission
 /// is enabled, record it in `tracker` for delivery tracking.
@@ -80,6 +86,7 @@ const RETRY_TICK: Duration = Duration::from_millis(500);
 /// (logged) rather than blocking the caller; depth is generous and this is rare.
 fn enqueue_text(
     tracker: &Mutex<SendTracker>,
+    stats: &DeliveryStats,
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     prefix: [u8; 6],
     text: String,
@@ -97,11 +104,17 @@ fn enqueue_text(
     let mut t = tracker.lock().expect("send tracker mutex poisoned");
     match cmd_tx.try_send(frame) {
         Ok(()) => {
+            // Count every frame that reaches the wire, independent of whether
+            // retransmission (and hence the tracker's record) is enabled.
+            stats.on_send(prefix, attempt);
             if t.retries_enabled() {
                 t.record(prefix, text, TXT_TYPE_PLAIN, attempt, Instant::now());
             }
         }
-        Err(e) => warn!(error = %e, "mesh: command channel full/closed — reply dropped"),
+        Err(e) => {
+            stats.on_dropped();
+            warn!(error = %e, "mesh: command channel full/closed — reply dropped");
+        }
     }
 }
 
@@ -113,6 +126,7 @@ fn retransmit_due_replies(
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
     tracker: &Arc<Mutex<SendTracker>>,
+    stats: &DeliveryStats,
     flood_after_send: bool,
 ) {
     let due = {
@@ -123,6 +137,8 @@ fn retransmit_due_replies(
         t.collect_due(Instant::now())
     };
     for rec in due.gave_up {
+        stats.on_gave_up();
+        stats.on_node_gave_up(rec.prefix);
         warn!(
             attempts = rec.attempt,
             "mesh: reply undelivered after all retries — giving up"
@@ -142,7 +158,14 @@ fn retransmit_due_replies(
             next_attempt = rec.attempt + 1,
             "mesh: retransmitting unacknowledged reply"
         );
-        enqueue_text(tracker, cmd_tx, rec.prefix, rec.text, rec.attempt + 1);
+        enqueue_text(
+            tracker,
+            stats,
+            cmd_tx,
+            rec.prefix,
+            rec.text,
+            rec.attempt + 1,
+        );
     }
 }
 
@@ -206,6 +229,19 @@ pub struct MeshTransport {
     /// Shared with the event-loop task (which owns the retry timer and the
     /// `Sent`/`SendConfirmed` correlation). See [`crate::send_tracker`].
     send_tracker: Arc<Mutex<SendTracker>>,
+    /// Cumulative reply-delivery counters, surfaced to the admin UI. Shared with
+    /// the event-loop and notification tasks; lock-free. See [`crate::metrics`].
+    delivery_stats: Arc<DeliveryStats>,
+}
+
+impl MeshTransport {
+    /// Shared handle to this transport's reply-delivery counters.
+    ///
+    /// The host binary clones this and registers it with the web admin (as an
+    /// `Arc<dyn TransportStats>`) so the operator can see round-trip link health.
+    pub fn delivery_stats(&self) -> Arc<DeliveryStats> {
+        Arc::clone(&self.delivery_stats)
+    }
 }
 
 #[async_trait]
@@ -283,6 +319,7 @@ impl Plugin for MeshTransport {
                 min_timeout: REPLY_ACK_MIN_WAIT,
                 max_timeout: REPLY_ACK_MAX_WAIT,
             }))),
+            delivery_stats: Arc::new(DeliveryStats::default()),
         })
     }
 
@@ -370,6 +407,7 @@ impl Plugin for MeshTransport {
         let notif_cmd_tx = self.cmd_tx.clone();
         let notif_host = Arc::clone(&self.host);
         let notif_tracker = Arc::clone(&self.send_tracker);
+        let notif_stats = Arc::clone(&self.delivery_stats);
         let mut notif_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             loop {
@@ -383,6 +421,7 @@ impl Plugin for MeshTransport {
                                     &notif_cmd_tx,
                                     &notif_state,
                                     &notif_tracker,
+                                    &notif_stats,
                                     flood_after_send,
                                 )
                                 .await;
@@ -400,6 +439,7 @@ impl Plugin for MeshTransport {
 
         let draining = Arc::clone(&self.draining);
         let send_tracker = Arc::clone(&self.send_tracker);
+        let delivery_stats = Arc::clone(&self.delivery_stats);
         tokio::spawn(event_loop(
             client,
             host,
@@ -412,6 +452,7 @@ impl Plugin for MeshTransport {
             draining,
             flood_after_send,
             send_tracker,
+            delivery_stats,
             key_rx,
         ));
 
@@ -462,7 +503,14 @@ impl TransportEngine for MeshTransport {
         };
 
         let text = render_notification(&payload);
-        enqueue_text(&self.send_tracker, &self.cmd_tx, pubkey_prefix, text, 1);
+        enqueue_text(
+            &self.send_tracker,
+            &self.delivery_stats,
+            &self.cmd_tx,
+            pubkey_prefix,
+            text,
+            1,
+        );
 
         if self.flood_after_send {
             let full_pubkey = self
@@ -491,6 +539,7 @@ async fn push_domain_notification(
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
     send_tracker: &Arc<Mutex<SendTracker>>,
+    stats: &Arc<DeliveryStats>,
     flood_after_send: bool,
 ) {
     let sessions: Vec<SessionId> = state
@@ -519,6 +568,7 @@ async fn push_domain_notification(
                 if let Some(prefix) = prefix {
                     enqueue_text(
                         send_tracker,
+                        stats,
                         cmd_tx,
                         prefix,
                         "Your account has been validated. You now have full access. Type 'H'."
@@ -554,6 +604,7 @@ async fn push_domain_notification(
                 if let Some(prefix) = prefix {
                     enqueue_text(
                         send_tracker,
+                        stats,
                         cmd_tx,
                         prefix,
                         format!(
@@ -611,6 +662,7 @@ async fn event_loop(
     draining: Arc<AtomicBool>,
     flood_after_send: bool,
     send_tracker: Arc<Mutex<SendTracker>>,
+    delivery_stats: Arc<DeliveryStats>,
     mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
 ) {
     // Pending one-shot key operation. At most one at a time.
@@ -619,6 +671,25 @@ async fn event_loop(
     // Periodically retransmit replies that timed out awaiting an end-to-end ACK.
     let mut retry_tick = tokio::time::interval(RETRY_TICK);
     retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Periodically snapshot the delivery counters into the trend history.
+    let mut sample_tick = tokio::time::interval(SAMPLE_TICK);
+    sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Seed the in-memory trend from persisted samples so the confirm-rate chart
+    // survives a restart. Best-effort: an empty/erroring store just starts fresh.
+    let since = (now_unix_secs() as u64).saturating_sub(HISTORY_SEED_SECS);
+    match host.delivery_samples(TRANSPORT_NAME, since).await {
+        Ok(samples) if !samples.is_empty() => {
+            info!(
+                count = samples.len(),
+                "mesh: seeded delivery trend from storage"
+            );
+            delivery_stats.load_history(samples);
+        }
+        Ok(_) => {}
+        Err(e) => debug!("mesh: loading delivery history failed: {e}"),
+    }
 
     loop {
         tokio::select! {
@@ -795,13 +866,22 @@ async fn event_loop(
                             _ => false,
                         };
                         if !consumed {
-                            handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining, flood_after_send, &send_tracker).await;
+                            handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining, flood_after_send, &send_tracker, &delivery_stats).await;
                         }
                     }
                 }
             }
             _ = retry_tick.tick() => {
-                retransmit_due_replies(&cmd_tx, &state, &send_tracker, flood_after_send);
+                retransmit_due_replies(&cmd_tx, &state, &send_tracker, &delivery_stats, flood_after_send);
+            }
+            _ = sample_tick.tick() => {
+                let s = delivery_stats.sample(now_unix_secs() as u64);
+                // Persist durably so the trend survives a restart. Best-effort:
+                // a host without metrics storage just no-ops, and a write error
+                // must not disturb the event loop.
+                if let Err(e) = host.record_delivery_sample(TRANSPORT_NAME, s).await {
+                    debug!("mesh: persisting delivery sample failed: {e}");
+                }
             }
             Some(req) = key_rx.recv() => {
                 use bbs_plugin_api::MeshKeyRequest;
@@ -862,6 +942,7 @@ async fn handle_frame(
     draining: &Arc<AtomicBool>,
     flood_after_send: bool,
     send_tracker: &Arc<Mutex<SendTracker>>,
+    delivery_stats: &Arc<DeliveryStats>,
 ) {
     use meshcore_companion::frame::InboundFrame;
 
@@ -913,6 +994,7 @@ async fn handle_frame(
                 node_credential_ttl_days,
                 flood_after_send,
                 send_tracker,
+                delivery_stats,
             )
             .await;
         }
@@ -1004,7 +1086,9 @@ async fn handle_frame(
         // Log a warning if the device could not route the message so operators
         // can diagnose delivery failures without digging through device logs.
         InboundFrame::Sent(result) => {
-            if !result.is_flood && result.expected_ack == 0 {
+            let accepted = result.is_flood || result.expected_ack != 0;
+            delivery_stats.on_sent_result(accepted);
+            if !accepted {
                 // MSG_SEND_FAILED — device could not route the message.
                 // Common causes: no path to the destination, contact not in
                 // the device's table, or the destination is out of range.
@@ -1030,8 +1114,18 @@ async fn handle_frame(
                 .lock()
                 .expect("send tracker mutex poisoned")
                 .on_sent(result.expected_ack, result.timeout_ms, Instant::now());
-            if matches!(outcome, SentOutcome::Spurious) {
-                debug!("mesh: Sent frame with no tracked send (retries off or already resolved)");
+            // Attribute the device verdict to the destination node (best-effort:
+            // requires the tracker to have correlated a record, i.e. retries on).
+            match outcome {
+                SentOutcome::Accepted(prefix) => delivery_stats.on_node_sent_result(prefix, true),
+                SentOutcome::Failed(ref rec) => {
+                    delivery_stats.on_node_sent_result(rec.prefix, false)
+                }
+                SentOutcome::Spurious => {
+                    debug!(
+                        "mesh: Sent frame with no tracked send (retries off or already resolved)"
+                    );
+                }
             }
         }
 
@@ -1039,12 +1133,19 @@ async fn handle_frame(
         // PUSH_CODE_SEND_CONFIRMED (0x82): the destination acknowledged receipt.
         // Clear the pending retransmission for this message.
         InboundFrame::SendConfirmed { crc } => {
-            if send_tracker
+            delivery_stats.on_confirmed(crc);
+            let confirmed = send_tracker
                 .lock()
                 .expect("send tracker mutex poisoned")
-                .on_confirmed(crc)
-            {
-                debug!(crc, "mesh: reply delivery confirmed");
+                .on_confirmed(crc);
+            if let Some(rec) = confirmed {
+                // Round-trip latency of the delivered transmission. Available
+                // only when retransmission tracking kept a record for this CRC.
+                let latency = Instant::now().saturating_duration_since(rec.sent_at);
+                let latency_ms = latency.as_millis() as u64;
+                delivery_stats.record_latency(latency_ms);
+                delivery_stats.on_node_confirmed(rec.prefix, latency_ms);
+                debug!(crc, latency_ms, "mesh: reply delivery confirmed");
             }
         }
 
@@ -1175,6 +1276,7 @@ async fn dispatch_message(
     node_credential_ttl_days: u32,
     flood_after_send: bool,
     send_tracker: &Arc<Mutex<SendTracker>>,
+    delivery_stats: &Arc<DeliveryStats>,
 ) {
     // ── Get or create a session for this node ─────────────────────────────────
     let Some((session, is_new)) = get_or_create_session(sender_prefix, host, state).await else {
@@ -1472,7 +1574,14 @@ async fn dispatch_message(
             "mesh: sending reply to node"
         );
 
-        enqueue_text(send_tracker, cmd_tx, sender_prefix, reply_text, 1);
+        enqueue_text(
+            send_tracker,
+            delivery_stats,
+            cmd_tx,
+            sender_prefix,
+            reply_text,
+            1,
+        );
         // Reset path only after the last frame so intermediate frames travel
         // the same (possibly direct) route as the first.
         if is_last && flood_after_send {

@@ -41,3 +41,28 @@ pub trait TransportEngine: Plugin {
         payload: Notification,
     ) -> Result<NotifyOutcome, TransportError>;
 }
+
+/// A source of transport-specific operational metrics for the admin UI.
+///
+/// Implemented by transports that track delivery or link health — e.g. the
+/// mesh transport's reply-delivery counters (sends, device accepts, route
+/// failures, end-to-end confirmations, retransmissions, give-ups).
+///
+/// The host binary injects an `Arc<dyn TransportStats>` per transport into the
+/// web admin, which serves the snapshot at `GET /api/v1/transports/:name/stats`.
+/// A transport with nothing useful to report simply does not register one.
+pub trait TransportStats: Send + Sync + 'static {
+    /// A JSON snapshot of the transport's current counters.
+    ///
+    /// Called on demand when the admin UI polls; implementations should make
+    /// this cheap (read a handful of atomics) and must not block.
+    fn snapshot(&self) -> serde_json::Value;
+
+    /// A JSON array of historical samples for trend display, oldest first.
+    ///
+    /// Optional — defaults to an empty array for transports that keep no
+    /// history. Served at `GET /api/v1/transports/:name/history`.
+    fn history(&self) -> serde_json::Value {
+        serde_json::Value::Array(Vec::new())
+    }
+}

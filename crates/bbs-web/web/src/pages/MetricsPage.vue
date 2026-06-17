@@ -5,6 +5,14 @@ import { useStatsStore } from '../stores/stats'
 
 const stats = useStatsStore()
 
+// Reliability-trend chart geometry.
+const CHART_W = 600
+const CHART_H = 120
+const PAD_L = 30
+const PAD_R = 8
+const PAD_T = 8
+const PAD_B = 18
+
 interface DiskInfo {
   name: string
   mount: string
@@ -31,7 +39,56 @@ interface MetricsSnapshot {
   sampled_at: number
 }
 
+interface NodeRow {
+  prefix: string
+  first_sends: number
+  accepted: number
+  failed_no_route: number
+  confirmed: number
+  gave_up: number
+  confirm_rate: number | null
+  avg_latency_ms: number | null
+}
+
+interface DeliveryStats {
+  sends_total: number
+  retransmits: number
+  first_sends: number
+  dropped: number
+  accepted: number
+  failed_no_route: number
+  confirmed: number
+  gave_up: number
+  confirm_rate: number | null
+  route_failure_rate: number | null
+  latency_count: number
+  avg_latency_ms: number | null
+  min_latency_ms: number | null
+  max_latency_ms: number | null
+  nodes_tracked: number
+  per_node: NodeRow[]
+}
+
+interface Advert {
+  pubkey: string
+  name: string
+}
+
+interface DeliverySample {
+  ts: number
+  sends_total: number
+  retransmits: number
+  accepted: number
+  failed_no_route: number
+  confirmed: number
+  latency_count: number
+  latency_sum_ms: number
+}
+
 const snap = ref<MetricsSnapshot | null>(null)
+const delivery = ref<DeliveryStats | null>(null)
+const history = ref<DeliverySample[]>([])
+const nodeNames = ref<Record<string, string>>({})
 const loading = ref(false)
 const error = ref<string | null>(null)
 
@@ -45,6 +102,118 @@ async function load() {
   } finally {
     loading.value = false
   }
+  // Mesh delivery counters are optional — a 404 just means the mesh transport
+  // is not compiled in / enabled, so hide the section rather than erroring.
+  try {
+    delivery.value = await api.get<DeliveryStats>('/api/v1/transports/meshcore/stats')
+  } catch {
+    delivery.value = null
+  }
+  if (delivery.value) {
+    try {
+      history.value = await api.get<DeliverySample[]>('/api/v1/transports/meshcore/history')
+    } catch {
+      history.value = []
+    }
+  } else {
+    history.value = []
+  }
+  // Best-effort node-name lookup so the per-node table reads in node names
+  // rather than key prefixes. The per-node prefix is the first 12 hex chars
+  // (6 bytes) of the advert pubkey.
+  if (delivery.value && delivery.value.per_node.length > 0) {
+    try {
+      const adverts = await api.get<Advert[]>('/api/v1/adverts')
+      const map: Record<string, string> = {}
+      for (const a of adverts) {
+        if (a.name) map[a.pubkey.slice(0, 12).toLowerCase()] = a.name
+      }
+      nodeNames.value = map
+    } catch {
+      nodeNames.value = {}
+    }
+  }
+}
+
+function nodeLabel(prefix: string): string {
+  return nodeNames.value[prefix.toLowerCase()] ?? prefix
+}
+
+// Per-interval confirm rate derived from the deltas between cumulative samples.
+interface TrendPt {
+  x: number
+  rate: number | null
+}
+const trend = computed<TrendPt[]>(() => {
+  const h = history.value
+  const n = h.length
+  const out: TrendPt[] = []
+  const denom = n - 2 > 0 ? n - 2 : 1
+  for (let i = 1; i < n; i++) {
+    // Per-reply confirm rate over the interval: confirmed / first-sends, where
+    // first-sends = sends_total − retransmits. Matches the headline card, so
+    // retransmissions don't deflate the trend.
+    const firstPrev = h[i - 1].sends_total - h[i - 1].retransmits
+    const firstCur = h[i].sends_total - h[i].retransmits
+    const dFirst = firstCur - firstPrev
+    const dConf = h[i].confirmed - h[i - 1].confirmed
+    const rate = dFirst > 0 ? Math.min(1, dConf / dFirst) : null
+    const x = PAD_L + ((i - 1) / denom) * (CHART_W - PAD_L - PAD_R)
+    out.push({ x, rate })
+  }
+  return out
+})
+
+function trendY(rate: number): number {
+  return PAD_T + (1 - rate) * (CHART_H - PAD_T - PAD_B)
+}
+const confirmLinePoints = computed(() =>
+  trend.value
+    .filter((p) => p.rate !== null)
+    .map((p) => `${p.x.toFixed(1)},${trendY(p.rate as number).toFixed(1)}`)
+    .join(' ')
+)
+const trendHasData = computed(() => trend.value.filter((p) => p.rate !== null).length >= 2)
+
+function sampleTime(ts: number): string {
+  return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+const trendStart = computed(() => (history.value.length ? sampleTime(history.value[0].ts) : ''))
+const trendEnd = computed(() =>
+  history.value.length ? sampleTime(history.value[history.value.length - 1].ts) : ''
+)
+
+function ratePct(r: number | null): string {
+  return r === null ? '—' : `${(r * 100).toFixed(1)}%`
+}
+
+// Width of a rate bar, 0–100. `null` (no data yet) renders an empty track.
+function rateWidth(r: number | null): number {
+  return r === null ? 0 : Math.round(r * 100)
+}
+
+// Confirm rate: higher is better, so the colour scale is inverted relative to
+// the usage bars — green when most replies are getting through, red when few are.
+function confirmBarClass(r: number | null): string {
+  if (r === null) return ''
+  if (r < 0.7) return 'bar-critical'
+  if (r < 0.9) return 'bar-warn'
+  return ''
+}
+
+// Route-failure rate: higher is worse, same direction as the usage bars.
+function failBarClass(r: number | null): string {
+  if (r === null) return ''
+  if (r >= 0.3) return 'bar-critical'
+  if (r >= 0.1) return 'bar-warn'
+  return ''
+}
+
+// Round-trip latency: ms under a second, otherwise seconds.
+function fmtMs(ms: number | null): string {
+  if (ms === null) return '—'
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)} s`
+  return `${Math.round(ms)} ms`
 }
 
 function fmt(bytes: number): string {
@@ -142,6 +311,95 @@ onUnmounted(() => {
       </div>
 
     </div>
+
+    <!-- Mesh link health -->
+    <section v-if="delivery" class="section">
+      <h2 class="section-title">Mesh link health (cumulative since start)</h2>
+      <div class="metrics-grid">
+        <div class="card">
+          <div class="card-label">Confirm rate</div>
+          <div class="big-num">{{ ratePct(delivery.confirm_rate) }}</div>
+          <div class="bar-track"><div class="bar-fill" :style="{ width: rateWidth(delivery.confirm_rate) + '%' }" :class="confirmBarClass(delivery.confirm_rate)"></div></div>
+          <div class="card-sub muted">{{ delivery.confirmed }} of {{ delivery.first_sends }} replies confirmed</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Route failures</div>
+          <div class="big-num">{{ ratePct(delivery.route_failure_rate) }}</div>
+          <div class="bar-track"><div class="bar-fill" :style="{ width: rateWidth(delivery.route_failure_rate) + '%' }" :class="failBarClass(delivery.route_failure_rate)"></div></div>
+          <div class="card-sub muted">{{ delivery.failed_no_route }} of {{ delivery.accepted + delivery.failed_no_route }} had no route</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Sends</div>
+          <div class="big-num">{{ delivery.sends_total }}</div>
+          <div class="card-sub muted">{{ delivery.retransmits }} retransmit(s), {{ delivery.dropped }} dropped</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Gave up</div>
+          <div class="big-num">{{ delivery.gave_up }}</div>
+          <div class="card-sub muted">undelivered after all retries</div>
+        </div>
+        <div class="card" v-if="delivery.latency_count > 0">
+          <div class="card-label">Avg round-trip</div>
+          <div class="big-num">{{ fmtMs(delivery.avg_latency_ms) }}</div>
+          <div class="card-sub muted">min {{ fmtMs(delivery.min_latency_ms) }} / max {{ fmtMs(delivery.max_latency_ms) }}</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Reliability trend -->
+    <section v-if="delivery && trendHasData" class="section">
+      <h2 class="section-title">Confirm-rate trend (per-minute, last few hours)</h2>
+      <svg class="trend-chart" :viewBox="`0 0 ${CHART_W} ${CHART_H}`" preserveAspectRatio="none" role="img" aria-label="Confirm rate over time">
+        <line :x1="PAD_L" :y1="trendY(0)" :x2="CHART_W - PAD_R" :y2="trendY(0)" class="grid-line" />
+        <line :x1="PAD_L" :y1="trendY(0.5)" :x2="CHART_W - PAD_R" :y2="trendY(0.5)" class="grid-line" />
+        <line :x1="PAD_L" :y1="trendY(1)" :x2="CHART_W - PAD_R" :y2="trendY(1)" class="grid-line" />
+        <text :x="PAD_L - 4" :y="trendY(1) + 3" class="axis-label" text-anchor="end">100</text>
+        <text :x="PAD_L - 4" :y="trendY(0.5) + 3" class="axis-label" text-anchor="end">50</text>
+        <text :x="PAD_L - 4" :y="trendY(0) + 3" class="axis-label" text-anchor="end">0</text>
+        <polyline :points="confirmLinePoints" class="trend-line" />
+      </svg>
+      <div class="trend-axis muted">
+        <span>{{ trendStart }}</span>
+        <span>confirm rate % — gaps are minutes with no reply traffic</span>
+        <span>{{ trendEnd }}</span>
+      </div>
+    </section>
+
+    <!-- Per-node link health -->
+    <section v-if="delivery && delivery.per_node.length > 0" class="section">
+      <h2 class="section-title">Per-node link health — worst first ({{ delivery.nodes_tracked }} node{{ delivery.nodes_tracked === 1 ? '' : 's' }} tracked)</h2>
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>node</th>
+              <th style="min-width:130px">confirm rate</th>
+              <th>replies</th>
+              <th>no route</th>
+              <th>confirmed</th>
+              <th>gave up</th>
+              <th>avg rtt</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="n in delivery.per_node" :key="n.prefix">
+              <td><span :class="{ mono: nodeLabel(n.prefix) === n.prefix }">{{ nodeLabel(n.prefix) }}</span></td>
+              <td>
+                <div class="bar-track inline">
+                  <div class="bar-fill" :style="{ width: rateWidth(n.confirm_rate) + '%' }" :class="confirmBarClass(n.confirm_rate)"></div>
+                </div>
+                <span class="muted pct-label">{{ ratePct(n.confirm_rate) }}</span>
+              </td>
+              <td>{{ n.first_sends }}</td>
+              <td>{{ n.failed_no_route }}</td>
+              <td>{{ n.confirmed }} / {{ n.first_sends }}</td>
+              <td>{{ n.gave_up }}</td>
+              <td>{{ fmtMs(n.avg_latency_ms) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
 
     <!-- Disks -->
     <section v-if="snap && snap.disks.length > 0" class="section">
@@ -288,6 +546,27 @@ p { margin: 0; }
 .pct-label { font-size: 0.82em; margin-left: 0.4rem; }
 
 .sampled-at { font-size: 0.8em; }
+
+.trend-chart {
+  width: 100%;
+  height: 120px;
+  display: block;
+}
+.grid-line { stroke: var(--border); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.axis-label { fill: var(--muted); font-size: 9px; }
+.trend-line {
+  fill: none;
+  stroke: var(--accent, #22c55e);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+  stroke-linejoin: round;
+}
+.trend-axis {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75em;
+  margin-top: 0.25rem;
+}
 
 .rss-alert-banner {
   background: rgba(217, 119, 6, 0.12);

@@ -7,6 +7,31 @@
 
 use serde::{Deserialize, Serialize};
 
+/// One point in a transport's delivery history: cumulative counters stamped with
+/// a wall-clock time. Persisted by the host and consumed to draw reliability
+/// trends. Field names match the mesh transport's in-memory sample so the same
+/// shape serves the `/history` endpoint whether read from memory or the DB.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliverySampleRecord {
+    /// Unix timestamp (seconds) the sample was taken.
+    pub ts: u64,
+    /// Cumulative frames sent at this point (first sends + retransmissions).
+    pub sends_total: u64,
+    /// Cumulative retransmissions. `sends_total − retransmits` gives first sends,
+    /// the per-reply confirm-rate denominator a trend consumer should use.
+    pub retransmits: u64,
+    /// Cumulative device-accepted sends.
+    pub accepted: u64,
+    /// Cumulative no-route failures.
+    pub failed_no_route: u64,
+    /// Cumulative end-to-end confirmations.
+    pub confirmed: u64,
+    /// Cumulative latency sample count (for deriving interval average latency).
+    pub latency_count: u64,
+    /// Cumulative latency sum in milliseconds.
+    pub latency_sum_ms: u64,
+}
+
 /// A live BBS session as seen by the admin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdminSessionInfo {

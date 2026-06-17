@@ -52,8 +52,9 @@ pub mod transport;
 pub use admin::{
     AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity,
     AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStaleRoom,
-    AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups, MeshRadioParams,
-    MeshtasticDeviceSnapshot, MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
+    AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups,
+    DeliverySampleRecord, MeshRadioParams, MeshtasticDeviceSnapshot, MeshtasticLoRaConfig,
+    MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };
 pub use advert::{AdvertBus, AdvertRecord};
 pub use command::{Command, Response, Secret};
@@ -66,4 +67,4 @@ pub use plugin::Plugin;
 pub use registry::{
     PluginRegistryApi, PluginState, PluginStatus, ProcessPluginConfig, RegistryError,
 };
-pub use transport::TransportEngine;
+pub use transport::{TransportEngine, TransportStats};
