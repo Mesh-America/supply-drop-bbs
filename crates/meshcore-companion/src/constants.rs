@@ -5,10 +5,9 @@ pub const FRAME_INBOUND_PREFIX: u8 = 0x3C;
 
 /// Maximum total frame size for frames we *send* (prefix + 2-byte length + payload).
 ///
-/// Used by the transport layer to compute [`MAX_REPLY_BYTES`] so that outgoing
-/// `SendTxtMsg` frames fit within the radio bridge's expected frame size.
-///
-/// [`MAX_REPLY_BYTES`]: bbs_mesh::transport::MAX_REPLY_BYTES
+/// Used by the transport layer to compute `MAX_REPLY_BYTES` in `bbs-mesh` so
+/// that outgoing `SendTxtMsg` frames fit within the radio bridge's expected
+/// frame size.
 pub const MAX_FRAME_SIZE: usize = 172;
 
 /// Maximum payload size for frames we *receive* from the radio bridge.
