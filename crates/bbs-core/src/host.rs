@@ -1688,7 +1688,11 @@ impl BbsHost {
     /// Authenticate `session` as `user`: set the session identity/level/room,
     /// fire `SessionAuthenticated`, and return the `LoggedIn` response. Shared by
     /// the normal login path and the forced-password-change completion. (#134)
-    async fn finalize_login(&self, session: SessionId, user: &crate::user::User) -> Response {
+    async fn finalize_login(
+        &self,
+        session: SessionId,
+        user: &crate::user::User,
+    ) -> Result<Response, HostError> {
         // Unverified users land in the guest room (if configured).
         let initial_room = if user.permission_level < PermissionLevel::User {
             self.guest_room_id().unwrap_or(LOBBY_ROOM_ID)
@@ -1697,21 +1701,32 @@ impl BbsHost {
         };
         {
             let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.username = Some(user.username.clone());
-                r.user_id = Some(user.id);
-                r.level = user.permission_level;
-                r.workflow = Workflow::None;
-                r.current_room = initial_room;
+            match sessions.get_mut(&session) {
+                Some(r) => {
+                    r.username = Some(user.username.clone());
+                    r.user_id = Some(user.id);
+                    r.level = user.permission_level;
+                    r.workflow = Workflow::None;
+                    r.current_room = initial_room;
+                }
+                // Session unknown — almost always a stale ID the transport kept
+                // after a logout or server restart. Surface the error instead of
+                // silently writing nothing and still reporting LoggedIn: that
+                // left the transport's prefix mapping pinned to a dead session,
+                // so every command after a one-shot LOGIN failed with "Unknown
+                // session". Returning the error lets the transport mint a fresh
+                // session and replay the command. Mirrors handle_login /
+                // handle_workflow_reply (and the handle_register fix, 50966ab).
+                None => return Err(HostError::UnknownSession(session)),
             }
         }
         let _ = self.events_tx.send(DomainEvent::SessionAuthenticated {
             session,
             user: user.username.clone(),
         });
-        Response::LoggedIn {
+        Ok(Response::LoggedIn {
             user: user.username.clone(),
-        }
+        })
     }
 
     /// If `username` is within its login-backoff window, return the seconds
@@ -1809,12 +1824,20 @@ impl BbsHost {
                 LOBBY_ROOM_ID
             };
             let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.username = Some(username.clone());
-                r.user_id = Some(user_id);
-                r.level = initial_level;
-                r.workflow = Workflow::None;
-                r.current_room = initial_room;
+            match sessions.get_mut(&session) {
+                Some(r) => {
+                    r.username = Some(username.clone());
+                    r.user_id = Some(user_id);
+                    r.level = initial_level;
+                    r.workflow = Workflow::None;
+                    r.current_room = initial_room;
+                }
+                // Session vanished (stale ID after logout/restart). The account
+                // is already persisted; surface the error so the transport
+                // refreshes the session and replays, rather than reporting
+                // LoggedIn on a dead session. See finalize_login for the full
+                // rationale (the one-shot session-squash bug).
+                None => return Err(HostError::UnknownSession(session)),
             }
         }
         let _ = self.events_tx.send(DomainEvent::UserCreated {
@@ -1871,17 +1894,24 @@ impl BbsHost {
     ) -> Result<Response, HostError> {
         {
             let sessions = self.sessions.read().await;
-            if let Some(r) = sessions.get(&session) {
-                if r.username.is_some() {
-                    return Ok(Response::Error(
-                        "Already logged in. Use 'logout' first.".into(),
-                    ));
+            match sessions.get(&session) {
+                Some(r) => {
+                    if r.username.is_some() {
+                        return Ok(Response::Error(
+                            "Already logged in. Use 'logout' first.".into(),
+                        ));
+                    }
+                    if !matches!(r.workflow, Workflow::None) {
+                        return Ok(Response::Error(
+                            "A workflow is already in progress. Type 'cancel' first.".into(),
+                        ));
+                    }
                 }
-                if !matches!(r.workflow, Workflow::None) {
-                    return Ok(Response::Error(
-                        "A workflow is already in progress. Type 'cancel' first.".into(),
-                    ));
-                }
+                // Stale session — reject before creating the account, so the
+                // transport refreshes and replays on a fresh session. Surfacing
+                // this only after create_user_and_login would persist the
+                // account, then the replay would bounce off "username taken".
+                None => return Err(HostError::UnknownSession(session)),
             }
         }
 
@@ -1924,17 +1954,25 @@ impl BbsHost {
     ) -> Result<Response, HostError> {
         {
             let sessions = self.sessions.read().await;
-            if let Some(r) = sessions.get(&session) {
-                if r.username.is_some() {
-                    return Ok(Response::Error(
-                        "Already logged in. Use 'logout' first.".into(),
-                    ));
+            match sessions.get(&session) {
+                Some(r) => {
+                    if r.username.is_some() {
+                        return Ok(Response::Error(
+                            "Already logged in. Use 'logout' first.".into(),
+                        ));
+                    }
+                    if !matches!(r.workflow, Workflow::None) {
+                        return Ok(Response::Error(
+                            "A workflow is already in progress. Type 'cancel' first.".into(),
+                        ));
+                    }
                 }
-                if !matches!(r.workflow, Workflow::None) {
-                    return Ok(Response::Error(
-                        "A workflow is already in progress. Type 'cancel' first.".into(),
-                    ));
-                }
+                // Stale session (e.g. the transport kept the prefix mapping
+                // after a logout). Surface the error so the transport mints a
+                // fresh session and replays, instead of authenticating against
+                // a dead session and reporting LoggedIn while writing nothing —
+                // the one-shot session-squash bug.
+                None => return Err(HostError::UnknownSession(session)),
             }
         }
 
@@ -1989,12 +2027,18 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("must_change lookup: {e}")))?;
         if must_change {
             let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.workflow = Workflow::ForceChangePassword {
-                    username: username.clone(),
-                    user_id: user.id,
-                    stage: ForcePwdStage::EnterNew,
-                };
+            match sessions.get_mut(&session) {
+                Some(r) => {
+                    r.workflow = Workflow::ForceChangePassword {
+                        username: username.clone(),
+                        user_id: user.id,
+                        stage: ForcePwdStage::EnterNew,
+                    };
+                }
+                // Stale session — don't return a prompt the transport would
+                // arm against a dead session. Surface the error so it refreshes
+                // and replays. See finalize_login for the full rationale.
+                None => return Err(HostError::UnknownSession(session)),
             }
             return Ok(Response::Prompt {
                 text: "Your password was reset by an operator. \
@@ -2005,7 +2049,7 @@ impl BbsHost {
         }
 
         info!(%session, %username, "one-shot login successful");
-        Ok(self.finalize_login(session, &user).await)
+        self.finalize_login(session, &user).await
     }
 
     async fn handle_login(
@@ -2239,7 +2283,7 @@ impl BbsHost {
                     }
 
                     info!(%session, %username, "login successful");
-                    Ok(self.finalize_login(session, &user).await)
+                    self.finalize_login(session, &user).await
                 } else {
                     let delay_secs = self.record_login_failure(username.as_str()).await;
                     warn!(%session, %username, delay_secs, "login failed: wrong password");
@@ -2696,7 +2740,7 @@ impl BbsHost {
                     }
                 };
                 info!(%username, "forced password change complete; login finalised");
-                Ok(self.finalize_login(session, &user).await)
+                self.finalize_login(session, &user).await
             }
 
             // ── Message reading ──────────────────────────────────────────────
@@ -5706,6 +5750,82 @@ mod tests {
         assert!(
             matches!(resp, Err(HostError::UnknownSession(_))),
             "LOGIN on an ended session must surface UnknownSession, got: {resp:?}"
+        );
+    }
+
+    /// Regression for the one-shot session-squash bug: a `LOGIN <user> <pw>`
+    /// against a session the host no longer has must surface `UnknownSession`,
+    /// NOT report `LoggedIn` while writing nothing. The latter pinned the mesh
+    /// transport's prefix mapping to a dead session, so every command after a
+    /// one-shot login failed with "Unknown session" / the anonymous banner.
+    #[tokio::test]
+    async fn login_oneshot_on_ended_session_errors() {
+        let (host, _db) = make_host().await;
+        let uname = Username::new("ghosto").unwrap();
+
+        // Register + validate a real user so the one-shot login passes the
+        // username/password checks and reaches finalize_login.
+        let sid = host.create_session("meshcore").await.unwrap();
+        host.process_command(
+            sid,
+            Command::RegisterOneShot {
+                username: uname.as_str().to_owned(),
+                password: "password1".into(),
+            },
+        )
+        .await
+        .unwrap();
+        force_validate(&host, &uname).await;
+
+        // One-shot login on a session the host has ended.
+        let sid2 = host.create_session("meshcore").await.unwrap();
+        host.end_session(sid2).await.unwrap();
+        let resp = host
+            .process_command(
+                sid2,
+                Command::LoginOneShot {
+                    username: uname,
+                    password: "password1".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(resp, Err(HostError::UnknownSession(_))),
+            "one-shot LOGIN on an ended session must surface UnknownSession, got: {resp:?}"
+        );
+    }
+
+    /// One-shot REGISTER on a dead session must surface `UnknownSession` BEFORE
+    /// persisting the account — otherwise the transport's replay on a fresh
+    /// session would bounce off "username taken", and the original session
+    /// stays squashed.
+    #[tokio::test]
+    async fn register_oneshot_on_ended_session_errors() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("meshcore").await.unwrap();
+        host.end_session(sid).await.unwrap();
+        let resp = host
+            .process_command(
+                sid,
+                Command::RegisterOneShot {
+                    username: "ghostr".into(),
+                    password: "password1".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(resp, Err(HostError::UnknownSession(_))),
+            "one-shot REGISTER on an ended session must surface UnknownSession, got: {resp:?}"
+        );
+        // The account must NOT have been created (no orphaned half-registration).
+        let exists = host
+            .db
+            .get_by_username(&Username::new("ghostr").unwrap())
+            .await
+            .unwrap();
+        assert!(
+            exists.is_none(),
+            "one-shot REGISTER on a dead session must not persist the account"
         );
     }
 

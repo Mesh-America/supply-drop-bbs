@@ -849,3 +849,104 @@ async fn real_host_logout_then_register_prompt_reply_advances() {
 
     transport.stop().await.unwrap();
 }
+
+/// End-to-end regression for the one-shot session-squash bug: after a node logs
+/// out (`Q`) the transport keeps its prefix → session mapping, so the next
+/// one-shot `LOGIN <user> <pw>` lands on the dead session. The host must surface
+/// `UnknownSession` so the transport refreshes to a live session — NOT report
+/// `LoggedIn` while writing nothing, which left every subsequent command failing
+/// with "Unknown session" / the anonymous banner.
+#[tokio::test]
+async fn real_host_oneshot_login_after_logout_yields_live_session() {
+    let dbfile = tempfile::NamedTempFile::new().unwrap();
+    let db = bbs_core::Database::open(&dbfile.path().to_string_lossy())
+        .await
+        .unwrap();
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(bbs_core::BbsHost::new(db));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = MeshConfig {
+        addr,
+        command_prefix: None,
+        welcome_message: String::new(),
+        reconnect_delay_initial_ms: 20,
+        reconnect_delay_max_ms: 50,
+        reply_max_attempts: 1,
+        ..MeshConfig::default()
+    };
+    let transport = MeshTransport::init(config, host).await.unwrap();
+    transport.start().await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut bridge = Bridge { stream };
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x9Au8; 6];
+
+    // Read the next text-send frame body, or None on a short timeout. The host
+    // emits async sysop notifications (e.g. "New registration: …") on the same
+    // bridge, so callers skip frames by content rather than by position.
+    async fn next_text(bridge: &mut Bridge) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+            .await
+            .ok()
+            .map(|f| String::from_utf8_lossy(&f[13..]).to_string())
+    }
+    // Drain frames until one contains `want` (case-insensitive); panics on timeout.
+    async fn expect_text_containing(bridge: &mut Bridge, want: &str) -> String {
+        loop {
+            let t = next_text(bridge)
+                .await
+                .unwrap_or_else(|| panic!("expected a frame containing {want:?}; timed out"));
+            if t.to_lowercase().contains(&want.to_lowercase()) {
+                return t;
+            }
+        }
+    }
+
+    // One-shot register creates the account and logs in (first user → Sysop).
+    bridge
+        .send(&contact_msg_frame(sender, "register squashed secretpw1"))
+        .await;
+    expect_text_containing(&mut bridge, "welcome").await;
+
+    // Log out — host drops the session; transport keeps the prefix mapping.
+    bridge.send(&contact_msg_frame(sender, "Q")).await;
+    expect_text_containing(&mut bridge, "ended").await;
+
+    // One-shot login on the SAME node after logout (the squash trigger). With
+    // the bug this returned LoggedIn against the dead session (welcome shown)
+    // but wrote nothing; the fix surfaces UnknownSession so the transport
+    // refreshes to a live session before replaying the login.
+    bridge
+        .send(&contact_msg_frame(sender, "login squashed secretpw1"))
+        .await;
+    expect_text_containing(&mut bridge, "welcome").await;
+
+    // The decisive check: the NEXT command must hit a LIVE, authenticated
+    // session. Accept whichever outcome frame arrives (skipping async
+    // notifications) and assert it reports the logged-in user — NOT "Unknown
+    // session" and NOT the anonymous register/login banner.
+    bridge.send(&contact_msg_frame(sender, "whoami")).await;
+    let mut who_text = String::new();
+    for _ in 0..8 {
+        let Some(t) = next_text(&mut bridge).await else {
+            break;
+        };
+        let lower = t.to_lowercase();
+        if lower.contains("logged in as")
+            || lower.contains("unknown session")
+            || lower.contains("not logged in")
+            || lower.contains("register <user>")
+        {
+            who_text = t;
+            break;
+        }
+    }
+    assert!(
+        who_text.contains("Logged in as squashed"),
+        "BUG: session squashed after one-shot login — whoami got: {who_text:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
