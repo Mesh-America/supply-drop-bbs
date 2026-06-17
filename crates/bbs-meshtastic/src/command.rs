@@ -36,16 +36,44 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         "h" | "help" | "?" => Some(Command::Help {
             topic: rest.map(str::to_owned),
         }),
+        // `register <user>` → interactive; `register <user> <password>` → one-shot.
         "register" => match rest {
-            Some(name) if !name.is_empty() => Some(Command::Register {
-                username: name.to_owned(),
-            }),
-            _ => Some(Command::Help {
+            Some(r) => {
+                let (name, password) = split_first_word(r);
+                if name.is_empty() {
+                    Some(Command::Help {
+                        topic: Some("register".to_owned()),
+                    })
+                } else if let Some(password) = password {
+                    Some(Command::RegisterOneShot {
+                        username: name.to_owned(),
+                        password: password.into(),
+                    })
+                } else {
+                    Some(Command::Register {
+                        username: name.to_owned(),
+                    })
+                }
+            }
+            None => Some(Command::Help {
                 topic: Some("register".to_owned()),
             }),
         },
-        "login" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::Login { username }),
+        // `login <user>` → interactive; `login <user> <password>` → one-shot.
+        "login" => match rest {
+            Some(r) => {
+                let (name, password) = split_first_word(r);
+                match (Username::new(name).ok(), password) {
+                    (Some(username), Some(password)) => Some(Command::LoginOneShot {
+                        username,
+                        password: password.into(),
+                    }),
+                    (Some(username), None) => Some(Command::Login { username }),
+                    (None, _) => Some(Command::Help {
+                        topic: Some("login".to_owned()),
+                    }),
+                }
+            }
             None => Some(Command::Help {
                 topic: Some("login".to_owned()),
             }),

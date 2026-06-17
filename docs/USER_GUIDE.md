@@ -78,10 +78,36 @@ REGISTER alice
 - Case-insensitive at login (stored exactly as typed)
 - The names `bbs` and `system` are reserved and cannot be registered
 
-The BBS then prompts for a password and a confirmation — two short steps,
-each naming the account so you always know where you are:
+### One message (radio only)
+
+On a **radio transport** (MeshCore or Meshtastic) you can register in a **single
+message** by including a password after the username:
 
 ```
+REGISTER alice hunter2pass
+```
+
+This creates the account and logs you straight in — no back-and-forth prompts.
+On a multi-hop mesh link every extra round-trip is another chance for a message
+to be lost, so the one-message form is far more reliable over radio. The password
+is everything after the username, so it may contain spaces (a passphrase works).
+
+This one-message form is offered only on the radio transports. Over the CLI
+socket, use the step-by-step flow below (where password input is hidden).
+
+> **Heads-up:** the password travels in that message, so it is visible over the
+> air (and in your client's sent history) — the same as typing a password at a
+> prompt on radio. Use something you don't reuse elsewhere. There is no
+> confirmation step, so type it carefully.
+
+### Step by step (password not on the command line)
+
+Send just the username and the BBS walks you through a password and a
+confirmation — two short steps, each naming the account so you always know where
+you are:
+
+```
+REGISTER alice
 Registering 'alice'. Choose a password (min 8 characters):
 > ••••••••
 
@@ -121,19 +147,32 @@ messages or read rooms.
 
 ### Logging in
 
+Like registration, login works in **one message** (radio transports only) or
+step by step.
+
+**One message (radio only):**
+
+```
+LOGIN alice hunter2pass
+```
+
+Logs you straight in — no prompt round-trip. The same heads-up applies: the
+password is visible over the air.
+
+**Step by step** — send just the username and you'll be prompted (input is
+hidden on supporting clients):
+
 ```
 LOGIN alice
-```
-
-You'll be prompted for your password (input is hidden on supporting clients):
-
-```
 Enter the password for 'alice':
 > ••••••••
 ```
 
 After three wrong attempts the login workflow is cancelled and you must type
 `LOGIN <username>` again to retry.
+
+> If an operator reset your account to a temporary password, one-message login
+> still drops into a "choose a new password" prompt — that step can't be skipped.
 
 ### Logging out
 

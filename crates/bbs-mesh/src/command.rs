@@ -95,19 +95,48 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             topic: rest.map(str::to_owned),
         }),
 
+        // `register <user>` → interactive flow; `register <user> <password>` →
+        // one-shot (account created + logged in from one message — fewer
+        // round-trips on lossy multi-hop links). Host validates the username
+        // (#128) and password.
         "register" => match rest {
-            // Pass the raw username through; the host validates it and reports a
-            // specific error (#128). Bare `register` → help.
-            Some(name) if !name.is_empty() => Some(Command::Register {
-                username: name.to_owned(),
-            }),
-            _ => Some(Command::Help {
+            Some(r) => {
+                let (name, password) = split_first_word(r);
+                if name.is_empty() {
+                    Some(Command::Help {
+                        topic: Some("register".to_owned()),
+                    })
+                } else if let Some(password) = password {
+                    Some(Command::RegisterOneShot {
+                        username: name.to_owned(),
+                        password: password.into(),
+                    })
+                } else {
+                    Some(Command::Register {
+                        username: name.to_owned(),
+                    })
+                }
+            }
+            None => Some(Command::Help {
                 topic: Some("register".to_owned()),
             }),
         },
 
-        "login" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::Login { username }),
+        // `login <user>` → interactive; `login <user> <password>` → one-shot.
+        "login" => match rest {
+            Some(r) => {
+                let (name, password) = split_first_word(r);
+                match (Username::new(name).ok(), password) {
+                    (Some(username), Some(password)) => Some(Command::LoginOneShot {
+                        username,
+                        password: password.into(),
+                    }),
+                    (Some(username), None) => Some(Command::Login { username }),
+                    (None, _) => Some(Command::Help {
+                        topic: Some("login".to_owned()),
+                    }),
+                }
+            }
             None => Some(Command::Help {
                 topic: Some("login".to_owned()),
             }),
@@ -423,11 +452,48 @@ mod tests {
     #[test]
     fn register_passes_raw_username_to_host() {
         // The parser no longer rejects invalid usernames — it forwards the raw
-        // text so the host can return a specific error (#128).
+        // (single-word) text so the host can return a specific error (#128).
         assert_eq!(
-            cmd("register alice bob"),
+            cmd("register Bad!Name"),
             Some(Command::Register {
-                username: "alice bob".to_owned()
+                username: "Bad!Name".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn register_with_password_is_one_shot() {
+        assert_eq!(
+            cmd("register alice hunter2!"),
+            Some(Command::RegisterOneShot {
+                username: "alice".to_owned(),
+                password: "hunter2!".into(),
+            })
+        );
+        // Password may contain spaces (passphrase-friendly).
+        assert_eq!(
+            cmd("register alice my pass phrase"),
+            Some(Command::RegisterOneShot {
+                username: "alice".to_owned(),
+                password: "my pass phrase".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn login_with_password_is_one_shot() {
+        assert_eq!(
+            cmd("login bob s3cr3tpw"),
+            Some(Command::LoginOneShot {
+                username: Username::new("bob").unwrap(),
+                password: "s3cr3tpw".into(),
+            })
+        );
+        // Bare login still starts the interactive flow.
+        assert_eq!(
+            cmd("login bob"),
+            Some(Command::Login {
+                username: Username::new("bob").unwrap()
             })
         );
     }
