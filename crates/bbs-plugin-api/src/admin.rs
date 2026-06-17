@@ -15,8 +15,11 @@ use serde::{Deserialize, Serialize};
 pub struct DeliverySampleRecord {
     /// Unix timestamp (seconds) the sample was taken.
     pub ts: u64,
-    /// Cumulative frames sent at this point.
+    /// Cumulative frames sent at this point (first sends + retransmissions).
     pub sends_total: u64,
+    /// Cumulative retransmissions. `sends_total − retransmits` gives first sends,
+    /// the per-reply confirm-rate denominator a trend consumer should use.
+    pub retransmits: u64,
     /// Cumulative device-accepted sends.
     pub accepted: u64,
     /// Cumulative no-route failures.

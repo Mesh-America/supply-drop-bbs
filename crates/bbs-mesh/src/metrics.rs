@@ -21,7 +21,7 @@
 //! persisted time-series for trend analysis is a separate, later layer — this
 //! module is the live snapshot only.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
@@ -44,11 +44,20 @@ const MAX_NODES_IN_SNAPSHOT: usize = 50;
 /// restart; durable persistence is a separate layer.
 const MAX_HISTORY_SAMPLES: usize = 480;
 
+/// Size of the recent-confirmation CRC window used to drop duplicate end-to-end
+/// ACK frames. Duplicates arrive close together, so a small window suffices; a
+/// legitimate CRC reuse for a later reply falls outside it.
+const RECENT_CONFIRMED_CAP: usize = 256;
+
 /// Per-node delivery counters. Plain integers — guarded by the `nodes` mutex,
 /// not atomics, since they are only touched under that lock.
 #[derive(Debug, Default, Clone)]
 struct NodeCounters {
     sends: u64,
+    /// First sends (attempt == 1) — i.e. distinct replies addressed to this
+    /// node. The per-reply confirm-rate denominator, so retransmissions don't
+    /// deflate it.
+    first_sends: u64,
     accepted: u64,
     failed_no_route: u64,
     confirmed: u64,
@@ -100,8 +109,10 @@ pub struct DeliveryStats {
     /// Device reported `MSG_SEND_FAILED` (ACK CRC 0, not flood): no route /
     /// unknown contact. The send never left the device.
     failed_no_route: AtomicU64,
-    /// End-to-end delivery confirmations (`PUSH_CODE_SEND_CONFIRMED`): the
-    /// destination acknowledged receipt.
+    /// Distinct end-to-end delivery confirmations (`PUSH_CODE_SEND_CONFIRMED`):
+    /// the destination acknowledged receipt. Deduplicated against
+    /// [`Self::recent_confirmed`] so a repeated ACK frame can't push the rate
+    /// over 100%.
     confirmed: AtomicU64,
     /// Replies abandoned after exhausting the retransmission budget without a
     /// confirmation.
@@ -124,6 +135,10 @@ pub struct DeliveryStats {
     /// Bounded at [`MAX_HISTORY_SAMPLES`]; consumers derive per-interval rates
     /// from the deltas between consecutive samples.
     history: Mutex<VecDeque<DeliverySample>>,
+    /// Recent confirmation CRCs (FIFO + membership set) for deduplicating
+    /// duplicate `SendConfirmed` frames on the global counter, independent of the
+    /// retransmission tracker so it works with retries off too.
+    recent_confirmed: Mutex<(VecDeque<u32>, HashSet<u32>)>,
 }
 
 impl Default for DeliveryStats {
@@ -143,6 +158,7 @@ impl Default for DeliveryStats {
             latency_max_ms: AtomicU64::new(0),
             nodes: Mutex::new(HashMap::new()),
             history: Mutex::new(VecDeque::new()),
+            recent_confirmed: Mutex::new((VecDeque::new(), HashSet::new())),
         }
     }
 }
@@ -174,10 +190,16 @@ impl DeliveryStats {
     /// anything greater is a retransmission.
     pub fn on_send(&self, prefix: [u8; 6], attempt: u8) {
         self.sends_total.fetch_add(1, Ordering::Relaxed);
-        if attempt > 1 {
+        let first = attempt <= 1;
+        if !first {
             self.retransmits.fetch_add(1, Ordering::Relaxed);
         }
-        self.with_node(prefix, |c| c.sends += 1);
+        self.with_node(prefix, |c| {
+            c.sends += 1;
+            if first {
+                c.first_sends += 1;
+            }
+        });
     }
 
     /// Record an outbound text frame dropped before the wire (channel full/closed).
@@ -208,8 +230,28 @@ impl DeliveryStats {
         });
     }
 
-    /// Record an end-to-end delivery confirmation (global).
-    pub fn on_confirmed(&self) {
+    /// Record an end-to-end delivery confirmation (global), keyed by ACK `crc`
+    /// so a duplicate `SendConfirmed` frame is counted once. The per-node path is
+    /// already deduped by the retransmission tracker; this dedups the global
+    /// counter the same way without depending on the tracker (so it holds with
+    /// retries off too).
+    pub fn on_confirmed(&self, crc: u32) {
+        {
+            let mut g = self
+                .recent_confirmed
+                .lock()
+                .expect("recent_confirmed mutex poisoned");
+            let (queue, seen) = &mut *g;
+            if !seen.insert(crc) {
+                return; // duplicate within the recent window — already counted
+            }
+            queue.push_back(crc);
+            if queue.len() > RECENT_CONFIRMED_CAP {
+                if let Some(old) = queue.pop_front() {
+                    seen.remove(&old);
+                }
+            }
+        }
         self.confirmed.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -240,6 +282,7 @@ impl DeliveryStats {
         let s = DeliverySample {
             ts,
             sends_total: self.sends_total.load(Ordering::Relaxed),
+            retransmits: self.retransmits.load(Ordering::Relaxed),
             accepted: self.accepted.load(Ordering::Relaxed),
             failed_no_route: self.failed_no_route.load(Ordering::Relaxed),
             confirmed: self.confirmed.load(Ordering::Relaxed),
@@ -298,11 +341,18 @@ impl DeliveryStats {
         let confirmed = self.confirmed.load(Ordering::Relaxed);
         let gave_up = self.gave_up.load(Ordering::Relaxed);
 
-        // Confirm rate: of the sends the device accepted, how many were
-        // confirmed end-to-end. `None` until there is something to divide.
-        let confirm_rate = ratio(confirmed, accepted);
+        // Confirm rate is PER REPLY, not per transmission: the denominator is
+        // first sends (distinct replies), not `accepted` (which counts every
+        // retransmission and every flood send). Otherwise a reply delivered on
+        // attempt 3 would score 1/3, and the headline would move *against* the
+        // reliability the retransmission layer provides on a recovering link.
+        // `confirmed` is deduplicated (see `on_confirmed`), so the ratio is
+        // clamped only as a defensive guard against a stray confirm.
+        let first_sends = sends_total.saturating_sub(retransmits);
+        let confirm_rate = ratio(confirmed, first_sends).map(|r| r.min(1.0));
         // Route-failure rate: of the sends the device gave a verdict on, how
-        // many it could not route.
+        // many it could not route. Per-verdict (device-level), kept distinct from
+        // the per-reply confirm rate above.
         let route_failure_rate = ratio(failed_no_route, accepted + failed_no_route);
 
         // Round-trip latency. Only meaningful once at least one confirmation
@@ -321,6 +371,7 @@ impl DeliveryStats {
         DeliveryStatsSnapshot {
             sends_total,
             retransmits,
+            first_sends,
             dropped,
             accepted,
             failed_no_route,
@@ -352,24 +403,26 @@ impl DeliveryStats {
                     (c.latency_count > 0).then(|| c.latency_sum_ms as f64 / c.latency_count as f64);
                 NodeDeliverySnapshot {
                     prefix: prefix_hex,
-                    sends: c.sends,
+                    first_sends: c.first_sends,
                     accepted: c.accepted,
                     failed_no_route: c.failed_no_route,
                     confirmed: c.confirmed,
                     gave_up: c.gave_up,
-                    confirm_rate: ratio(c.confirmed, c.accepted),
+                    // Per reply (first sends), not per transmission — and the
+                    // per-node `confirmed` is already deduped by the tracker.
+                    confirm_rate: ratio(c.confirmed, c.first_sends).map(|r| r.min(1.0)),
                     avg_latency_ms,
                 }
             })
             .collect();
         // Worst link first: lowest confirm rate (a node with no confirmations
-        // sorts as 0.0), then highest send volume so busy bad links lead.
+        // sorts as 0.0), then highest volume so busy bad links lead.
         rows.sort_by(|a, b| {
             let ra = a.confirm_rate.unwrap_or(0.0);
             let rb = b.confirm_rate.unwrap_or(0.0);
             ra.partial_cmp(&rb)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then(b.sends.cmp(&a.sends))
+                .then(b.first_sends.cmp(&a.first_sends))
         });
         rows.truncate(MAX_NODES_IN_SNAPSHOT);
         (rows, total)
@@ -388,17 +441,22 @@ pub struct DeliveryStatsSnapshot {
     pub sends_total: u64,
     /// Retransmissions among `sends_total`.
     pub retransmits: u64,
+    /// First sends (`sends_total − retransmits`) — distinct replies originated.
+    /// The denominator for the per-reply `confirm_rate`.
+    pub first_sends: u64,
     /// Outbound frames dropped before the wire (channel full/closed).
     pub dropped: u64,
-    /// Sends the device accepted for delivery.
+    /// Sends the device accepted for delivery (counts each retransmission).
     pub accepted: u64,
     /// Sends the device could not route (`MSG_SEND_FAILED`).
     pub failed_no_route: u64,
-    /// End-to-end delivery confirmations received.
+    /// Distinct end-to-end delivery confirmations received (deduplicated).
     pub confirmed: u64,
     /// Replies abandoned after exhausting all retransmission attempts.
     pub gave_up: u64,
-    /// `confirmed / accepted`, or `null` when nothing has been accepted yet.
+    /// Per-reply confirm rate: `confirmed / first_sends` (clamped to ≤ 1.0), or
+    /// `null` before any reply has been sent. Not per-transmission, so retries
+    /// and floods don't deflate it.
     pub confirm_rate: Option<f64>,
     /// `failed_no_route / (accepted + failed_no_route)`, or `null` when the
     /// device has not reported on any send yet.
@@ -427,17 +485,19 @@ pub struct DeliveryStatsSnapshot {
 pub struct NodeDeliverySnapshot {
     /// Destination pubkey prefix, 12 hex chars (the first 6 bytes).
     pub prefix: String,
-    /// Outbound frames addressed to this node (first sends + retransmissions).
-    pub sends: u64,
-    /// Sends the device accepted for delivery to this node.
+    /// First sends (distinct replies) addressed to this node. The per-reply
+    /// confirm-rate denominator.
+    pub first_sends: u64,
+    /// Sends the device accepted for delivery to this node (counts retransmissions).
     pub accepted: u64,
     /// Sends to this node the device could not route.
     pub failed_no_route: u64,
-    /// End-to-end confirmations from this node.
+    /// Distinct end-to-end confirmations from this node.
     pub confirmed: u64,
     /// Replies to this node abandoned after exhausting retransmissions.
     pub gave_up: u64,
-    /// `confirmed / accepted` for this node, or `null` when nothing accepted yet.
+    /// Per-reply confirm rate `confirmed / first_sends` (clamped ≤ 1.0), or
+    /// `null` when nothing has been sent to this node yet.
     pub confirm_rate: Option<f64>,
     /// Mean round-trip to this node in milliseconds, or `null` with no samples.
     pub avg_latency_ms: Option<f64>,
@@ -492,21 +552,60 @@ mod tests {
     #[test]
     fn confirm_and_route_failure_rates() {
         let s = DeliveryStats::default();
-        // 4 accepted, 1 no-route → route failure 1/5.
+        // 5 replies sent (first sends); the device routed 4 and failed 1.
+        for _ in 0..5 {
+            s.on_send(P1, 1);
+        }
         for _ in 0..4 {
             s.on_sent_result(true);
         }
         s.on_sent_result(false);
-        // 3 of the 4 accepted were confirmed.
-        for _ in 0..3 {
-            s.on_confirmed();
-        }
+        // 3 of the 5 replies were confirmed end-to-end (distinct CRCs).
+        s.on_confirmed(0x1);
+        s.on_confirmed(0x2);
+        s.on_confirmed(0x3);
         let snap = s.snapshot();
+        assert_eq!(snap.first_sends, 5);
         assert_eq!(snap.accepted, 4);
         assert_eq!(snap.failed_no_route, 1);
         assert_eq!(snap.confirmed, 3);
-        assert_eq!(snap.confirm_rate, Some(0.75));
+        // Per reply: confirmed / first_sends = 3/5.
+        assert_eq!(snap.confirm_rate, Some(0.6));
+        // Per device verdict: failed / (accepted + failed) = 1/5.
         assert_eq!(snap.route_failure_rate, Some(0.2));
+    }
+
+    #[test]
+    fn confirm_rate_is_per_reply_not_per_transmission() {
+        let s = DeliveryStats::default();
+        // One reply, delivered on the third transmission.
+        s.on_send(P1, 1); // first send
+        s.on_send(P1, 2); // retransmit
+        s.on_send(P1, 3); // retransmit
+        for _ in 0..3 {
+            s.on_sent_result(true); // device accepted each attempt
+        }
+        s.on_confirmed(0xAB); // confirmed once
+        let snap = s.snapshot();
+        // 1 confirmed / 1 first-send = 100%, NOT 1/3. The headline must not be
+        // deflated by the retransmissions the retry layer is doing.
+        assert_eq!(snap.first_sends, 1);
+        assert_eq!(snap.confirm_rate, Some(1.0));
+    }
+
+    #[test]
+    fn duplicate_confirm_is_deduplicated() {
+        let s = DeliveryStats::default();
+        s.on_send(P1, 1);
+        s.on_confirmed(0xCD);
+        s.on_confirmed(0xCD); // duplicate ACK frame for the same reply
+        let snap = s.snapshot();
+        assert_eq!(snap.confirmed, 1, "duplicate confirm counted once");
+        assert_eq!(
+            snap.confirm_rate,
+            Some(1.0),
+            "rate stays at 100%, never exceeds it"
+        );
     }
 
     #[test]
@@ -540,7 +639,9 @@ mod tests {
         s.on_send(P1, 1);
         let v = TransportStats::snapshot(&s);
         assert_eq!(v["sends_total"], 1);
-        assert!(v["confirm_rate"].is_null());
+        assert_eq!(v["first_sends"], 1);
+        // One reply sent, none confirmed yet → 0%, not null.
+        assert_eq!(v["confirm_rate"], 0.0);
     }
 
     #[test]

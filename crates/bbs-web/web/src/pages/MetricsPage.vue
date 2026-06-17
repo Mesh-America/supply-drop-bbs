@@ -41,7 +41,7 @@ interface MetricsSnapshot {
 
 interface NodeRow {
   prefix: string
-  sends: number
+  first_sends: number
   accepted: number
   failed_no_route: number
   confirmed: number
@@ -53,6 +53,7 @@ interface NodeRow {
 interface DeliveryStats {
   sends_total: number
   retransmits: number
+  first_sends: number
   dropped: number
   accepted: number
   failed_no_route: number
@@ -76,6 +77,7 @@ interface Advert {
 interface DeliverySample {
   ts: number
   sends_total: number
+  retransmits: number
   accepted: number
   failed_no_route: number
   confirmed: number
@@ -148,9 +150,14 @@ const trend = computed<TrendPt[]>(() => {
   const out: TrendPt[] = []
   const denom = n - 2 > 0 ? n - 2 : 1
   for (let i = 1; i < n; i++) {
-    const dAcc = h[i].accepted - h[i - 1].accepted
+    // Per-reply confirm rate over the interval: confirmed / first-sends, where
+    // first-sends = sends_total − retransmits. Matches the headline card, so
+    // retransmissions don't deflate the trend.
+    const firstPrev = h[i - 1].sends_total - h[i - 1].retransmits
+    const firstCur = h[i].sends_total - h[i].retransmits
+    const dFirst = firstCur - firstPrev
     const dConf = h[i].confirmed - h[i - 1].confirmed
-    const rate = dAcc > 0 ? dConf / dAcc : null
+    const rate = dFirst > 0 ? Math.min(1, dConf / dFirst) : null
     const x = PAD_L + ((i - 1) / denom) * (CHART_W - PAD_L - PAD_R)
     out.push({ x, rate })
   }
@@ -313,7 +320,7 @@ onUnmounted(() => {
           <div class="card-label">Confirm rate</div>
           <div class="big-num">{{ ratePct(delivery.confirm_rate) }}</div>
           <div class="bar-track"><div class="bar-fill" :style="{ width: rateWidth(delivery.confirm_rate) + '%' }" :class="confirmBarClass(delivery.confirm_rate)"></div></div>
-          <div class="card-sub muted">{{ delivery.confirmed }} ACK'd / {{ delivery.accepted }} accepted</div>
+          <div class="card-sub muted">{{ delivery.confirmed }} of {{ delivery.first_sends }} replies confirmed</div>
         </div>
         <div class="card">
           <div class="card-label">Route failures</div>
@@ -367,7 +374,7 @@ onUnmounted(() => {
             <tr>
               <th>node</th>
               <th style="min-width:130px">confirm rate</th>
-              <th>sends</th>
+              <th>replies</th>
               <th>no route</th>
               <th>confirmed</th>
               <th>gave up</th>
@@ -383,9 +390,9 @@ onUnmounted(() => {
                 </div>
                 <span class="muted pct-label">{{ ratePct(n.confirm_rate) }}</span>
               </td>
-              <td>{{ n.sends }}</td>
+              <td>{{ n.first_sends }}</td>
               <td>{{ n.failed_no_route }}</td>
-              <td>{{ n.confirmed }} / {{ n.accepted }}</td>
+              <td>{{ n.confirmed }} / {{ n.first_sends }}</td>
               <td>{{ n.gave_up }}</td>
               <td>{{ fmtMs(n.avg_latency_ms) }}</td>
             </tr>

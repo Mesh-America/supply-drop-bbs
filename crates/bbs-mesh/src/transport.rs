@@ -1133,7 +1133,7 @@ async fn handle_frame(
         // PUSH_CODE_SEND_CONFIRMED (0x82): the destination acknowledged receipt.
         // Clear the pending retransmission for this message.
         InboundFrame::SendConfirmed { crc } => {
-            delivery_stats.on_confirmed();
+            delivery_stats.on_confirmed(crc);
             let confirmed = send_tracker
                 .lock()
                 .expect("send tracker mutex poisoned")

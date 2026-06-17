@@ -26,13 +26,14 @@ impl Database {
     ) -> Result<(), StoreError> {
         sqlx::query(
             "INSERT INTO delivery_samples \
-             (transport, ts, sends_total, accepted, failed_no_route, confirmed, \
+             (transport, ts, sends_total, retransmits, accepted, failed_no_route, confirmed, \
               latency_count, latency_sum_ms) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(transport)
         .bind(s.ts as i64)
         .bind(s.sends_total as i64)
+        .bind(s.retransmits as i64)
         .bind(s.accepted as i64)
         .bind(s.failed_no_route as i64)
         .bind(s.confirmed as i64)
@@ -58,7 +59,7 @@ impl Database {
         since: u64,
     ) -> Result<Vec<DeliverySampleRecord>, StoreError> {
         let rows = sqlx::query(
-            "SELECT ts, sends_total, accepted, failed_no_route, confirmed, \
+            "SELECT ts, sends_total, retransmits, accepted, failed_no_route, confirmed, \
                     latency_count, latency_sum_ms \
              FROM delivery_samples \
              WHERE transport = ? AND ts >= ? \
@@ -74,6 +75,7 @@ impl Database {
                 Ok(DeliverySampleRecord {
                     ts: r.try_get::<i64, _>("ts")? as u64,
                     sends_total: r.try_get::<i64, _>("sends_total")? as u64,
+                    retransmits: r.try_get::<i64, _>("retransmits")? as u64,
                     accepted: r.try_get::<i64, _>("accepted")? as u64,
                     failed_no_route: r.try_get::<i64, _>("failed_no_route")? as u64,
                     confirmed: r.try_get::<i64, _>("confirmed")? as u64,
@@ -101,6 +103,7 @@ mod tests {
         DeliverySampleRecord {
             ts,
             sends_total: ts,
+            retransmits: ts / 10,
             accepted: ts,
             failed_no_route: 0,
             confirmed: ts,
@@ -126,6 +129,7 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].ts, 1000, "oldest first");
         assert_eq!(all[1].ts, 1060);
+        assert_eq!(all[1].retransmits, 106, "retransmits column round-trips");
         assert_eq!(
             all[1].confirmed, 1060,
             "u64 round-trips through i64 columns"
