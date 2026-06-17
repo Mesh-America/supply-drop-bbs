@@ -15,6 +15,7 @@
 //! │  │  POST /api/v1/auth/logout          (auth)       │    │
 //! │  │  GET  /api/v1/status               (auth)       │    │
 //! │  │  GET  /api/v1/transports           (auth)       │    │
+//! │  │  GET  /api/v1/transports/:name/stats (auth)     │    │
 //! │  │  GET  /api/v1/native-plugins       (auth)       │    │
 //! │  │  PATCH /api/v1/native-plugins/:name (auth)      │    │
 //! │  │  GET  /api/v1/adverts              (auth)       │    │
@@ -96,6 +97,7 @@ use bbs_plugin_api::event::{DomainEvent, MessageRecipient};
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::plugin::Plugin;
 use bbs_plugin_api::registry::{PluginRegistryApi, ProcessPluginConfig, RegistryError};
+use bbs_plugin_api::transport::TransportStats;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
@@ -249,6 +251,10 @@ struct AppState {
     ext_log_buf: std::sync::Mutex<Option<Arc<Mutex<LogBuffer>>>>,
     plugin_registry: std::sync::Mutex<Option<Arc<dyn PluginRegistryApi>>>,
     active_transports: std::sync::Mutex<TransportFlags>,
+    /// Per-transport operational metrics sources, keyed by transport name.
+    /// Populated by the host binary after plugin init; served at
+    /// `GET /api/v1/transports/:name/stats`.
+    transport_stats: std::sync::Mutex<HashMap<String, Arc<dyn TransportStats>>>,
     pending_restart: AtomicBool,
     log_reload: std::sync::Mutex<Option<LogReloadFn>>,
     error_store: std::sync::Mutex<Option<Arc<Mutex<ErrorStore>>>>,
@@ -270,6 +276,7 @@ impl AppState {
             ext_log_buf: std::sync::Mutex::new(None),
             plugin_registry: std::sync::Mutex::new(None),
             active_transports: std::sync::Mutex::new(TransportFlags::default()),
+            transport_stats: std::sync::Mutex::new(HashMap::new()),
             pending_restart: AtomicBool::new(false),
             log_reload: std::sync::Mutex::new(None),
             error_store: std::sync::Mutex::new(None),
@@ -501,6 +508,23 @@ impl WebPlugin {
             .expect("active_transports poisoned") = flags;
     }
 
+    /// Register a transport's operational-metrics source.
+    ///
+    /// `name` is the transport name as used in the session registry and API
+    /// paths (e.g. `"meshcore"`). The snapshot is served at
+    /// `GET /api/v1/transports/:name/stats`. Call before `start()`.
+    pub fn register_transport_stats(
+        &self,
+        name: impl Into<String>,
+        stats: Arc<dyn TransportStats>,
+    ) {
+        self.state
+            .transport_stats
+            .lock()
+            .expect("transport_stats poisoned")
+            .insert(name.into(), stats);
+    }
+
     /// Inject the tracing-subscriber reload handle so the web API can change
     /// the log level at runtime without a restart.
     ///
@@ -589,6 +613,7 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/auth/logout", post(api_logout))
         .route("/status", get(api_status))
         .route("/transports", get(api_active_transports))
+        .route("/transports/:name/stats", get(api_transport_stats))
         .route("/native-plugins", get(api_list_native_plugins))
         .route("/native-plugins/:name", patch(api_update_native_plugin))
         .route("/adverts", get(api_adverts))
@@ -836,6 +861,32 @@ async fn api_active_transports(State(state): State<Arc<AppState>>) -> impl IntoR
         .lock()
         .expect("active_transports poisoned");
     Json(flags)
+}
+
+/// Operational-metrics snapshot for a single transport.
+///
+/// Returns the transport's live counters (delivery rates, link health) as JSON.
+/// 404 if the named transport did not register a metrics source — either it is
+/// not compiled in / enabled, or it has no stats to report.
+async fn api_transport_stats(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Response {
+    let stats = {
+        let map = state
+            .transport_stats
+            .lock()
+            .expect("transport_stats poisoned");
+        map.get(&name).cloned()
+    };
+    match stats {
+        Some(stats) => Json(stats.snapshot()).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json_error(&format!("no metrics for transport '{name}'"))),
+        )
+            .into_response(),
+    }
 }
 
 // ── Native plugins ────────────────────────────────────────────────────────────

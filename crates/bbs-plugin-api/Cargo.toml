@@ -15,14 +15,16 @@ publish      = false
 [dependencies]
 async-trait.workspace = true
 serde.workspace       = true
+# Light, ubiquitous, and already in the graph. Used for the
+# `TransportStats` snapshot type that transports expose to the admin UI.
+serde_json.workspace  = true
 thiserror.workspace   = true
 tokio.workspace       = true
 
 [dev-dependencies]
 # Tokio with the full feature set for tests (we use the macro
 # attributes for #[tokio::test]).
-tokio      = { workspace = true, features = ["macros", "rt-multi-thread"] }
-serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]
 workspace = true

@@ -31,7 +31,20 @@ interface MetricsSnapshot {
   sampled_at: number
 }
 
+interface DeliveryStats {
+  sends_total: number
+  retransmits: number
+  dropped: number
+  accepted: number
+  failed_no_route: number
+  confirmed: number
+  gave_up: number
+  confirm_rate: number | null
+  route_failure_rate: number | null
+}
+
 const snap = ref<MetricsSnapshot | null>(null)
+const delivery = ref<DeliveryStats | null>(null)
 const loading = ref(false)
 const error = ref<string | null>(null)
 
@@ -45,6 +58,17 @@ async function load() {
   } finally {
     loading.value = false
   }
+  // Mesh delivery counters are optional — a 404 just means the mesh transport
+  // is not compiled in / enabled, so hide the section rather than erroring.
+  try {
+    delivery.value = await api.get<DeliveryStats>('/api/v1/transports/meshcore/stats')
+  } catch {
+    delivery.value = null
+  }
+}
+
+function ratePct(r: number | null): string {
+  return r === null ? '—' : `${(r * 100).toFixed(1)}%`
 }
 
 function fmt(bytes: number): string {
@@ -142,6 +166,33 @@ onUnmounted(() => {
       </div>
 
     </div>
+
+    <!-- Mesh link health -->
+    <section v-if="delivery" class="section">
+      <h2 class="section-title">Mesh link health (cumulative since start)</h2>
+      <div class="metrics-grid">
+        <div class="card">
+          <div class="card-label">Confirm rate</div>
+          <div class="big-num">{{ ratePct(delivery.confirm_rate) }}</div>
+          <div class="card-sub muted">{{ delivery.confirmed }} ACK'd / {{ delivery.accepted }} accepted</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Route failures</div>
+          <div class="big-num">{{ ratePct(delivery.route_failure_rate) }}</div>
+          <div class="card-sub muted">{{ delivery.failed_no_route }} of {{ delivery.accepted + delivery.failed_no_route }} had no route</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Sends</div>
+          <div class="big-num">{{ delivery.sends_total }}</div>
+          <div class="card-sub muted">{{ delivery.retransmits }} retransmit(s), {{ delivery.dropped }} dropped</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Gave up</div>
+          <div class="big-num">{{ delivery.gave_up }}</div>
+          <div class="card-sub muted">undelivered after all retries</div>
+        </div>
+      </div>
+    </section>
 
     <!-- Disks -->
     <section v-if="snap && snap.disks.length > 0" class="section">

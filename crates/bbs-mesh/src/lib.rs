@@ -49,10 +49,12 @@
 
 pub mod command;
 pub mod config;
+pub mod metrics;
 mod send_tracker;
 pub mod session;
 pub mod transport;
 
 pub use config::{ConnectionType, MeshConfig};
+pub use metrics::{DeliveryStats, DeliveryStatsSnapshot};
 pub use session::{SessionEntry, SessionState};
 pub use transport::MeshTransport;

@@ -66,4 +66,4 @@ pub use plugin::Plugin;
 pub use registry::{
     PluginRegistryApi, PluginState, PluginStatus, ProcessPluginConfig, RegistryError,
 };
-pub use transport::TransportEngine;
+pub use transport::{TransportEngine, TransportStats};
