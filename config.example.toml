@@ -104,7 +104,7 @@
 # specific subsystem without turning the whole BBS verbose.
 # Defaults clamp the noisy ones to WARN.
 # [logging.targets]
-# "supply_drop_bbs::transport::mesh" = "DEBUG"
+# "bbs_mesh" = "DEBUG"                  # MeshCore transport (whole crate)
 # "sqlx::query" = "INFO"
 # "meshcore_companion::frame" = "WARN"
 

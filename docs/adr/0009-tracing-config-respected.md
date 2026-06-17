@@ -145,7 +145,7 @@ The default per-target levels (clamped from root):
 
 | Target prefix              | Default | Notes                          |
 |----------------------------|---------|--------------------------------|
-| `supply_drop_bbs::*`       | inherit | Our own code; root level       |
+| `bbs_*`, `supply_drop_bbs` | inherit | Our own code (per-crate paths) |
 | `meshcore_companion::frame` | WARN   | Per-frame trace; very noisy   |
 | `sqlx::query`              | WARN    | Per-query trace; very noisy   |
 | `hyper`, `tower`, `axum`   | WARN    | Web framework internals       |
@@ -154,7 +154,7 @@ Operators override individual targets via:
 
 ```toml
 [logging.targets]
-"supply_drop_bbs::transport::mesh" = "DEBUG"
+"bbs_mesh" = "DEBUG"
 "sqlx::query" = "INFO"
 ```
 
