@@ -985,6 +985,7 @@ async fn handle_frame(
             );
             dispatch_message(
                 msg.sender_key_prefix,
+                msg.timestamp,
                 &msg.text,
                 host,
                 cmd_tx,
@@ -1267,6 +1268,7 @@ async fn handle_frame(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_message(
     sender_prefix: [u8; 6],
+    timestamp: u32,
     text: &str,
     host: &Arc<dyn Host>,
     cmd_tx: &mpsc::Sender<OutboundFrame>,
@@ -1367,30 +1369,44 @@ async fn dispatch_message(
         None
     };
 
-    // ── Dedup radio retransmissions of all inbound messages ──────────────────
-    // The radio layer retransmits packets; process only the first copy within
-    // the dedup window. This covers both regular commands and workflow replies.
-    if state
-        .lock()
-        .expect("state mutex poisoned")
-        .dedup_message(&sender_prefix, text)
-    {
-        debug!("mesh: dropping retransmitted message (dedup)");
-        return;
-    }
-
-    // ── Dedup mesh retransmissions of workflow replies ────────────────────────
-    // A retransmitted password can arrive after login completes
-    // (awaiting_reply=false). Drop it silently if it matches the most recently
-    // processed WorkflowReply within the dedup window.
-    if !awaiting_reply
-        && state
+    // ── Deduplicate retransmissions ───────────────────────────────────────────
+    // Prefer the sender's per-message timestamp: a retransmission reuses it, so
+    // matching on (timestamp, text) drops resends robustly — even ones delayed
+    // past the text-only window or arriving after the workflow state changed
+    // (the "Error: Already logged in" symptom). When the sender supplies no
+    // timestamp (0), fall back to the text-only window, which additionally
+    // guards mesh retransmissions of a workflow reply that land after the
+    // workflow has completed.
+    if timestamp != 0 {
+        if state
             .lock()
             .expect("state mutex poisoned")
-            .is_recent_workflow_reply(&sender_prefix, text)
-    {
-        debug!("mesh: dropping retransmitted workflow reply (dedup)");
-        return;
+            .dedup_by_timestamp(&sender_prefix, timestamp, text)
+        {
+            debug!(
+                timestamp,
+                "mesh: dropping retransmitted message (timestamp dedup)"
+            );
+            return;
+        }
+    } else {
+        if state
+            .lock()
+            .expect("state mutex poisoned")
+            .dedup_message(&sender_prefix, text)
+        {
+            debug!("mesh: dropping retransmitted message (text dedup)");
+            return;
+        }
+        if !awaiting_reply
+            && state
+                .lock()
+                .expect("state mutex poisoned")
+                .is_recent_workflow_reply(&sender_prefix, text)
+        {
+            debug!("mesh: dropping retransmitted workflow reply (text dedup)");
+            return;
+        }
     }
 
     // ── Parse the command ─────────────────────────────────────────────────────

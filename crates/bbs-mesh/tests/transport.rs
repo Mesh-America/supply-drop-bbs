@@ -11,7 +11,13 @@
 //! entering the event loop.  The test bridge must read all 11 bytes before
 //! sending SelfInfo to avoid leaving stale bytes in the TCP buffer.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use bbs_mesh::{MeshConfig, MeshTransport};
 use bbs_plugin_api::{
@@ -61,12 +67,25 @@ fn err_frame(error_code: u8) -> Vec<u8> {
     radio_frame(&[RESP_CODE_ERR, error_code])
 }
 
+/// Monotonic source of distinct sender timestamps so each `contact_msg_frame`
+/// models a genuinely new message. A real retransmission reuses a timestamp —
+/// use [`contact_msg_frame_ts`] with a repeated value for that.
+static NEXT_TS: AtomicU32 = AtomicU32::new(1_700_000_000);
+
 fn contact_msg_frame(sender_prefix: [u8; 6], text: &str) -> Vec<u8> {
+    let ts = NEXT_TS.fetch_add(1, Ordering::Relaxed);
+    contact_msg_frame_ts(sender_prefix, text, ts)
+}
+
+/// Like [`contact_msg_frame`] but with an explicit sender timestamp. Reuse the
+/// same `timestamp` across two frames to model a retransmission of one message;
+/// use distinct values to model two separate messages.
+fn contact_msg_frame_ts(sender_prefix: [u8; 6], text: &str, timestamp: u32) -> Vec<u8> {
     let mut payload = vec![RESP_CODE_CONTACT_MSG_RECV];
     payload.extend_from_slice(&sender_prefix);
     payload.push(0u8); // path_len
     payload.push(TXT_TYPE_PLAIN);
-    payload.extend_from_slice(&1_700_000_000u32.to_le_bytes());
+    payload.extend_from_slice(&timestamp.to_le_bytes());
     payload.extend_from_slice(text.as_bytes());
     radio_frame(&payload)
 }
@@ -367,6 +386,41 @@ async fn identical_workflow_replies_after_prompt_both_reach_host() {
         2,
         "both identical confirmations must reach the host, got commands: {:?}",
         received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// A true retransmission — the same message re-sent by the radio or a client
+/// that did not hear its ACK, reusing the sender's per-message timestamp — must
+/// reach the host only once, even though the text and session state are
+/// unchanged. This is the "Error: Already logged in" hardening: a resend can no
+/// longer be reprocessed, including copies that arrive after the text-only
+/// window or out of step with the workflow state.
+#[tokio::test]
+async fn retransmitted_command_with_same_timestamp_reaches_host_once() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x77u8; 6];
+    let ts = 1_700_000_900u32;
+    // The same message arrives three times reusing the sender's timestamp.
+    for _ in 0..3 {
+        bridge.send(&contact_msg_frame_ts(sender, "help", ts)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let help_count = host
+        .commands_received()
+        .iter()
+        .filter(|(_, c)| matches!(c, Command::Help { .. }))
+        .count();
+    assert_eq!(
+        help_count, 1,
+        "a retransmitted command (same sender timestamp) must be processed once"
     );
 
     transport.stop().await.unwrap();
@@ -751,15 +805,17 @@ async fn real_host_register_double_send_then_password() {
 
     let sender = [0x88u8; 6];
 
-    // The flaky client sends REGISTER twice in quick succession.
+    // The flaky client RE-SENDS the same REGISTER message: a true retransmit
+    // reuses the sender's timestamp, so both copies carry the same one.
+    let register_ts = 1_700_000_500u32;
     bridge
-        .send(&contact_msg_frame(sender, "register dupe"))
+        .send(&contact_msg_frame_ts(sender, "register dupe", register_ts))
         .await;
     let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("first register reply");
     bridge
-        .send(&contact_msg_frame(sender, "register dupe"))
+        .send(&contact_msg_frame_ts(sender, "register dupe", register_ts))
         .await;
     // Second copy may or may not produce a frame depending on dedup; drain with a
     // short timeout so we don't block.
