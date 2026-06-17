@@ -386,6 +386,15 @@ pub trait TransportEngine: Send + Sync + 'static {
 }
 ```
 
+A transport may also implement the optional `TransportStats` trait (also
+in `bbs-plugin-api`), exposing operational metrics as JSON via `snapshot()`
+and `history()`. The mesh transport implements it to surface reply-delivery
+"link health"; the web admin reads it through
+`GET /api/v1/transports/:name/stats` and `.../history`. Samples are stored
+durably via two defaulted `Host` methods (`record_delivery_sample` /
+`delivery_samples`) backing the `delivery_samples` table, so the trend
+survives a restart.
+
 ### 5.3 The Host interface
 
 What the BBS-core exposes **to** transports. Lives in
@@ -512,6 +521,15 @@ binary via `rust-embed`. Speaks a JSON API documented as OpenAPI.
 - View reports: message volume over time, top senders, top rooms,
   activity heatmap, validation funnel, failed login attempts,
   stale rooms. Aggregations only - no new sampling tables.
+- View mesh link health: reply-delivery metrics per mesh transport -
+  confirm rate (confirmed replies / first sends), route failures,
+  sends, gave-up count, average round-trip latency, a per-node "worst
+  links" table joined to advert names, and a per-minute confirm-rate
+  trend. This one *does* sample: it writes the `delivery_samples` table
+  (about once a minute, pruned after 7 days) and re-seeds the trend
+  from it on startup so it survives a restart. Latency and the per-node
+  breakdown populate only when reply retransmission is on
+  (`reply_max_attempts > 1`, the default).
 - Manage backups: list, trigger manual backup, download.
 - View logs: tail the structured-log feed live.
 - View audit log: read-only, append-only history of sysop actions.

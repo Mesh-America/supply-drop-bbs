@@ -729,6 +729,32 @@ If the web admin plugin is enabled, `GET /health` returns:
 `status` is `"healthy"` only if every transport reports running and the bridge
 is connected; otherwise `"degraded"`.
 
+### Mesh link health
+
+When the web admin UI is enabled, the **Metrics** page includes a **Mesh link
+health** section that surfaces reply-delivery quality for the MeshCore
+transport — so you can see whether replies are reaching users, which nodes have
+bad links, how fast round-trips are, and whether reliability is trending up or
+down as you tune the link:
+
+- summary cards — confirm rate (per reply), route failures, total sends,
+  gave-up count, and average round-trip latency
+- a **worst-links** table — per-node delivery stats, joined to advert names
+- a per-minute confirm-rate trend sparkline
+
+The same data backs a sysop-authenticated JSON API (handy for external
+dashboards or scripting against a logged-in session):
+
+```
+GET /api/v1/transports/meshcore/stats     # current snapshot
+GET /api/v1/transports/meshcore/history   # recent ~8h of samples
+```
+
+Latency and the per-node breakdown are populated only when reply retransmission
+is active (`reply_max_attempts > 1`, the default — see
+[CONFIG.md](CONFIG.md)). Samples are persisted in the database and pruned after
+7 days, so the trend survives a service restart or upgrade rather than resetting.
+
 ### Logs
 
 ```sh
