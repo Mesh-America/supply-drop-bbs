@@ -426,6 +426,143 @@ async fn retransmitted_command_with_same_timestamp_reaches_host_once() {
     transport.stop().await.unwrap();
 }
 
+/// Dispatch runs on a single off-loop command worker; this guards the invariant
+/// the offload relies on — a node's messages reach the host in arrival order. A
+/// per-message spawn instead of one FIFO worker would let workflow input race
+/// and reorder.
+#[tokio::test]
+async fn commands_from_same_node_processed_in_order() {
+    let host = Arc::new(MockHost::new());
+    // Every command returns a Prompt, so the session stays in awaiting-reply
+    // mode and each later message is delivered verbatim as a WorkflowReply.
+    host.set_default_response(Response::Prompt {
+        text: "?".to_owned(),
+        hide_input: false,
+    });
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x44u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await; // enters awaiting-reply
+    for reply in ["one", "two", "three"] {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        bridge.send(&contact_msg_frame(sender, reply)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let replies: Vec<String> = host
+        .commands_received()
+        .iter()
+        .filter_map(|(_, c)| match c {
+            Command::WorkflowReply { reply } => Some(reply.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        vec!["one", "two", "three"],
+        "messages must reach the host in arrival order"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Two different nodes interleaving through the single FIFO worker: each node's
+/// messages reach the host in that node's own arrival order, and the per-node
+/// dedup rings don't cross-contaminate.
+#[tokio::test]
+async fn two_nodes_interleaved_preserve_per_node_order() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Prompt {
+        text: "?".to_owned(),
+        hide_input: false,
+    });
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let a = [0xA1u8; 6];
+    let b = [0xB2u8; 6];
+    // Each node enters awaiting-reply, then sends ordered replies, interleaved.
+    bridge.send(&contact_msg_frame(a, "help")).await;
+    bridge.send(&contact_msg_frame(b, "help")).await;
+    for (ra, rb) in [("a1", "b1"), ("a2", "b2"), ("a3", "b3")] {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        bridge.send(&contact_msg_frame(a, ra)).await;
+        bridge.send(&contact_msg_frame(b, rb)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let replies: Vec<String> = host
+        .commands_received()
+        .iter()
+        .filter_map(|(_, c)| match c {
+            Command::WorkflowReply { reply } => Some(reply.clone()),
+            _ => None,
+        })
+        .collect();
+    let a_order: Vec<&str> = replies
+        .iter()
+        .filter(|r| r.starts_with('a'))
+        .map(String::as_str)
+        .collect();
+    let b_order: Vec<&str> = replies
+        .iter()
+        .filter(|r| r.starts_with('b'))
+        .map(String::as_str)
+        .collect();
+    assert_eq!(a_order, vec!["a1", "a2", "a3"], "node A in arrival order");
+    assert_eq!(b_order, vec!["b1", "b2", "b3"], "node B in arrival order");
+
+    transport.stop().await.unwrap();
+}
+
+/// A burst larger than the worker queue depth applies backpressure (the event
+/// loop blocks on `send`) rather than dropping work: with a deliberately slow
+/// host, every message still reaches the host exactly once, in order.
+#[tokio::test]
+async fn burst_beyond_queue_depth_is_not_dropped_and_stays_ordered() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Prompt {
+        text: "?".to_owned(),
+        hide_input: false,
+    });
+    // Slow host so the worker drains slower than the burst arrives, forcing the
+    // bounded channel (COMMAND_QUEUE_DEPTH = 64) to fill and backpressure.
+    host.set_process_delay(Duration::from_millis(10));
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0xCCu8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await; // enters awaiting-reply
+    let n = 80usize; // > COMMAND_QUEUE_DEPTH
+    for i in 0..n {
+        bridge
+            .send(&contact_msg_frame(sender, &format!("m{i}")))
+            .await;
+    }
+    // Wait for the slow host to drain the whole burst (~n * delay + margin).
+    tokio::time::sleep(Duration::from_millis(n as u64 * 10 + 800)).await;
+
+    let replies: Vec<String> = host
+        .commands_received()
+        .iter()
+        .filter_map(|(_, c)| match c {
+            Command::WorkflowReply { reply } => Some(reply.clone()),
+            _ => None,
+        })
+        .collect();
+    let expected: Vec<String> = (0..n).map(|i| format!("m{i}")).collect();
+    assert_eq!(
+        replies, expected,
+        "every burst message must reach the host once, in order, with none dropped"
+    );
+
+    transport.stop().await.unwrap();
+}
+
 /// A sender that supplies no per-message timestamp (`timestamp == 0`) still gets
 /// retransmission dedup via the text-only fallback window — the path that guards
 /// legacy/no-clock devices. Exercises the `timestamp == 0` branch end-to-end.

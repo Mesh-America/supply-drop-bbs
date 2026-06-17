@@ -76,6 +76,12 @@ const SAMPLE_TICK: Duration = Duration::from_secs(60);
 /// (matches the in-memory ring's ~8h capacity).
 const HISTORY_SEED_SECS: u64 = 8 * 60 * 60;
 
+/// Depth of the queue feeding the command worker. Inbound LoRa traffic is slow
+/// (airtime-limited), so this is rarely above 1; the headroom only matters if
+/// frames arrive faster than the host can drain them, in which case the event
+/// loop blocks on `send` (backpressure) rather than dropping work.
+const COMMAND_QUEUE_DEPTH: usize = 64;
+
 /// Enqueue a plain-text reply to the companion client and, when retransmission
 /// is enabled, record it in `tracker` for delivery tracking.
 ///
@@ -691,6 +697,27 @@ async fn event_loop(
         Err(e) => debug!("mesh: loading delivery history failed: {e}"),
     }
 
+    // Offload command processing to a single FIFO worker so handling a command
+    // (host DB I/O) never blocks the event loop from reading the next frame —
+    // delivery confirmations, queued-message notifications, and the next
+    // `SyncNextMessage` stay responsive. One worker preserves per-node ordering
+    // and the dedup check-and-record exactly as inline dispatch did. On
+    // shutdown the loop drops `cmd_worker_tx` and awaits the worker (bounded
+    // below) so any queued commands drain before the task exits.
+    let (cmd_worker_tx, cmd_worker_rx) = mpsc::channel::<InboundCommand>(COMMAND_QUEUE_DEPTH);
+    let worker = tokio::spawn(command_worker(
+        cmd_worker_rx,
+        Arc::clone(&host),
+        cmd_tx.clone(),
+        Arc::clone(&state),
+        command_prefix,
+        welcome_message,
+        node_credential_ttl_days,
+        flood_after_send,
+        Arc::clone(&send_tracker),
+        Arc::clone(&delivery_stats),
+    ));
+
     loop {
         tokio::select! {
             event = client.recv() => {
@@ -866,7 +893,7 @@ async fn event_loop(
                             _ => false,
                         };
                         if !consumed {
-                            handle_frame(frame, &host, &cmd_tx, &state, command_prefix, &welcome_message, node_credential_ttl_days, &draining, flood_after_send, &send_tracker, &delivery_stats).await;
+                            handle_frame(frame, &host, &cmd_tx, &state, &draining, &send_tracker, &delivery_stats, &cmd_worker_tx).await;
                         }
                     }
                 }
@@ -927,6 +954,13 @@ async fn event_loop(
             }
         }
     }
+
+    // Drain the command worker before the task ends: dropping the sender closes
+    // the channel, the worker finishes any queued commands, then `recv` returns
+    // `None` and it exits. Bounded so a stuck host command can't hang shutdown —
+    // on timeout the worker is left to finish (or be torn down with the runtime).
+    drop(cmd_worker_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
 }
 
 /// Dispatch a single inbound frame from the radio bridge.
@@ -936,13 +970,10 @@ async fn handle_frame(
     host: &Arc<dyn Host>,
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
-    command_prefix: Option<char>,
-    welcome_message: &str,
-    node_credential_ttl_days: u32,
     draining: &Arc<AtomicBool>,
-    flood_after_send: bool,
     send_tracker: &Arc<Mutex<SendTracker>>,
     delivery_stats: &Arc<DeliveryStats>,
+    cmd_worker_tx: &mpsc::Sender<InboundCommand>,
 ) {
     use meshcore_companion::frame::InboundFrame;
 
@@ -987,21 +1018,21 @@ async fn handle_frame(
                 len = msg.text.len(),
                 "mesh: inbound message received"
             );
-            dispatch_message(
-                msg.sender_key_prefix,
-                msg.timestamp,
-                &msg.text,
-                host,
-                cmd_tx,
-                state,
-                command_prefix,
-                welcome_message,
-                node_credential_ttl_days,
-                flood_after_send,
-                send_tracker,
-                delivery_stats,
-            )
-            .await;
+            // Hand the message to the command worker and return immediately so
+            // the event loop stays free to read the next frame instead of
+            // blocking on host I/O. The bounded channel applies backpressure
+            // (rarely reached at LoRa rates) rather than dropping a message.
+            if cmd_worker_tx
+                .send(InboundCommand {
+                    sender_prefix: msg.sender_key_prefix,
+                    timestamp: msg.timestamp,
+                    text: msg.text,
+                })
+                .await
+                .is_err()
+            {
+                warn!("mesh: command worker stopped — dropping inbound message");
+            }
         }
 
         // ── Queued message notification ───────────────────────────────────────
@@ -1268,6 +1299,57 @@ async fn handle_frame(
     }
 }
 
+/// A plain-text direct message handed off from the event loop to the command
+/// worker for processing. Carries everything [`dispatch_message`] needs that is
+/// specific to one inbound message; the rest of its context is owned by the
+/// worker.
+struct InboundCommand {
+    sender_prefix: [u8; 6],
+    timestamp: u32,
+    text: String,
+}
+
+/// Process inbound commands off the event loop, one at a time, in arrival order.
+///
+/// The event loop forwards each plain-text DM here and immediately returns to
+/// reading frames, so handling a command (which awaits host DB I/O) never
+/// blocks delivery-confirmation handling or the next queued-message fetch. A
+/// single worker keeps per-node ordering — and the dedup check-and-record —
+/// identical to the previous inline dispatch. Exits when the event loop drops
+/// the sender and the queue drains.
+#[allow(clippy::too_many_arguments)]
+async fn command_worker(
+    mut rx: mpsc::Receiver<InboundCommand>,
+    host: Arc<dyn Host>,
+    cmd_tx: mpsc::Sender<OutboundFrame>,
+    state: Arc<Mutex<SessionState>>,
+    command_prefix: Option<char>,
+    welcome_message: String,
+    node_credential_ttl_days: u32,
+    flood_after_send: bool,
+    send_tracker: Arc<Mutex<SendTracker>>,
+    delivery_stats: Arc<DeliveryStats>,
+) {
+    while let Some(cmd) = rx.recv().await {
+        dispatch_message(
+            cmd.sender_prefix,
+            cmd.timestamp,
+            &cmd.text,
+            &host,
+            &cmd_tx,
+            &state,
+            command_prefix,
+            &welcome_message,
+            node_credential_ttl_days,
+            flood_after_send,
+            &send_tracker,
+            &delivery_stats,
+        )
+        .await;
+    }
+    debug!("mesh: command worker stopped (queue closed)");
+}
+
 /// Parse a direct message text, route it through the host, and send the reply.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_message(
@@ -1287,7 +1369,8 @@ async fn dispatch_message(
     // ── Get or create a session for this node ─────────────────────────────────
     let Some((session, is_new)) = get_or_create_session(sender_prefix, host, state).await else {
         // Session creation failed; the error was already logged inside
-        // get_or_create_session.  Skip this message â the event loop continues.
+        // get_or_create_session.  Skip this message â the command worker continues
+        // with the next queued command.
         return;
     };
 
@@ -1650,13 +1733,13 @@ async fn get_or_create_session(
                 return Some((sid, false));
             }
             // We cannot proceed without a session, but we must NOT panic here.
-            // This function is called from a detached tokio::spawn event-loop
-            // task; a panic would kill the task permanently and silently, causing
-            // the BBS to stop responding to all mesh nodes with no visible error.
-            // Instead, log the failure and return None so the caller can skip
-            // this message and keep the event loop alive for future messages.
+            // This runs on the detached command_worker task; a panic would kill
+            // it permanently and silently, halting all mesh command processing
+            // with no visible error. Instead, log the failure and return None so
+            // the caller skips this message and the worker stays alive for the
+            // next queued command.
             error!(
-                "mesh: host.create_session failed and no fallback: {e}                  skipping this message to keep the event loop alive"
+                "mesh: host.create_session failed and no fallback: {e} — skipping this message to keep the command worker alive"
             );
             return None;
         }
