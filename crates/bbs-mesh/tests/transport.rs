@@ -426,6 +426,133 @@ async fn retransmitted_command_with_same_timestamp_reaches_host_once() {
     transport.stop().await.unwrap();
 }
 
+/// A sender that supplies no per-message timestamp (`timestamp == 0`) still gets
+/// retransmission dedup via the text-only fallback window — the path that guards
+/// legacy/no-clock devices. Exercises the `timestamp == 0` branch end-to-end.
+#[tokio::test]
+async fn zero_timestamp_retransmission_deduped_via_text_window() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x91u8; 6];
+    // Same command twice with timestamp 0, inside the text-dedup window.
+    bridge.send(&contact_msg_frame_ts(sender, "help", 0)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bridge.send(&contact_msg_frame_ts(sender, "help", 0)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let help_count = host
+        .commands_received()
+        .iter()
+        .filter(|(_, c)| matches!(c, Command::Help { .. }))
+        .count();
+    assert_eq!(
+        help_count, 1,
+        "a zero-timestamp retransmission must be dropped by the text-only fallback"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// With `timestamp == 0`, a retransmitted workflow reply that lands after the
+/// workflow completed is still dropped by the text-only fallback (the
+/// `dedup_message` / `is_recent_workflow_reply` guards), so the host never
+/// reprocesses it.
+#[tokio::test]
+async fn zero_timestamp_workflow_reply_retransmission_after_completion_dropped() {
+    let host = Arc::new(MockHost::new());
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::Help { .. }),
+        Response::Prompt {
+            text: "enter code:".to_owned(),
+            hide_input: false,
+        },
+    );
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::WorkflowReply { .. }),
+        Response::Text("done".to_owned()),
+    );
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x92u8; 6];
+    bridge.send(&contact_msg_frame_ts(sender, "help", 0)).await; // → Prompt
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bridge.send(&contact_msg_frame_ts(sender, "1234", 0)).await; // reply → completes
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bridge.send(&contact_msg_frame_ts(sender, "1234", 0)).await; // retransmit after completion
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let reply_count = host
+        .commands_received()
+        .iter()
+        .filter(|(_, c)| matches!(c, Command::WorkflowReply { reply } if reply == "1234"))
+        .count();
+    assert_eq!(
+        reply_count, 1,
+        "a zero-timestamp workflow-reply retransmission after completion must be dropped"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Boundary/documentation test for the dedup invariant: two identical workflow
+/// replies that reuse ONE timestamp are treated as a retransmission, so the
+/// second is dropped. This is exactly why issue #104 (password + identical
+/// confirmation) relies on the client stamping each distinct send with a DISTINCT
+/// timestamp — see `identical_workflow_replies_after_prompt_both_reach_host` for
+/// the distinct-timestamp (real-client) path where both reach the host.
+#[tokio::test]
+async fn identical_workflow_replies_with_same_timestamp_dedup_second() {
+    let host = Arc::new(MockHost::new());
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::Help { .. }),
+        Response::Prompt {
+            text: "Choose a password:".to_owned(),
+            hide_input: true,
+        },
+    );
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::WorkflowReply { .. }),
+        Response::Prompt {
+            text: "Confirm your password:".to_owned(),
+            hide_input: true,
+        },
+    );
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x93u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await; // distinct ts, enters workflow
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let pw_ts = 1_700_050_000u32;
+    bridge
+        .send(&contact_msg_frame_ts(sender, "hunter2pw", pw_ts))
+        .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    bridge
+        .send(&contact_msg_frame_ts(sender, "hunter2pw", pw_ts))
+        .await; // SAME timestamp ⇒ a retransmission
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let reply_count = host
+        .commands_received()
+        .iter()
+        .filter(|(_, c)| matches!(c, Command::WorkflowReply { reply } if reply == "hunter2pw"))
+        .count();
+    assert_eq!(
+        reply_count, 1,
+        "a confirmation reusing the same timestamp is a retransmission and is dropped"
+    );
+
+    transport.stop().await.unwrap();
+}
+
 /// After a prompt, the next message must reach the host as a `WorkflowReply` —
 /// it must NOT be re-parsed as a standalone command at the transport layer. The
 /// host owns the decision of how to interpret a reply (including whether a
@@ -1018,6 +1145,83 @@ async fn real_host_oneshot_login_after_logout_yields_live_session() {
         who_text.contains("Logged in as squashed"),
         "BUG: session squashed after one-shot login — whoami got: {who_text:?}"
     );
+
+    transport.stop().await.unwrap();
+}
+
+/// Regression guard for the literal "Already logged in" symptom on a real host: a
+/// retransmitted `login` (same sender timestamp) must be deduped before reaching
+/// the host, so it is never reprocessed and the host never replies "Already
+/// logged in." Dedup runs before command parsing, so this also exercises the
+/// `login`-specific path of the symptom that motivated the feature.
+#[tokio::test]
+async fn real_host_retransmitted_login_is_not_reprocessed() {
+    let dbfile = tempfile::NamedTempFile::new().unwrap();
+    let db = bbs_core::Database::open(&dbfile.path().to_string_lossy())
+        .await
+        .unwrap();
+    let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(bbs_core::BbsHost::new(db));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = MeshConfig {
+        addr,
+        command_prefix: None,
+        welcome_message: String::new(),
+        reconnect_delay_initial_ms: 20,
+        reconnect_delay_max_ms: 50,
+        reply_max_attempts: 1,
+        ..MeshConfig::default()
+    };
+    let transport = MeshTransport::init(config, host).await.unwrap();
+    transport.start().await.unwrap();
+    let (stream, _) = listener.accept().await.unwrap();
+    let mut bridge = Bridge { stream };
+    bridge.complete_handshake("Node").await;
+
+    async fn next_text(bridge: &mut Bridge) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+            .await
+            .ok()
+            .map(|f| String::from_utf8_lossy(&f[13..]).to_string())
+    }
+    async fn expect_text_containing(bridge: &mut Bridge, want: &str) -> String {
+        loop {
+            let t = next_text(bridge)
+                .await
+                .unwrap_or_else(|| panic!("expected a frame containing {want:?}; timed out"));
+            if t.to_lowercase().contains(&want.to_lowercase()) {
+                return t;
+            }
+        }
+    }
+
+    let node_a = [0x9Bu8; 6];
+    let node_b = [0x9Cu8; 6];
+
+    // Node A registers the account (first user → Sysop, auto-verified).
+    bridge
+        .send(&contact_msg_frame(node_a, "register alice secretpw1"))
+        .await;
+    expect_text_containing(&mut bridge, "welcome").await;
+
+    // Node B is a fresh node: its first message mints a live session, so the
+    // one-shot login is processed directly (no UnknownSession refresh, which
+    // would otherwise reset the dedup ring). Then the byte-identical
+    // retransmission (same sender timestamp) must be deduped before the host.
+    let login_frame = contact_msg_frame_ts(node_b, "login alice secretpw1", 1_700_060_000);
+    bridge.send(&login_frame).await;
+    expect_text_containing(&mut bridge, "welcome").await;
+    bridge.send(&login_frame).await; // retransmission — must be deduped
+
+    // Drain any frames produced after the retransmission; none may be the
+    // reprocessing error.
+    while let Some(t) = next_text(&mut bridge).await {
+        assert!(
+            !t.to_lowercase().contains("already logged in"),
+            "retransmitted login was reprocessed by the host: {t:?}"
+        );
+    }
 
     transport.stop().await.unwrap();
 }
