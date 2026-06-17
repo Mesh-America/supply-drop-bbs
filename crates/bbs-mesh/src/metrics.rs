@@ -256,7 +256,7 @@ impl DeliveryStats {
 
     /// Seed the in-memory history from persisted samples (oldest first), e.g. on
     /// startup so the trend survives a restart. Keeps only the most recent
-    /// [`MAX_HISTORY_SAMPLES`]. Replaces any existing in-memory history.
+    /// `MAX_HISTORY_SAMPLES`. Replaces any existing in-memory history.
     pub fn load_history(&self, samples: Vec<DeliverySample>) {
         let mut h = self.history.lock().expect("history mutex poisoned");
         h.clear();
@@ -446,7 +446,7 @@ pub struct NodeDeliverySnapshot {
 /// One point in the delivery history: cumulative counters at a moment in time.
 /// Consumers derive per-interval rates from the deltas between samples.
 ///
-/// This is the host-boundary [`DeliverySampleRecord`] so the same value flows
+/// This is the host-boundary `DeliverySampleRecord` so the same value flows
 /// from the in-memory ring to durable storage and the `/history` endpoint
 /// without conversion.
 pub use bbs_plugin_api::DeliverySampleRecord as DeliverySample;
