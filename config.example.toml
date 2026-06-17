@@ -201,6 +201,14 @@
 # every direct message is treated as a command.
 # command_prefix = "!"
 
+# Reply delivery on lossy multi-hop paths. See docs/CONFIG.md §[plugins.mesh].
+# Reset the node's path after each send so the next message floods (more
+# reliable than a possibly-stale direct route).
+# flood_after_send = true
+# Total transmissions per reply, including the first. >1 retransmits a reply
+# the destination never confirms; 1 disables retransmission.
+# reply_max_attempts = 3
+
 
 # ─── Plugin: Meshtastic transport ─────────────────────────────────
 #
