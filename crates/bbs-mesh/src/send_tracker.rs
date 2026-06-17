@@ -66,6 +66,10 @@ pub(crate) struct PendingSend {
     pub txt_type: u8,
     /// 1-based count of transmissions made so far (1 = first send).
     pub attempt: u8,
+    /// When this attempt was written to the wire. Used to measure round-trip
+    /// latency when a `SendConfirmed` arrives. A retransmission carries the time
+    /// of the retransmission, so latency is from the delivered attempt.
+    pub sent_at: Instant,
     /// When the wait for this attempt's `SendConfirmed` expires. Only meaningful
     /// once the record is in `awaiting_ack`; a placeholder while in
     /// `awaiting_sent`.
@@ -122,6 +126,7 @@ impl SendTracker {
             text,
             txt_type,
             attempt,
+            sent_at: now,
             deadline: now, // replaced when the CRC + timeout arrive
         });
     }
@@ -141,10 +146,11 @@ impl SendTracker {
         SentOutcome::Accepted
     }
 
-    /// Mark a message delivered (`SendConfirmed`). Returns true if it was being
-    /// tracked (false for an unknown/duplicate CRC).
-    pub fn on_confirmed(&mut self, crc: u32) -> bool {
-        self.awaiting_ack.remove(&crc).is_some()
+    /// Mark a message delivered (`SendConfirmed`). Returns the tracked record
+    /// (so the caller can read its prefix and `sent_at` for per-node and latency
+    /// metrics), or `None` for an unknown/duplicate CRC.
+    pub fn on_confirmed(&mut self, crc: u32) -> Option<PendingSend> {
+        self.awaiting_ack.remove(&crc)
     }
 
     /// Remove and return all entries whose ACK deadline has passed, split into
@@ -207,7 +213,7 @@ mod tests {
         let mut t = SendTracker::new(cfg(3));
         rec(&mut t, "hi", 1, now);
         assert_eq!(t.on_sent(0xABCD, 5_000, now), SentOutcome::Accepted);
-        assert!(t.on_confirmed(0xABCD));
+        assert!(t.on_confirmed(0xABCD).is_some());
         // Past the deadline, nothing is due — it was delivered.
         let due = t.collect_due(now + Duration::from_secs(60));
         assert!(due.to_retry.is_empty() && due.gave_up.is_empty());
@@ -272,10 +278,25 @@ mod tests {
         t.on_sent(0xAA, 5_000, now);
         t.on_sent(0xBB, 5_000, now);
         // Confirm the second; the first is still in flight.
-        assert!(t.on_confirmed(0xBB));
+        assert!(t.on_confirmed(0xBB).is_some());
         let due = t.collect_due(now + Duration::from_secs(10));
         assert_eq!(due.to_retry.len(), 1);
         assert_eq!(due.to_retry[0].text, "first");
+    }
+
+    #[test]
+    fn confirmed_returns_record_with_send_time_and_prefix() {
+        let now = Instant::now();
+        let mut t = SendTracker::new(cfg(3));
+        t.record([9, 9, 9, 9, 9, 9], "hi".to_owned(), 0, 1, now);
+        // on_sent happens slightly later but must not overwrite the wire-send time.
+        t.on_sent(0x55, 5_000, now + Duration::from_millis(1));
+        let rec = t.on_confirmed(0x55).expect("tracked send");
+        assert_eq!(rec.prefix, [9, 9, 9, 9, 9, 9]);
+        assert_eq!(
+            rec.sent_at, now,
+            "sent_at is the record() time, used to measure round-trip latency"
+        );
     }
 
     #[test]

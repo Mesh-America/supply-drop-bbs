@@ -41,6 +41,10 @@ interface DeliveryStats {
   gave_up: number
   confirm_rate: number | null
   route_failure_rate: number | null
+  latency_count: number
+  avg_latency_ms: number | null
+  min_latency_ms: number | null
+  max_latency_ms: number | null
 }
 
 const snap = ref<MetricsSnapshot | null>(null)
@@ -91,6 +95,13 @@ function failBarClass(r: number | null): string {
   if (r >= 0.3) return 'bar-critical'
   if (r >= 0.1) return 'bar-warn'
   return ''
+}
+
+// Round-trip latency: ms under a second, otherwise seconds.
+function fmtMs(ms: number | null): string {
+  if (ms === null) return '—'
+  if (ms >= 1000) return `${(ms / 1000).toFixed(1)} s`
+  return `${Math.round(ms)} ms`
 }
 
 function fmt(bytes: number): string {
@@ -214,6 +225,11 @@ onUnmounted(() => {
           <div class="card-label">Gave up</div>
           <div class="big-num">{{ delivery.gave_up }}</div>
           <div class="card-sub muted">undelivered after all retries</div>
+        </div>
+        <div class="card" v-if="delivery.latency_count > 0">
+          <div class="card-label">Avg round-trip</div>
+          <div class="big-num">{{ fmtMs(delivery.avg_latency_ms) }}</div>
+          <div class="card-sub muted">min {{ fmtMs(delivery.min_latency_ms) }} / max {{ fmtMs(delivery.max_latency_ms) }}</div>
         </div>
       </div>
     </section>

@@ -1090,12 +1090,17 @@ async fn handle_frame(
         // Clear the pending retransmission for this message.
         InboundFrame::SendConfirmed { crc } => {
             delivery_stats.on_confirmed();
-            if send_tracker
+            let confirmed = send_tracker
                 .lock()
                 .expect("send tracker mutex poisoned")
-                .on_confirmed(crc)
-            {
-                debug!(crc, "mesh: reply delivery confirmed");
+                .on_confirmed(crc);
+            if let Some(rec) = confirmed {
+                // Round-trip latency of the delivered transmission. Available
+                // only when retransmission tracking kept a record for this CRC.
+                let latency = Instant::now().saturating_duration_since(rec.sent_at);
+                let latency_ms = latency.as_millis() as u64;
+                delivery_stats.record_latency(latency_ms);
+                debug!(crc, latency_ms, "mesh: reply delivery confirmed");
             }
         }
 

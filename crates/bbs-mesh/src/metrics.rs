@@ -30,7 +30,7 @@ use serde_json::Value;
 /// Cumulative reply-delivery counters, updated from the transport's send path
 /// and inbound-frame handlers. Shared via `Arc`; all methods take `&self`
 /// (atomic, lock-free) so they can be called from any task without coordination.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct DeliveryStats {
     /// Outbound text frames handed to the companion client (first sends and
     /// retransmissions both count). The denominator for "did the device even
@@ -53,6 +53,36 @@ pub struct DeliveryStats {
     /// Replies abandoned after exhausting the retransmission budget without a
     /// confirmation.
     gave_up: AtomicU64,
+    /// Number of round-trip latency samples. A sample is recorded when a
+    /// confirmation correlates to a tracked send, so this is only populated when
+    /// retransmission tracking is enabled (`reply_max_attempts > 1`).
+    latency_count: AtomicU64,
+    /// Sum of round-trip latencies in milliseconds, for the average.
+    latency_sum_ms: AtomicU64,
+    /// Smallest round-trip latency seen, in milliseconds. Initialised to
+    /// `u64::MAX` so the first `fetch_min` wins; ignore unless `latency_count > 0`.
+    latency_min_ms: AtomicU64,
+    /// Largest round-trip latency seen, in milliseconds.
+    latency_max_ms: AtomicU64,
+}
+
+impl Default for DeliveryStats {
+    fn default() -> Self {
+        Self {
+            sends_total: AtomicU64::new(0),
+            retransmits: AtomicU64::new(0),
+            dropped: AtomicU64::new(0),
+            accepted: AtomicU64::new(0),
+            failed_no_route: AtomicU64::new(0),
+            confirmed: AtomicU64::new(0),
+            gave_up: AtomicU64::new(0),
+            latency_count: AtomicU64::new(0),
+            latency_sum_ms: AtomicU64::new(0),
+            // Sentinel so the first recorded sample becomes the minimum.
+            latency_min_ms: AtomicU64::new(u64::MAX),
+            latency_max_ms: AtomicU64::new(0),
+        }
+    }
 }
 
 impl DeliveryStats {
@@ -91,6 +121,16 @@ impl DeliveryStats {
         self.gave_up.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record a round-trip latency sample (send → end-to-end confirmation), in
+    /// milliseconds. Only called when a confirmation correlates to a tracked
+    /// send, so it requires retransmission tracking to be enabled.
+    pub fn record_latency(&self, ms: u64) {
+        self.latency_count.fetch_add(1, Ordering::Relaxed);
+        self.latency_sum_ms.fetch_add(ms, Ordering::Relaxed);
+        self.latency_min_ms.fetch_min(ms, Ordering::Relaxed);
+        self.latency_max_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
     /// Take a consistent-enough point-in-time snapshot for serialisation.
     ///
     /// Counters are read independently (no global lock), so a snapshot taken
@@ -112,6 +152,17 @@ impl DeliveryStats {
         // many it could not route.
         let route_failure_rate = ratio(failed_no_route, accepted + failed_no_route);
 
+        // Round-trip latency. Only meaningful once at least one confirmation
+        // correlated to a tracked send.
+        let latency_count = self.latency_count.load(Ordering::Relaxed);
+        let latency_sum_ms = self.latency_sum_ms.load(Ordering::Relaxed);
+        let avg_latency_ms =
+            (latency_count > 0).then(|| latency_sum_ms as f64 / latency_count as f64);
+        let min_latency_ms =
+            (latency_count > 0).then(|| self.latency_min_ms.load(Ordering::Relaxed));
+        let max_latency_ms =
+            (latency_count > 0).then(|| self.latency_max_ms.load(Ordering::Relaxed));
+
         DeliveryStatsSnapshot {
             sends_total,
             retransmits,
@@ -122,6 +173,10 @@ impl DeliveryStats {
             gave_up,
             confirm_rate,
             route_failure_rate,
+            latency_count,
+            avg_latency_ms,
+            min_latency_ms,
+            max_latency_ms,
         }
     }
 }
@@ -153,6 +208,16 @@ pub struct DeliveryStatsSnapshot {
     /// `failed_no_route / (accepted + failed_no_route)`, or `null` when the
     /// device has not reported on any send yet.
     pub route_failure_rate: Option<f64>,
+    /// Number of round-trip latency samples behind the latency figures. Zero
+    /// when retransmission tracking is disabled.
+    pub latency_count: u64,
+    /// Mean send→confirmation round-trip in milliseconds, or `null` when there
+    /// are no samples.
+    pub avg_latency_ms: Option<f64>,
+    /// Fastest round-trip in milliseconds, or `null` when there are no samples.
+    pub min_latency_ms: Option<u64>,
+    /// Slowest round-trip in milliseconds, or `null` when there are no samples.
+    pub max_latency_ms: Option<u64>,
 }
 
 impl TransportStats for DeliveryStats {
@@ -203,6 +268,20 @@ mod tests {
         assert_eq!(snap.confirmed, 3);
         assert_eq!(snap.confirm_rate, Some(0.75));
         assert_eq!(snap.route_failure_rate, Some(0.2));
+    }
+
+    #[test]
+    fn latency_tracks_avg_min_max() {
+        let s = DeliveryStats::default();
+        assert_eq!(s.snapshot().avg_latency_ms, None, "no samples yet");
+        s.record_latency(100);
+        s.record_latency(300);
+        s.record_latency(200);
+        let snap = s.snapshot();
+        assert_eq!(snap.latency_count, 3);
+        assert_eq!(snap.avg_latency_ms, Some(200.0));
+        assert_eq!(snap.min_latency_ms, Some(100));
+        assert_eq!(snap.max_latency_ms, Some(300));
     }
 
     #[test]
