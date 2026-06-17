@@ -426,6 +426,48 @@ async fn retransmitted_command_with_same_timestamp_reaches_host_once() {
     transport.stop().await.unwrap();
 }
 
+/// Dispatch runs on a single off-loop command worker; this guards the invariant
+/// the offload relies on — a node's messages reach the host in arrival order. A
+/// per-message spawn instead of one FIFO worker would let workflow input race
+/// and reorder.
+#[tokio::test]
+async fn commands_from_same_node_processed_in_order() {
+    let host = Arc::new(MockHost::new());
+    // Every command returns a Prompt, so the session stays in awaiting-reply
+    // mode and each later message is delivered verbatim as a WorkflowReply.
+    host.set_default_response(Response::Prompt {
+        text: "?".to_owned(),
+        hide_input: false,
+    });
+
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x44u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await; // enters awaiting-reply
+    for reply in ["one", "two", "three"] {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        bridge.send(&contact_msg_frame(sender, reply)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+
+    let replies: Vec<String> = host
+        .commands_received()
+        .iter()
+        .filter_map(|(_, c)| match c {
+            Command::WorkflowReply { reply } => Some(reply.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        replies,
+        vec!["one", "two", "three"],
+        "messages must reach the host in arrival order"
+    );
+
+    transport.stop().await.unwrap();
+}
+
 /// After a prompt, the next message must reach the host as a `WorkflowReply` —
 /// it must NOT be re-parsed as a standalone command at the transport layer. The
 /// host owns the decision of how to interpret a reply (including whether a
