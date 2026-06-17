@@ -175,8 +175,8 @@ journalctl -u supply-drop-bbs -f
 You should see a connected line for each transport within a few seconds:
 
 ```
-INFO supply_drop_bbs::transport::mesh        connected
-INFO supply_drop_bbs::transport::meshtastic  connected
+INFO bbs_mesh::transport     connected
+INFO bbs_meshtastic           connected
 ```
 
 If the MeshCore HAT transport logs a connection error, check that `pymc_core` is running:
@@ -191,8 +191,8 @@ To turn on verbose logging for just one transport without making everything nois
 
 ```toml
 [logging.targets]
-"supply_drop_bbs::transport::mesh"       = "DEBUG"
-"supply_drop_bbs::transport::meshtastic" = "DEBUG"
+"bbs_mesh"       = "DEBUG"   # MeshCore transport crate
+"bbs_meshtastic" = "DEBUG"   # Meshtastic transport crate
 ```
 
 ---
