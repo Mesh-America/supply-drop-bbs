@@ -71,6 +71,28 @@ function ratePct(r: number | null): string {
   return r === null ? '—' : `${(r * 100).toFixed(1)}%`
 }
 
+// Width of a rate bar, 0–100. `null` (no data yet) renders an empty track.
+function rateWidth(r: number | null): number {
+  return r === null ? 0 : Math.round(r * 100)
+}
+
+// Confirm rate: higher is better, so the colour scale is inverted relative to
+// the usage bars — green when most replies are getting through, red when few are.
+function confirmBarClass(r: number | null): string {
+  if (r === null) return ''
+  if (r < 0.7) return 'bar-critical'
+  if (r < 0.9) return 'bar-warn'
+  return ''
+}
+
+// Route-failure rate: higher is worse, same direction as the usage bars.
+function failBarClass(r: number | null): string {
+  if (r === null) return ''
+  if (r >= 0.3) return 'bar-critical'
+  if (r >= 0.1) return 'bar-warn'
+  return ''
+}
+
 function fmt(bytes: number): string {
   if (bytes >= 1_073_741_824) return `${(bytes / 1_073_741_824).toFixed(1)} GB`
   if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`
@@ -174,11 +196,13 @@ onUnmounted(() => {
         <div class="card">
           <div class="card-label">Confirm rate</div>
           <div class="big-num">{{ ratePct(delivery.confirm_rate) }}</div>
+          <div class="bar-track"><div class="bar-fill" :style="{ width: rateWidth(delivery.confirm_rate) + '%' }" :class="confirmBarClass(delivery.confirm_rate)"></div></div>
           <div class="card-sub muted">{{ delivery.confirmed }} ACK'd / {{ delivery.accepted }} accepted</div>
         </div>
         <div class="card">
           <div class="card-label">Route failures</div>
           <div class="big-num">{{ ratePct(delivery.route_failure_rate) }}</div>
+          <div class="bar-track"><div class="bar-fill" :style="{ width: rateWidth(delivery.route_failure_rate) + '%' }" :class="failBarClass(delivery.route_failure_rate)"></div></div>
           <div class="card-sub muted">{{ delivery.failed_no_route }} of {{ delivery.accepted + delivery.failed_no_route }} had no route</div>
         </div>
         <div class="card">
