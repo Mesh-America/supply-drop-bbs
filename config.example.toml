@@ -205,9 +205,12 @@
 # Reset the node's path after each send so the next message floods (more
 # reliable than a possibly-stale direct route).
 # flood_after_send = true
-# Total transmissions per reply, including the first. >1 retransmits a reply
-# the destination never confirms; 1 disables retransmission.
-# reply_max_attempts = 3
+# Total transmissions per reply, including the first. 1 (default) disables
+# retransmission. Raise above 1 ONLY on a link whose confirm rate is non-zero
+# (check the Mesh link health panel on the Metrics page): a link that never
+# confirms delivery resends EVERY reply reply_max_attempts times. See
+# docs/CONFIG.md §[plugins.mesh].
+# reply_max_attempts = 1
 
 
 # ─── Plugin: Meshtastic transport ─────────────────────────────────

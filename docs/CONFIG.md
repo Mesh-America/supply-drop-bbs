@@ -268,13 +268,27 @@ arrive.
 | Key                 | Type    | Default | Required | Description                                     |
 |---------------------|---------|---------|----------|-------------------------------------------------|
 | `flood_after_send`  | bool    | `true`  | no       | Reset the node's stored path after each send so the next message floods (hop-by-hop) rather than using a possibly-stale direct route. |
-| `reply_max_attempts`| integer | `3`     | no       | Total transmissions per reply, including the first. When > 1, the transport tracks each reply's delivery via the device's send-result CRC and delivery confirmation and retransmits if no confirmation arrives in time. `1` disables retransmission. |
+| `reply_max_attempts`| integer | `1`     | no       | Total transmissions per reply, including the first. `1` (the default) disables retransmission. When > 1, the transport tracks each reply's delivery via the device's send-result CRC and delivery confirmation and retransmits — up to this many attempts — if no confirmation arrives in time. **Only raise this on a link that confirms deliveries — see the warning below.** |
 
-> **At-least-once delivery.** With `reply_max_attempts > 1`, a delivery
-> confirmation lost on the return path can cause the BBS to retransmit a reply
-> the user already received — a duplicate message is preferable to silence, and
-> inbound commands are deduplicated separately. The per-attempt wait is the
-> device's own timeout hint, clamped to the 4–30 s range.
+> **Check the confirm rate before enabling retransmission.** Retransmission
+> relies on the radio returning an end-to-end delivery confirmation
+> (`PUSH_CODE_SEND_CONFIRMED`). On a link that never confirms — some multi-hop
+> or bridge setups never surface one, giving a **0% confirm rate** — the
+> transport cannot distinguish a delivered reply from a lost one, so it
+> retransmits *every* reply to exhaustion and the user receives it
+> `reply_max_attempts` times. That is why the default is `1` (retransmission
+> off).
+>
+> Before raising it, open the **Mesh link health** panel on the Metrics page
+> (see [OPERATIONS.md](OPERATIONS.md)) and confirm the link's *confirm rate* is
+> non-zero. Latency and the per-node breakdown also populate only when
+> `reply_max_attempts > 1`.
+>
+> **At-least-once delivery.** Even on a healthy link, a confirmation lost on the
+> return path can cause the BBS to retransmit a reply the user already received
+> — a duplicate message is preferable to silence, and inbound commands are
+> deduplicated separately. The per-attempt wait is the device's own timeout
+> hint, clamped to the 4–30 s range.
 
 ### Serial mode (`connection_type = "serial"`)
 
