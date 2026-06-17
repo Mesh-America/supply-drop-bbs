@@ -961,6 +961,12 @@ From the **Users** page you can:
 - Filter to **"pending verification"** to see only unvalidated accounts
 - Click **verify** to approve an account
 - Click **ban** / **unban** to manage banned users
+- Click **delete** to soft-delete an account — the same effect as `.DU`
+  (status becomes **deleted** and active sessions end immediately)
+
+Deleted accounts no longer appear in the Users list at all. The record is
+retained, so recovering one is a server-side operation (restore its status
+with a SQL query), not something done through the web UI.
 
 An orange **"N pending"** badge appears in the page header whenever there are
 accounts waiting for approval.

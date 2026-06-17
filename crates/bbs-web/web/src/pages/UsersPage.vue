@@ -87,6 +87,10 @@ async function doAction(username: string, body: object, okMsg: string) {
 const validate   = (u: string) => doAction(u, { status: 0, permission_level: 10 }, `${u} verified`)
 const ban        = (u: string) => doAction(u, { status: 1 }, `${u} banned`)
 const unban      = (u: string) => doAction(u, { status: 0 }, `${u} unbanned`)
+const del        = (u: string) => {
+  if (!confirm(`Delete user "${u}"? They will be removed from this list. Recovery is only possible via SQL.`)) return
+  doAction(u, { status: 2 }, `${u} deleted`)
+}
 
 async function setLevel(u: UserInfo, level: number) {
   if (level === u.permission_level) return
@@ -256,6 +260,11 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
               :disabled="acting"
               @click="unban(u.username)"
             >unban</button>
+            <button
+              class="small-btn danger"
+              :disabled="acting"
+              @click="del(u.username)"
+            >delete</button>
           </td>
         </tr>
       </tbody>

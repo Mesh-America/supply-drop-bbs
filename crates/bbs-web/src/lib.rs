@@ -1289,7 +1289,11 @@ async fn api_update_user(
                 // a banned or demoted user cannot continue using a cached web token.
                 state.invalidate_sessions_for(&username);
                 if let Some(s) = body.status {
-                    let action = if s == 1 { "ban" } else { "unban" };
+                    let action = match s {
+                        1 => "ban",
+                        2 => "delete_user",
+                        _ => "unban",
+                    };
                     if let Err(e) = state
                         .host
                         .admin_write_audit(&actor_str, action, Some(username.as_str()), None)
