@@ -221,7 +221,7 @@ impl AdvertBus {
     /// whose key prefix (first 6 bytes) does not appear in `exclude_prefixes`.
     ///
     /// Used by the mesh transport to pick a stale contact for eviction when
-    /// the radio's contact table is full ([`ContactsFull`] push): the caller
+    /// the radio's contact table is full (`ContactsFull` push): the caller
     /// can then send `RemoveContact` for the returned key to free a table slot.
     ///
     /// Returns `None` if the bus is empty or all contacts match an excluded
