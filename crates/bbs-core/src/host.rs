@@ -1125,6 +1125,12 @@ impl Host for BbsHost {
             new_status,
             Some(UserStatus::Banned) | Some(UserStatus::Deleted)
         ) {
+            // Reflect the actual action in the end reason rather than always "banned".
+            let reason = if matches!(new_status, Some(UserStatus::Deleted)) {
+                "user deleted"
+            } else {
+                "user banned"
+            };
             let to_end: Vec<SessionId> = {
                 let mut sessions = self.sessions.write().await;
                 let ids: Vec<SessionId> = sessions
@@ -1140,7 +1146,7 @@ impl Host for BbsHost {
             for id in to_end {
                 let _ = self.events_tx.send(DomainEvent::SessionEnded {
                     session: id,
-                    reason: "user banned".into(),
+                    reason: reason.into(),
                 });
             }
         }
