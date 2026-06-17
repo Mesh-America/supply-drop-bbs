@@ -61,6 +61,18 @@ pub trait UserStore: Send + Sync {
         offset: u32,
     ) -> Result<Vec<User>, StoreError>;
 
+    /// Like [`list`](Self::list) but never returns `Deleted` users.
+    ///
+    /// Used by the admin web UI, which hides deleted accounts entirely — a
+    /// deleted account is recovered by setting its status back via SQL, not
+    /// through the UI. A `filter_status` of `Deleted` therefore yields nothing.
+    async fn list_visible(
+        &self,
+        filter_status: Option<UserStatus>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<User>, StoreError>;
+
     /// Insert a new user row and return its auto-assigned ID.
     ///
     /// The new user starts with `status = Active` and no
@@ -195,6 +207,58 @@ impl UserStore for Database {
         } else {
             self.list_all_users(limit as i64, offset as i64).await
         }
+    }
+
+    async fn list_visible(
+        &self,
+        filter_status: Option<UserStatus>,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<User>, StoreError> {
+        use sqlx::Row;
+        // Runtime query (not the query! macro) so the deleted-exclusion composes
+        // with the optional status filter without regenerating the offline sqlx
+        // cache. The exclusion is in SQL so pagination stays correct.
+        let deleted = UserStatus::Deleted as i64;
+        let lim = limit as i64;
+        let off = offset as i64;
+        let cols =
+            "id, username, display_name, status, permission_level, created_at, last_login_at";
+        let rows = if let Some(s) = filter_status {
+            sqlx::query(&format!(
+                "SELECT {cols} FROM users WHERE status != ? AND status = ? \
+                 ORDER BY created_at LIMIT ? OFFSET ?"
+            ))
+            .bind(deleted)
+            .bind(s as i64)
+            .bind(lim)
+            .bind(off)
+            .fetch_all(&self.read_pool)
+            .await?
+        } else {
+            sqlx::query(&format!(
+                "SELECT {cols} FROM users WHERE status != ? \
+                 ORDER BY created_at LIMIT ? OFFSET ?"
+            ))
+            .bind(deleted)
+            .bind(lim)
+            .bind(off)
+            .fetch_all(&self.read_pool)
+            .await?
+        };
+        rows.into_iter()
+            .map(|r| -> Result<User, StoreError> {
+                map_user_row(
+                    r.try_get("id")?,
+                    r.try_get("username")?,
+                    r.try_get("display_name")?,
+                    r.try_get("status")?,
+                    r.try_get("permission_level")?,
+                    r.try_get("created_at")?,
+                    r.try_get("last_login_at")?,
+                )
+            })
+            .collect()
     }
 
     async fn create(
