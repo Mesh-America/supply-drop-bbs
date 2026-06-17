@@ -242,6 +242,19 @@ impl SessionState {
     /// distinct messages that happen to share a one-second timestamp are not
     /// conflated.  No-op (returns `false`) if `prefix` has no session.
     pub fn dedup_by_timestamp(&mut self, prefix: &[u8; 6], timestamp: u32, text: &str) -> bool {
+        self.dedup_by_timestamp_at(prefix, timestamp, text, Instant::now())
+    }
+
+    /// [`Self::dedup_by_timestamp`] with an injectable `now`, so the window and
+    /// cap eviction are unit-testable without sleeping. `now` must be monotonic
+    /// across calls (it is when threaded from `Instant::now`).
+    fn dedup_by_timestamp_at(
+        &mut self,
+        prefix: &[u8; 6],
+        timestamp: u32,
+        text: &str,
+        now: Instant,
+    ) -> bool {
         if timestamp == 0 {
             return false;
         }
@@ -254,7 +267,7 @@ impl SessionState {
         while entry
             .recent_msgs
             .front()
-            .is_some_and(|(_, _, seen)| seen.elapsed() >= window)
+            .is_some_and(|(_, _, seen)| now.saturating_duration_since(*seen) >= window)
         {
             entry.recent_msgs.pop_front();
         }
@@ -267,7 +280,11 @@ impl SessionState {
         }
         entry
             .recent_msgs
-            .push_back((timestamp, text.to_owned(), Instant::now()));
+            .push_back((timestamp, text.to_owned(), now));
+        // Bound memory. Note the cap can evict a still-in-window identity under a
+        // burst of >RECENT_MSG_CAP distinct messages, so the effective dedup
+        // horizon is min(TIMESTAMP_DEDUP_SECS, last RECENT_MSG_CAP messages) — at
+        // airtime-limited LoRa rates this many distinct messages in 120s is rare.
         if entry.recent_msgs.len() > RECENT_MSG_CAP {
             entry.recent_msgs.pop_front();
         }
@@ -278,7 +295,10 @@ impl SessionState {
     /// within the deduplication window.  If it does not match, record `text`
     /// as the new last message and return `false`.
     ///
-    /// Used to silently drop radio retransmissions of regular commands.
+    /// This is the **fallback** dedup path, used only when the sender supplies no
+    /// per-message timestamp (`timestamp == 0`); when a timestamp is present
+    /// [`Self::dedup_by_timestamp`] handles dedup instead. Silently drops radio
+    /// retransmissions of regular commands.
     pub fn dedup_message(&mut self, prefix: &[u8; 6], text: &str) -> bool {
         if let Some(entry) = self.by_prefix.get_mut(prefix) {
             if let Some((last, instant)) = &entry.last_message {
@@ -389,6 +409,55 @@ mod tests {
         assert!(
             !st.dedup_by_timestamp(&PREFIX, 0, "hello"),
             "a zero timestamp is never treated as a duplicate"
+        );
+    }
+
+    #[test]
+    fn timestamp_dedup_cap_evicts_oldest_identity() {
+        let mut st = state_with_session();
+        let now = Instant::now();
+        // Fill the ring with RECENT_MSG_CAP+1 distinct identities at one instant
+        // (within the window, so only the cap — not the window — evicts).
+        for i in 0..=RECENT_MSG_CAP as u32 {
+            assert!(
+                !st.dedup_by_timestamp_at(&PREFIX, 1_000 + i, "cmd", now),
+                "each distinct timestamp is a new message"
+            );
+        }
+        assert!(
+            st.by_prefix.get(&PREFIX).unwrap().recent_msgs.len() <= RECENT_MSG_CAP,
+            "the ring stays bounded by RECENT_MSG_CAP"
+        );
+        // The most-recent identity is still remembered → its resend is dropped.
+        assert!(
+            st.dedup_by_timestamp_at(&PREFIX, 1_000 + RECENT_MSG_CAP as u32, "cmd", now),
+            "a recent identity within the cap is still deduped"
+        );
+        // The oldest identity (ts 1_000) was evicted by the cap, so a resend of it
+        // is reprocessed even though it is within the 120s window — the documented
+        // cap-vs-window trade-off.
+        assert!(
+            !st.dedup_by_timestamp_at(&PREFIX, 1_000, "cmd", now),
+            "an identity evicted by the cap is no longer deduped"
+        );
+    }
+
+    #[test]
+    fn timestamp_dedup_window_expiry_treats_late_resend_as_new() {
+        let mut st = state_with_session();
+        let t0 = Instant::now();
+        assert!(!st.dedup_by_timestamp_at(&PREFIX, 1_000, "login bob", t0));
+        // A resend just inside the window is still dropped.
+        let inside = t0 + Duration::from_secs(TIMESTAMP_DEDUP_SECS - 1);
+        assert!(
+            st.dedup_by_timestamp_at(&PREFIX, 1_000, "login bob", inside),
+            "a resend within the window is deduped"
+        );
+        // Past the window the identity is evicted and the resend is processed anew.
+        let outside = t0 + Duration::from_secs(TIMESTAMP_DEDUP_SECS + 1);
+        assert!(
+            !st.dedup_by_timestamp_at(&PREFIX, 1_000, "login bob", outside),
+            "a resend after the window expires is processed as new"
         );
     }
 }

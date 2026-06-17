@@ -1003,6 +1003,10 @@ async fn handle_frame(
             debug!(
                 prefix = msg.sender_key_prefix[0],
                 txt_type = msg.txt_type,
+                // The sender's per-message timestamp drives retransmission dedup;
+                // logging it lets an operator confirm two distinct sends carry
+                // distinct timestamps (e.g. a password and its confirmation).
+                timestamp = msg.timestamp,
                 len = msg.text.len(),
                 "mesh: inbound message received"
             );
@@ -1598,6 +1602,15 @@ async fn dispatch_message(
         // the message-dedup baseline so the general retransmission dedup can't
         // silently drop, for example, the matching password entered again at
         // "Confirm your password:". (#104)
+        //
+        // This only matters for the timestamp==0 fallback path. On the timestamp
+        // path, #104 is handled naturally: the re-typed confirmation is a new
+        // send with a new per-message timestamp, so dedup_by_timestamp's
+        // (timestamp, text) key already treats it as distinct — the dedup hinges
+        // on the client stamping each distinct send with a distinct timestamp.
+        // Do NOT also clear `recent_msgs` here: that would let a delayed
+        // retransmission of the previous reply through after a prompt, re-opening
+        // the very "Error: Already logged in" reprocessing this dedup prevents.
         if is_prompt {
             state.clear_last_message(&sender_prefix);
         }
