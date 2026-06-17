@@ -618,7 +618,8 @@ and not yet committed to backward compatibility.
   `pub(crate)`; only the `Plugin`-implementing struct is `pub`
 - Config struct is named `<Plugin>Config`
 - Errors: one enum per plugin, named `<Plugin>Error`
-- Logging: use `tracing` macros, target `supply_drop_bbs::<plugin-name>`
+- Logging: use `tracing` macros; events are tagged with the plugin crate's
+  module path (e.g. `bbs_mesh::transport`), which is what operators filter on
 
 ## Contributing a plugin
 

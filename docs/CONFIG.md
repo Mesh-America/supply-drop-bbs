@@ -210,10 +210,15 @@ Per-target overrides example:
 
 ```toml
 [logging.targets]
-"supply_drop_bbs::transport::mesh" = "DEBUG"
+"bbs_mesh" = "DEBUG"                  # MeshCore transport (whole crate)
 "sqlx::query" = "INFO"
 "meshcore_companion::frame" = "WARN"
 ```
+
+Targets are Rust module paths. First-party code lives in per-crate paths
+(`bbs_mesh`, `bbs_meshtastic`, `bbs_core`, `bbs_web`, `meshcore_companion`, and
+the `supply_drop_bbs` binary), so target the crate (or a module within it, e.g.
+`bbs_mesh::transport`) — not a single `supply_drop_bbs::*` prefix.
 
 See [ADR-0009](adr/0009-tracing-config-respected.md) for the
 no-silent-overrides rule.

@@ -323,7 +323,7 @@ pub struct LoggingConfig {
     /// Example in TOML:
     /// ```toml
     /// [logging.targets]
-    /// "supply_drop_bbs::transport::mesh" = "DEBUG"
+    /// "bbs_mesh" = "DEBUG"
     /// "sqlx::query" = "WARN"
     /// ```
     #[serde(default)]
