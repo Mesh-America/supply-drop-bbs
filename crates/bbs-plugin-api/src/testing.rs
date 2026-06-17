@@ -30,6 +30,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -73,6 +74,9 @@ struct MockHostState {
     default_response: Response,
     /// Every command that has been dispatched, in order.
     commands_received: Vec<(SessionId, Command)>,
+    /// Artificial delay applied inside `process_command` before recording and
+    /// responding, to exercise slow-host / backpressure paths. Zero by default.
+    process_delay: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +116,7 @@ impl MockHost {
                 responses: Vec::new(),
                 default_response: Response::Text("(unscripted)".to_owned()),
                 commands_received: Vec::new(),
+                process_delay: Duration::ZERO,
             }),
             events: tx,
             advert_bus: Arc::new(AdvertBus::new()),
@@ -158,6 +163,13 @@ impl MockHost {
         state.default_response = response;
     }
 
+    /// Make `process_command` sleep `delay` before recording and responding.
+    /// Lets tests model a slow host to exercise the transport's command-queue
+    /// backpressure without dropping or reordering. Defaults to zero (no delay).
+    pub fn set_process_delay(&self, delay: Duration) {
+        self.state.lock().expect("mock poisoned").process_delay = delay;
+    }
+
     /// Inspect the commands that have been dispatched, in order.
     /// Returns owned clones — the mock keeps its own record.
     #[must_use]
@@ -192,6 +204,13 @@ impl Host for MockHost {
         session: SessionId,
         cmd: Command,
     ) -> Result<Response, HostError> {
+        // Read the configured delay without holding the lock across the await,
+        // then sleep to model a slow host (used by backpressure tests).
+        let delay = self.state.lock().expect("mock poisoned").process_delay;
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+
         let mut state = self.state.lock().expect("mock poisoned");
 
         // Verify the session is known.

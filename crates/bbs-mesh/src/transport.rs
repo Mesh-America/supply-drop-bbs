@@ -77,9 +77,9 @@ const SAMPLE_TICK: Duration = Duration::from_secs(60);
 const HISTORY_SEED_SECS: u64 = 8 * 60 * 60;
 
 /// Depth of the queue feeding the command worker. Inbound LoRa traffic is slow
-/// (airtime-limited), so this is rarely above 1; the headroom only matters if a
-/// burst of queued messages drains faster than the host can process them, in
-/// which case the event loop applies backpressure rather than dropping work.
+/// (airtime-limited), so this is rarely above 1; the headroom only matters if
+/// frames arrive faster than the host can drain them, in which case the event
+/// loop blocks on `send` (backpressure) rather than dropping work.
 const COMMAND_QUEUE_DEPTH: usize = 64;
 
 /// Enqueue a plain-text reply to the companion client and, when retransmission
@@ -701,10 +701,11 @@ async fn event_loop(
     // (host DB I/O) never blocks the event loop from reading the next frame —
     // delivery confirmations, queued-message notifications, and the next
     // `SyncNextMessage` stay responsive. One worker preserves per-node ordering
-    // and the dedup check-and-record exactly as inline dispatch did. It drains
-    // and exits when `cmd_worker_tx` is dropped on event-loop exit.
+    // and the dedup check-and-record exactly as inline dispatch did. On
+    // shutdown the loop drops `cmd_worker_tx` and awaits the worker (bounded
+    // below) so any queued commands drain before the task exits.
     let (cmd_worker_tx, cmd_worker_rx) = mpsc::channel::<InboundCommand>(COMMAND_QUEUE_DEPTH);
-    tokio::spawn(command_worker(
+    let worker = tokio::spawn(command_worker(
         cmd_worker_rx,
         Arc::clone(&host),
         cmd_tx.clone(),
@@ -953,6 +954,13 @@ async fn event_loop(
             }
         }
     }
+
+    // Drain the command worker before the task ends: dropping the sender closes
+    // the channel, the worker finishes any queued commands, then `recv` returns
+    // `None` and it exits. Bounded so a stuck host command can't hang shutdown —
+    // on timeout the worker is left to finish (or be torn down with the runtime).
+    drop(cmd_worker_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
 }
 
 /// Dispatch a single inbound frame from the radio bridge.
@@ -1361,7 +1369,8 @@ async fn dispatch_message(
     // ── Get or create a session for this node ─────────────────────────────────
     let Some((session, is_new)) = get_or_create_session(sender_prefix, host, state).await else {
         // Session creation failed; the error was already logged inside
-        // get_or_create_session.  Skip this message â the event loop continues.
+        // get_or_create_session.  Skip this message â the command worker continues
+        // with the next queued command.
         return;
     };
 
@@ -1724,13 +1733,13 @@ async fn get_or_create_session(
                 return Some((sid, false));
             }
             // We cannot proceed without a session, but we must NOT panic here.
-            // This function is called from a detached tokio::spawn event-loop
-            // task; a panic would kill the task permanently and silently, causing
-            // the BBS to stop responding to all mesh nodes with no visible error.
-            // Instead, log the failure and return None so the caller can skip
-            // this message and keep the event loop alive for future messages.
+            // This runs on the detached command_worker task; a panic would kill
+            // it permanently and silently, halting all mesh command processing
+            // with no visible error. Instead, log the failure and return None so
+            // the caller skips this message and the worker stays alive for the
+            // next queued command.
             error!(
-                "mesh: host.create_session failed and no fallback: {e}                  skipping this message to keep the event loop alive"
+                "mesh: host.create_session failed and no fallback: {e} — skipping this message to keep the command worker alive"
             );
             return None;
         }
