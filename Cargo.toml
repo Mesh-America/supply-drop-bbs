@@ -64,7 +64,7 @@ resolver = "2"
 members  = ["crates/*"]
 
 [workspace.package]
-version = "0.9.9"
+version = "0.10.0"
 edition      = "2021"
 authors      = ["Mesh-America"]
 repository   = "https://github.com/Mesh-America/supply-drop-bbs"
@@ -73,14 +73,14 @@ rust-version = "1.88"
 # Shared dependencies. As we add real deps (sqlx, axum, etc.) they
 # go here so every workspace member uses the same version.
 [workspace.dependencies]
-bbs-core              = { path = "crates/bbs-core",              version = "0.9.9" }
-bbs-plugin-api        = { path = "crates/bbs-plugin-api",        version = "0.9.9" }
-bbs-cli               = { path = "crates/bbs-cli",               version = "0.9.9" }
-bbs-mesh              = { path = "crates/bbs-mesh",              version = "0.9.9" }
-bbs-meshtastic        = { path = "crates/bbs-meshtastic",        version = "0.9.9" }
-bbs-web               = { path = "crates/bbs-web",              version = "0.9.9" }
-bbs-process-transport = { path = "crates/bbs-process-transport", version = "0.9.9" }
-meshcore-companion    = { path = "crates/meshcore-companion",    version = "0.9.9" }
+bbs-core              = { path = "crates/bbs-core",              version = "0.10.0" }
+bbs-plugin-api        = { path = "crates/bbs-plugin-api",        version = "0.10.0" }
+bbs-cli               = { path = "crates/bbs-cli",               version = "0.10.0" }
+bbs-mesh              = { path = "crates/bbs-mesh",              version = "0.10.0" }
+bbs-meshtastic        = { path = "crates/bbs-meshtastic",        version = "0.10.0" }
+bbs-web               = { path = "crates/bbs-web",              version = "0.10.0" }
+bbs-process-transport = { path = "crates/bbs-process-transport", version = "0.10.0" }
+meshcore-companion    = { path = "crates/meshcore-companion",    version = "0.10.0" }
 
 # Third-party deps. We use loose version constraints (semver-major)
 # so cargo can pick patch updates; the lockfile pins the exact
