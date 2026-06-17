@@ -1025,7 +1025,8 @@ impl Host for BbsHost {
             }
         };
 
-        let users = UserStore::list(&self.db, filter, limit, offset)
+        // Deleted accounts are hidden from the admin UI entirely (recover via SQL).
+        let users = UserStore::list_visible(&self.db, filter, limit, offset)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 

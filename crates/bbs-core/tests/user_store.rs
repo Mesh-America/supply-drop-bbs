@@ -156,6 +156,52 @@ async fn list_filters_by_status() {
     assert_eq!(banned[0].username.as_str(), "bob");
 }
 
+#[tokio::test]
+async fn list_visible_hides_deleted_users() {
+    let (db, _dir) = test_db().await;
+    use bbs_core::user::UserStatus;
+
+    for name in ["alice", "bob"] {
+        let u = Username::new(name).unwrap();
+        db.create(&u, None, PermissionLevel::User, Timestamp::now())
+            .await
+            .unwrap();
+    }
+    // Soft-delete alice.
+    let alice = db
+        .get_by_username(&Username::new("alice").unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    db.update(alice.id, None, Some(UserStatus::Deleted), None, None)
+        .await
+        .unwrap();
+
+    // Plain list() still includes the deleted row (used by internal callers).
+    let all = db.list(None, 100, 0).await.unwrap();
+    assert!(all.iter().any(|u| u.username.as_str() == "alice"));
+
+    // list_visible() excludes it, keeping the active user.
+    let visible = db.list_visible(None, 100, 0).await.unwrap();
+    assert!(!visible.iter().any(|u| u.username.as_str() == "alice"));
+    assert!(visible.iter().any(|u| u.username.as_str() == "bob"));
+
+    // Even an explicit Deleted filter returns nothing through list_visible.
+    let deleted = db
+        .list_visible(Some(UserStatus::Deleted), 100, 0)
+        .await
+        .unwrap();
+    assert!(deleted.is_empty());
+
+    // A non-deleted status filter still works.
+    let active = db
+        .list_visible(Some(UserStatus::Active), 100, 0)
+        .await
+        .unwrap();
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].username.as_str(), "bob");
+}
+
 // ── Proptest: username round-trip ─────────────────────────────────────
 
 use proptest::prelude::*;
