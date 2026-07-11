@@ -812,8 +812,9 @@ ls -la /dev/ttyACM* /dev/ttyUSB*
 sudo journalctl -u supply-drop-bbs -f
 ```
 
-Common causes: wrong `serial_port` in config; device not in `dialout` group
-(`sudo usermod -aG dialout supply-drop`); firmware crashed (unplug and replug).
+Common causes: wrong `serial_port` in config; **permission denied** on the port
+(see [Serial port: Permission denied](#serial-port-permission-denied) below);
+firmware crashed (unplug and replug).
 
 **Pi HAT:**
 
@@ -828,6 +829,51 @@ Common causes:
 - `supply-drop` user not in `spi`/`gpio` groups (installer adds these; a reboot may be needed)
 - Missing Python dependency - `sudo /opt/pymc-companion/venv/bin/pip install spidev lgpio`
 - Wrong HAT selected - edit `/etc/supply-drop-bbs/pymc-companion.yaml` and restart pymc-companion
+
+### Serial port: Permission denied
+
+Symptom — the log repeats:
+
+```
+could not open serial port /dev/ttyACM0: Permission denied (os error 13)
+```
+
+The service (running as the `supply-drop` user) is not in the group that owns the
+serial device. Check the owning group:
+
+```sh
+ls -l /dev/ttyACM* /dev/ttyUSB*
+```
+
+```
+crw-rw----+ 1 root plugdev 166, 0 … /dev/ttyACM0
+```
+
+The **owning group varies by distro** — `dialout` on many systems, but `plugdev`
+on current Raspberry Pi OS / Debian 13 "Trixie". The trailing `+` is a POSIX ACL
+that grants the interactive desktop (seat) user; a headless system service never
+receives it, so access depends on group membership.
+
+**Packaged installs** (`.deb` / `install.sh`) ship a udev rule
+(`/lib/udev/rules.d/70-supply-drop-bbs.rules`) that re-owns the radio's tty to the
+`supply-drop` group automatically. If it has not taken effect, reapply it:
+
+```sh
+sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=tty
+sudo systemctl restart supply-drop-bbs
+```
+
+**Manual / raw-binary installs** — add the service user to the owning group, then
+restart:
+
+```sh
+sudo usermod -aG <owning-group> supply-drop   # e.g. plugdev or dialout
+sudo systemctl restart supply-drop-bbs
+```
+
+`udevadm trigger` re-applies device ownership without unplugging the radio, but a
+**group-membership change takes effect only after the service restarts** (a reboot
+always works).
 
 ### Database locked
 

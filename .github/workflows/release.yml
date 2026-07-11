@@ -105,6 +105,7 @@ jobs:
           mkdir -p "${PKG}/DEBIAN"
           mkdir -p "${PKG}/usr/local/bin"
           mkdir -p "${PKG}/lib/systemd/system"
+          mkdir -p "${PKG}/lib/udev/rules.d"
           mkdir -p "${PKG}/etc/supply-drop-bbs"
           mkdir -p "${PKG}/var/lib/supply-drop-bbs"
 
@@ -116,6 +117,10 @@ jobs:
           # Systemd service unit
           cp supply-drop-bbs.service \
              "${PKG}/lib/systemd/system/supply-drop-bbs.service"
+
+          # udev rule — grants the service serial-port access across distros
+          cp packaging/70-supply-drop-bbs.rules \
+             "${PKG}/lib/udev/rules.d/70-supply-drop-bbs.rules"
 
           # control — dpkg extended description continuation lines need exactly
           # one leading space, which is produced here by the YAML indentation.

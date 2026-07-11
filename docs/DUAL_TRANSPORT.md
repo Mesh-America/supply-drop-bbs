@@ -185,7 +185,7 @@ If the MeshCore HAT transport logs a connection error, check that `pymc_core` is
 systemctl status pymc-core
 ```
 
-If either transport logs a serial error, confirm the port name with `dmesg | grep tty` and update `serial_port` in the config.
+If either transport logs a serial error, confirm the port name with `dmesg | grep tty` and update `serial_port` in the config. If the error is `Permission denied (os error 13)`, the service user lacks access to the port's group — see [OPERATIONS.md → Serial port: Permission denied](OPERATIONS.md#serial-port-permission-denied).
 
 To turn on verbose logging for just one transport without making everything noisy:
 

@@ -137,6 +137,31 @@ async fn run_serial_worker(
         .await;
 }
 
+/// Map a serial-open error to an `io::Error`, upgrading a permission-denied
+/// failure to an actionable message. Access-denied on the radio's tty is a
+/// common Pi/Debian gotcha: the device is group-owned by `plugdev` (or
+/// `dialout`, depending on the distro) and the `supply-drop` service user is
+/// not in that group.
+fn serial_open_error(port: &str, e: tokio_serial::Error) -> io::Error {
+    if matches!(
+        e.kind(),
+        tokio_serial::ErrorKind::Io(io::ErrorKind::PermissionDenied)
+    ) {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "permission denied opening serial port {port}: the service user is not in the \
+                 group that owns the device. Run `ls -l {port}` to find the owning group \
+                 (commonly `dialout` or `plugdev`), add the user to it \
+                 (`sudo usermod -aG <group> supply-drop`), then restart the service. \
+                 See docs/OPERATIONS.md — \"Serial port: Permission denied\"."
+            ),
+        )
+    } else {
+        io::Error::other(format!("could not open serial port {port}: {e}"))
+    }
+}
+
 async fn attempt_serial_session(
     config: &SerialConfig,
     cmd_rx: &mut mpsc::Receiver<ToRadio>,
@@ -145,10 +170,7 @@ async fn attempt_serial_session(
     let stream = match tokio_serial::new(&config.port, config.baud_rate).open_native_async() {
         Ok(s) => s,
         Err(e) => {
-            return SessionOutcome::IoError(io::Error::other(format!(
-                "could not open serial port {}: {e}",
-                config.port
-            )));
+            return SessionOutcome::IoError(serial_open_error(&config.port, e));
         }
     };
     info!(port = %config.port, baud = config.baud_rate, "meshtastic/serial: opened");
@@ -364,5 +386,25 @@ mod tests {
         tx.write_all(&bytes).await.unwrap();
         let decoded = read_from_radio(&mut rx).await.unwrap();
         assert_eq!(decoded.id, 1);
+    }
+
+    #[test]
+    fn permission_denied_serial_error_is_actionable() {
+        let e = tokio_serial::Error::new(
+            tokio_serial::ErrorKind::Io(io::ErrorKind::PermissionDenied),
+            "permission denied",
+        );
+        let mapped = serial_open_error("/dev/ttyACM0", e);
+        assert_eq!(mapped.kind(), io::ErrorKind::PermissionDenied);
+        assert!(mapped.to_string().contains("usermod"));
+        assert!(mapped.to_string().contains("ls -l"));
+    }
+
+    #[test]
+    fn other_serial_error_keeps_generic_message() {
+        let e = tokio_serial::Error::new(tokio_serial::ErrorKind::NoDevice, "nope");
+        let mapped = serial_open_error("/dev/ttyACM0", e);
+        assert_ne!(mapped.kind(), io::ErrorKind::PermissionDenied);
+        assert!(mapped.to_string().contains("could not open serial port"));
     }
 }
