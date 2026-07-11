@@ -1,0 +1,9 @@
+# Supply Drop BBS — grant the service account access to USB serial radios
+# regardless of the distro's default tty group (dialout on some systems,
+# plugdev on current Raspberry Pi OS / Debian Trixie).
+#
+# Runs after 50-udev-default.rules so this GROUP= assignment wins. The device
+# node is re-owned to the service's own primary group (`supply-drop`), which
+# exists because the package/installer creates the user before udev is applied.
+SUBSYSTEM=="tty", KERNEL=="ttyACM[0-9]*", GROUP="supply-drop", MODE="0660"
+SUBSYSTEM=="tty", KERNEL=="ttyUSB[0-9]*", GROUP="supply-drop", MODE="0660"

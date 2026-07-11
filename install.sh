@@ -97,6 +97,13 @@ if [[ "${1:-}" == "--uninstall" ]]; then
             success "Removed $_unit"
         fi
     done
+
+    # Remove the serial-port udev rule.
+    if [[ -f /lib/udev/rules.d/70-supply-drop-bbs.rules ]]; then
+        rm -f /lib/udev/rules.d/70-supply-drop-bbs.rules
+        success "Removed /lib/udev/rules.d/70-supply-drop-bbs.rules"
+        command -v udevadm &>/dev/null && udevadm control --reload-rules || true
+    fi
     systemctl daemon-reload
 
     # Remove sudoers rule.
@@ -407,6 +414,17 @@ fi
 
 # Add service user to dialout for serial port access.
 usermod -aG dialout "$SERVICE_USER"
+
+# Install the udev rule so the service can open the radio's serial port
+# regardless of the distro's default tty group (dialout on some systems,
+# plugdev on current Raspberry Pi OS / Debian Trixie). It re-owns ttyACM*/
+# ttyUSB* to the `supply-drop` group (created above).
+install -m 644 "$SRC_DIR/packaging/70-supply-drop-bbs.rules" \
+    /lib/udev/rules.d/70-supply-drop-bbs.rules
+if command -v udevadm &>/dev/null; then
+    udevadm control --reload-rules || true
+    udevadm trigger --subsystem-match=tty --action=add || true
+fi
 
 # ── Directories ───────────────────────────────────────────────────────────────
 

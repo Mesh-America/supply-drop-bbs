@@ -2096,17 +2096,23 @@ fn print_next_steps(
         println!();
     }
 
-    let needs_dialout = cfg!(target_os = "linux")
+    let needs_serial_access = cfg!(target_os = "linux")
         && ((use_mesh && mesh_conn_type == "serial")
             || (use_meshtastic && matches!(meshtastic_conn_type, "serial" | "hat")));
 
-    if needs_dialout {
-        println!("To allow Supply Drop BBS to access serial ports, your user must");
-        println!("be in the 'dialout' group:");
+    if needs_serial_access {
+        println!("Serial port access:");
         println!();
-        println!("  sudo usermod -aG dialout $USER");
-        println!("  # then log out and back in, or run:");
-        println!("  newgrp dialout");
+        println!("The .deb package and install.sh ship a udev rule that grants the");
+        println!("'supply-drop' service user access to the radio automatically, so no");
+        println!("group change is usually needed.");
+        println!();
+        println!("If you installed the binary manually and hit 'Permission denied' on");
+        println!("the port, add the service user to the group that owns the device");
+        println!("(it varies by distro — 'dialout' or 'plugdev'):");
+        println!();
+        println!("  ls -l <port>                          # shows the owning group");
+        println!("  sudo usermod -aG <group> supply-drop  # then restart the service");
         println!();
         if use_mesh && mesh_conn_type == "serial" {
             if let Some(port) = mesh_serial_port {

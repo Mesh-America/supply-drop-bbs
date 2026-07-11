@@ -26,6 +26,17 @@ case "$1" in
     # ── Config directory — populated by the setup wizard ────────────────────
     mkdir -p /etc/supply-drop-bbs
 
+    # ── Serial-port access — apply the packaged udev rule ───────────────────
+    # 70-supply-drop-bbs.rules re-owns the radio's tty to the `supply-drop`
+    # group so the service can open it regardless of the distro's default tty
+    # group (dialout vs plugdev). The `supply-drop` group exists by now
+    # (created above). Reload + trigger so an already-connected radio picks up
+    # the new ownership without needing a replug. Idempotent on upgrades.
+    if command -v udevadm >/dev/null 2>&1; then
+      udevadm control --reload-rules || true
+      udevadm trigger --subsystem-match=tty --action=add || true
+    fi
+
     if command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload || true
 
