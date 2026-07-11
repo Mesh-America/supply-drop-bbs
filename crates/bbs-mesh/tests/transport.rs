@@ -215,6 +215,18 @@ impl Bridge {
             }
         }
     }
+
+    /// Read outbound frames until a `CMD_SYNC_NEXT_MESSAGE` appears, skipping
+    /// replies, path resets, and connect-time bookkeeping (GET_CONTACTS /
+    /// GET_AUTOADD_CONFIG).
+    async fn read_until_sync(&mut self) {
+        loop {
+            let cmd = self.read_command().await;
+            if cmd[0] == CMD_SYNC_NEXT_MESSAGE {
+                return;
+            }
+        }
+    }
 }
 
 /// Spin up a [`MeshTransport`] against an in-process loopback listener.
@@ -290,7 +302,9 @@ async fn response_text_returned_to_sender() {
     bridge.send(&contact_msg_frame(sender, "help")).await;
 
     // Payload layout: [CMD_SEND_TXT_MSG][txt_type][attempt][reserved×4][prefix×6][text…]
-    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    // read_text_send skips the drain SyncNextMessage the transport now emits after
+    // each processed inbound message (drain-to-NoMoreMessages hardening).
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out waiting for reply");
 
@@ -780,7 +794,8 @@ async fn notify_sends_text_to_node() {
     // Establish a session by sending a message first.
     let sender = [0x33u8; 6];
     bridge.send(&contact_msg_frame(sender, "whoami")).await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    // read_text_send skips the post-message drain SyncNextMessage.
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out waiting for whoami reply");
 
@@ -791,7 +806,7 @@ async fn notify_sends_text_to_node() {
         .unwrap();
     assert!(matches!(outcome, NotifyOutcome::Queued));
 
-    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out waiting for notification");
 
@@ -842,8 +857,9 @@ async fn unsupported_app_start_and_sync_still_processes_messages() {
     let sender = [0x55u8; 6];
     bridge.send(&contact_msg_frame(sender, "help")).await;
 
-    // The transport should send back a reply (from MockHost).
-    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    // The transport should send back a reply (from MockHost). read_text_send skips
+    // the post-message drain SyncNextMessage.
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out — drain flag was not cleared; message was silently dropped");
 
@@ -892,10 +908,119 @@ async fn unsupported_app_start_with_successful_drain_processes_messages() {
     let sender = [0x66u8; 6];
     bridge.send(&contact_msg_frame(sender, "whoami")).await;
 
-    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    // read_text_send skips the post-message drain SyncNextMessage.
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out waiting for reply");
     assert_eq!(cmd_payload[0], CMD_SEND_TXT_MSG);
+
+    transport.stop().await.unwrap();
+}
+
+/// Drain-to-NoMoreMessages: after processing a normal (non-draining) inbound
+/// message, the transport emits a follow-up `SyncNextMessage` so it keeps pulling
+/// until the bridge reports the queue empty. This makes delivery robust to a
+/// dropped `MsgWaiting` push (or a bridge/firmware that notifies once per
+/// empty→non-empty transition) instead of stranding a backlog until reconnect.
+#[tokio::test]
+async fn processed_message_emits_followup_sync() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x21u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+
+    // Collect outbound frames until we've seen BOTH the text reply and the drain
+    // SyncNextMessage (their relative order is not guaranteed).
+    let mut saw_sync = false;
+    let mut saw_reply = false;
+    for _ in 0..6 {
+        let cmd = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+            .await
+            .expect("timed out waiting for outbound frames");
+        match cmd[0] {
+            CMD_SYNC_NEXT_MESSAGE => saw_sync = true,
+            CMD_SEND_TXT_MSG => saw_reply = true,
+            _ => {}
+        }
+        if saw_sync && saw_reply {
+            break;
+        }
+    }
+    assert!(saw_reply, "the text reply must be sent");
+    assert!(
+        saw_sync,
+        "a follow-up SyncNextMessage must be emitted to drain the bridge queue"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// On reconnect the transport drains the bridge's queued backlog. A FRESH queued
+/// message (recent sender timestamp) is now processed — a DM sent during a brief
+/// disconnect still gets a reply — while a clearly-STALE one (older than the
+/// freshness window) is discarded so recovering from a long outage does not
+/// unleash a burst of replies to long-dead messages.
+#[tokio::test]
+async fn reconnect_drain_processes_fresh_and_discards_stale() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    // Manual handshake so queued messages can be injected during the on-connect
+    // drain (before NoMoreMessages clears the draining flag).
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let sender = [0x31u8; 6];
+
+    // First drain sync → feed a FRESH queued message (age ~0, within the window).
+    let drain1 = bridge.read_command().await;
+    assert_eq!(drain1[0], CMD_SYNC_NEXT_MESSAGE);
+    bridge
+        .send(&contact_msg_frame_ts(sender, "fresh", now))
+        .await;
+
+    // Next drain sync → feed a STALE queued message (an hour old, past the window).
+    bridge.read_until_sync().await;
+    bridge
+        .send(&contact_msg_frame_ts(
+            sender,
+            "stale",
+            now.saturating_sub(3600),
+        ))
+        .await;
+
+    // Next drain sync → end the drain.
+    bridge.read_until_sync().await;
+    bridge
+        .send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]))
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let received = host.commands_received();
+    let has = |t: &str| {
+        received
+            .iter()
+            .any(|(_, c)| matches!(c, Command::Unknown { raw } if raw == t))
+    };
+    assert!(
+        has("fresh"),
+        "a fresh queued message must be processed on reconnect, got: {:?}",
+        received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+    assert!(
+        !has("stale"),
+        "a stale queued message must be discarded on reconnect"
+    );
 
     transport.stop().await.unwrap();
 }
