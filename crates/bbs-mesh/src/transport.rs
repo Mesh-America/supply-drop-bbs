@@ -876,12 +876,13 @@ async fn event_loop(
 
                         // Query the radio's autoadd config so we can ensure
                         // auto-pruning is enabled.  When the contact table is full
-                        // and autoadd is active the firmware evicts the oldest entry
+                        // and AUTO_ADD_OVERWRITE_OLDEST (autoadd_config bit 0) is
+                        // set, the firmware evicts the oldest non-favourite entry
                         // to make room for newly-heard nodes.  Without this, a full
                         // table (PUSH_CODE_CONTACTS_FULL) prevents new contacts from
                         // being stored, causing outbound DMs to those nodes to fail.
                         // The response (InboundFrame::AutoaddConfig) is handled in
-                        // handle_frame, which sets config if it is currently disabled.
+                        // handle_frame, which sets bit 0 if it is currently clear.
                         let _ = cmd_tx.send(OutboundFrame::GetAutoaddConfig).await;
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
@@ -1323,21 +1324,32 @@ async fn handle_frame(
 
         // ── Autoadd / autoprune config ────────────────────────────────────────
         // Response to CMD_GET_AUTOADD_CONFIG sent at startup.
-        // When bit 0 is clear the firmware will NOT automatically add newly-heard
-        // nodes to the contact table, and will NOT prune old entries when the
-        // table is full.  Enable it so the table self-manages.
+        // Bit 0 is AUTO_ADD_OVERWRITE_OLDEST: when set, a full contact table
+        // evicts the oldest non-favourite entry to make room for a newly-heard
+        // node (firmware MyMesh::shouldOverwriteWhenFull).  It does NOT control
+        // whether newly-heard nodes are auto-added at all — that is gated by the
+        // separate `manual_add_contacts` pref plus autoadd_config type bits 1-4
+        // (MyMesh::isAutoAddEnabled / shouldAutoAddContactType).  Enable bit 0
+        // so stale contacts are pruned when the table fills.
+        //
+        // Note: firmware built with `manual_add_contacts` = 1 (e.g. the Keymind
+        // fork's "cascade" build profile) disables auto-add via a pref this
+        // client never touches.  A BBS radio must not run such a build unless
+        // the transport also clears `manual_add_contacts` (CMD_SET_OTHER_PARAMS
+        // / OutboundFrame::SetOtherParams) or sets autoadd_config bits 1-4.
         InboundFrame::AutoaddConfig { config } => {
             if config & 1 == 0 {
                 warn!(
                     config,
-                    "mesh: contact autoadd is disabled on the radio — \
-                     enabling it so stale contacts are pruned when the table is full"
+                    "mesh: overwrite-oldest (autoadd_config bit 0) is disabled \
+                     on the radio — enabling it so the oldest contact is evicted \
+                     when the table is full"
                 );
                 let _ = cmd_tx
                     .send(OutboundFrame::SetAutoaddConfig { config: config | 1 })
                     .await;
             } else {
-                debug!(config, "mesh: contact autoadd already enabled");
+                debug!(config, "mesh: contact overwrite-oldest already enabled");
             }
         }
 
