@@ -107,6 +107,14 @@ fn send_confirmed_frame(crc: u32) -> Vec<u8> {
     radio_frame(&payload)
 }
 
+/// PUSH_CODE_PATH_UPDATED: the device learned a route to a node and reports its
+/// full 32-byte pubkey.
+fn path_updated_frame(pubkey: [u8; 32]) -> Vec<u8> {
+    let mut payload = vec![PUSH_CODE_PATH_UPDATED];
+    payload.extend_from_slice(&pubkey);
+    radio_frame(&payload)
+}
+
 // ── Test harness ──────────────────────────────────────────────────────────────
 
 struct Bridge {
@@ -348,6 +356,158 @@ async fn prompt_sets_workflow_state() {
         matches!(&received[1].1, Command::WorkflowReply { reply } if reply == "mypassword"),
         "expected WorkflowReply, got {:?}",
         received[1].1
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Workflow idle-timeout: a node stranded in a workflow because its prompt reply
+/// was lost (every message it sends is consumed as workflow input it never sees a
+/// response to) is freed after `workflow_timeout_secs`. The message that trips the
+/// timeout is Cancelled out of the workflow and re-processed as a fresh command.
+#[tokio::test]
+async fn workflow_idle_timeout_frees_stranded_user() {
+    let host = Arc::new(MockHost::new());
+    // A workflow whose reply always re-prompts with the SAME text — models a stage
+    // stuck because the user never sees the prompt (its reply keeps getting lost).
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::Help { .. }),
+        Response::Prompt {
+            text: "Enter code:".to_owned(),
+            hide_input: false,
+        },
+    );
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::WorkflowReply { .. }),
+        Response::Prompt {
+            text: "Enter code:".to_owned(),
+            hide_input: false,
+        },
+    );
+    host.set_default_response(Response::Text("ok".to_owned())); // Cancel etc.
+
+    let (transport, mut bridge) =
+        make_transport_with(Arc::clone(&host), |cfg| cfg.workflow_timeout_secs = 1).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x51u8; 6];
+    // Enter the workflow.
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("initial prompt");
+
+    // Wait past the 1s idle window, then send another message. It should trip the
+    // timeout: Cancel the stale workflow and re-parse "help" as a fresh Help.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("reply after timeout");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let received = host.commands_received();
+    let cmds: Vec<_> = received.iter().map(|(_, c)| c).collect();
+    assert!(
+        received.iter().any(|(_, c)| matches!(c, Command::Cancel)),
+        "the idle-timeout must cancel the stale workflow, got: {cmds:?}"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|(_, c)| matches!(c, Command::WorkflowReply { .. }))
+            .count(),
+        0,
+        "the message that tripped the timeout must NOT be consumed as a workflow reply, got: {cmds:?}"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|(_, c)| matches!(c, Command::Help { .. }))
+            .count(),
+        2,
+        "both messages reached the host as Help (the 2nd re-parsed after the timeout), got: {cmds:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// The device pushes `PathUpdated` with a node's full 32-byte pubkey after learning
+/// a route. Capturing it enables `flood_after_send`: the post-reply `ResetPath`
+/// (which needs the full key — an inbound DM carries only the 6-byte prefix) then
+/// fires, so the next reply to that node floods instead of dying on a stale direct
+/// path. Without the capture, `get_full_pubkey` is `None` and `ResetPath` is skipped.
+#[tokio::test]
+async fn path_updated_enables_flood_after_send() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x55u8; 6];
+    // Establish a session first (set_full_pubkey no-ops without one).
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("first reply");
+
+    // Device reports the full pubkey (its first 6 bytes are the sender's prefix).
+    let mut pubkey = [0u8; 32];
+    pubkey[..6].copy_from_slice(&sender);
+    pubkey[6] = 0xAB;
+    bridge.send(&path_updated_frame(pubkey)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The next reply should now be followed by a ResetPath (flood_after_send).
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let mut saw_reset = false;
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(2), bridge.read_command()).await {
+            Ok(cmd) if cmd[0] == CMD_RESET_PATH => {
+                saw_reset = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_reset,
+        "flood_after_send must emit ResetPath once PathUpdated supplied the full pubkey"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Two distinct messages that produce the SAME reply text in the same second must
+/// still be stamped with DIFFERENT outbound timestamps, so the radio's outbound
+/// dedup doesn't collapse them into one byte-identical frame and silently drop the
+/// second reply (the mirror of the inbound whole-second collision). The SendTxtMsg
+/// timestamp is bytes [3..7] of the payload.
+#[tokio::test]
+async fn same_second_identical_replies_get_distinct_timestamps() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x61u8; 6];
+    // Two messages back-to-back (same wall-clock second), same canned reply.
+    bridge.send(&contact_msg_frame(sender, "a")).await;
+    bridge.send(&contact_msg_frame(sender, "b")).await;
+
+    let r1 = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("first reply");
+    let r2 = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("second reply");
+    let ts1 = u32::from_le_bytes([r1[3], r1[4], r1[5], r1[6]]);
+    let ts2 = u32::from_le_bytes([r2[3], r2[4], r2[5], r2[6]]);
+    assert!(
+        ts2 > ts1,
+        "outbound reply timestamps must be strictly increasing so same-second \
+         identical replies aren't dedup-collapsed by the radio (ts1={ts1}, ts2={ts2})"
     );
 
     transport.stop().await.unwrap();

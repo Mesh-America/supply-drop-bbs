@@ -274,6 +274,7 @@ arrive.
 |---------------------|---------|---------|----------|-------------------------------------------------|
 | `flood_after_send`  | bool    | `true`  | no       | Reset the node's stored path after each send so the next message floods (hop-by-hop) rather than using a possibly-stale direct route. |
 | `reply_max_attempts`| integer | `1`     | no       | Total transmissions per reply, including the first. `1` (the default) disables retransmission. When > 1, the transport tracks each reply's delivery via the device's send-result CRC and delivery confirmation and retransmits — up to this many attempts — if no confirmation arrives in time. **Only raise this on a link that confirms deliveries — see the warning below.** |
+| `workflow_timeout_secs`| integer | `300` | no       | Seconds a node may sit awaiting a workflow reply before the transport cancels the stale workflow and treats the node's next message as a fresh command. On a lossy multi-hop link a prompt reply (e.g. "Choose a password:") can be lost, stranding the node — every message it then sends is consumed as workflow input whose "try again" response is *also* lost, and only `cancel` breaks the loop. The timer is reset per workflow *stage* (a changed prompt), so a legitimately-progressing multi-step flow is not cut short. `0` disables the timeout. |
 
 > **Check the confirm rate before enabling retransmission.** Retransmission
 > relies on the radio returning an end-to-end delivery confirmation
