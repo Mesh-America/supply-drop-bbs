@@ -756,6 +756,39 @@ enable it only on a link with a non-zero confirm rate (see
 [CONFIG.md](CONFIG.md)). Samples are persisted in the database and pruned after
 7 days, so the trend survives a service restart or upgrade rather than resetting.
 
+### Diagnosing message deliverability
+
+When users report that DMs to the BBS are "less reliable than normal messaging"
+or that "the BBS didn't respond", the stats snapshot
+(`GET /api/v1/transports/meshcore/stats`) carries **inbound** counters alongside
+the outbound reply metrics above. Together they localize *where* a message is
+being lost — the radio return path, the BBS's own dedup, or a reconnect:
+
+- `inbound_received` — plain-text DMs the BBS accepted for processing.
+- `dedup_dropped_timestamp` / `dedup_dropped_text` — inbound messages the BBS
+  dropped as retransmissions before acting on them.
+- `reconnect_discarded` — messages discarded as stale backlog while draining the
+  bridge queue after a reconnect.
+
+Read them against the outbound `sends_total` / `confirm_rate` / `failed_no_route`
+to tell the three failure modes apart:
+
+| Symptom | What the numbers show | Likely cause |
+|---------|-----------------------|--------------|
+| BBS replies, user never sees them | `sends_total` climbs, `confirm_rate ≈ 0`, `failed_no_route ≈ 0` | **Outbound return-path loss.** The device accepts every send but no end-to-end ACK returns — a lossy multi-hop reverse path. Replies are not retried by default (`reply_max_attempts = 1`). |
+| BBS "ignores" repeated commands | `dedup_dropped_timestamp` rises against `inbound_received` for that node | **Inbound dedup.** A bridge that stamps coarse whole-second timestamps (the pyMC bridge does) makes two identical sends in the same second collide and the second is dropped. Confirm with a `DEBUG` log line `dropping retransmitted message (timestamp dedup)`. |
+| DMs sent during an outage vanish | `reconnect_discarded` is non-zero | **Reconnect backlog.** Messages older than the freshness window are discarded on reconnect; fresh ones are now processed. |
+
+For a live trace, raise the log level to `DEBUG` (Settings page or `[logging]
+level = "DEBUG"`) and watch for `mesh: inbound message received`,
+`mesh: dropping retransmitted message …`, and
+`mesh: discarding stale queued message (draining)`.
+
+> Note: retrying lost **outbound** replies is not as simple as raising
+> `reply_max_attempts` — on a link that never confirms, the tracker would
+> retransmit every reply to exhaustion and flood the mesh with duplicates. A
+> confirm-gated retransmission strategy for far nodes is planned separately.
+
 ### Logs
 
 ```sh

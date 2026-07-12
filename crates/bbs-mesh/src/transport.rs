@@ -82,6 +82,16 @@ const HISTORY_SEED_SECS: u64 = 8 * 60 * 60;
 /// loop blocks on `send` (backpressure) rather than dropping work.
 const COMMAND_QUEUE_DEPTH: usize = 64;
 
+/// How fresh a queued message must be to be processed when draining the bridge
+/// backlog on reconnect. Messages whose sender timestamp is older than this are
+/// discarded rather than acted on, so recovering from a long outage does not
+/// unleash a burst of replies to DMs the user sent long ago. Sized generously
+/// (10 minutes) so it cleanly separates a brief link blip (process the backlog)
+/// from a real outage (drop it), tolerating modest sender/BBS clock skew. A
+/// message with no sender timestamp (0) is treated as fresh — we cannot prove it
+/// stale, and dropping a real DM is worse than a late reply.
+const DRAIN_STALE_AFTER_SECS: u32 = 600;
+
 /// Enqueue a plain-text reply to the companion client and, when retransmission
 /// is enabled, record it in `tracker` for delivery tracking.
 ///
@@ -987,24 +997,60 @@ async fn handle_frame(
 
         // ── Direct text messages (v1/v2 and v3 with SNR) ─────────────────────
         InboundFrame::ContactMsgRecv(msg) | InboundFrame::ContactMsgRecvV3(msg) => {
-            // While draining, discard queued messages and request the next one
-            // so we flush the entire backlog before serving live traffic.
-            if draining.load(Ordering::Relaxed) {
-                debug!(
-                    prefix = msg.sender_key_prefix[0],
-                    "mesh: discarding stale queued message (draining)"
-                );
-                let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
-                return;
-            }
+            let is_draining = draining.load(Ordering::Relaxed);
 
             // Only handle plain-text messages; CLI data and signed frames are
-            // not BBS commands.
+            // not BBS commands. Keep draining past a non-command frame so the
+            // backlog still flushes to NoMoreMessages.
             if msg.txt_type != meshcore_companion::constants::TXT_TYPE_PLAIN {
                 debug!(
                     txt_type = msg.txt_type,
                     "mesh: ignoring non-plain-text ContactMsg"
                 );
+                if is_draining {
+                    let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
+                }
+                return;
+            }
+
+            // On reconnect we drain whatever queued while we were offline. Unlike
+            // before — when the whole backlog was discarded — we now *process*
+            // fresh messages so a DM sent during a brief blip still gets a reply.
+            // Clearly-stale backlog (older than DRAIN_STALE_AFTER_SECS, judged by
+            // the sender's timestamp) is still discarded so recovering from a long
+            // outage doesn't unleash a burst of replies to long-dead messages.
+            if is_draining {
+                let age = now_unix_secs().saturating_sub(msg.timestamp);
+                if msg.timestamp != 0 && age > DRAIN_STALE_AFTER_SECS {
+                    debug!(
+                        prefix = msg.sender_key_prefix[0],
+                        age_secs = age,
+                        "mesh: discarding stale queued message (draining)"
+                    );
+                    delivery_stats.on_reconnect_discard();
+                    let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
+                    return;
+                }
+                debug!(
+                    prefix = msg.sender_key_prefix[0],
+                    timestamp = msg.timestamp,
+                    age_secs = age,
+                    "mesh: processing queued message from reconnect backlog"
+                );
+                delivery_stats.on_inbound_received();
+                if cmd_worker_tx
+                    .send(InboundCommand {
+                        sender_prefix: msg.sender_key_prefix,
+                        timestamp: msg.timestamp,
+                        text: msg.text,
+                    })
+                    .await
+                    .is_err()
+                {
+                    warn!("mesh: command worker stopped — dropping inbound message");
+                }
+                // Keep pulling the rest of the backlog.
+                let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
                 return;
             }
 
@@ -1018,6 +1064,7 @@ async fn handle_frame(
                 len = msg.text.len(),
                 "mesh: inbound message received"
             );
+            delivery_stats.on_inbound_received();
             // Hand the message to the command worker and return immediately so
             // the event loop stays free to read the next frame instead of
             // blocking on host I/O. The bounded channel applies backpressure
@@ -1032,6 +1079,20 @@ async fn handle_frame(
                 .is_err()
             {
                 warn!("mesh: command worker stopped — dropping inbound message");
+            }
+            // Drain-to-NoMoreMessages: keep fetching until the bridge reports the
+            // queue empty, so message delivery no longer depends on a perfect 1:1
+            // MsgWaiting↔message correspondence. This recovers a message whose
+            // MsgWaiting push was dropped (e.g. under bridge write-queue
+            // backpressure) and is robust to a bridge/firmware that notifies once
+            // per empty→non-empty transition rather than per message. The
+            // follow-up sync uses a blocking send so a transiently full command
+            // channel backpressures the event loop rather than dropping the sync
+            // (a dropped sync would re-open the stranding gap). When the queue is
+            // empty the bridge replies NoMoreMessages, which — while not draining —
+            // falls through to a harmless no-op and stops the loop.
+            if cmd_tx.send(OutboundFrame::SyncNextMessage).await.is_err() {
+                warn!("mesh: could not enqueue drain SyncNextMessage — cmd channel closed");
             }
         }
 
@@ -1464,6 +1525,21 @@ async fn dispatch_message(
     // timestamp (0), fall back to the text-only window, which additionally
     // guards mesh retransmissions of a workflow reply that land after the
     // workflow has completed.
+    //
+    // The `on_dedup_drop_*` counters here are DIAGNOSTIC ONLY — they do not
+    // change behaviour. They let an operator see, from the field, how often the
+    // dedup fires on a given node's traffic. This matters because a coarse-clock
+    // bridge (the pyMC bridge stamps whole-second `int(time.time())` and discards
+    // the client's own timestamp) makes two distinct sends in the same second
+    // collide on the (timestamp, text) key. Whether that ever drops *legitimate*
+    // traffic in practice is what these counters measure; the behavioural fix (if
+    // the data shows one is warranted) is deliberately deferred, because a
+    // same-second confirmation is on-the-wire indistinguishable from a stale
+    // retransmission of the command that triggered the prompt, so no
+    // transport-layer rule can tell them apart (see the tests
+    // `identical_workflow_replies_with_same_timestamp_dedup_second` and
+    // `real_host_register_double_send_then_password`, which demand opposite
+    // outcomes for byte-identical input).
     if timestamp != 0 {
         if state
             .lock()
@@ -1474,6 +1550,7 @@ async fn dispatch_message(
                 timestamp,
                 "mesh: dropping retransmitted message (timestamp dedup)"
             );
+            delivery_stats.on_dedup_drop_timestamp();
             return;
         }
     } else {
@@ -1483,6 +1560,7 @@ async fn dispatch_message(
             .dedup_message(&sender_prefix, text)
         {
             debug!("mesh: dropping retransmitted message (text dedup)");
+            delivery_stats.on_dedup_drop_text();
             return;
         }
         if !awaiting_reply
@@ -1492,6 +1570,7 @@ async fn dispatch_message(
                 .is_recent_workflow_reply(&sender_prefix, text)
         {
             debug!("mesh: dropping retransmitted workflow reply (text dedup)");
+            delivery_stats.on_dedup_drop_text();
             return;
         }
     }
