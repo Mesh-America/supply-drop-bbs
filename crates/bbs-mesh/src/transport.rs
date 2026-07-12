@@ -25,7 +25,7 @@
 //! [`ClientEvent`]s; `notify()` is the sole producer of outbound commands
 //! from the `MeshTransport` side.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -113,7 +113,10 @@ fn enqueue_text(
         // The wire `attempt` field is 0-based (0 = first send); the tracker
         // counts transmissions 1-based.
         attempt: attempt.saturating_sub(1),
-        timestamp: now_unix_secs(),
+        // Unique per send so two distinct replies to the same node in the same
+        // second aren't collapsed into one byte-identical frame by the radio's
+        // outbound dedup. See next_outbound_timestamp.
+        timestamp: next_outbound_timestamp(),
         pubkey_prefix: prefix,
         text: text.clone(),
     };
@@ -193,6 +196,39 @@ pub fn now_unix_secs() -> u32 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0)
+}
+
+/// Last timestamp handed out by [`next_outbound_timestamp`]. Process-global so
+/// every outbound reply frame is unique regardless of which task sends it.
+static NEXT_OUTBOUND_TS: AtomicU32 = AtomicU32::new(0);
+
+/// A strictly-increasing, never-repeating timestamp for OUTBOUND reply frames.
+///
+/// Returns the current Unix time, but never a value already handed out — if
+/// called again within the same second it advances by one. Mirrors MeshCore
+/// firmware's own `getCurrentTimeUnique()`. Two distinct replies to the same node
+/// in the same second would otherwise stamp byte-identical `(dest, timestamp,
+/// text)` frames — e.g. the identical "Welcome" banner an unauthenticated node
+/// gets for every message — which the radio firmware deduplicates, silently
+/// dropping the second reply so the user sees no response. A per-send unique
+/// stamp keeps each reply a distinct packet. Under a burst the stamp can run a
+/// few seconds ahead of real time (harmless; real time catches up when traffic
+/// quiets).
+fn next_outbound_timestamp() -> u32 {
+    let now = now_unix_secs();
+    let mut last = NEXT_OUTBOUND_TS.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match NEXT_OUTBOUND_TS.compare_exchange_weak(
+            last,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => last = observed,
+        }
+    }
 }
 
 // ── MeshTransport ─────────────────────────────────────────────────────────────

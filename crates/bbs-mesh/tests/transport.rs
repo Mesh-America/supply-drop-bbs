@@ -479,6 +479,40 @@ async fn path_updated_enables_flood_after_send() {
     transport.stop().await.unwrap();
 }
 
+/// Two distinct messages that produce the SAME reply text in the same second must
+/// still be stamped with DIFFERENT outbound timestamps, so the radio's outbound
+/// dedup doesn't collapse them into one byte-identical frame and silently drop the
+/// second reply (the mirror of the inbound whole-second collision). The SendTxtMsg
+/// timestamp is bytes [3..7] of the payload.
+#[tokio::test]
+async fn same_second_identical_replies_get_distinct_timestamps() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x61u8; 6];
+    // Two messages back-to-back (same wall-clock second), same canned reply.
+    bridge.send(&contact_msg_frame(sender, "a")).await;
+    bridge.send(&contact_msg_frame(sender, "b")).await;
+
+    let r1 = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("first reply");
+    let r2 = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("second reply");
+    let ts1 = u32::from_le_bytes([r1[3], r1[4], r1[5], r1[6]]);
+    let ts2 = u32::from_le_bytes([r2[3], r2[4], r2[5], r2[6]]);
+    assert!(
+        ts2 > ts1,
+        "outbound reply timestamps must be strictly increasing so same-second \
+         identical replies aren't dedup-collapsed by the radio (ts1={ts1}, ts2={ts2})"
+    );
+
+    transport.stop().await.unwrap();
+}
+
 /// Issue #104: two identical workflow replies in a row (e.g. the password and
 /// its matching confirmation) must BOTH reach the host. The general
 /// retransmission dedup must not silently drop the second one just because its
