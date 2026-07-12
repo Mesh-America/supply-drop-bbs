@@ -25,7 +25,7 @@
 //! [`ClientEvent`]s; `notify()` is the sole producer of outbound commands
 //! from the `MeshTransport` side.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,12 +85,17 @@ const COMMAND_QUEUE_DEPTH: usize = 64;
 /// Enqueue a plain-text reply to the companion client and, when retransmission
 /// is enabled, record it in `tracker` for delivery tracking.
 ///
-/// Record + enqueue happen together under the tracker lock with a *non-blocking*
-/// `try_send`, so the tracker's send-order FIFO matches the wire order even when
-/// called from several tasks (the event loop, `notify`, domain-event pushes).
-/// No `.await` is held across the lock. A full command channel drops the reply
-/// (logged) rather than blocking the caller; depth is generous and this is rare.
-fn enqueue_text(
+/// Channel capacity is reserved with `reserve().await` BEFORE the tracker lock
+/// is taken; the frame is then recorded and placed with the synchronous
+/// [`mpsc::Permit::send`] under the lock. This keeps two invariants at once: no
+/// `.await` is ever held across the (std) tracker lock, and the tracker's
+/// send-order FIFO matches the wire order even when called from several tasks
+/// (the command worker, `notify`, domain-event pushes, the retry tick) — that
+/// FIFO is what correlates each `RESP_CODE_SENT` CRC back to its reply. A
+/// transiently full channel now waits (backpressure) instead of preferentially
+/// dropping the user-visible reply — the drain syncs already block the same
+/// way. Only a closed channel (shutdown) drops the reply, and that is counted.
+async fn enqueue_text(
     tracker: &Mutex<SendTracker>,
     stats: &DeliveryStats,
     cmd_tx: &mpsc::Sender<OutboundFrame>,
@@ -98,37 +103,44 @@ fn enqueue_text(
     text: String,
     attempt: u8,
 ) {
+    // Reserve a slot first — never await while holding the tracker lock.
+    let permit = match cmd_tx.reserve().await {
+        Ok(p) => p,
+        Err(e) => {
+            stats.on_dropped();
+            warn!(error = %e, "mesh: command channel closed — reply dropped");
+            return;
+        }
+    };
     let frame = OutboundFrame::SendTxtMsg {
         txt_type: TXT_TYPE_PLAIN,
         // The wire `attempt` field is 0-based (0 = first send); the tracker
         // counts transmissions 1-based.
         attempt: attempt.saturating_sub(1),
-        timestamp: now_unix_secs(),
+        // Unique per send: two same-second identical replies would otherwise be
+        // byte-identical packets, and the first RECEIVING mesh node's seen-
+        // packet-hash table (the sending radio transmits both copies) drops the
+        // duplicate before it is decrypted or ACKed. See next_outbound_timestamp.
+        timestamp: next_outbound_timestamp(),
         pubkey_prefix: prefix,
         text: text.clone(),
     };
     let mut t = tracker.lock().expect("send tracker mutex poisoned");
-    match cmd_tx.try_send(frame) {
-        Ok(()) => {
-            // Count every frame that reaches the wire, independent of whether
-            // retransmission (and hence the tracker's record) is enabled.
-            stats.on_send(prefix, attempt);
-            if t.retries_enabled() {
-                t.record(prefix, text, TXT_TYPE_PLAIN, attempt, Instant::now());
-            }
-        }
-        Err(e) => {
-            stats.on_dropped();
-            warn!(error = %e, "mesh: command channel full/closed — reply dropped");
-        }
+    // Count every frame that reaches the wire, independent of whether
+    // retransmission (and hence the tracker's record) is enabled.
+    stats.on_send(prefix, attempt);
+    if t.retries_enabled() {
+        t.record(prefix, text, TXT_TYPE_PLAIN, attempt, Instant::now());
     }
+    // Synchronous send: wire order equals record order, no await under the lock.
+    permit.send(frame);
 }
 
 /// Retransmit any replies whose end-to-end ACK deadline has passed, and log the
 /// ones that have exhausted their attempt budget. Called on the retry tick from
 /// the event loop. On retry the node's stored path is reset first (when flooding
 /// is enabled) so a stale direct route doesn't keep failing the same way.
-fn retransmit_due_replies(
+async fn retransmit_due_replies(
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
     tracker: &Arc<Mutex<SendTracker>>,
@@ -171,7 +183,8 @@ fn retransmit_due_replies(
             rec.prefix,
             rec.text,
             rec.attempt + 1,
-        );
+        )
+        .await;
     }
 }
 
@@ -183,6 +196,45 @@ pub fn now_unix_secs() -> u32 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0)
+}
+
+/// Last timestamp handed out by [`next_outbound_timestamp`]. Process-global so
+/// every outbound reply frame is unique regardless of which task sends it.
+static NEXT_OUTBOUND_TS: AtomicU32 = AtomicU32::new(0);
+
+/// A strictly-increasing, never-repeating timestamp for OUTBOUND reply frames.
+///
+/// Returns the current Unix time, but never a value already handed out — if
+/// called again within the same second it advances by one. Mirrors MeshCore
+/// firmware's own `getCurrentTimeUnique()`. Two distinct replies to the same node
+/// in the same second would otherwise stamp byte-identical `(dest, timestamp,
+/// text)` frames — e.g. the identical "Welcome" banner an unauthenticated node
+/// gets for every message. The firmware passes the app timestamp through
+/// unchanged for plain text and encrypts deterministically (AES-ECB), so the two
+/// packets are byte-identical on air; the sending radio transmits BOTH, and the
+/// FIRST RECEIVING mesh node's seen-packet-hash table (the recipient itself at
+/// close range, or any repeater) drops the second before it is decrypted or
+/// ACKed — the user sees one reply and the BBS sees one confirmation. Distinct
+/// stamps also give each in-flight reply a distinct ACK CRC, which the
+/// send-tracker needs to correlate `SendConfirmed` per reply (identical stamps
+/// made two sends share a CRC and silently overwrite each other's record). Under
+/// a burst the stamp can run a few seconds ahead of real time (harmless; real
+/// time catches up when traffic quiets).
+fn next_outbound_timestamp() -> u32 {
+    let now = now_unix_secs();
+    let mut last = NEXT_OUTBOUND_TS.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match NEXT_OUTBOUND_TS.compare_exchange_weak(
+            last,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return next,
+            Err(observed) => last = observed,
+        }
+    }
 }
 
 // ── MeshTransport ─────────────────────────────────────────────────────────────
@@ -231,6 +283,11 @@ pub struct MeshTransport {
     /// a potentially-stale direct path.  Can be disabled in config to
     /// restore pre-v0.2.4 direct-path-only behaviour.
     flood_after_send: bool,
+    /// Seconds a node may await a workflow reply before the transport cancels the
+    /// stale workflow and treats the node's next message as a fresh command.
+    /// A lost prompt reply otherwise strands the node in an invisible workflow.
+    /// `0` disables the timeout.
+    workflow_timeout_secs: u64,
     /// Tracks in-flight replies and drives retransmission on missing ACKs.
     /// Shared with the event-loop task (which owns the retry timer and the
     /// `Sent`/`SendConfirmed` correlation). See [`crate::send_tracker`].
@@ -320,6 +377,7 @@ impl Plugin for MeshTransport {
             node_credential_ttl_days: config.node_credential_ttl_days,
             draining: Arc::new(AtomicBool::new(false)),
             flood_after_send: config.flood_after_send,
+            workflow_timeout_secs: config.workflow_timeout_secs,
             send_tracker: Arc::new(Mutex::new(SendTracker::new(RetryConfig {
                 max_attempts: config.reply_max_attempts.max(1),
                 min_timeout: REPLY_ACK_MIN_WAIT,
@@ -349,6 +407,7 @@ impl Plugin for MeshTransport {
         let welcome = self.welcome_message.clone();
         let ttl_days = self.node_credential_ttl_days;
         let flood_after_send = self.flood_after_send;
+        let workflow_timeout_secs = self.workflow_timeout_secs;
 
         // Admin channel: web UI → event loop for key operations.
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<bbs_plugin_api::MeshKeyRequest>(4);
@@ -457,6 +516,7 @@ impl Plugin for MeshTransport {
             ttl_days,
             draining,
             flood_after_send,
+            workflow_timeout_secs,
             send_tracker,
             delivery_stats,
             key_rx,
@@ -516,7 +576,8 @@ impl TransportEngine for MeshTransport {
             pubkey_prefix,
             text,
             1,
-        );
+        )
+        .await;
 
         if self.flood_after_send {
             let full_pubkey = self
@@ -580,7 +641,8 @@ async fn push_domain_notification(
                         "Your account has been validated. You now have full access. Type 'H'."
                             .to_owned(),
                         1,
-                    );
+                    )
+                    .await;
                     if flood_after_send {
                         let pubkey = state
                             .lock()
@@ -618,7 +680,8 @@ async fn push_domain_notification(
                             user.as_str()
                         ),
                         1,
-                    );
+                    )
+                    .await;
                     if flood_after_send {
                         let pubkey = state
                             .lock()
@@ -667,6 +730,7 @@ async fn event_loop(
     node_credential_ttl_days: u32,
     draining: Arc<AtomicBool>,
     flood_after_send: bool,
+    workflow_timeout_secs: u64,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
     mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
@@ -714,6 +778,7 @@ async fn event_loop(
         welcome_message,
         node_credential_ttl_days,
         flood_after_send,
+        workflow_timeout_secs,
         Arc::clone(&send_tracker),
         Arc::clone(&delivery_stats),
     ));
@@ -727,9 +792,12 @@ async fn event_loop(
                         break;
                     }
                     Some(ClientEvent::Connected { self_info }) => {
-                        // Drain any messages that queued while we were offline so
-                        // they don't corrupt in-progress workflows.  Always done
-                        // regardless of whether SelfInfo is available.
+                        // Drain the bridge's offline queue on connect so any
+                        // messages that queued while we were offline are handled
+                        // promptly (they are processed like live traffic — see
+                        // the ContactMsgRecv arm). Always done regardless of
+                        // whether SelfInfo is available; the flag's main job is
+                        // the Err fallback for firmware without SYNC support.
                         draining.store(true, Ordering::Relaxed);
                         let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
 
@@ -738,7 +806,7 @@ async fn event_loop(
                                 node = %info.node_name,
                                 freq_khz = info.frequency_khz,
                                 adv_type = info.adv_type,
-                                "mesh: radio bridge connected — draining stale queue"
+                                "mesh: radio bridge connected — draining offline queue"
                             );
                             // Register the BBS node in the advert bus so it appears in
                             // the web UI immediately (using whatever GPS the radio reports).
@@ -900,7 +968,7 @@ async fn event_loop(
                 }
             }
             _ = retry_tick.tick() => {
-                retransmit_due_replies(&cmd_tx, &state, &send_tracker, &delivery_stats, flood_after_send);
+                retransmit_due_replies(&cmd_tx, &state, &send_tracker, &delivery_stats, flood_after_send).await;
             }
             _ = sample_tick.tick() => {
                 let s = delivery_stats.sample(now_unix_secs() as u64);
@@ -983,29 +1051,28 @@ async fn handle_frame(
         // Bridge has no more queued messages; resume normal processing.
         InboundFrame::NoMoreMessages if draining.load(Ordering::Relaxed) => {
             draining.store(false, Ordering::Relaxed);
-            info!("mesh: stale queue drained — resuming normal processing");
+            info!("mesh: offline queue drained — resuming normal processing");
         }
 
         // ── Direct text messages (v1/v2 and v3 with SNR) ─────────────────────
+        // Live pushes and offline-queue pops (reconnect backlog included) take
+        // the same path: process the message and continue the sync chain. The
+        // backlog is the user's own commands sent while we were offline — they
+        // get replies like live traffic. No age-based discard: the timestamp is
+        // stamped by the SENDER, whose clock may be unset (firmware's unsynced
+        // RTC defaults to a 2024 epoch), so "old-looking" does not mean stale;
+        // and the firmware offline queue holds at most 16 frames, so the worst
+        // reconnect burst is small and bounded.
         InboundFrame::ContactMsgRecv(msg) | InboundFrame::ContactMsgRecvV3(msg) => {
-            // While draining, discard queued messages and request the next one
-            // so we flush the entire backlog before serving live traffic.
-            if draining.load(Ordering::Relaxed) {
-                debug!(
-                    prefix = msg.sender_key_prefix[0],
-                    "mesh: discarding stale queued message (draining)"
-                );
-                let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
-                return;
-            }
-
             // Only handle plain-text messages; CLI data and signed frames are
-            // not BBS commands.
+            // not BBS commands. Still continue the sync chain unconditionally:
+            // this frame may be a queue pop with more backlog behind it.
             if msg.txt_type != meshcore_companion::constants::TXT_TYPE_PLAIN {
                 debug!(
                     txt_type = msg.txt_type,
                     "mesh: ignoring non-plain-text ContactMsg"
                 );
+                let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
                 return;
             }
 
@@ -1019,6 +1086,7 @@ async fn handle_frame(
                 len = msg.text.len(),
                 "mesh: inbound message received"
             );
+            delivery_stats.on_inbound_received();
             // Hand the message to the command worker and return immediately so
             // the event loop stays free to read the next frame instead of
             // blocking on host I/O. The bounded channel applies backpressure
@@ -1034,6 +1102,46 @@ async fn handle_frame(
             {
                 warn!("mesh: command worker stopped — dropping inbound message");
             }
+            // Drain-to-NoMoreMessages: keep fetching until the bridge reports the
+            // queue empty, so message delivery no longer depends on a perfect 1:1
+            // MsgWaiting↔message correspondence. This recovers a message whose
+            // MsgWaiting push was dropped (e.g. under bridge write-queue
+            // backpressure) and is robust to a bridge/firmware that notifies once
+            // per empty→non-empty transition rather than per message. The
+            // follow-up sync uses a blocking send so a transiently full command
+            // channel backpressures the event loop rather than dropping the sync
+            // (a dropped sync would re-open the stranding gap). When the queue is
+            // empty the bridge replies NoMoreMessages, which — while not draining —
+            // falls through to a harmless no-op and stops the loop.
+            if cmd_tx.send(OutboundFrame::SyncNextMessage).await.is_err() {
+                warn!("mesh: could not enqueue drain SyncNextMessage — cmd channel closed");
+            }
+        }
+
+        // ── Channel (group) traffic — not BBS commands, but queue-poppable ───
+        // The BBS ignores channel messages, but the device stores them in the
+        // SAME offline queue as DMs (firmware `addToOfflineQueue`; pyMC
+        // `message_queue`), so a `CMD_SYNC_NEXT_MESSAGE` pop can return one.
+        // The sync chain MUST continue past them, unconditionally: without this,
+        // a channel message popped during the reconnect drain pinned
+        // `draining = true` until the next MsgWaiting tickle (indefinitely on a
+        // quiet mesh), and in normal mode it broke the drain-to-NoMoreMessages
+        // recovery, stranding a DM queued behind it. Only queue-poppable frame
+        // families get this continuation — re-syncing on non-queue frames
+        // (Sent, Advert, PathUpdated, …) would let a spurious NoMoreMessages
+        // clear `draining` prematurely while real backlog pops are in flight.
+        // Cost: one SyncNextMessage → NoMoreMessages round-trip per channel
+        // frame; the chain always terminates because a non-draining
+        // NoMoreMessages is a no-op.
+        InboundFrame::ChannelMsgRecv(_) | InboundFrame::ChannelMsgRecvV3(_) => {
+            debug!("mesh: ignoring channel message — continuing queue sync");
+            let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
+        }
+        // RESP_CODE_CHANNEL_DATA_RECV (27): queued by firmware like channel
+        // messages but not parsed by the codec, so it surfaces as Unknown.
+        InboundFrame::Unknown { type_byte: 27, .. } => {
+            debug!("mesh: ignoring channel data frame — continuing queue sync");
+            let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
         }
 
         // ── Queued message notification ───────────────────────────────────────
@@ -1304,6 +1412,29 @@ async fn handle_frame(
             }
         }
 
+        // ── Path (re)learned to a node ────────────────────────────────────────
+        // The device pushes the full 32-byte pubkey when it learns or refreshes a
+        // route to a contact. Capture it: forcing a reply to flood (so it isn't
+        // lost on a stale multi-hop direct path) is done with `ResetPath`, which
+        // needs the full key — but an inbound DM only carries the 6-byte prefix,
+        // and `GetContacts` runs once on connect, before first-contact sessions
+        // exist. Without this the full key stays unknown for exactly the far
+        // nodes that need flooding, so `flood_after_send`'s post-reply ResetPath
+        // is silently skipped (`get_full_pubkey` returns None) and every reply
+        // goes direct. `set_full_pubkey` no-ops until a session exists; PathUpdated
+        // arrives after the inbound DM created it, so it lands.
+        InboundFrame::PathUpdated { pubkey } => {
+            let prefix: [u8; 6] = pubkey[..6].try_into().expect("pubkey is 32 bytes");
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_full_pubkey(&prefix, pubkey);
+            debug!(
+                prefix = prefix[0],
+                "mesh: PathUpdated — captured full pubkey (enables flood-after-send for this node)"
+            );
+        }
+
         // ── Everything else ───────────────────────────────────────────────────
         other => {
             debug!("mesh: ignoring frame {other:?}");
@@ -1339,6 +1470,7 @@ async fn command_worker(
     welcome_message: String,
     node_credential_ttl_days: u32,
     flood_after_send: bool,
+    workflow_timeout_secs: u64,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
 ) {
@@ -1354,6 +1486,7 @@ async fn command_worker(
             &welcome_message,
             node_credential_ttl_days,
             flood_after_send,
+            workflow_timeout_secs,
             &send_tracker,
             &delivery_stats,
         )
@@ -1375,6 +1508,7 @@ async fn dispatch_message(
     welcome_message: &str,
     node_credential_ttl_days: u32,
     flood_after_send: bool,
+    workflow_timeout_secs: u64,
     send_tracker: &Arc<Mutex<SendTracker>>,
     delivery_stats: &Arc<DeliveryStats>,
 ) {
@@ -1402,6 +1536,44 @@ async fn dispatch_message(
         .lock()
         .expect("state mutex poisoned")
         .is_awaiting_reply(&sender_prefix);
+
+    // ── Workflow idle-timeout ─────────────────────────────────────────────────
+    // If this node has been awaiting a workflow reply longer than the configured
+    // window, its prompt reply was almost certainly lost on the return path and
+    // the node is stranded: every message it sends is consumed as workflow input
+    // whose "try again" response is also lost, and only `cancel` breaks the loop.
+    // Cancel the stale workflow on BOTH sides — via Command::Cancel so the host's
+    // Workflow resets in sync with the transport flag — and treat THIS message as
+    // a fresh command (fall through with awaiting_reply = false). The timer is
+    // stamped per workflow stage (see SessionState::update_awaiting_reply), so a
+    // legitimately-progressing multi-step flow is not cut short.
+    let awaiting_reply = if awaiting_reply
+        && workflow_timeout_secs > 0
+        && state
+            .lock()
+            .expect("state mutex poisoned")
+            .awaiting_reply_expired(&sender_prefix, Duration::from_secs(workflow_timeout_secs))
+    {
+        info!(
+            ?session,
+            timeout_secs = workflow_timeout_secs,
+            "mesh: workflow idle-timeout — cancelling stale workflow, treating message as a fresh command"
+        );
+        // Reset host-side workflow state in sync (handle_cancel → Workflow::None).
+        // The response is discarded; the current message is re-processed below as
+        // a fresh command. Cancel is infallible on a live session; on a stale one
+        // it errors harmlessly and the replay below hits the UnknownSession path.
+        if let Err(e) = host.process_command(session, Command::Cancel).await {
+            warn!(?session, "mesh: workflow-timeout cancel error: {e}");
+        }
+        state
+            .lock()
+            .expect("state mutex poisoned")
+            .update_awaiting_reply(&sender_prefix, None);
+        false
+    } else {
+        awaiting_reply
+    };
 
     // ── Build greeting for unauthenticated nodes ──────────────────────────────
     // Show the welcome banner to any unauthenticated node on every message so
@@ -1476,6 +1648,30 @@ async fn dispatch_message(
     // timestamp (0), fall back to the text-only window, which additionally
     // guards mesh retransmissions of a workflow reply that land after the
     // workflow has completed.
+    //
+    // The `on_dedup_drop_*` counters here are DIAGNOSTIC ONLY — they do not
+    // change behaviour. They let an operator see, from the field, how often the
+    // dedup fires on a given node's traffic. The timestamp we key on is whatever
+    // the ORIGIN stamped: both bridge implementations preserve the packet's
+    // embedded sender timestamp on receive (firmware `queueMessage` copies
+    // `sender_timestamp` verbatim; pyMC's text handler extracts it from the
+    // decrypted payload), so collision risk is set by the SENDING side. Senders
+    // attached to real firmware get the app-supplied stamp passed through
+    // unchanged (apps observed in the field stamp distinct sends distinctly, and
+    // firmware stamps CLI data with strictly-increasing `getCurrentTimeUnique`).
+    // Senders bridged through pyMC, however, are RE-stamped whole-second
+    // `int(time.time())` at send time — pyMC's CMD_SEND_TXT_MSG handler discards
+    // the client's own timestamp bytes — so two distinct, byte-identical sends
+    // from such a sender in the same second collide on the (timestamp, text) key
+    // and the second is dropped here. That is a property of the sender's bridge,
+    // not of ours. Whether it ever drops *legitimate* traffic in practice is
+    // what these counters measure; the behavioural fix (if the data shows one is
+    // warranted) is deliberately deferred, because a same-second confirmation is
+    // on-the-wire indistinguishable from a stale retransmission of the command
+    // that triggered the prompt, so no transport-layer rule can tell them apart
+    // (see the tests `identical_workflow_replies_with_same_timestamp_dedup_second`
+    // and `real_host_register_double_send_then_password`, which demand opposite
+    // outcomes for byte-identical input).
     if timestamp != 0 {
         if state
             .lock()
@@ -1486,6 +1682,7 @@ async fn dispatch_message(
                 timestamp,
                 "mesh: dropping retransmitted message (timestamp dedup)"
             );
+            delivery_stats.on_dedup_drop_timestamp();
             return;
         }
     } else {
@@ -1495,6 +1692,7 @@ async fn dispatch_message(
             .dedup_message(&sender_prefix, text)
         {
             debug!("mesh: dropping retransmitted message (text dedup)");
+            delivery_stats.on_dedup_drop_text();
             return;
         }
         if !awaiting_reply
@@ -1504,6 +1702,7 @@ async fn dispatch_message(
                 .is_recent_workflow_reply(&sender_prefix, text)
         {
             debug!("mesh: dropping retransmitted workflow reply (text dedup)");
+            delivery_stats.on_dedup_drop_text();
             return;
         }
     }
@@ -1613,11 +1812,19 @@ async fn dispatch_message(
         }
     }
 
-    // ── Update workflow-reply flag ────────────────────────────────────────────
-    let is_prompt = matches!(response, Response::Prompt { .. });
+    // ── Update workflow-reply state ───────────────────────────────────────────
+    // A Prompt response means the node's next message continues a workflow; any
+    // other response ends it. update_awaiting_reply also stamps the idle-timeout
+    // clock (per workflow stage — only when the prompt text changes), so a node
+    // stranded by a lost prompt reply can be freed (see the workflow idle-timeout
+    // near the top of dispatch_message).
+    let prompt_text: Option<&str> = match &response {
+        Response::Prompt { text, .. } => Some(text.as_str()),
+        _ => None,
+    };
     {
         let mut state = state.lock().expect("state mutex poisoned");
-        state.set_awaiting_reply(&sender_prefix, is_prompt);
+        state.update_awaiting_reply(&sender_prefix, prompt_text);
         // A new prompt begins a fresh reply turn, so the user's next message is
         // genuine input even if it repeats the previous reply verbatim. Clear
         // the message-dedup baseline so the general retransmission dedup can't
@@ -1625,14 +1832,18 @@ async fn dispatch_message(
         // "Confirm your password:". (#104)
         //
         // This only matters for the timestamp==0 fallback path. On the timestamp
-        // path, #104 is handled naturally: the re-typed confirmation is a new
-        // send with a new per-message timestamp, so dedup_by_timestamp's
-        // (timestamp, text) key already treats it as distinct — the dedup hinges
-        // on the client stamping each distinct send with a distinct timestamp.
-        // Do NOT also clear `recent_msgs` here: that would let a delayed
+        // path, #104 is handled naturally whenever the origin stamps each send
+        // distinctly: the re-typed confirmation carries a new per-message
+        // timestamp, so dedup_by_timestamp's (timestamp, text) key already
+        // treats it as distinct. Caveat: a sender bridged through pyMC is
+        // re-stamped whole-second `int(time.time())` at send time, so a
+        // confirmation byte-identical to the previous reply and sent within the
+        // same second (e.g. a pasted password) still collides and is dropped —
+        // a real, narrow false-drop for that sender population, independent of
+        // our own bridge. Do NOT also clear `recent_msgs` here: that would let a delayed
         // retransmission of the previous reply through after a prompt, re-opening
         // the very "Error: Already logged in" reprocessing this dedup prevents.
-        if is_prompt {
+        if prompt_text.is_some() {
             state.clear_last_message(&sender_prefix);
         }
     }
@@ -1705,7 +1916,8 @@ async fn dispatch_message(
             sender_prefix,
             reply_text,
             1,
-        );
+        )
+        .await;
         // Reset path only after the last frame so intermediate frames travel
         // the same (possibly direct) route as the first.
         if is_last && flood_after_send {

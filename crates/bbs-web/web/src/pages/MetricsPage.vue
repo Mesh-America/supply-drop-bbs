@@ -59,6 +59,9 @@ interface DeliveryStats {
   failed_no_route: number
   confirmed: number
   gave_up: number
+  inbound_received: number
+  dedup_dropped_timestamp: number
+  dedup_dropped_text: number
   confirm_rate: number | null
   route_failure_rate: number | null
   latency_count: number
@@ -182,6 +185,15 @@ const trendStart = computed(() => (history.value.length ? sampleTime(history.val
 const trendEnd = computed(() =>
   history.value.length ? sampleTime(history.value[history.value.length - 1].ts) : ''
 )
+
+// Share of received inbound messages the dedup dropped as retransmissions, 0–1
+// (or null before any inbound traffic). A high ratio for a node that repeats
+// commands is the signature of the dedup over-dropping legitimate messages.
+const dedupDropRate = computed<number | null>(() => {
+  const d = delivery.value
+  if (!d || d.inbound_received === 0) return null
+  return (d.dedup_dropped_timestamp + d.dedup_dropped_text) / d.inbound_received
+})
 
 function ratePct(r: number | null): string {
   return r === null ? '—' : `${(r * 100).toFixed(1)}%`
@@ -342,6 +354,28 @@ onUnmounted(() => {
           <div class="card-label">Avg round-trip</div>
           <div class="big-num">{{ fmtMs(delivery.avg_latency_ms) }}</div>
           <div class="card-sub muted">min {{ fmtMs(delivery.min_latency_ms) }} / max {{ fmtMs(delivery.max_latency_ms) }}</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Inbound message health -->
+    <section v-if="delivery" class="section">
+      <h2 class="section-title">Inbound message health (cumulative since start)</h2>
+      <p class="muted">
+        Where inbound DMs are lost before the BBS acts on them — read alongside the confirm rate above
+        to tell an outbound return-path problem from an inbound one.
+      </p>
+      <div class="metrics-grid">
+        <div class="card">
+          <div class="card-label">Received</div>
+          <div class="big-num">{{ delivery.inbound_received }}</div>
+          <div class="card-sub muted">plain-text DMs accepted for processing (pre-dedup)</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Dedup drops</div>
+          <div class="big-num">{{ ratePct(dedupDropRate) }}</div>
+          <div class="bar-track"><div class="bar-fill" :style="{ width: rateWidth(dedupDropRate) + '%' }" :class="failBarClass(dedupDropRate)"></div></div>
+          <div class="card-sub muted">{{ delivery.dedup_dropped_timestamp }} timestamp / {{ delivery.dedup_dropped_text }} text — retransmissions dropped</div>
         </div>
       </div>
     </section>

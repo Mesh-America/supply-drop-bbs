@@ -211,6 +211,12 @@
 # confirms delivery resends EVERY reply reply_max_attempts times. See
 # docs/CONFIG.md §[plugins.mesh].
 # reply_max_attempts = 1
+# Seconds a node may sit awaiting a workflow reply before the stale workflow is
+# cancelled and its next message is treated as a fresh command. A lost prompt
+# reply on a lossy multi-hop link otherwise strands the node (every message it
+# sends is consumed as workflow input it never sees a response to). Reset per
+# workflow stage, so a progressing multi-step flow isn't cut short. 0 disables.
+# workflow_timeout_secs = 300
 
 
 # ─── Plugin: Meshtastic transport ─────────────────────────────────

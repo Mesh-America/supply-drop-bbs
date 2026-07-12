@@ -199,6 +199,15 @@ pub struct MeshConfig {
     /// destination regardless of whether the BBS's stored route is still
     /// valid.  Disabling this restores the previous direct-path-only
     /// behaviour.  Defaults to `true`.
+    ///
+    /// Note the reply itself is **not** flooded — it travels the device's
+    /// current stored path; the reset only affects the *next* outbound to that
+    /// node. The device also re-learns a path from the node's own inbound
+    /// traffic (`PathUpdated`), which bounds the flooding cost to occasional
+    /// unsolicited pushes. Purely single-hop deployments (every node in direct
+    /// range) may set this to `false`; multi-hop deployments should leave it
+    /// on — retransmission (when enabled) also relies on the reset to flood a
+    /// retried reply.
     #[serde(default = "default_flood_after_send")]
     pub flood_after_send: bool,
 
@@ -226,6 +235,20 @@ pub struct MeshConfig {
     /// and inbound commands are deduplicated separately.
     #[serde(default = "default_reply_max_attempts")]
     pub reply_max_attempts: u8,
+
+    /// How long (seconds) a node may sit awaiting a workflow reply before the
+    /// transport cancels the stale workflow and treats the node's next message as
+    /// a fresh command.
+    ///
+    /// On a lossy multi-hop link a prompt reply (e.g. "Choose a password:") can be
+    /// lost, stranding the node: every message it sends is then consumed as
+    /// workflow input whose "try again" response is *also* lost, and only `cancel`
+    /// breaks the loop. This frees the node automatically after the window. The
+    /// timer is reset per workflow *stage* (a changed prompt), so a
+    /// legitimately-progressing multi-step flow is not cut short. `0` disables the
+    /// timeout. Defaults to `300` (5 minutes).
+    #[serde(default = "default_workflow_timeout_secs")]
+    pub workflow_timeout_secs: u64,
 
     /// Radio parameter configuration.
     ///
@@ -270,6 +293,7 @@ impl Default for MeshConfig {
             node_credential_ttl_days: default_node_credential_ttl_days(),
             flood_after_send: default_flood_after_send(),
             reply_max_attempts: default_reply_max_attempts(),
+            workflow_timeout_secs: default_workflow_timeout_secs(),
             radio: None,
         }
     }
@@ -311,6 +335,10 @@ fn default_flood_after_send() -> bool {
 
 fn default_reply_max_attempts() -> u8 {
     1
+}
+
+fn default_workflow_timeout_secs() -> u64 {
+    300
 }
 
 fn default_true() -> bool {

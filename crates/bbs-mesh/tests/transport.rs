@@ -90,6 +90,20 @@ fn contact_msg_frame_ts(sender_prefix: [u8; 6], text: &str, timestamp: u32) -> V
     radio_frame(&payload)
 }
 
+/// RESP_CODE_CHANNEL_MSG_RECV: a channel (group) message popped from the device's
+/// offline queue — the same queue that holds DMs, so the sync chain must be able
+/// to continue past one. Layout: [code][channel_idx][path_len][txt_type][ts×4][text].
+fn channel_msg_frame(channel_idx: u8, text: &str) -> Vec<u8> {
+    let ts = NEXT_TS.fetch_add(1, Ordering::Relaxed);
+    let mut payload = vec![RESP_CODE_CHANNEL_MSG_RECV];
+    payload.push(channel_idx);
+    payload.push(0u8); // path_len
+    payload.push(TXT_TYPE_PLAIN);
+    payload.extend_from_slice(&ts.to_le_bytes());
+    payload.extend_from_slice(text.as_bytes());
+    radio_frame(&payload)
+}
+
 /// RESP_CODE_SENT: the device's reply to a send. `send_type` 0=failed, 1=flood,
 /// 2=direct; `crc` is the expected-ack identifier; `timeout_ms` the delivery hint.
 fn sent_frame(send_type: u8, crc: u32, timeout_ms: u32) -> Vec<u8> {
@@ -104,6 +118,14 @@ fn send_confirmed_frame(crc: u32) -> Vec<u8> {
     let mut payload = vec![PUSH_CODE_SEND_CONFIRMED];
     payload.extend_from_slice(&crc.to_le_bytes());
     payload.extend_from_slice(&0u32.to_le_bytes());
+    radio_frame(&payload)
+}
+
+/// PUSH_CODE_PATH_UPDATED: the device learned a route to a node and reports its
+/// full 32-byte pubkey.
+fn path_updated_frame(pubkey: [u8; 32]) -> Vec<u8> {
+    let mut payload = vec![PUSH_CODE_PATH_UPDATED];
+    payload.extend_from_slice(&pubkey);
     radio_frame(&payload)
 }
 
@@ -215,6 +237,18 @@ impl Bridge {
             }
         }
     }
+
+    /// Read outbound frames until a `CMD_SYNC_NEXT_MESSAGE` appears, skipping
+    /// replies, path resets, and connect-time bookkeeping (GET_CONTACTS /
+    /// GET_AUTOADD_CONFIG).
+    async fn read_until_sync(&mut self) {
+        loop {
+            let cmd = self.read_command().await;
+            if cmd[0] == CMD_SYNC_NEXT_MESSAGE {
+                return;
+            }
+        }
+    }
 }
 
 /// Spin up a [`MeshTransport`] against an in-process loopback listener.
@@ -290,7 +324,9 @@ async fn response_text_returned_to_sender() {
     bridge.send(&contact_msg_frame(sender, "help")).await;
 
     // Payload layout: [CMD_SEND_TXT_MSG][txt_type][attempt][reserved×4][prefix×6][text…]
-    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    // read_text_send skips the drain SyncNextMessage the transport now emits after
+    // each processed inbound message (drain-to-NoMoreMessages hardening).
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out waiting for reply");
 
@@ -334,6 +370,158 @@ async fn prompt_sets_workflow_state() {
         matches!(&received[1].1, Command::WorkflowReply { reply } if reply == "mypassword"),
         "expected WorkflowReply, got {:?}",
         received[1].1
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Workflow idle-timeout: a node stranded in a workflow because its prompt reply
+/// was lost (every message it sends is consumed as workflow input it never sees a
+/// response to) is freed after `workflow_timeout_secs`. The message that trips the
+/// timeout is Cancelled out of the workflow and re-processed as a fresh command.
+#[tokio::test]
+async fn workflow_idle_timeout_frees_stranded_user() {
+    let host = Arc::new(MockHost::new());
+    // A workflow whose reply always re-prompts with the SAME text — models a stage
+    // stuck because the user never sees the prompt (its reply keeps getting lost).
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::Help { .. }),
+        Response::Prompt {
+            text: "Enter code:".to_owned(),
+            hide_input: false,
+        },
+    );
+    host.set_response_for(
+        |cmd| matches!(cmd, Command::WorkflowReply { .. }),
+        Response::Prompt {
+            text: "Enter code:".to_owned(),
+            hide_input: false,
+        },
+    );
+    host.set_default_response(Response::Text("ok".to_owned())); // Cancel etc.
+
+    let (transport, mut bridge) =
+        make_transport_with(Arc::clone(&host), |cfg| cfg.workflow_timeout_secs = 1).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x51u8; 6];
+    // Enter the workflow.
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("initial prompt");
+
+    // Wait past the 1s idle window, then send another message. It should trip the
+    // timeout: Cancel the stale workflow and re-parse "help" as a fresh Help.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("reply after timeout");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let received = host.commands_received();
+    let cmds: Vec<_> = received.iter().map(|(_, c)| c).collect();
+    assert!(
+        received.iter().any(|(_, c)| matches!(c, Command::Cancel)),
+        "the idle-timeout must cancel the stale workflow, got: {cmds:?}"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|(_, c)| matches!(c, Command::WorkflowReply { .. }))
+            .count(),
+        0,
+        "the message that tripped the timeout must NOT be consumed as a workflow reply, got: {cmds:?}"
+    );
+    assert_eq!(
+        received
+            .iter()
+            .filter(|(_, c)| matches!(c, Command::Help { .. }))
+            .count(),
+        2,
+        "both messages reached the host as Help (the 2nd re-parsed after the timeout), got: {cmds:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// The device pushes `PathUpdated` with a node's full 32-byte pubkey after learning
+/// a route. Capturing it enables `flood_after_send`: the post-reply `ResetPath`
+/// (which needs the full key — an inbound DM carries only the 6-byte prefix) then
+/// fires, so the next reply to that node floods instead of dying on a stale direct
+/// path. Without the capture, `get_full_pubkey` is `None` and `ResetPath` is skipped.
+#[tokio::test]
+async fn path_updated_enables_flood_after_send() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x55u8; 6];
+    // Establish a session first (set_full_pubkey no-ops without one).
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("first reply");
+
+    // Device reports the full pubkey (its first 6 bytes are the sender's prefix).
+    let mut pubkey = [0u8; 32];
+    pubkey[..6].copy_from_slice(&sender);
+    pubkey[6] = 0xAB;
+    bridge.send(&path_updated_frame(pubkey)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // The next reply should now be followed by a ResetPath (flood_after_send).
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let mut saw_reset = false;
+    for _ in 0..8 {
+        match tokio::time::timeout(Duration::from_secs(2), bridge.read_command()).await {
+            Ok(cmd) if cmd[0] == CMD_RESET_PATH => {
+                saw_reset = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_reset,
+        "flood_after_send must emit ResetPath once PathUpdated supplied the full pubkey"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Two distinct messages that produce the SAME reply text in the same second must
+/// still be stamped with DIFFERENT outbound timestamps, so the radio's outbound
+/// dedup doesn't collapse them into one byte-identical frame and silently drop the
+/// second reply (the mirror of the inbound whole-second collision). The SendTxtMsg
+/// timestamp is bytes [3..7] of the payload.
+#[tokio::test]
+async fn same_second_identical_replies_get_distinct_timestamps() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x61u8; 6];
+    // Two messages back-to-back (same wall-clock second), same canned reply.
+    bridge.send(&contact_msg_frame(sender, "a")).await;
+    bridge.send(&contact_msg_frame(sender, "b")).await;
+
+    let r1 = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("first reply");
+    let r2 = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("second reply");
+    let ts1 = u32::from_le_bytes([r1[3], r1[4], r1[5], r1[6]]);
+    let ts2 = u32::from_le_bytes([r2[3], r2[4], r2[5], r2[6]]);
+    assert!(
+        ts2 > ts1,
+        "outbound reply timestamps must be strictly increasing so same-second \
+         identical replies aren't dedup-collapsed by the radio (ts1={ts1}, ts2={ts2})"
     );
 
     transport.stop().await.unwrap();
@@ -780,7 +968,8 @@ async fn notify_sends_text_to_node() {
     // Establish a session by sending a message first.
     let sender = [0x33u8; 6];
     bridge.send(&contact_msg_frame(sender, "whoami")).await;
-    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    // read_text_send skips the post-message drain SyncNextMessage.
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out waiting for whoami reply");
 
@@ -791,7 +980,7 @@ async fn notify_sends_text_to_node() {
         .unwrap();
     assert!(matches!(outcome, NotifyOutcome::Queued));
 
-    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out waiting for notification");
 
@@ -842,8 +1031,9 @@ async fn unsupported_app_start_and_sync_still_processes_messages() {
     let sender = [0x55u8; 6];
     bridge.send(&contact_msg_frame(sender, "help")).await;
 
-    // The transport should send back a reply (from MockHost).
-    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    // The transport should send back a reply (from MockHost). read_text_send skips
+    // the post-message drain SyncNextMessage.
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out — drain flag was not cleared; message was silently dropped");
 
@@ -892,10 +1082,215 @@ async fn unsupported_app_start_with_successful_drain_processes_messages() {
     let sender = [0x66u8; 6];
     bridge.send(&contact_msg_frame(sender, "whoami")).await;
 
-    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+    // read_text_send skips the post-message drain SyncNextMessage.
+    let cmd_payload = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
         .await
         .expect("timed out waiting for reply");
     assert_eq!(cmd_payload[0], CMD_SEND_TXT_MSG);
+
+    transport.stop().await.unwrap();
+}
+
+/// Drain-to-NoMoreMessages: after processing a normal (non-draining) inbound
+/// message, the transport emits a follow-up `SyncNextMessage` so it keeps pulling
+/// until the bridge reports the queue empty. This makes delivery robust to a
+/// dropped `MsgWaiting` push (or a bridge/firmware that notifies once per
+/// empty→non-empty transition) instead of stranding a backlog until reconnect.
+#[tokio::test]
+async fn processed_message_emits_followup_sync() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x21u8; 6];
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+
+    // Collect outbound frames until we've seen BOTH the text reply and the drain
+    // SyncNextMessage (their relative order is not guaranteed).
+    let mut saw_sync = false;
+    let mut saw_reply = false;
+    for _ in 0..6 {
+        let cmd = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+            .await
+            .expect("timed out waiting for outbound frames");
+        match cmd[0] {
+            CMD_SYNC_NEXT_MESSAGE => saw_sync = true,
+            CMD_SEND_TXT_MSG => saw_reply = true,
+            _ => {}
+        }
+        if saw_sync && saw_reply {
+            break;
+        }
+    }
+    assert!(saw_reply, "the text reply must be sent");
+    assert!(
+        saw_sync,
+        "a follow-up SyncNextMessage must be emitted to drain the bridge queue"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// On reconnect the transport drains the bridge's queued backlog and processes
+/// EVERY message — including one whose sender clock looks old. The timestamp is
+/// stamped by the sender, whose RTC may never have been synced (firmware's
+/// unsynced default is a 2024 epoch), so an old-looking stamp is not evidence of
+/// staleness; age-based discarding silently ate real commands from clockless
+/// nodes. The backlog is bounded (the firmware offline queue holds 16 frames),
+/// so processing everything cannot burst-reply meaningfully.
+#[tokio::test]
+async fn reconnect_drain_processes_entire_backlog() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    // Manual handshake so queued messages can be injected during the on-connect
+    // drain (before NoMoreMessages clears the draining flag).
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+    let sender = [0x31u8; 6];
+
+    // First drain sync → feed a FRESH queued message (age ~0).
+    let drain1 = bridge.read_command().await;
+    assert_eq!(drain1[0], CMD_SYNC_NEXT_MESSAGE);
+    bridge
+        .send(&contact_msg_frame_ts(sender, "fresh", now))
+        .await;
+
+    // Next drain sync → feed a message whose sender clock reads an hour behind
+    // (a never-synced RTC can be years behind — must still be processed).
+    bridge.read_until_sync().await;
+    bridge
+        .send(&contact_msg_frame_ts(
+            sender,
+            "oldclock",
+            now.saturating_sub(3600),
+        ))
+        .await;
+
+    // Next drain sync → end the drain.
+    bridge.read_until_sync().await;
+    bridge
+        .send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]))
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let received = host.commands_received();
+    let has = |t: &str| {
+        received
+            .iter()
+            .any(|(_, c)| matches!(c, Command::Unknown { raw } if raw == t))
+    };
+    assert!(
+        has("fresh"),
+        "a fresh queued message must be processed on reconnect, got: {:?}",
+        received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+    assert!(
+        has("oldclock"),
+        "a queued message with an old sender clock must be processed too, got: {:?}",
+        received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Channel (group) messages share the device's offline queue with DMs, so a
+/// `CMD_SYNC_NEXT_MESSAGE` pop can return one. The drain chain must continue
+/// past it: without the fix, a channel message popped during the reconnect
+/// drain pinned `draining=true` and stranded any DM queued behind it.
+#[tokio::test]
+async fn channel_message_during_drain_does_not_stall_the_chain() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    // Manual handshake so queue pops can be injected during the on-connect drain.
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    let sender = [0x35u8; 6];
+
+    // First drain sync → the queue pop returns a CHANNEL message.
+    let drain1 = bridge.read_command().await;
+    assert_eq!(drain1[0], CMD_SYNC_NEXT_MESSAGE);
+    bridge.send(&channel_msg_frame(0, "group chatter")).await;
+
+    // The chain must continue: another sync pops the DM queued BEHIND it.
+    bridge.read_until_sync().await;
+    bridge.send(&contact_msg_frame(sender, "behind-chan")).await;
+
+    // And on to the end of the queue.
+    bridge.read_until_sync().await;
+    bridge
+        .send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let received = host.commands_received();
+    assert!(
+        received
+            .iter()
+            .any(|(_, c)| matches!(c, Command::Unknown { raw } if raw == "behind-chan")),
+        "a DM queued behind a channel message must still be drained and processed, got: {:?}",
+        received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+
+    // Draining must have cleared: a LIVE message is processed normally.
+    bridge.send(&contact_msg_frame(sender, "live-after")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("live message after drain must be answered (draining stuck?)");
+
+    transport.stop().await.unwrap();
+}
+
+/// In NORMAL mode the drain-to-NoMoreMessages recovery must also continue past a
+/// channel message: a DM whose MsgWaiting tickle was lost can sit queued behind
+/// one, and only the continued sync chain recovers it.
+#[tokio::test]
+async fn channel_message_in_normal_mode_continues_queue_sync() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x36u8; 6];
+
+    // A MsgWaiting tickle whose pop returns a CHANNEL message; the DM behind it
+    // never got a tickle (dropped). The continued chain must recover it.
+    bridge.send(&radio_frame(&[PUSH_CODE_MSG_WAITING])).await;
+    bridge.read_until_sync().await;
+    bridge.send(&channel_msg_frame(0, "group chatter")).await;
+
+    // Continuation sync → pops the tickle-less DM.
+    bridge.read_until_sync().await;
+    bridge
+        .send(&contact_msg_frame(sender, "tickleless-dm"))
+        .await;
+
+    // The DM's own continuation → queue is empty.
+    bridge.read_until_sync().await;
+    bridge
+        .send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        host.commands_received()
+            .iter()
+            .any(|(_, c)| matches!(c, Command::Unknown { raw } if raw == "tickleless-dm")),
+        "a tickle-less DM behind a channel message must be recovered by the sync chain"
+    );
 
     transport.stop().await.unwrap();
 }

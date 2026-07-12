@@ -117,6 +117,17 @@ pub struct DeliveryStats {
     /// Replies abandoned after exhausting the retransmission budget without a
     /// confirmation.
     gave_up: AtomicU64,
+    /// Inbound plain-text DMs accepted for processing (after the `TXT_TYPE_PLAIN`
+    /// gate, before dedup). The denominator for "how much of what the bridge
+    /// delivered did we actually act on".
+    inbound_received: AtomicU64,
+    /// Inbound messages dropped by the `(timestamp, text)` retransmission dedup.
+    /// A high ratio against `inbound_received` for a node that repeats commands is
+    /// the signature of the dedup over-dropping legitimate traffic.
+    dedup_dropped_timestamp: AtomicU64,
+    /// Inbound messages dropped by the text-only dedup (workflow-reply input and
+    /// the `timestamp == 0` fallback).
+    dedup_dropped_text: AtomicU64,
     /// Number of round-trip latency samples. A sample is recorded when a
     /// confirmation correlates to a tracked send, so this is only populated when
     /// retransmission tracking is enabled (`reply_max_attempts > 1`).
@@ -151,6 +162,9 @@ impl Default for DeliveryStats {
             failed_no_route: AtomicU64::new(0),
             confirmed: AtomicU64::new(0),
             gave_up: AtomicU64::new(0),
+            inbound_received: AtomicU64::new(0),
+            dedup_dropped_timestamp: AtomicU64::new(0),
+            dedup_dropped_text: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_sum_ms: AtomicU64::new(0),
             // Sentinel so the first recorded sample becomes the minimum.
@@ -273,6 +287,23 @@ impl DeliveryStats {
         self.with_node(prefix, |c| c.gave_up += 1);
     }
 
+    /// Record an inbound plain-text DM accepted for processing (post-`TXT_TYPE_PLAIN`,
+    /// pre-dedup).
+    pub fn on_inbound_received(&self) {
+        self.inbound_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an inbound message dropped by the `(timestamp, text)` dedup.
+    pub fn on_dedup_drop_timestamp(&self) {
+        self.dedup_dropped_timestamp.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an inbound message dropped by the text-only dedup (workflow-reply or
+    /// `timestamp == 0` fallback).
+    pub fn on_dedup_drop_text(&self) {
+        self.dedup_dropped_text.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Append a history sample of the current cumulative counters, stamped with
     /// `ts` (Unix seconds). Called on a timer; the oldest sample is dropped once
     /// the buffer is full. Consumers diff consecutive samples for interval rates.
@@ -340,6 +371,9 @@ impl DeliveryStats {
         let failed_no_route = self.failed_no_route.load(Ordering::Relaxed);
         let confirmed = self.confirmed.load(Ordering::Relaxed);
         let gave_up = self.gave_up.load(Ordering::Relaxed);
+        let inbound_received = self.inbound_received.load(Ordering::Relaxed);
+        let dedup_dropped_timestamp = self.dedup_dropped_timestamp.load(Ordering::Relaxed);
+        let dedup_dropped_text = self.dedup_dropped_text.load(Ordering::Relaxed);
 
         // Confirm rate is PER REPLY, not per transmission: the denominator is
         // first sends (distinct replies), not `accepted` (which counts every
@@ -377,6 +411,9 @@ impl DeliveryStats {
             failed_no_route,
             confirmed,
             gave_up,
+            inbound_received,
+            dedup_dropped_timestamp,
+            dedup_dropped_text,
             confirm_rate,
             route_failure_rate,
             latency_count,
@@ -454,6 +491,14 @@ pub struct DeliveryStatsSnapshot {
     pub confirmed: u64,
     /// Replies abandoned after exhausting all retransmission attempts.
     pub gave_up: u64,
+    /// Inbound plain-text DMs accepted for processing (post-`TXT_TYPE_PLAIN`,
+    /// pre-dedup).
+    pub inbound_received: u64,
+    /// Inbound messages dropped by the `(timestamp, text)` retransmission dedup.
+    pub dedup_dropped_timestamp: u64,
+    /// Inbound messages dropped by the text-only dedup (workflow-reply /
+    /// `timestamp == 0` fallback).
+    pub dedup_dropped_text: u64,
     /// Per-reply confirm rate: `confirmed / first_sends` (clamped to ≤ 1.0), or
     /// `null` before any reply has been sent. Not per-transmission, so retries
     /// and floods don't deflate it.
@@ -631,6 +676,26 @@ mod tests {
         let snap = s.snapshot();
         assert_eq!(snap.dropped, 1);
         assert_eq!(snap.gave_up, 2);
+    }
+
+    #[test]
+    fn inbound_counters_are_counted() {
+        let s = DeliveryStats::default();
+        let snap = s.snapshot();
+        // Default is zero across the board.
+        assert_eq!(snap.inbound_received, 0);
+        assert_eq!(snap.dedup_dropped_timestamp, 0);
+        assert_eq!(snap.dedup_dropped_text, 0);
+
+        s.on_inbound_received();
+        s.on_inbound_received();
+        s.on_dedup_drop_timestamp();
+        s.on_dedup_drop_text();
+        s.on_dedup_drop_text();
+        let snap = s.snapshot();
+        assert_eq!(snap.inbound_received, 2);
+        assert_eq!(snap.dedup_dropped_timestamp, 1);
+        assert_eq!(snap.dedup_dropped_text, 2);
     }
 
     #[test]
