@@ -90,6 +90,20 @@ fn contact_msg_frame_ts(sender_prefix: [u8; 6], text: &str, timestamp: u32) -> V
     radio_frame(&payload)
 }
 
+/// RESP_CODE_CHANNEL_MSG_RECV: a channel (group) message popped from the device's
+/// offline queue — the same queue that holds DMs, so the sync chain must be able
+/// to continue past one. Layout: [code][channel_idx][path_len][txt_type][ts×4][text].
+fn channel_msg_frame(channel_idx: u8, text: &str) -> Vec<u8> {
+    let ts = NEXT_TS.fetch_add(1, Ordering::Relaxed);
+    let mut payload = vec![RESP_CODE_CHANNEL_MSG_RECV];
+    payload.push(channel_idx);
+    payload.push(0u8); // path_len
+    payload.push(TXT_TYPE_PLAIN);
+    payload.extend_from_slice(&ts.to_le_bytes());
+    payload.extend_from_slice(text.as_bytes());
+    radio_frame(&payload)
+}
+
 /// RESP_CODE_SENT: the device's reply to a send. `send_type` 0=failed, 1=flood,
 /// 2=direct; `crc` is the expected-ack identifier; `timeout_ms` the delivery hint.
 fn sent_frame(send_type: u8, crc: u32, timeout_ms: u32) -> Vec<u8> {
@@ -1118,13 +1132,15 @@ async fn processed_message_emits_followup_sync() {
     transport.stop().await.unwrap();
 }
 
-/// On reconnect the transport drains the bridge's queued backlog. A FRESH queued
-/// message (recent sender timestamp) is now processed — a DM sent during a brief
-/// disconnect still gets a reply — while a clearly-STALE one (older than the
-/// freshness window) is discarded so recovering from a long outage does not
-/// unleash a burst of replies to long-dead messages.
+/// On reconnect the transport drains the bridge's queued backlog and processes
+/// EVERY message — including one whose sender clock looks old. The timestamp is
+/// stamped by the sender, whose RTC may never have been synced (firmware's
+/// unsynced default is a 2024 epoch), so an old-looking stamp is not evidence of
+/// staleness; age-based discarding silently ate real commands from clockless
+/// nodes. The backlog is bounded (the firmware offline queue holds 16 frames),
+/// so processing everything cannot burst-reply meaningfully.
 #[tokio::test]
-async fn reconnect_drain_processes_fresh_and_discards_stale() {
+async fn reconnect_drain_processes_entire_backlog() {
     let host = Arc::new(MockHost::new());
     host.set_default_response(Response::Text("ok".to_owned()));
     let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
@@ -1141,19 +1157,20 @@ async fn reconnect_drain_processes_fresh_and_discards_stale() {
         .as_secs() as u32;
     let sender = [0x31u8; 6];
 
-    // First drain sync → feed a FRESH queued message (age ~0, within the window).
+    // First drain sync → feed a FRESH queued message (age ~0).
     let drain1 = bridge.read_command().await;
     assert_eq!(drain1[0], CMD_SYNC_NEXT_MESSAGE);
     bridge
         .send(&contact_msg_frame_ts(sender, "fresh", now))
         .await;
 
-    // Next drain sync → feed a STALE queued message (an hour old, past the window).
+    // Next drain sync → feed a message whose sender clock reads an hour behind
+    // (a never-synced RTC can be years behind — must still be processed).
     bridge.read_until_sync().await;
     bridge
         .send(&contact_msg_frame_ts(
             sender,
-            "stale",
+            "oldclock",
             now.saturating_sub(3600),
         ))
         .await;
@@ -1178,8 +1195,101 @@ async fn reconnect_drain_processes_fresh_and_discards_stale() {
         received.iter().map(|(_, c)| c).collect::<Vec<_>>()
     );
     assert!(
-        !has("stale"),
-        "a stale queued message must be discarded on reconnect"
+        has("oldclock"),
+        "a queued message with an old sender clock must be processed too, got: {:?}",
+        received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Channel (group) messages share the device's offline queue with DMs, so a
+/// `CMD_SYNC_NEXT_MESSAGE` pop can return one. The drain chain must continue
+/// past it: without the fix, a channel message popped during the reconnect
+/// drain pinned `draining=true` and stranded any DM queued behind it.
+#[tokio::test]
+async fn channel_message_during_drain_does_not_stall_the_chain() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    // Manual handshake so queue pops can be injected during the on-connect drain.
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    let sender = [0x35u8; 6];
+
+    // First drain sync → the queue pop returns a CHANNEL message.
+    let drain1 = bridge.read_command().await;
+    assert_eq!(drain1[0], CMD_SYNC_NEXT_MESSAGE);
+    bridge.send(&channel_msg_frame(0, "group chatter")).await;
+
+    // The chain must continue: another sync pops the DM queued BEHIND it.
+    bridge.read_until_sync().await;
+    bridge.send(&contact_msg_frame(sender, "behind-chan")).await;
+
+    // And on to the end of the queue.
+    bridge.read_until_sync().await;
+    bridge
+        .send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let received = host.commands_received();
+    assert!(
+        received
+            .iter()
+            .any(|(_, c)| matches!(c, Command::Unknown { raw } if raw == "behind-chan")),
+        "a DM queued behind a channel message must still be drained and processed, got: {:?}",
+        received.iter().map(|(_, c)| c).collect::<Vec<_>>()
+    );
+
+    // Draining must have cleared: a LIVE message is processed normally.
+    bridge.send(&contact_msg_frame(sender, "live-after")).await;
+    let _ = tokio::time::timeout(Duration::from_secs(2), bridge.read_text_send())
+        .await
+        .expect("live message after drain must be answered (draining stuck?)");
+
+    transport.stop().await.unwrap();
+}
+
+/// In NORMAL mode the drain-to-NoMoreMessages recovery must also continue past a
+/// channel message: a DM whose MsgWaiting tickle was lost can sit queued behind
+/// one, and only the continued sync chain recovers it.
+#[tokio::test]
+async fn channel_message_in_normal_mode_continues_queue_sync() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("ok".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    let sender = [0x36u8; 6];
+
+    // A MsgWaiting tickle whose pop returns a CHANNEL message; the DM behind it
+    // never got a tickle (dropped). The continued chain must recover it.
+    bridge.send(&radio_frame(&[PUSH_CODE_MSG_WAITING])).await;
+    bridge.read_until_sync().await;
+    bridge.send(&channel_msg_frame(0, "group chatter")).await;
+
+    // Continuation sync → pops the tickle-less DM.
+    bridge.read_until_sync().await;
+    bridge
+        .send(&contact_msg_frame(sender, "tickleless-dm"))
+        .await;
+
+    // The DM's own continuation → queue is empty.
+    bridge.read_until_sync().await;
+    bridge
+        .send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        host.commands_received()
+            .iter()
+            .any(|(_, c)| matches!(c, Command::Unknown { raw } if raw == "tickleless-dm")),
+        "a tickle-less DM behind a channel message must be recovered by the sync chain"
     );
 
     transport.stop().await.unwrap();

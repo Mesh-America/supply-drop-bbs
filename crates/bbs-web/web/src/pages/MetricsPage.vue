@@ -62,7 +62,6 @@ interface DeliveryStats {
   inbound_received: number
   dedup_dropped_timestamp: number
   dedup_dropped_text: number
-  reconnect_discarded: number
   confirm_rate: number | null
   route_failure_rate: number | null
   latency_count: number
@@ -377,11 +376,6 @@ onUnmounted(() => {
           <div class="big-num">{{ ratePct(dedupDropRate) }}</div>
           <div class="bar-track"><div class="bar-fill" :style="{ width: rateWidth(dedupDropRate) + '%' }" :class="failBarClass(dedupDropRate)"></div></div>
           <div class="card-sub muted">{{ delivery.dedup_dropped_timestamp }} timestamp / {{ delivery.dedup_dropped_text }} text — retransmissions dropped</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Reconnect discards</div>
-          <div class="big-num">{{ delivery.reconnect_discarded }}</div>
-          <div class="card-sub muted">stale backlog dropped while draining on reconnect</div>
         </div>
       </div>
     </section>

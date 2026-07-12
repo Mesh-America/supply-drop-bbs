@@ -12,7 +12,7 @@
 //! It exercises the three inbound signatures this instrumentation surfaces:
 //!   1. a normal DM → `inbound_received`.
 //!   2. a same-timestamp resend → `dedup_dropped_timestamp` (a coarse-clock bridge like pyMC collides two same-second sends).
-//!   3. a reconnect backlog → fresh processed, clearly-stale → `reconnect_discarded`.
+//!   3. a reconnect backlog → all queued messages processed (even old sender clocks).
 //!
 //! This is a diagnostic/demo harness, not a test — it prints, it doesn't assert.
 //! The equivalent assertions live in `tests/transport.rs`.
@@ -127,12 +127,8 @@ fn now_secs() -> u32 {
 fn print_counters(label: &str, transport: &MeshTransport) {
     let s = transport.delivery_stats().snapshot();
     println!(
-        "    {label:<26} inbound_received={}  dedup_dropped_timestamp={}  dedup_dropped_text={}  reconnect_discarded={}  sends_total={}",
-        s.inbound_received,
-        s.dedup_dropped_timestamp,
-        s.dedup_dropped_text,
-        s.reconnect_discarded,
-        s.sends_total,
+        "    {label:<26} inbound_received={}  dedup_dropped_timestamp={}  dedup_dropped_text={}  sends_total={}",
+        s.inbound_received, s.dedup_dropped_timestamp, s.dedup_dropped_text, s.sends_total,
     );
 }
 
@@ -171,8 +167,9 @@ async fn main() {
     print_counters("after normal DM", &transport);
 
     // ── Scenario 2: a resend reusing the SAME timestamp ─────────────────────────
-    // This is the coarse-clock collision: a whole-second bridge (pyMC) stamps two
-    // sends in the same second identically, so the second collides on the
+    // This is the coarse-clock collision: a SENDER bridged through pyMC is
+    // re-stamped whole-second `int(time.time())` at send time, so two sends in
+    // the same second arrive identical and the second collides on the
     // (timestamp, text) key and is dropped. Note `inbound_received` counts
     // *pre-dedup*, so it also increments — net-processed is
     // `inbound_received - dedup_dropped_*`, and `dedup_dropped / inbound_received`
@@ -184,8 +181,11 @@ async fn main() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     print_counters("after same-ts resend", &transport);
 
-    // ── Scenario 3: a reconnect backlog (fresh processed, stale discarded) ──────
-    println!("\n[3] reconnect with a FRESH and a STALE queued message  →  expect inbound_received +1, reconnect_discarded +1");
+    // ── Scenario 3: a reconnect backlog (everything processed) ──────────────────
+    // Queued messages are the user's own commands sent while the BBS was offline;
+    // both are processed and answered, even one whose sender clock looks old (a
+    // never-synced RTC stamps a stale-looking epoch — not evidence of staleness).
+    println!("\n[3] reconnect with two queued messages (one with an old sender clock)  →  expect inbound_received +2");
     drop(bridge); // close the link → the transport reconnects
     let (stream2, _) = listener.accept().await.unwrap();
     let mut bridge = Bridge { stream: stream2 };
@@ -204,7 +204,7 @@ async fn main() {
     bridge
         .send(&contact_msg_frame_ts(
             user,
-            "reconnect-stale",
+            "reconnect-old-clock",
             now.saturating_sub(3600),
         ))
         .await;

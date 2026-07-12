@@ -199,6 +199,15 @@ pub struct MeshConfig {
     /// destination regardless of whether the BBS's stored route is still
     /// valid.  Disabling this restores the previous direct-path-only
     /// behaviour.  Defaults to `true`.
+    ///
+    /// Note the reply itself is **not** flooded — it travels the device's
+    /// current stored path; the reset only affects the *next* outbound to that
+    /// node. The device also re-learns a path from the node's own inbound
+    /// traffic (`PathUpdated`), which bounds the flooding cost to occasional
+    /// unsolicited pushes. Purely single-hop deployments (every node in direct
+    /// range) may set this to `false`; multi-hop deployments should leave it
+    /// on — retransmission (when enabled) also relies on the reset to flood a
+    /// retried reply.
     #[serde(default = "default_flood_after_send")]
     pub flood_after_send: bool,
 

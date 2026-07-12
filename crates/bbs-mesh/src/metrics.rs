@@ -128,10 +128,6 @@ pub struct DeliveryStats {
     /// Inbound messages dropped by the text-only dedup (workflow-reply input and
     /// the `timestamp == 0` fallback).
     dedup_dropped_text: AtomicU64,
-    /// Inbound messages discarded while draining the bridge queue on reconnect
-    /// because they were older than the freshness window (stale backlog). A
-    /// non-zero value means DMs sent while the BBS was disconnected were dropped.
-    reconnect_discarded: AtomicU64,
     /// Number of round-trip latency samples. A sample is recorded when a
     /// confirmation correlates to a tracked send, so this is only populated when
     /// retransmission tracking is enabled (`reply_max_attempts > 1`).
@@ -169,7 +165,6 @@ impl Default for DeliveryStats {
             inbound_received: AtomicU64::new(0),
             dedup_dropped_timestamp: AtomicU64::new(0),
             dedup_dropped_text: AtomicU64::new(0),
-            reconnect_discarded: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             latency_sum_ms: AtomicU64::new(0),
             // Sentinel so the first recorded sample becomes the minimum.
@@ -309,12 +304,6 @@ impl DeliveryStats {
         self.dedup_dropped_text.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record an inbound message discarded as stale backlog while draining on
-    /// reconnect.
-    pub fn on_reconnect_discard(&self) {
-        self.reconnect_discarded.fetch_add(1, Ordering::Relaxed);
-    }
-
     /// Append a history sample of the current cumulative counters, stamped with
     /// `ts` (Unix seconds). Called on a timer; the oldest sample is dropped once
     /// the buffer is full. Consumers diff consecutive samples for interval rates.
@@ -385,7 +374,6 @@ impl DeliveryStats {
         let inbound_received = self.inbound_received.load(Ordering::Relaxed);
         let dedup_dropped_timestamp = self.dedup_dropped_timestamp.load(Ordering::Relaxed);
         let dedup_dropped_text = self.dedup_dropped_text.load(Ordering::Relaxed);
-        let reconnect_discarded = self.reconnect_discarded.load(Ordering::Relaxed);
 
         // Confirm rate is PER REPLY, not per transmission: the denominator is
         // first sends (distinct replies), not `accepted` (which counts every
@@ -426,7 +414,6 @@ impl DeliveryStats {
             inbound_received,
             dedup_dropped_timestamp,
             dedup_dropped_text,
-            reconnect_discarded,
             confirm_rate,
             route_failure_rate,
             latency_count,
@@ -512,8 +499,6 @@ pub struct DeliveryStatsSnapshot {
     /// Inbound messages dropped by the text-only dedup (workflow-reply /
     /// `timestamp == 0` fallback).
     pub dedup_dropped_text: u64,
-    /// Inbound messages discarded as stale backlog while draining on reconnect.
-    pub reconnect_discarded: u64,
     /// Per-reply confirm rate: `confirmed / first_sends` (clamped to ≤ 1.0), or
     /// `null` before any reply has been sent. Not per-transmission, so retries
     /// and floods don't deflate it.
@@ -701,19 +686,16 @@ mod tests {
         assert_eq!(snap.inbound_received, 0);
         assert_eq!(snap.dedup_dropped_timestamp, 0);
         assert_eq!(snap.dedup_dropped_text, 0);
-        assert_eq!(snap.reconnect_discarded, 0);
 
         s.on_inbound_received();
         s.on_inbound_received();
         s.on_dedup_drop_timestamp();
         s.on_dedup_drop_text();
         s.on_dedup_drop_text();
-        s.on_reconnect_discard();
         let snap = s.snapshot();
         assert_eq!(snap.inbound_received, 2);
         assert_eq!(snap.dedup_dropped_timestamp, 1);
         assert_eq!(snap.dedup_dropped_text, 2);
-        assert_eq!(snap.reconnect_discarded, 1);
     }
 
     #[test]
