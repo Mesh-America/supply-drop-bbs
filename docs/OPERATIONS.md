@@ -762,27 +762,27 @@ When users report that DMs to the BBS are "less reliable than normal messaging"
 or that "the BBS didn't respond", the stats snapshot
 (`GET /api/v1/transports/meshcore/stats`) carries **inbound** counters alongside
 the outbound reply metrics above. Together they localize *where* a message is
-being lost — the radio return path, the BBS's own dedup, or a reconnect:
+being lost — the radio return path or the BBS's own dedup:
 
 - `inbound_received` — plain-text DMs the BBS accepted for processing.
 - `dedup_dropped_timestamp` / `dedup_dropped_text` — inbound messages the BBS
   dropped as retransmissions before acting on them.
-- `reconnect_discarded` — messages discarded as stale backlog while draining the
-  bridge queue after a reconnect.
+
+(Messages queued at the bridge while the BBS was offline are all processed on
+reconnect — they get replies like live traffic — so there is no separate
+reconnect-loss counter.)
 
 Read them against the outbound `sends_total` / `confirm_rate` / `failed_no_route`
-to tell the three failure modes apart:
+to tell the failure modes apart:
 
 | Symptom | What the numbers show | Likely cause |
 |---------|-----------------------|--------------|
 | BBS replies, user never sees them | `sends_total` climbs, `confirm_rate ≈ 0`, `failed_no_route ≈ 0` | **Outbound return-path loss.** The device accepts every send but no end-to-end ACK returns — a lossy multi-hop reverse path. Replies are not retried by default (`reply_max_attempts = 1`). |
-| BBS "ignores" repeated commands | `dedup_dropped_timestamp` rises against `inbound_received` for that node | **Inbound dedup.** A bridge that stamps coarse whole-second timestamps (the pyMC bridge does) makes two identical sends in the same second collide and the second is dropped. Confirm with a `DEBUG` log line `dropping retransmitted message (timestamp dedup)`. |
-| DMs sent during an outage vanish | `reconnect_discarded` is non-zero | **Reconnect backlog.** Messages older than the freshness window are discarded on reconnect; fresh ones are now processed. |
+| BBS "ignores" repeated commands | `dedup_dropped_timestamp` rises against `inbound_received` for that node | **Inbound dedup.** The dedup keys on the timestamp the *sender* stamped. Senders bridged through pyMC are re-stamped whole-second `int(time.time())` at send time, so two identical sends from such a sender in the same second collide and the second is dropped. Senders on real firmware carry their app's stamp, which is normally distinct per send. Confirm with a `DEBUG` log line `dropping retransmitted message (timestamp dedup)`. |
 
 For a live trace, raise the log level to `DEBUG` (Settings page or `[logging]
-level = "DEBUG"`) and watch for `mesh: inbound message received`,
-`mesh: dropping retransmitted message …`, and
-`mesh: discarding stale queued message (draining)`.
+level = "DEBUG"`) and watch for `mesh: inbound message received` and
+`mesh: dropping retransmitted message …`.
 
 > Note: retrying lost **outbound** replies is not as simple as raising
 > `reply_max_attempts` — on a link that never confirms, the tracker would
