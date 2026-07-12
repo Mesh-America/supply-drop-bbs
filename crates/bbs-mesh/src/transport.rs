@@ -241,6 +241,11 @@ pub struct MeshTransport {
     /// a potentially-stale direct path.  Can be disabled in config to
     /// restore pre-v0.2.4 direct-path-only behaviour.
     flood_after_send: bool,
+    /// Seconds a node may await a workflow reply before the transport cancels the
+    /// stale workflow and treats the node's next message as a fresh command.
+    /// A lost prompt reply otherwise strands the node in an invisible workflow.
+    /// `0` disables the timeout.
+    workflow_timeout_secs: u64,
     /// Tracks in-flight replies and drives retransmission on missing ACKs.
     /// Shared with the event-loop task (which owns the retry timer and the
     /// `Sent`/`SendConfirmed` correlation). See [`crate::send_tracker`].
@@ -330,6 +335,7 @@ impl Plugin for MeshTransport {
             node_credential_ttl_days: config.node_credential_ttl_days,
             draining: Arc::new(AtomicBool::new(false)),
             flood_after_send: config.flood_after_send,
+            workflow_timeout_secs: config.workflow_timeout_secs,
             send_tracker: Arc::new(Mutex::new(SendTracker::new(RetryConfig {
                 max_attempts: config.reply_max_attempts.max(1),
                 min_timeout: REPLY_ACK_MIN_WAIT,
@@ -359,6 +365,7 @@ impl Plugin for MeshTransport {
         let welcome = self.welcome_message.clone();
         let ttl_days = self.node_credential_ttl_days;
         let flood_after_send = self.flood_after_send;
+        let workflow_timeout_secs = self.workflow_timeout_secs;
 
         // Admin channel: web UI → event loop for key operations.
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<bbs_plugin_api::MeshKeyRequest>(4);
@@ -467,6 +474,7 @@ impl Plugin for MeshTransport {
             ttl_days,
             draining,
             flood_after_send,
+            workflow_timeout_secs,
             send_tracker,
             delivery_stats,
             key_rx,
@@ -677,6 +685,7 @@ async fn event_loop(
     node_credential_ttl_days: u32,
     draining: Arc<AtomicBool>,
     flood_after_send: bool,
+    workflow_timeout_secs: u64,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
     mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
@@ -724,6 +733,7 @@ async fn event_loop(
         welcome_message,
         node_credential_ttl_days,
         flood_after_send,
+        workflow_timeout_secs,
         Arc::clone(&send_tracker),
         Arc::clone(&delivery_stats),
     ));
@@ -1353,6 +1363,29 @@ async fn handle_frame(
             }
         }
 
+        // ── Path (re)learned to a node ────────────────────────────────────────
+        // The device pushes the full 32-byte pubkey when it learns or refreshes a
+        // route to a contact. Capture it: forcing a reply to flood (so it isn't
+        // lost on a stale multi-hop direct path) is done with `ResetPath`, which
+        // needs the full key — but an inbound DM only carries the 6-byte prefix,
+        // and `GetContacts` runs once on connect, before first-contact sessions
+        // exist. Without this the full key stays unknown for exactly the far
+        // nodes that need flooding, so `flood_after_send`'s post-reply ResetPath
+        // is silently skipped (`get_full_pubkey` returns None) and every reply
+        // goes direct. `set_full_pubkey` no-ops until a session exists; PathUpdated
+        // arrives after the inbound DM created it, so it lands.
+        InboundFrame::PathUpdated { pubkey } => {
+            let prefix: [u8; 6] = pubkey[..6].try_into().expect("pubkey is 32 bytes");
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_full_pubkey(&prefix, pubkey);
+            debug!(
+                prefix = prefix[0],
+                "mesh: PathUpdated — captured full pubkey (enables flood-after-send for this node)"
+            );
+        }
+
         // ── Everything else ───────────────────────────────────────────────────
         other => {
             debug!("mesh: ignoring frame {other:?}");
@@ -1388,6 +1421,7 @@ async fn command_worker(
     welcome_message: String,
     node_credential_ttl_days: u32,
     flood_after_send: bool,
+    workflow_timeout_secs: u64,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
 ) {
@@ -1403,6 +1437,7 @@ async fn command_worker(
             &welcome_message,
             node_credential_ttl_days,
             flood_after_send,
+            workflow_timeout_secs,
             &send_tracker,
             &delivery_stats,
         )
@@ -1424,6 +1459,7 @@ async fn dispatch_message(
     welcome_message: &str,
     node_credential_ttl_days: u32,
     flood_after_send: bool,
+    workflow_timeout_secs: u64,
     send_tracker: &Arc<Mutex<SendTracker>>,
     delivery_stats: &Arc<DeliveryStats>,
 ) {
@@ -1451,6 +1487,44 @@ async fn dispatch_message(
         .lock()
         .expect("state mutex poisoned")
         .is_awaiting_reply(&sender_prefix);
+
+    // ── Workflow idle-timeout ─────────────────────────────────────────────────
+    // If this node has been awaiting a workflow reply longer than the configured
+    // window, its prompt reply was almost certainly lost on the return path and
+    // the node is stranded: every message it sends is consumed as workflow input
+    // whose "try again" response is also lost, and only `cancel` breaks the loop.
+    // Cancel the stale workflow on BOTH sides — via Command::Cancel so the host's
+    // Workflow resets in sync with the transport flag — and treat THIS message as
+    // a fresh command (fall through with awaiting_reply = false). The timer is
+    // stamped per workflow stage (see SessionState::update_awaiting_reply), so a
+    // legitimately-progressing multi-step flow is not cut short.
+    let awaiting_reply = if awaiting_reply
+        && workflow_timeout_secs > 0
+        && state
+            .lock()
+            .expect("state mutex poisoned")
+            .awaiting_reply_expired(&sender_prefix, Duration::from_secs(workflow_timeout_secs))
+    {
+        info!(
+            ?session,
+            timeout_secs = workflow_timeout_secs,
+            "mesh: workflow idle-timeout — cancelling stale workflow, treating message as a fresh command"
+        );
+        // Reset host-side workflow state in sync (handle_cancel → Workflow::None).
+        // The response is discarded; the current message is re-processed below as
+        // a fresh command. Cancel is infallible on a live session; on a stale one
+        // it errors harmlessly and the replay below hits the UnknownSession path.
+        if let Err(e) = host.process_command(session, Command::Cancel).await {
+            warn!(?session, "mesh: workflow-timeout cancel error: {e}");
+        }
+        state
+            .lock()
+            .expect("state mutex poisoned")
+            .update_awaiting_reply(&sender_prefix, None);
+        false
+    } else {
+        awaiting_reply
+    };
 
     // ── Build greeting for unauthenticated nodes ──────────────────────────────
     // Show the welcome banner to any unauthenticated node on every message so
@@ -1680,11 +1754,19 @@ async fn dispatch_message(
         }
     }
 
-    // ── Update workflow-reply flag ────────────────────────────────────────────
-    let is_prompt = matches!(response, Response::Prompt { .. });
+    // ── Update workflow-reply state ───────────────────────────────────────────
+    // A Prompt response means the node's next message continues a workflow; any
+    // other response ends it. update_awaiting_reply also stamps the idle-timeout
+    // clock (per workflow stage — only when the prompt text changes), so a node
+    // stranded by a lost prompt reply can be freed (see the workflow idle-timeout
+    // near the top of dispatch_message).
+    let prompt_text: Option<&str> = match &response {
+        Response::Prompt { text, .. } => Some(text.as_str()),
+        _ => None,
+    };
     {
         let mut state = state.lock().expect("state mutex poisoned");
-        state.set_awaiting_reply(&sender_prefix, is_prompt);
+        state.update_awaiting_reply(&sender_prefix, prompt_text);
         // A new prompt begins a fresh reply turn, so the user's next message is
         // genuine input even if it repeats the previous reply verbatim. Clear
         // the message-dedup baseline so the general retransmission dedup can't
@@ -1699,7 +1781,7 @@ async fn dispatch_message(
         // Do NOT also clear `recent_msgs` here: that would let a delayed
         // retransmission of the previous reply through after a prompt, re-opening
         // the very "Error: Already logged in" reprocessing this dedup prevents.
-        if is_prompt {
+        if prompt_text.is_some() {
             state.clear_last_message(&sender_prefix);
         }
     }

@@ -68,6 +68,20 @@ pub struct SessionEntry {
     /// prompted input are never mis-parsed as command keywords.
     pub awaiting_reply: bool,
 
+    /// When the current workflow *stage* began awaiting a reply. Used to expire a
+    /// workflow stranded by a lost prompt reply (the node keeps sending messages
+    /// that are consumed as workflow input whose responses it never sees). Stamped
+    /// only when the prompt text changes (a new stage), so a user stuck repeating
+    /// the same prompt does not keep resetting the idle timer. `None` when not
+    /// awaiting a reply.
+    pub awaiting_reply_since: Option<Instant>,
+
+    /// The text of the last `Response::Prompt` sent to this node. Distinguishes a
+    /// *new* workflow stage (different prompt text → reset `awaiting_reply_since`)
+    /// from a stage stuck because its prompt reply keeps getting lost (identical
+    /// prompt text → timer keeps running so the workflow can time out).
+    pub last_prompt_text: Option<String>,
+
     /// The last text sent as a `WorkflowReply`, with the time it was
     /// processed. Used to silently drop mesh retransmissions of workflow
     /// input (passwords etc.) that arrive after the workflow completes.
@@ -136,6 +150,8 @@ impl SessionState {
             SessionEntry {
                 session_id: new_id,
                 awaiting_reply: false,
+                awaiting_reply_since: None,
+                last_prompt_text: None,
                 last_workflow_reply: None,
                 last_message: None,
                 recent_msgs: VecDeque::new(),
@@ -162,11 +178,34 @@ impl SessionState {
         }
     }
 
-    /// Set the `awaiting_reply` flag for `prefix`.  No-op if the prefix has no
-    /// session.
-    pub fn set_awaiting_reply(&mut self, prefix: &[u8; 6], value: bool) {
+    /// Update the workflow-reply state for `prefix` from a host response.
+    ///
+    /// `prompt_text` is `Some` when the host response was a `Response::Prompt`
+    /// (the node's next message continues a workflow) and `None` otherwise.
+    ///
+    /// On a prompt, `awaiting_reply` is set and `awaiting_reply_since` is stamped
+    /// **only if the prompt text differs from the last one** — a *new* workflow
+    /// stage. A repeated identical prompt (a stage stuck because its reply keeps
+    /// getting lost on a multi-hop link) does not reset the timer, so
+    /// [`Self::awaiting_reply_expired`] can eventually free the node. On a
+    /// non-prompt response the workflow state is cleared. No-op if the prefix has
+    /// no session.
+    pub fn update_awaiting_reply(&mut self, prefix: &[u8; 6], prompt_text: Option<&str>) {
         if let Some(entry) = self.by_prefix.get_mut(prefix) {
-            entry.awaiting_reply = value;
+            match prompt_text {
+                Some(text) => {
+                    entry.awaiting_reply = true;
+                    if entry.last_prompt_text.as_deref() != Some(text) {
+                        entry.awaiting_reply_since = Some(Instant::now());
+                        entry.last_prompt_text = Some(text.to_owned());
+                    }
+                }
+                None => {
+                    entry.awaiting_reply = false;
+                    entry.awaiting_reply_since = None;
+                    entry.last_prompt_text = None;
+                }
+            }
         }
     }
 
@@ -174,6 +213,17 @@ impl SessionState {
     /// workflow reply.
     pub fn is_awaiting_reply(&self, prefix: &[u8; 6]) -> bool {
         self.by_prefix.get(prefix).is_some_and(|e| e.awaiting_reply)
+    }
+
+    /// Return `true` if `prefix` has been awaiting a workflow reply (for the
+    /// current stage) longer than `timeout` — i.e. the workflow is stale (its
+    /// prompt reply was likely lost) and should be cancelled. `false` if the
+    /// prefix is not awaiting a reply or is still within the window.
+    pub fn awaiting_reply_expired(&self, prefix: &[u8; 6], timeout: Duration) -> bool {
+        self.by_prefix
+            .get(prefix)
+            .and_then(|e| e.awaiting_reply_since)
+            .is_some_and(|since| since.elapsed() >= timeout)
     }
 
     /// Record `text` as the most-recently-processed workflow reply for
@@ -323,6 +373,68 @@ mod tests {
         let mut st = SessionState::default();
         st.get_or_insert(PREFIX, SessionId::__internal_new(1));
         st
+    }
+
+    #[test]
+    fn awaiting_reply_stamps_on_prompt_and_clears() {
+        let mut st = state_with_session();
+        assert!(!st.is_awaiting_reply(&PREFIX));
+
+        st.update_awaiting_reply(&PREFIX, Some("Choose a password:"));
+        assert!(st.is_awaiting_reply(&PREFIX));
+        assert!(
+            st.by_prefix
+                .get(&PREFIX)
+                .unwrap()
+                .awaiting_reply_since
+                .is_some(),
+            "a prompt stamps the idle-timeout clock"
+        );
+
+        // A non-prompt response ends the workflow and clears the clock.
+        st.update_awaiting_reply(&PREFIX, None);
+        assert!(!st.is_awaiting_reply(&PREFIX));
+        assert!(st
+            .by_prefix
+            .get(&PREFIX)
+            .unwrap()
+            .awaiting_reply_since
+            .is_none());
+    }
+
+    #[test]
+    fn repeated_prompt_does_not_reset_the_idle_clock() {
+        let mut st = state_with_session();
+        let stuck = "Password must be at least 8 characters. Try again:";
+        st.update_awaiting_reply(&PREFIX, Some(stuck));
+        let first = st.by_prefix.get(&PREFIX).unwrap().awaiting_reply_since;
+
+        // The SAME prompt text (a stage stuck because its reply keeps getting lost)
+        // must NOT reset the clock — otherwise a retrying user never times out.
+        st.update_awaiting_reply(&PREFIX, Some(stuck));
+        let second = st.by_prefix.get(&PREFIX).unwrap().awaiting_reply_since;
+        assert_eq!(
+            first, second,
+            "an identical repeated prompt keeps the timestamp"
+        );
+
+        // A DIFFERENT prompt (the workflow advanced a stage) DOES reset it.
+        st.update_awaiting_reply(&PREFIX, Some("Confirm your password:"));
+        let third = st.by_prefix.get(&PREFIX).unwrap().awaiting_reply_since;
+        assert_ne!(first, third, "a new workflow stage resets the idle clock");
+    }
+
+    #[test]
+    fn awaiting_reply_expiry_respects_window() {
+        let mut st = state_with_session();
+        // Not awaiting → never expired.
+        assert!(!st.awaiting_reply_expired(&PREFIX, Duration::ZERO));
+
+        st.update_awaiting_reply(&PREFIX, Some("Choose a password:"));
+        // Elapsed is always ≥ 0, so a zero window is immediately expired…
+        assert!(st.awaiting_reply_expired(&PREFIX, Duration::ZERO));
+        // …but a generous window is not.
+        assert!(!st.awaiting_reply_expired(&PREFIX, Duration::from_secs(3600)));
     }
 
     #[test]
