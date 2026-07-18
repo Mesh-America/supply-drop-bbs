@@ -42,6 +42,7 @@ export default defineConfig({
         link: 'https://github.com/Mesh-America/supply-drop-bbs',
       },
       { text: 'Mesh America', link: 'https://meshamerica.com' },
+      { text: '💚 Pitch In', link: 'https://meshamerica.com/pitch-in/' },
     ],
 
     sidebar: [
