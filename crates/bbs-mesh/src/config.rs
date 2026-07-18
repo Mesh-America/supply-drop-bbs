@@ -191,6 +191,18 @@ pub struct MeshConfig {
     #[serde(default = "default_node_credential_ttl_days")]
     pub node_credential_ttl_days: u32,
 
+    /// Number of bytes each hop adds to a flooded packet's routing path
+    /// (MeshCore's path-hash width): `2` or `3`.
+    ///
+    /// More bytes make path-hash collisions — and the mis-routes they cause — less
+    /// likely on a dense mesh, at the cost of a little more airtime per packet and
+    /// a lower maximum hop count. Pushed to the radio on each connect. Defaults to
+    /// `3`. Values other than `2` or `3` are clamped into range. (Maps to the
+    /// firmware `path_hash_mode = path_bytes - 1`; the 1-byte legacy mode is not
+    /// exposed.)
+    #[serde(default = "default_path_bytes")]
+    pub path_bytes: u8,
+
     /// Reset a node's stored path immediately after sending it a message,
     /// so that the next outbound message (e.g. a mail notification) is
     /// delivered via flood rather than a potentially-stale direct path.
@@ -275,6 +287,13 @@ impl MeshConfig {
     pub fn reconnect_delay_max(&self) -> Duration {
         Duration::from_millis(self.reconnect_delay_max_ms)
     }
+
+    /// The firmware `path_hash_mode` value (`path_bytes - 1`) to push to the
+    /// radio. `path_bytes` is clamped to the supported 2–3 byte range first, so
+    /// an out-of-range config value can never send an illegal mode.
+    pub fn path_hash_mode(&self) -> u8 {
+        self.path_bytes.clamp(2, 3) - 1
+    }
 }
 
 impl Default for MeshConfig {
@@ -291,6 +310,7 @@ impl Default for MeshConfig {
             reconnect_delay_initial_ms: default_reconnect_initial_ms(),
             reconnect_delay_max_ms: default_reconnect_max_ms(),
             node_credential_ttl_days: default_node_credential_ttl_days(),
+            path_bytes: default_path_bytes(),
             flood_after_send: default_flood_after_send(),
             reply_max_attempts: default_reply_max_attempts(),
             workflow_timeout_secs: default_workflow_timeout_secs(),
@@ -329,6 +349,10 @@ fn default_node_credential_ttl_days() -> u32 {
     14
 }
 
+fn default_path_bytes() -> u8 {
+    3
+}
+
 fn default_flood_after_send() -> bool {
     true
 }
@@ -359,5 +383,30 @@ mod tests {
         // An omitted key must resolve to the off default via the serde wiring.
         let cfg: MeshConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.reply_max_attempts, 1);
+    }
+
+    /// Paths default to 3 bytes, and `path_hash_mode()` maps bytes → firmware
+    /// mode (2→1, 3→2) while clamping out-of-range values so the transport can
+    /// never push an illegal mode to the radio.
+    #[test]
+    fn path_bytes_defaults_to_three() {
+        assert_eq!(MeshConfig::default().path_bytes, 3);
+        let cfg: MeshConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.path_bytes, 3);
+    }
+
+    #[test]
+    fn path_hash_mode_maps_and_clamps() {
+        let mode = |b: u8| {
+            MeshConfig {
+                path_bytes: b,
+                ..MeshConfig::default()
+            }
+            .path_hash_mode()
+        };
+        assert_eq!(mode(2), 1); // 2-byte → firmware mode 1
+        assert_eq!(mode(3), 2); // 3-byte → firmware mode 2
+        assert_eq!(mode(0), 1); // clamped up to 2-byte
+        assert_eq!(mode(9), 2); // clamped down to 3-byte
     }
 }

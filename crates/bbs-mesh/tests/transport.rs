@@ -162,6 +162,17 @@ impl Bridge {
         );
         let no_more = radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]);
         self.send(&no_more).await;
+        // On connect the transport sets the routing path-hash width (2/3-byte
+        // paths). With the default config this is 3-byte → firmware mode 2.
+        let set_path = self.read_command().await;
+        assert_eq!(
+            set_path[0], CMD_SET_PATH_HASH_MODE,
+            "expected CMD_SET_PATH_HASH_MODE after drain"
+        );
+        assert_eq!(
+            set_path[2], 2,
+            "default path_bytes=3 maps to firmware mode 2"
+        );
         // Transport sends CMD_GET_CONTACTS immediately after connect to populate
         // the advert bus. Read and discard it — the mock bridge sends no contacts.
         let get_contacts = self.read_command().await;
@@ -249,6 +260,17 @@ impl Bridge {
             }
         }
     }
+
+    /// Read outbound frames until one with command byte `want` appears, skipping
+    /// any others. Returns its payload.
+    async fn read_until_cmd(&mut self, want: u8) -> Vec<u8> {
+        loop {
+            let cmd = self.read_command().await;
+            if cmd[0] == want {
+                return cmd;
+            }
+        }
+    }
 }
 
 /// Spin up a [`MeshTransport`] against an in-process loopback listener.
@@ -286,6 +308,34 @@ async fn make_transport_with(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// The configured `path_bytes` is pushed to the radio on connect as the firmware
+/// path-hash mode: 2-byte paths → mode 1 (3-byte → mode 2 is covered by the
+/// default assertion in `complete_handshake`). The command layout is
+/// `[CMD_SET_PATH_HASH_MODE, 0x00, mode]`.
+#[tokio::test]
+async fn path_hash_mode_set_from_config_on_connect() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
+        cfg.path_bytes = 2; // 2-byte paths → firmware mode 1
+    })
+    .await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    let set_path = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_PATH_HASH_MODE),
+    )
+    .await
+    .expect("expected CMD_SET_PATH_HASH_MODE on connect");
+    assert_eq!(set_path[1], 0, "subtype byte must be 0");
+    assert_eq!(set_path[2], 1, "path_bytes=2 maps to firmware mode 1");
+
+    transport.stop().await.unwrap();
+}
 
 /// After the handshake, a `help` DM reaches the host as `Command::Help`.
 #[tokio::test]

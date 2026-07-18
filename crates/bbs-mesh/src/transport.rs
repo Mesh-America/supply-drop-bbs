@@ -288,6 +288,9 @@ pub struct MeshTransport {
     /// A lost prompt reply otherwise strands the node in an invisible workflow.
     /// `0` disables the timeout.
     workflow_timeout_secs: u64,
+    /// Firmware path-hash mode (`path_bytes - 1`) pushed to the radio on connect,
+    /// selecting 2- or 3-byte routing paths.
+    path_hash_mode: u8,
     /// Tracks in-flight replies and drives retransmission on missing ACKs.
     /// Shared with the event-loop task (which owns the retry timer and the
     /// `Sent`/`SendConfirmed` correlation). See [`crate::send_tracker`].
@@ -365,6 +368,8 @@ impl Plugin for MeshTransport {
 
         let cmd_tx = client.sender();
         let (shutdown_tx, _) = watch::channel(false);
+        // Compute before the struct literal moves fields out of `config`.
+        let path_hash_mode = config.path_hash_mode();
 
         Ok(Self {
             host,
@@ -378,6 +383,7 @@ impl Plugin for MeshTransport {
             draining: Arc::new(AtomicBool::new(false)),
             flood_after_send: config.flood_after_send,
             workflow_timeout_secs: config.workflow_timeout_secs,
+            path_hash_mode,
             send_tracker: Arc::new(Mutex::new(SendTracker::new(RetryConfig {
                 max_attempts: config.reply_max_attempts.max(1),
                 min_timeout: REPLY_ACK_MIN_WAIT,
@@ -408,6 +414,7 @@ impl Plugin for MeshTransport {
         let ttl_days = self.node_credential_ttl_days;
         let flood_after_send = self.flood_after_send;
         let workflow_timeout_secs = self.workflow_timeout_secs;
+        let path_hash_mode = self.path_hash_mode;
 
         // Admin channel: web UI → event loop for key operations.
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<bbs_plugin_api::MeshKeyRequest>(4);
@@ -517,6 +524,7 @@ impl Plugin for MeshTransport {
             draining,
             flood_after_send,
             workflow_timeout_secs,
+            path_hash_mode,
             send_tracker,
             delivery_stats,
             key_rx,
@@ -731,6 +739,7 @@ async fn event_loop(
     draining: Arc<AtomicBool>,
     flood_after_send: bool,
     workflow_timeout_secs: u64,
+    path_hash_mode: u8,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
     mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
@@ -857,6 +866,18 @@ async fn event_loop(
                                     TRANSPORT_NAME,
                                 );
                             }
+                            // Set the routing path-hash width (2- or 3-byte paths).
+                            // Pushed here in the SelfInfo branch — a device modern
+                            // enough to answer AppStart supports this newer command;
+                            // older firmware (no SelfInfo) is left on its own default.
+                            let mode = path_hash_mode;
+                            info!(
+                                path_bytes = mode + 1,
+                                "mesh: setting path-hash width"
+                            );
+                            let _ = cmd_tx
+                                .send(OutboundFrame::SetPathHashMode { mode })
+                                .await;
                         } else {
                             // Device did not return SelfInfo (CMD_APP_START
                             // was unsupported) — node identity is unavailable
