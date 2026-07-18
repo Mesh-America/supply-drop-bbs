@@ -56,6 +56,7 @@ struct Existing {
     mesh_serial_port: Option<String>,
     mesh_baud_rate: u32,
     mesh_addr: Option<String>,
+    mesh_path_bytes: u8,
     // Meshtastic
     meshtastic_enabled: bool,
     meshtastic_connection_type: String,
@@ -172,6 +173,11 @@ fn load_existing(out_path: &Path) -> Existing {
         .and_then(|m| m.get("addr"))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
+    let mesh_path_bytes = mesh
+        .and_then(|m| m.get("path_bytes"))
+        .and_then(|v| v.as_integer())
+        .map(|v| v as u8)
+        .unwrap_or(3);
 
     // Meshtastic existing values
     let meshtastic_enabled = meshtastic
@@ -304,6 +310,7 @@ fn load_existing(out_path: &Path) -> Existing {
         mesh_serial_port,
         mesh_baud_rate,
         mesh_addr,
+        mesh_path_bytes,
         meshtastic_enabled,
         meshtastic_connection_type,
         meshtastic_serial_port,
@@ -620,6 +627,32 @@ pub fn run_wizard(config_out: Option<&Path>) {
         mesh_baud_rate = None;
         mesh_addr = None;
     }
+
+    // ── MeshCore routing (path-hash width) ────────────────────────────────────
+    //
+    // A companion-frame protocol setting, not a physical radio parameter, so it
+    // applies regardless of connection type (serial/HAT/TCP). The BBS pushes it
+    // to the device on every connect.
+
+    let mesh_path_bytes: u8 = if use_mesh {
+        section("MeshCore routing");
+
+        println!("Bytes each hop adds to a flooded packet's routing path. More bytes");
+        println!("make path-hash collisions (mis-routes) less likely on a dense mesh,");
+        println!("at a little more airtime per packet.");
+        println!();
+
+        let items = &["3-byte (recommended)", "2-byte"];
+        let default = if ex.mesh_path_bytes == 2 { 1 } else { 0 };
+        let choice = prompt_select(&theme, "Routing path width", items, default);
+        if choice == 1 {
+            2
+        } else {
+            3
+        }
+    } else {
+        ex.mesh_path_bytes
+    };
 
     // ── MeshCore radio parameters (serial mode only) ──────────────────────────
     //
@@ -1133,6 +1166,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         mesh_serial_port: mesh_serial_port.as_deref(),
         mesh_baud_rate,
         mesh_addr: mesh_addr.as_deref(),
+        mesh_path_bytes,
         use_meshtastic,
         meshtastic_connection_type: meshtastic_conn_type,
         meshtastic_serial_port: meshtastic_serial_port.as_deref(),
@@ -1797,6 +1831,7 @@ struct TomlParams<'a> {
     mesh_serial_port: Option<&'a str>,
     mesh_baud_rate: Option<u32>,
     mesh_addr: Option<&'a str>,
+    mesh_path_bytes: u8,
     // Meshtastic
     use_meshtastic: bool,
     meshtastic_connection_type: &'a str,
@@ -1873,6 +1908,9 @@ fn build_toml(p: &TomlParams<'_>) -> String {
                 }
             }
             _ => {}
+        }
+        if p.mesh_path_bytes != 3 {
+            writeln!(s, "path_bytes = {}", p.mesh_path_bytes).unwrap();
         }
     }
 

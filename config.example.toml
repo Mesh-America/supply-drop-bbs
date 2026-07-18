@@ -201,6 +201,12 @@
 # every direct message is treated as a command.
 # command_prefix = "!"
 
+# Routing path-hash width: bytes each hop adds to a flooded packet's path.
+# 2 or 3. More bytes = fewer path-hash collisions (mis-routes) on a dense mesh,
+# at a little more airtime per packet. Pushed to the radio on each connect.
+# Default 3. Also settable with `supply-drop-bbs node set-path-bytes <2|3>`.
+# path_bytes = 3
+
 # Reply delivery on lossy multi-hop paths. See docs/CONFIG.md §[plugins.mesh].
 # Reset the node's path after each send so the next message floods (more
 # reliable than a possibly-stale direct route).

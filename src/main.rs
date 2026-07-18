@@ -361,6 +361,32 @@ enum NodeAction {
         list_presets: bool,
     },
 
+    /// Set the routing path-hash width (2- or 3-byte paths) on the companion
+    /// device.
+    ///
+    /// More bytes make path-hash collisions — and the mis-routes they cause —
+    /// less likely on a dense mesh, at the cost of a little more airtime per
+    /// packet. The device persists it in its own flash; the BBS also pushes the
+    /// configured value on every connect.
+    ///
+    /// The BBS service must not be running on the same port when you run this.
+    ///
+    /// Examples:
+    ///   supply-drop-bbs node set-path-bytes 3
+    ///   supply-drop-bbs node set-path-bytes 2 --save
+    SetPathBytes {
+        /// Bytes per hop in a flooded packet's routing path: 2 or 3.
+        #[arg(value_parser = clap::value_parser!(u8).range(2..=3))]
+        bytes: u8,
+        #[arg(long)]
+        port: Option<String>,
+        #[arg(long)]
+        baud: Option<u32>,
+        /// Also save the value to config.toml (`[plugins.mesh] path_bytes`).
+        #[arg(long)]
+        save: bool,
+    },
+
     /// Apply Meshtastic LoRa radio configuration from config.toml to the device.
     ///
     /// Reads `[plugins.meshtastic.radio]` (region and modem preset) and pushes
@@ -1988,6 +2014,49 @@ fn save_radio_config(config_path: Option<&std::path::Path>, r: &ResolvedRadio) {
     }
 }
 
+/// Persist `path_bytes` to `[plugins.mesh]` in config.toml (best-effort).
+fn save_path_bytes(config_path: Option<&std::path::Path>, bytes: u8) {
+    #[cfg(feature = "transport-process")]
+    let path_opt = config::resolve_config_path(config_path);
+    #[cfg(not(feature = "transport-process"))]
+    let path_opt = {
+        let explicit = config_path.map(|p| p.to_path_buf());
+        explicit.or_else(|| {
+            [
+                std::path::PathBuf::from("config.toml"),
+                std::path::PathBuf::from("/etc/supply-drop-bbs/config.toml"),
+            ]
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+        })
+    };
+
+    let path = match path_opt {
+        Some(p) => p,
+        None => {
+            eprintln!("warning: --save: no config file found, skipping write");
+            return;
+        }
+    };
+
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc: toml_edit::DocumentMut = content.parse().unwrap_or_default();
+    if doc.get("plugins").is_none() {
+        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    if doc["plugins"].get("mesh").is_none() {
+        doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["plugins"]["mesh"]["path_bytes"] = toml_edit::value(bytes as i64);
+
+    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
+        eprintln!("warning: --save: could not write {}: {e}", path.display());
+    } else {
+        eprintln!("Saved path_bytes = {bytes} to {}.", path.display());
+    }
+}
+
 // ── Meshtastic node command handler ──────────────────────────────────────────
 
 #[cfg(feature = "transport-meshtastic")]
@@ -2078,6 +2147,7 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
             NodeAction::ExportKey { port, baud } => (port.clone(), *baud),
             NodeAction::ImportKey { port, baud, .. } => (port.clone(), *baud),
             NodeAction::SetRadio { port, baud, .. } => (port.clone(), *baud),
+            NodeAction::SetPathBytes { port, baud, .. } => (port.clone(), *baud),
             // Meshtastic commands are intercepted and returned-from early above.
             // Only present when the meshtastic feature adds those NodeAction
             // variants; without it the arms above are already exhaustive.
@@ -2192,6 +2262,10 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
                 // Placeholder — the actual send is handled specially below.
                 OutboundFrame::GetBattAndStorage
             }
+            NodeAction::SetPathBytes { bytes, .. } => {
+                // clap already constrained `bytes` to 2..=3; mode = bytes - 1.
+                OutboundFrame::SetPathHashMode { mode: bytes - 1 }
+            }
             // Meshtastic commands are handled before this block — unreachable here.
             // Gated so the match stays exhaustive (no unreachable arm) in builds
             // without the meshtastic feature, where those variants don't exist.
@@ -2279,6 +2353,13 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
                         InboundFrame::Ok => {
                             if let NodeAction::ImportKey { .. } = &action {
                                 eprintln!("Key imported successfully.");
+                                return Ok(());
+                            }
+                            if let NodeAction::SetPathBytes { bytes, save, .. } = &action {
+                                eprintln!("Path width set to {bytes}-byte paths.");
+                                if *save {
+                                    save_path_bytes(config_path, *bytes);
+                                }
                                 return Ok(());
                             }
                             if let NodeAction::SetRadio { .. } = &action {

@@ -152,17 +152,30 @@ impl Bridge {
         let app_start = self.recv_n(11).await;
         assert_eq!(app_start[3], CMD_APP_START, "expected CMD_APP_START");
         self.send(&self_info_frame(name)).await;
-        // Transport immediately drains the queue on connect: read the
-        // SyncNextMessage it sends and reply with NoMoreMessages so the
-        // draining flag clears before tests send real commands.
+        // The transport applies every configured setting BEFORE any other radio
+        // operation, so config sync happens first — here, with no
+        // [plugins.mesh.radio] configured, that's just the path-hash width (2/3-
+        // byte paths; default path_bytes=3 → firmware mode 2).
+        let set_path = self.read_command().await;
+        assert_eq!(
+            set_path[0], CMD_SET_PATH_HASH_MODE,
+            "expected CMD_SET_PATH_HASH_MODE before any other radio operation"
+        );
+        assert_eq!(
+            set_path[2], 2,
+            "default path_bytes=3 maps to firmware mode 2"
+        );
+        // THEN the queue drain: read the SyncNextMessage it sends and reply with
+        // NoMoreMessages so the draining flag clears before tests send real
+        // commands.
         let drain_cmd = self.read_command().await;
         assert_eq!(
             drain_cmd[0], CMD_SYNC_NEXT_MESSAGE,
-            "expected initial SyncNextMessage drain"
+            "expected SyncNextMessage drain after config sync"
         );
         let no_more = radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]);
         self.send(&no_more).await;
-        // Transport sends CMD_GET_CONTACTS immediately after connect to populate
+        // Transport sends CMD_GET_CONTACTS immediately after the drain to populate
         // the advert bus. Read and discard it — the mock bridge sends no contacts.
         let get_contacts = self.read_command().await;
         assert_eq!(
@@ -249,6 +262,17 @@ impl Bridge {
             }
         }
     }
+
+    /// Read outbound frames until one with command byte `want` appears, skipping
+    /// any others. Returns its payload.
+    async fn read_until_cmd(&mut self, want: u8) -> Vec<u8> {
+        loop {
+            let cmd = self.read_command().await;
+            if cmd[0] == want {
+                return cmd;
+            }
+        }
+    }
 }
 
 /// Spin up a [`MeshTransport`] against an in-process loopback listener.
@@ -286,6 +310,121 @@ async fn make_transport_with(
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+/// The configured `path_bytes` is pushed to the radio on connect as the firmware
+/// path-hash mode: 2-byte paths → mode 1 (3-byte → mode 2 is covered by the
+/// default assertion in `complete_handshake`). The command layout is
+/// `[CMD_SET_PATH_HASH_MODE, 0x00, mode]`.
+#[tokio::test]
+async fn path_hash_mode_set_from_config_on_connect() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
+        cfg.path_bytes = 2; // 2-byte paths → firmware mode 1
+    })
+    .await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    let set_path = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_PATH_HASH_MODE),
+    )
+    .await
+    .expect("expected CMD_SET_PATH_HASH_MODE on connect");
+    assert_eq!(set_path[1], 0, "subtype byte must be 0");
+    assert_eq!(set_path[2], 1, "path_bytes=2 maps to firmware mode 1");
+
+    transport.stop().await.unwrap();
+}
+
+/// `self_info_frame` reports frequency_khz=915_000, bandwidth_hz=125_000,
+/// spreading_factor=10, coding_rate=5, tx_power_dbm=20 (see the helper below).
+/// When `[plugins.mesh.radio]` is configured with DIFFERENT values, the
+/// transport must push a correction — before any other radio operation (the
+/// queue drain / GetContacts / GetAutoaddConfig).
+#[tokio::test]
+async fn radio_params_synced_on_connect_when_they_differ() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
+        cfg.radio = Some(bbs_mesh::config::RadioConfig {
+            frequency_hz: Some(910_525_000),
+            bandwidth_hz: Some(62_500),
+            spreading_factor: Some(7),
+            coding_rate: Some(5), // matches the mock device — must NOT retrigger
+            tx_power_dbm: Some(17),
+            ..Default::default()
+        });
+    })
+    .await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    // Radio params sync is the very first radio operation on connect.
+    // Wire layout: [CMD][freq_khz:u32-LE][bw_hz:u32-LE][sf:u8][cr:u8]
+    // (frequency is encoded in kHz on the wire, per SetRadioParams's encoder).
+    let set_params = bridge.read_command().await;
+    assert_eq!(set_params[0], CMD_SET_RADIO_PARAMS);
+    assert_eq!(
+        u32::from_le_bytes(set_params[1..5].try_into().unwrap()),
+        910_525, // 910_525_000 Hz / 1000
+    );
+    assert_eq!(
+        u32::from_le_bytes(set_params[5..9].try_into().unwrap()),
+        62_500
+    );
+    assert_eq!(set_params[9], 7, "spreading factor");
+    assert_eq!(set_params[10], 5, "coding rate");
+
+    let set_power = bridge.read_command().await;
+    assert_eq!(set_power[0], CMD_SET_RADIO_TX_POWER);
+    assert_eq!(set_power[1] as i8, 17);
+
+    // Then the rest of the config sync, still ahead of the drain.
+    let set_path = bridge.read_command().await;
+    assert_eq!(set_path[0], CMD_SET_PATH_HASH_MODE);
+    let drain_cmd = bridge.read_command().await;
+    assert_eq!(drain_cmd[0], CMD_SYNC_NEXT_MESSAGE);
+
+    transport.stop().await.unwrap();
+}
+
+/// When the configured `[plugins.mesh.radio]` already matches what the device
+/// reports, the transport must NOT write it again — writing radio params
+/// re-inits the RF chip, so an unnecessary write on every connect would be a
+/// real cost, not just noise.
+#[tokio::test]
+async fn radio_params_not_resent_when_they_already_match() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
+        cfg.radio = Some(bbs_mesh::config::RadioConfig {
+            frequency_hz: Some(915_000_000), // matches self_info_frame exactly
+            bandwidth_hz: Some(125_000),
+            spreading_factor: Some(10),
+            coding_rate: Some(5),
+            tx_power_dbm: Some(20),
+            ..Default::default()
+        });
+    })
+    .await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    // First radio operation must be the path-hash sync (radio params skipped) —
+    // not CMD_SET_RADIO_PARAMS / CMD_SET_RADIO_TX_POWER.
+    let first = bridge.read_command().await;
+    assert_eq!(
+        first[0], CMD_SET_PATH_HASH_MODE,
+        "matching radio config must not be re-sent"
+    );
+
+    transport.stop().await.unwrap();
+}
 
 /// After the handshake, a `help` DM reaches the host as `Command::Help`.
 #[tokio::test]
@@ -1157,6 +1296,10 @@ async fn reconnect_drain_processes_entire_backlog() {
         .as_secs() as u32;
     let sender = [0x31u8; 6];
 
+    // Config sync (path-hash width) happens before any drain operation.
+    let set_path = bridge.read_command().await;
+    assert_eq!(set_path[0], CMD_SET_PATH_HASH_MODE);
+
     // First drain sync → feed a FRESH queued message (age ~0).
     let drain1 = bridge.read_command().await;
     assert_eq!(drain1[0], CMD_SYNC_NEXT_MESSAGE);
@@ -1219,6 +1362,10 @@ async fn channel_message_during_drain_does_not_stall_the_chain() {
     bridge.send(&self_info_frame("Node")).await;
 
     let sender = [0x35u8; 6];
+
+    // Config sync (path-hash width) happens before any drain operation.
+    let set_path = bridge.read_command().await;
+    assert_eq!(set_path[0], CMD_SET_PATH_HASH_MODE);
 
     // First drain sync → the queue pop returns a CHANNEL message.
     let drain1 = bridge.read_command().await;
