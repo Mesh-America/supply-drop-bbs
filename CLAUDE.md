@@ -27,7 +27,13 @@ Be certain to update documentation, where relevant.
 
 ## Branching and pull requests
 
-**Never commit directly to `main`.** All changes must go through a feature branch and a pull request, no matter how small.
+**`next` is the integration branch and the default branch.** All feature/fix work
+branches from `next` and PRs target `next`, not `main`. `main` tracks only what
+has actually been released — `next` is periodically merged into `main` via its
+own PR to cut a release.
+
+**Never commit directly to `next` or `main`.** All changes must go through a
+feature branch and a pull request, no matter how small.
 
 Branch naming follows the pattern `<type>/<short-description>`, e.g.:
 - `feat/guest-room-access`
@@ -36,10 +42,13 @@ Branch naming follows the pattern `<type>/<short-description>`, e.g.:
 - `chore/bump-v0-8-3`
 
 Workflow:
-1. Create a feature branch from `main`
+1. Create a feature branch from `next` (`git checkout -b <branch> next`, or
+   `git checkout -b <branch> origin/next` if `next` isn't checked out locally)
 2. Commit changes to the feature branch
-3. Push the branch and open a PR with `gh pr create --base main --head <branch>`
-4. Never push directly to `main`
+3. Push the branch and open a PR with `gh pr create --base next --head <branch>`
+4. Never push directly to `next` or `main`
+5. Periodically, `next` is merged into `main` via its own PR
+   (`gh pr create --base main --head next`) to cut a release.
 
 ## Commit style
 
