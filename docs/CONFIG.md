@@ -350,10 +350,11 @@ your wiring differs from the standard layout):
 
 ### Radio parameter configuration (`[plugins.mesh.radio]`)
 
-Stores the LoRa parameters that will be pushed to the companion device when you
-run `supply-drop-bbs node set-radio`. **Not applied automatically on every
-connect** — the device persists radio settings in its own flash after they are
-applied once.
+Stores the LoRa parameters the BBS pushes to the companion device — resolved
+and applied automatically on every connect (skipped when they already match
+what the device reports; see [Applying radio parameters](#applying-radio-parameters)
+below), or on demand via `supply-drop-bbs node set-radio`. The device persists
+radio settings in its own flash.
 
 Either specify a named `preset` (which fills all five parameters at once) or
 supply individual fields. Individual fields take precedence over the preset; you
@@ -425,9 +426,19 @@ tx_power_dbm = 17
 
 #### Applying radio parameters
 
-Saving a `[plugins.mesh.radio]` section **does not push the settings to the
-device**. The device persists its own radio parameters in flash; the config
-section is just a record of the intended configuration. To apply or re-apply:
+**Saving a `[plugins.mesh.radio]` section and restarting the BBS is enough** —
+the transport resolves it (preset + field overrides) and pushes a correction to
+the device on every connect, whenever the resolved values differ from what the
+device reports. The write is skipped when they already match, since writing
+radio params re-inits the device's RF chip; a restart with an unchanged section
+is a no-op on the wire. This applies *before* any other radio operation (the
+message-queue drain, contact fetch, autoadd query), the same way `path_bytes`
+and the advert name/GPS are synced on every startup.
+
+The CLI is for applying (or previewing) a change **without** starting the BBS —
+useful before the service is installed, for a one-off preset test, or to
+resolve a preset into concrete values and `--save` them back into
+`config.toml`:
 
 ```sh
 # BBS must not be running — it holds the serial port open.
@@ -450,7 +461,8 @@ sudo systemctl start supply-drop-bbs
 ```
 
 The setup wizard (`supply-drop-bbs setup`) also offers radio configuration and
-writes the chosen settings to both `config.toml` and the device in one step.
+writes the chosen settings to `config.toml`; the BBS applies them itself on
+its next connect, as above.
 
 #### Node identity (`[plugins.mesh]` — node key)
 

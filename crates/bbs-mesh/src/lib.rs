@@ -50,6 +50,7 @@
 pub mod command;
 pub mod config;
 pub mod metrics;
+pub mod presets;
 mod send_tracker;
 pub mod session;
 pub mod transport;

@@ -49,9 +49,14 @@ pub enum ConnectionType {
 
 /// Radio parameter configuration stored in `[plugins.mesh.radio]`.
 ///
-/// These values are **not** pushed to the device automatically on connect.
-/// Apply them explicitly via `supply-drop-bbs node set-radio` or during
-/// the setup wizard. Once applied the device (T114, Heltec V3, etc.)
+/// Pushed to the device automatically on every connect when the resolved
+/// values differ from what the device reports (in `SelfInfo`) — so editing
+/// this section and restarting the BBS is enough to apply it; a manual
+/// `supply-drop-bbs node set-radio` (or the setup wizard) is only needed to
+/// apply it once *without* starting the BBS (e.g. before the service is
+/// running, or to `--save` a resolved preset back into this section). The
+/// write is skipped whenever the values already match, since writing radio
+/// params re-inits the device's RF chip. The device (T114, Heltec V3, etc.)
 /// persists the settings in its own flash.
 ///
 /// Either specify a named `preset` (which sets all parameters at once) or

@@ -42,6 +42,7 @@ use meshcore_companion::{
     client::{ClientConfig, ClientEvent, CompanionClient, SerialConfig},
     constants::{MAX_FRAME_SIZE, TXT_TYPE_PLAIN},
     frame::OutboundFrame,
+    types::SelfInfo,
 };
 
 /// Maximum bytes of plain text that fit in one `SendTxtMsg` companion frame.
@@ -58,8 +59,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     command::{format_response, parse_command, render_notification},
-    config::{ConnectionType, MeshConfig},
+    config::{ConnectionType, MeshConfig, RadioConfig},
     metrics::DeliveryStats,
+    presets::resolve_radio,
     send_tracker::{RetryConfig, SendTracker, SentOutcome},
     session::SessionState,
 };
@@ -291,6 +293,10 @@ pub struct MeshTransport {
     /// Firmware path-hash mode (`path_bytes - 1`) pushed to the radio on connect,
     /// selecting 2- or 3-byte routing paths.
     path_hash_mode: u8,
+    /// `[plugins.mesh.radio]`, resolved and pushed to the radio on every connect
+    /// when it differs from what the device reports. `None` when unconfigured
+    /// (the device's own settings are left untouched, as before).
+    radio_config: Option<RadioConfig>,
     /// Tracks in-flight replies and drives retransmission on missing ACKs.
     /// Shared with the event-loop task (which owns the retry timer and the
     /// `Sent`/`SendConfirmed` correlation). See [`crate::send_tracker`].
@@ -384,6 +390,7 @@ impl Plugin for MeshTransport {
             flood_after_send: config.flood_after_send,
             workflow_timeout_secs: config.workflow_timeout_secs,
             path_hash_mode,
+            radio_config: config.radio.clone(),
             send_tracker: Arc::new(Mutex::new(SendTracker::new(RetryConfig {
                 max_attempts: config.reply_max_attempts.max(1),
                 min_timeout: REPLY_ACK_MIN_WAIT,
@@ -415,6 +422,7 @@ impl Plugin for MeshTransport {
         let flood_after_send = self.flood_after_send;
         let workflow_timeout_secs = self.workflow_timeout_secs;
         let path_hash_mode = self.path_hash_mode;
+        let radio_config = self.radio_config.clone();
 
         // Admin channel: web UI → event loop for key operations.
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<bbs_plugin_api::MeshKeyRequest>(4);
@@ -525,6 +533,7 @@ impl Plugin for MeshTransport {
             flood_after_send,
             workflow_timeout_secs,
             path_hash_mode,
+            radio_config,
             send_tracker,
             delivery_stats,
             key_rx,
@@ -723,6 +732,75 @@ enum PendingKeyOp {
     },
 }
 
+/// If `[plugins.mesh.radio]` is configured, resolve it and push a correction to
+/// the radio when it differs from what the device just reported in `SelfInfo` —
+/// so an operator's config changes (or a device that drifted, e.g. after a
+/// factory reset or a manual `node set-radio` on a different profile) take
+/// effect automatically on the next connect, the same way `path_bytes` and the
+/// advert name/GPS already do. Writing radio params re-inits the device's RF
+/// chip, so the write is skipped whenever the resolved config already matches —
+/// an unconfigured `[plugins.mesh.radio]` (the default) is always a no-op.
+async fn sync_radio_params_if_configured(
+    radio_config: &Option<RadioConfig>,
+    info: &SelfInfo,
+    cmd_tx: &mpsc::Sender<OutboundFrame>,
+) {
+    let Some(radio_config) = radio_config else {
+        return;
+    };
+    let resolved = match resolve_radio(Some(radio_config), None, None, None, None, None, None) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("mesh: [plugins.mesh.radio] is incomplete, skipping sync: {e}");
+            return;
+        }
+    };
+
+    // The device reports frequency in kHz (SelfInfo.frequency_khz); everything
+    // else is already in the same units/type as `ResolvedRadio`.
+    let current_freq_hz = info.frequency_khz.saturating_mul(1000);
+    let params_differ = current_freq_hz != resolved.frequency_hz
+        || info.bandwidth_hz != resolved.bandwidth_hz
+        || info.spreading_factor != resolved.spreading_factor
+        || info.coding_rate != resolved.coding_rate;
+    let power_differs = i32::from(info.tx_power_dbm) != resolved.tx_power_dbm;
+
+    if !params_differ && !power_differs {
+        debug!("mesh: [plugins.mesh.radio] already matches the device, skipping sync");
+        return;
+    }
+    info!(
+        current_freq_hz,
+        desired_freq_hz = resolved.frequency_hz,
+        current_bandwidth_hz = info.bandwidth_hz,
+        desired_bandwidth_hz = resolved.bandwidth_hz,
+        current_spreading_factor = info.spreading_factor,
+        desired_spreading_factor = resolved.spreading_factor,
+        current_coding_rate = info.coding_rate,
+        desired_coding_rate = resolved.coding_rate,
+        current_tx_power_dbm = info.tx_power_dbm,
+        desired_tx_power_dbm = resolved.tx_power_dbm,
+        "mesh: [plugins.mesh.radio] differs from the device — syncing"
+    );
+    if params_differ {
+        let _ = cmd_tx
+            .send(OutboundFrame::SetRadioParams {
+                frequency_hz: resolved.frequency_hz,
+                bandwidth_hz: resolved.bandwidth_hz,
+                spreading_factor: resolved.spreading_factor,
+                coding_rate: resolved.coding_rate,
+            })
+            .await;
+    }
+    if power_differs {
+        let _ = cmd_tx
+            .send(OutboundFrame::SetRadioTxPower {
+                power_dbm: resolved.tx_power_dbm as i8,
+            })
+            .await;
+    }
+}
+
 /// Background task: receive [`ClientEvent`]s and dispatch them.
 ///
 /// Runs until the shutdown watch fires or the companion client channel closes.
@@ -740,6 +818,7 @@ async fn event_loop(
     flood_after_send: bool,
     workflow_timeout_secs: u64,
     path_hash_mode: u8,
+    radio_config: Option<RadioConfig>,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
     mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
@@ -801,21 +880,22 @@ async fn event_loop(
                         break;
                     }
                     Some(ClientEvent::Connected { self_info }) => {
-                        // Drain the bridge's offline queue on connect so any
-                        // messages that queued while we were offline are handled
-                        // promptly (they are processed like live traffic — see
-                        // the ContactMsgRecv arm). Always done regardless of
-                        // whether SelfInfo is available; the flag's main job is
-                        // the Err fallback for firmware without SYNC support.
-                        draining.store(true, Ordering::Relaxed);
-                        let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
-
+                        // Apply every configured setting (radio params, advert
+                        // name/GPS, path-hash width) to the device FIRST, before
+                        // any other radio operation (the queue drain, GetContacts,
+                        // the autoadd query). This guarantees the radio is brought
+                        // back in sync with config.toml on every startup/reconnect
+                        // rather than silently running stale settings — e.g. from
+                        // before an operator edited [plugins.mesh.radio] or
+                        // path_bytes, or a device that was reset or reconfigured
+                        // out-of-band — until someone happens to run `node
+                        // set-radio` by hand.
                         if let Some(info) = self_info {
                             info!(
                                 node = %info.node_name,
                                 freq_khz = info.frequency_khz,
                                 adv_type = info.adv_type,
-                                "mesh: radio bridge connected — draining offline queue"
+                                "mesh: radio bridge connected — syncing config"
                             );
                             // Register the BBS node in the advert bus so it appears in
                             // the web UI immediately (using whatever GPS the radio reports).
@@ -834,6 +914,13 @@ async fn event_loop(
                             // Publish pubkey to Host so the web UI can display it.
                             let pubkey_hex: String = info.pubkey.iter().map(|b| format!("{b:02x}")).collect();
                             host.set_node_pubkey(pubkey_hex);
+
+                            // Sync [plugins.mesh.radio] (frequency/bandwidth/SF/CR/
+                            // power) first — the most consequential setting, and the
+                            // one previously never applied automatically (see
+                            // `sync_radio_params_if_configured`'s doc comment).
+                            sync_radio_params_if_configured(&radio_config, &info, &cmd_tx).await;
+
                             // Push the configured node name to the radio so the BBS
                             // advertises with a human name instead of its key-derived
                             // fallback (issue #101).  The host has already truncated it
@@ -881,13 +968,25 @@ async fn event_loop(
                         } else {
                             // Device did not return SelfInfo (CMD_APP_START
                             // was unsupported) — node identity is unavailable
-                            // until the device pushes an advert.
+                            // until the device pushes an advert, and there is no
+                            // current-value baseline to diff radio params against,
+                            // so config sync is skipped for this connection.
                             info!(
                                 "mesh: radio bridge connected (no SelfInfo — \
                                  CMD_APP_START unsupported by device) \
                                  — draining stale queue"
                             );
                         }
+
+                        // Drain the bridge's offline queue so any messages that
+                        // queued while we were offline are handled promptly (they
+                        // are processed like live traffic — see the ContactMsgRecv
+                        // arm). Always done regardless of whether SelfInfo is
+                        // available; the flag's main job is the Err fallback for
+                        // firmware without SYNC support. Deliberately AFTER the
+                        // config sync above, not before.
+                        draining.store(true, Ordering::Relaxed);
+                        let _ = cmd_tx.send(OutboundFrame::SyncNextMessage).await;
 
                         // Fetch the full contact list so the advert bus is populated
                         // with names, types, and locations. Without this, nodes already
