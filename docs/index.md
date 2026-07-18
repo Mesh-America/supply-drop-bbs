@@ -15,6 +15,9 @@ hero:
     - theme: alt
       text: View on GitHub
       link: https://github.com/Mesh-America/supply-drop-bbs
+    - theme: alt
+      text: 💚 Pitch In
+      link: https://meshamerica.com/pitch-in/
 
 features:
   - icon: 📻
