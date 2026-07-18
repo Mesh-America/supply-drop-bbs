@@ -77,6 +77,15 @@ const SAMPLE_TICK: Duration = Duration::from_secs(60);
 /// How far back to seed the in-memory trend from persisted samples on startup
 /// (matches the in-memory ring's ~8h capacity).
 const HISTORY_SEED_SECS: u64 = 8 * 60 * 60;
+/// Minimum spacing between *automatic* self-adverts (on-connect and periodic), so
+/// a flapping radio link can't emit a burst of flooded adverts on rapid
+/// reconnects. Manual (web-UI) adverts are not rate-limited by this.
+const MIN_ADVERT_SPACING: Duration = Duration::from_secs(60);
+/// How often the BBS broadcasts a periodic flood self-advert to keep the mesh's
+/// routes back to it fresh. Fixed at once per 24h (not operator-configurable):
+/// a flood advert is cheap but mesh-wide, and once a day is ample to refresh
+/// routes while keeping aggregate airtime negligible.
+const ADVERT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Depth of the queue feeding the command worker. Inbound LoRa traffic is slow
 /// (airtime-limited), so this is rarely above 1; the headroom only matters if
@@ -239,6 +248,42 @@ fn next_outbound_timestamp() -> u32 {
     }
 }
 
+/// Push the configured node name + location to the radio and broadcast a
+/// self-advert. Used by the on-connect advert, the periodic advert tick, and the
+/// web-UI "send advert" trigger. Refreshing the name/location first means the
+/// advert always carries the configured identity, even on a device that returned
+/// no SelfInfo on AppStart (issue #101). Adverts are typically flooded so they
+/// propagate mesh-wide and let repeaters (re)learn a route back to the BBS.
+async fn broadcast_self_advert(
+    cmd_tx: &mpsc::Sender<OutboundFrame>,
+    host: &Arc<dyn Host>,
+    flood: bool,
+) {
+    if let Some((lat, lon)) = host.node_location() {
+        let lat_1e6 = (lat * 1_000_000.0) as i32;
+        let lon_1e6 = (lon * 1_000_000.0) as i32;
+        let _ = cmd_tx
+            .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
+            .await;
+    }
+    if let Some(node_name) = host.mesh_node_name() {
+        if !node_name.is_empty() {
+            let _ = cmd_tx
+                .send(OutboundFrame::SetAdvertName { name: node_name })
+                .await;
+        }
+    }
+    if cmd_tx
+        .send(OutboundFrame::SendSelfAdvert { flood })
+        .await
+        .is_err()
+    {
+        warn!("mesh: could not enqueue SendSelfAdvert — cmd channel closed");
+    } else {
+        info!(flood, "mesh: broadcasting self-advert");
+    }
+}
+
 // ── MeshTransport ─────────────────────────────────────────────────────────────
 
 /// The MeshCore transport plugin.
@@ -297,6 +342,10 @@ pub struct MeshTransport {
     /// when it differs from what the device reports. `None` when unconfigured
     /// (the device's own settings are left untouched, as before).
     radio_config: Option<RadioConfig>,
+    /// Broadcast a self-advert on each (re)connect so the mesh relearns a route
+    /// to the BBS promptly. The periodic advert (every [`ADVERT_INTERVAL`]) is
+    /// always on and not configurable.
+    advert_on_connect: bool,
     /// Tracks in-flight replies and drives retransmission on missing ACKs.
     /// Shared with the event-loop task (which owns the retry timer and the
     /// `Sent`/`SendConfirmed` correlation). See [`crate::send_tracker`].
@@ -391,6 +440,7 @@ impl Plugin for MeshTransport {
             workflow_timeout_secs: config.workflow_timeout_secs,
             path_hash_mode,
             radio_config: config.radio.clone(),
+            advert_on_connect: config.advert_on_connect,
             send_tracker: Arc::new(Mutex::new(SendTracker::new(RetryConfig {
                 max_attempts: config.reply_max_attempts.max(1),
                 min_timeout: REPLY_ACK_MIN_WAIT,
@@ -423,6 +473,7 @@ impl Plugin for MeshTransport {
         let workflow_timeout_secs = self.workflow_timeout_secs;
         let path_hash_mode = self.path_hash_mode;
         let radio_config = self.radio_config.clone();
+        let advert_on_connect = self.advert_on_connect;
 
         // Admin channel: web UI → event loop for key operations.
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<bbs_plugin_api::MeshKeyRequest>(4);
@@ -439,36 +490,7 @@ impl Plugin for MeshTransport {
                     result = advert_send_rx.recv() => {
                         match result {
                             Ok(flood) => {
-                                // Refresh the radio's stored location before broadcasting
-                                // so manual sends include GPS just like the on-connect push.
-                                if let Some((lat, lon)) = advert_host.node_location() {
-                                    let lat_1e6 = (lat * 1_000_000.0) as i32;
-                                    let lon_1e6 = (lon * 1_000_000.0) as i32;
-                                    let _ = advert_cmd_tx
-                                        .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
-                                        .await;
-                                }
-                                // Set the advert name before broadcasting too, so manual
-                                // sends carry the configured node name even on devices that
-                                // return no SelfInfo on AppStart (where the on-connect push
-                                // is skipped). Issue #101.
-                                if let Some(node_name) = advert_host.mesh_node_name() {
-                                    if !node_name.is_empty() {
-                                        info!(node_name = %node_name, "mesh: setting advert name before send");
-                                        let _ = advert_cmd_tx
-                                            .send(OutboundFrame::SetAdvertName { name: node_name })
-                                            .await;
-                                    }
-                                }
-                                if advert_cmd_tx
-                                    .send(OutboundFrame::SendSelfAdvert { flood })
-                                    .await
-                                    .is_err()
-                                {
-                                    warn!("mesh: could not enqueue SendSelfAdvert — cmd channel closed");
-                                } else {
-                                    info!(flood, "mesh: sending self-advert");
-                                }
+                                broadcast_self_advert(&advert_cmd_tx, &advert_host, flood).await;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("mesh: advert send requests lagged by {n}");
@@ -534,6 +556,7 @@ impl Plugin for MeshTransport {
             workflow_timeout_secs,
             path_hash_mode,
             radio_config,
+            advert_on_connect,
             send_tracker,
             delivery_stats,
             key_rx,
@@ -819,12 +842,17 @@ async fn event_loop(
     workflow_timeout_secs: u64,
     path_hash_mode: u8,
     radio_config: Option<RadioConfig>,
+    advert_on_connect: bool,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
     mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
 ) {
     // Pending one-shot key operation. At most one at a time.
     let mut pending_key_op: Option<PendingKeyOp> = None;
+
+    // When the last automatic self-advert (on-connect or periodic) was sent, used
+    // to rate-limit a flapping link's reconnect bursts (see MIN_ADVERT_SPACING).
+    let mut last_advert_at: Option<Instant> = None;
 
     // Periodically retransmit replies that timed out awaiting an end-to-end ACK.
     let mut retry_tick = tokio::time::interval(RETRY_TICK);
@@ -833,6 +861,14 @@ async fn event_loop(
     // Periodically snapshot the delivery counters into the trend history.
     let mut sample_tick = tokio::time::interval(SAMPLE_TICK);
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Broadcast a periodic flood self-advert every ADVERT_INTERVAL (24h, fixed)
+    // so the mesh keeps a fresh route back to the BBS. The immediate first tick
+    // is consumed via `reset()` so it does not fire right at startup and double
+    // up with the on-connect advert.
+    let mut advert_tick = tokio::time::interval(ADVERT_INTERVAL);
+    advert_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    advert_tick.reset();
 
     // Seed the in-memory trend from persisted samples so the confirm-rate chart
     // survives a restart. Best-effort: an empty/erroring store just starts fresh.
@@ -965,6 +1001,25 @@ async fn event_loop(
                             let _ = cmd_tx
                                 .send(OutboundFrame::SetPathHashMode { mode })
                                 .await;
+
+                            // Announce ourselves on connect so repeaters across the
+                            // mesh (re)learn a route back to the BBS right away, rather
+                            // than waiting for the firmware's own advert schedule. Any
+                            // configured name/location pushed just above rides along.
+                            // Flooded so it propagates mesh-wide. Rate-limited so a
+                            // flapping link can't burst adverts on rapid reconnects.
+                            // Last in the config-sync sequence so the advert reflects
+                            // everything just applied above.
+                            if advert_on_connect
+                                && last_advert_at
+                                    .is_none_or(|t| t.elapsed() >= MIN_ADVERT_SPACING)
+                            {
+                                let _ = cmd_tx
+                                    .send(OutboundFrame::SendSelfAdvert { flood: true })
+                                    .await;
+                                last_advert_at = Some(Instant::now());
+                                info!("mesh: broadcasting self-advert on connect");
+                            }
                         } else {
                             // Device did not return SelfInfo (CMD_APP_START
                             // was unsupported) — node identity is unavailable
@@ -1098,6 +1153,10 @@ async fn event_loop(
                 if let Err(e) = host.record_delivery_sample(TRANSPORT_NAME, s).await {
                     debug!("mesh: persisting delivery sample failed: {e}");
                 }
+            }
+            _ = advert_tick.tick() => {
+                broadcast_self_advert(&cmd_tx, &host, true).await;
+                last_advert_at = Some(Instant::now());
             }
             Some(req) = key_rx.recv() => {
                 use bbs_plugin_api::MeshKeyRequest;

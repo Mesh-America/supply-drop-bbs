@@ -267,6 +267,21 @@ pub struct MeshConfig {
     #[serde(default = "default_workflow_timeout_secs")]
     pub workflow_timeout_secs: u64,
 
+    /// Broadcast a self-advert each time the radio (re)connects.
+    ///
+    /// An advert is how other nodes and repeaters discover the BBS and learn (or
+    /// refresh) a route back to it. Sending one on connect means the mesh relearns
+    /// the BBS promptly after a restart or link blip, rather than waiting for the
+    /// radio firmware's own advert schedule (which a companion device may run
+    /// rarely or not at all). Adverts are flooded so they propagate mesh-wide.
+    /// Defaults to `true`.
+    ///
+    /// In addition, the BBS broadcasts a periodic flood advert on a fixed
+    /// once-per-24h schedule (not configurable) to keep routes fresh at minimal
+    /// airtime cost.
+    #[serde(default = "default_true")]
+    pub advert_on_connect: bool,
+
     /// Radio parameter configuration.
     ///
     /// Stored here for reference and applied on demand via
@@ -319,6 +334,7 @@ impl Default for MeshConfig {
             flood_after_send: default_flood_after_send(),
             reply_max_attempts: default_reply_max_attempts(),
             workflow_timeout_secs: default_workflow_timeout_secs(),
+            advert_on_connect: true,
             radio: None,
         }
     }
@@ -413,5 +429,16 @@ mod tests {
         assert_eq!(mode(3), 2); // 3-byte → firmware mode 2
         assert_eq!(mode(0), 1); // clamped up to 2-byte
         assert_eq!(mode(9), 2); // clamped down to 3-byte
+    }
+
+    /// The BBS should advertise on connect by default so the mesh keeps a fresh
+    /// route back to it (the periodic advert is a fixed 24h schedule in the
+    /// transport, not a config knob). Guards the default and the serde wiring.
+    #[test]
+    fn advert_on_connect_is_on_by_default() {
+        assert!(MeshConfig::default().advert_on_connect);
+
+        let cfg: MeshConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.advert_on_connect);
     }
 }
