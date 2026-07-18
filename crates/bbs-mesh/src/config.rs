@@ -250,6 +250,28 @@ pub struct MeshConfig {
     #[serde(default = "default_workflow_timeout_secs")]
     pub workflow_timeout_secs: u64,
 
+    /// Broadcast a self-advert each time the radio (re)connects.
+    ///
+    /// An advert is how other nodes and repeaters discover the BBS and learn (or
+    /// refresh) a route back to it. Sending one on connect means the mesh relearns
+    /// the BBS promptly after a restart or link blip, rather than waiting for the
+    /// radio firmware's own advert schedule (which a companion device may run
+    /// rarely or not at all). Adverts are flooded so they propagate mesh-wide.
+    /// Defaults to `true`.
+    #[serde(default = "default_true")]
+    pub advert_on_connect: bool,
+
+    /// Interval, in seconds, at which the BBS broadcasts a periodic self-advert to
+    /// keep the mesh's routes back to it fresh.
+    ///
+    /// `0` disables periodic adverts (the radio firmware may still advertise on
+    /// its own schedule). An advert is a small packet but is flooded — every
+    /// in-range repeater rebroadcasts it once — so keep this generous to limit
+    /// airtime; there is rarely any need to advertise more than a few times an
+    /// hour. Defaults to `3600` (once per hour).
+    #[serde(default = "default_advert_interval_secs")]
+    pub advert_interval_secs: u64,
+
     /// Radio parameter configuration.
     ///
     /// Stored here for reference and applied on demand via
@@ -294,6 +316,8 @@ impl Default for MeshConfig {
             flood_after_send: default_flood_after_send(),
             reply_max_attempts: default_reply_max_attempts(),
             workflow_timeout_secs: default_workflow_timeout_secs(),
+            advert_on_connect: true,
+            advert_interval_secs: default_advert_interval_secs(),
             radio: None,
         }
     }
@@ -341,6 +365,10 @@ fn default_workflow_timeout_secs() -> u64 {
     300
 }
 
+fn default_advert_interval_secs() -> u64 {
+    3600
+}
+
 fn default_true() -> bool {
     true
 }
@@ -359,5 +387,19 @@ mod tests {
         // An omitted key must resolve to the off default via the serde wiring.
         let cfg: MeshConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(cfg.reply_max_attempts, 1);
+    }
+
+    /// The BBS should announce itself by default: advertise on connect and once
+    /// an hour, so the mesh keeps a fresh route back to it. Guards the defaults
+    /// (and the serde wiring for omitted keys).
+    #[test]
+    fn adverts_are_on_by_default() {
+        let d = MeshConfig::default();
+        assert!(d.advert_on_connect);
+        assert_eq!(d.advert_interval_secs, 3600);
+
+        let cfg: MeshConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.advert_on_connect);
+        assert_eq!(cfg.advert_interval_secs, 3600);
     }
 }
