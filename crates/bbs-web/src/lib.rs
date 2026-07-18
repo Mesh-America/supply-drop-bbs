@@ -1823,6 +1823,12 @@ struct RadioConfigResponse {
     connection_type: Option<String>,
     /// Serial port path (only set when `connection_type` is `"serial"`).
     serial_port: Option<String>,
+    /// Routing path-hash width in bytes (`2` or `3`). Lives at `[plugins.mesh]`,
+    /// not `[plugins.mesh.radio]` — it's a companion-protocol setting, not a
+    /// physical radio parameter, but it belongs on the same settings panel.
+    /// `None` means "not set in file" (the transport still applies its own
+    /// default of 3).
+    path_bytes: Option<u8>,
     /// Full preset details for populating the UI dropdown and auto-filling fields.
     presets: Vec<RadioPresetDetail>,
 }
@@ -1843,6 +1849,9 @@ struct RadioConfigPatch {
     coding_rate: Option<serde_json::Value>,
     /// TX power in dBm. JSON null clears it.
     tx_power_dbm: Option<serde_json::Value>,
+    /// Routing path-hash width in bytes: `2` or `3`. JSON null clears it (falls
+    /// back to the transport's default of 3).
+    path_bytes: Option<serde_json::Value>,
 }
 
 /// Editable subset of the BBS configuration, returned by GET /api/v1/config.
@@ -2215,6 +2224,32 @@ fn doc_remove_radio_field(doc: &mut toml_edit::DocumentMut, key: &str) {
     }
 }
 
+/// Set a scalar key directly in `[plugins.mesh]` (one level up from
+/// [`doc_set_radio_field`], which nests under `.radio`), creating the table
+/// path as needed.
+fn doc_set_mesh_field(doc: &mut toml_edit::DocumentMut, key: &str, val: toml_edit::Value) {
+    if doc.get("plugins").is_none() {
+        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    let plugins = doc["plugins"].as_table_mut().unwrap();
+    if plugins.get("mesh").is_none() {
+        plugins.insert("mesh", toml_edit::Item::Table(toml_edit::Table::new()));
+    }
+    let mesh = plugins.get_mut("mesh").unwrap().as_table_mut().unwrap();
+    mesh.insert(key, toml_edit::Item::Value(val));
+}
+
+/// Remove a key from `[plugins.mesh]` if the table path exists.
+fn doc_remove_mesh_field(doc: &mut toml_edit::DocumentMut, key: &str) {
+    if let Some(plugins) = doc.get_mut("plugins") {
+        if let Some(mesh) = plugins.as_table_mut().and_then(|t| t.get_mut("mesh")) {
+            if let Some(t) = mesh.as_table_mut() {
+                t.remove(key);
+            }
+        }
+    }
+}
+
 /// Remove a key from a section in a [`toml_edit::DocumentMut`], if it exists.
 fn doc_remove_key(doc: &mut toml_edit::DocumentMut, section: &str, key: &str) {
     if let Some(item) = doc.get_mut(section) {
@@ -2236,6 +2271,15 @@ fn toml_plugin_str(val: &toml::Value, plugin: &str, key: &str) -> Option<String>
         .get(key)?
         .as_str()
         .map(str::to_owned)
+}
+
+/// Read a small integer from `[plugins.<plugin>].<key>`.
+fn toml_plugin_u8(val: &toml::Value, plugin: &str, key: &str) -> Option<u8> {
+    val.get("plugins")?
+        .get(plugin)?
+        .get(key)?
+        .as_integer()
+        .map(|i| i as u8)
 }
 
 async fn api_get_config(
@@ -2631,6 +2675,7 @@ async fn api_get_radio_config(
         tx_power_dbm: toml_radio_i32(&val, "tx_power_dbm"),
         connection_type,
         serial_port,
+        path_bytes: toml_plugin_u8(&val, "mesh", "path_bytes"),
         presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
@@ -2726,6 +2771,13 @@ async fn api_patch_radio_config(
             doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n));
         }
     }
+    if let Some(v) = patch.path_bytes {
+        if v.is_null() {
+            doc_remove_mesh_field(&mut doc, "path_bytes");
+        } else if let Some(n) = v.as_i64().filter(|n| *n == 2 || *n == 3) {
+            doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n));
+        }
+    }
 
     if let Err(e) = atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes()) {
         return (
@@ -2760,6 +2812,7 @@ async fn api_patch_radio_config(
         tx_power_dbm: toml_radio_i32(&val, "tx_power_dbm"),
         connection_type: toml_plugin_str(&val, "mesh", "connection_type"),
         serial_port: toml_plugin_str(&val, "mesh", "serial_port"),
+        path_bytes: toml_plugin_u8(&val, "mesh", "path_bytes"),
         presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()

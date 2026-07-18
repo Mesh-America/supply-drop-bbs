@@ -366,6 +366,7 @@ interface RadioConfigData {
   tx_power_dbm: number | null
   connection_type: string | null
   serial_port: string | null
+  path_bytes: number | null
   presets: RadioPresetDetail[]
 }
 
@@ -384,6 +385,9 @@ const radioBandwidthHz = ref<string>('')
 const radioSpreadingFactor = ref<string>('')
 const radioCodingRate = ref<string>('')
 const radioTxPowerDbm = ref<string>('')
+// Routing path-hash width (companion-protocol setting, not a physical radio
+// param — applies to every connection type). Always 2 or 3; default 3.
+const radioPathBytes = ref<number>(3)
 
 function applyPreset(name: string) {
   const p = radioPresets.value.find(p => p.name === name)
@@ -407,6 +411,7 @@ async function loadRadioConfig() {
     radioConfig.value = r
     radioPresets.value = r.presets
     radioPreset.value = r.preset ?? ''
+    radioPathBytes.value = r.path_bytes ?? 3
     // Prefer stored individual values; if none, fall back to preset values
     if (r.frequency_hz != null || r.bandwidth_hz != null || r.spreading_factor != null ||
         r.coding_rate != null || r.tx_power_dbm != null) {
@@ -437,6 +442,7 @@ async function saveRadioConfig() {
       spreading_factor: radioSpreadingFactor.value ? parseInt(radioSpreadingFactor.value, 10) : null,
       coding_rate:      radioCodingRate.value      ? parseInt(radioCodingRate.value, 10)      : null,
       tx_power_dbm:     radioTxPowerDbm.value      ? parseInt(radioTxPowerDbm.value, 10)      : null,
+      path_bytes:       radioPathBytes.value,
     }
     const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
     radioConfig.value = updated
@@ -1185,10 +1191,12 @@ chmod g+w {{ configFile }}</pre>
       <section v-if="radioConfig" v-show="settingsTab === 'meshcore'" class="card">
         <h2>MeshCore radio</h2>
         <p class="hint">
-          LoRa parameters for the MeshCore companion device.
-          Save here to record them in config.toml. Use <strong>Apply to device</strong>
-          to push the current values directly to the live companion device over the
-          existing connection.
+          LoRa parameters and routing settings for the MeshCore companion device.
+          <strong>Save</strong> records them in config.toml — the BBS applies them to
+          the device automatically on every connect (skipped when they already
+          match, so a restart with no changes is a no-op). Use
+          <strong>Apply to device</strong> to push the LoRa parameters immediately,
+          without restarting.
         </p>
 
         <div v-if="radioError" class="notice error-notice">{{ radioError }}</div>
@@ -1204,6 +1212,20 @@ chmod g+w {{ configFile }}</pre>
             <option v-for="p in radioPresets" :key="p.name" :value="p.name">{{ p.name }}</option>
           </select>
           <p class="hint">Selecting a preset fills in the parameters below. You can then adjust individual values.</p>
+        </div>
+
+        <div class="field">
+          <label>Routing path width</label>
+          <select v-model.number="radioPathBytes" :disabled="radioLoading" style="max-width: 220px">
+            <option :value="3">3-byte (recommended)</option>
+            <option :value="2">2-byte</option>
+          </select>
+          <p class="hint">
+            Bytes each hop adds to a flooded packet's routing path. More bytes make
+            path-hash collisions (mis-routes) less likely on a dense mesh, at a little
+            more airtime per packet. Applied to the device on every connect —
+            regardless of connection type.
+          </p>
         </div>
 
         <div class="field-row">
