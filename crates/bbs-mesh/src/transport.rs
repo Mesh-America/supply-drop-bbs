@@ -79,6 +79,11 @@ const HISTORY_SEED_SECS: u64 = 8 * 60 * 60;
 /// a flapping radio link can't emit a burst of flooded adverts on rapid
 /// reconnects. Manual (web-UI) adverts are not rate-limited by this.
 const MIN_ADVERT_SPACING: Duration = Duration::from_secs(60);
+/// How often the BBS broadcasts a periodic flood self-advert to keep the mesh's
+/// routes back to it fresh. Fixed at once per 24h (not operator-configurable):
+/// a flood advert is cheap but mesh-wide, and once a day is ample to refresh
+/// routes while keeping aggregate airtime negligible.
+const ADVERT_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// Depth of the queue feeding the command worker. Inbound LoRa traffic is slow
 /// (airtime-limited), so this is rarely above 1; the headroom only matters if
@@ -329,11 +334,9 @@ pub struct MeshTransport {
     /// `0` disables the timeout.
     workflow_timeout_secs: u64,
     /// Broadcast a self-advert on each (re)connect so the mesh relearns a route
-    /// to the BBS promptly.
+    /// to the BBS promptly. The periodic advert (every [`ADVERT_INTERVAL`]) is
+    /// always on and not configurable.
     advert_on_connect: bool,
-    /// Seconds between periodic self-adverts that keep the mesh's route to the
-    /// BBS fresh. `0` disables the periodic advert.
-    advert_interval_secs: u64,
     /// Tracks in-flight replies and drives retransmission on missing ACKs.
     /// Shared with the event-loop task (which owns the retry timer and the
     /// `Sent`/`SendConfirmed` correlation). See [`crate::send_tracker`].
@@ -425,7 +428,6 @@ impl Plugin for MeshTransport {
             flood_after_send: config.flood_after_send,
             workflow_timeout_secs: config.workflow_timeout_secs,
             advert_on_connect: config.advert_on_connect,
-            advert_interval_secs: config.advert_interval_secs,
             send_tracker: Arc::new(Mutex::new(SendTracker::new(RetryConfig {
                 max_attempts: config.reply_max_attempts.max(1),
                 min_timeout: REPLY_ACK_MIN_WAIT,
@@ -457,7 +459,6 @@ impl Plugin for MeshTransport {
         let flood_after_send = self.flood_after_send;
         let workflow_timeout_secs = self.workflow_timeout_secs;
         let advert_on_connect = self.advert_on_connect;
-        let advert_interval_secs = self.advert_interval_secs;
 
         // Admin channel: web UI → event loop for key operations.
         let (key_tx, key_rx) = tokio::sync::mpsc::channel::<bbs_plugin_api::MeshKeyRequest>(4);
@@ -539,7 +540,6 @@ impl Plugin for MeshTransport {
             flood_after_send,
             workflow_timeout_secs,
             advert_on_connect,
-            advert_interval_secs,
             send_tracker,
             delivery_stats,
             key_rx,
@@ -755,7 +755,6 @@ async fn event_loop(
     flood_after_send: bool,
     workflow_timeout_secs: u64,
     advert_on_connect: bool,
-    advert_interval_secs: u64,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
     mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
@@ -775,13 +774,11 @@ async fn event_loop(
     let mut sample_tick = tokio::time::interval(SAMPLE_TICK);
     sample_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Periodically broadcast a self-advert so the mesh keeps a fresh route back
-    // to the BBS. The select arm below is guarded on `advert_interval_secs > 0`,
-    // so when disabled this interval is never polled; the `.max(1)` only avoids
-    // a zero-duration panic here. The immediate first tick is consumed via
-    // `reset()` so the periodic advert does not fire right at startup and double
+    // Broadcast a periodic flood self-advert every ADVERT_INTERVAL (24h, fixed)
+    // so the mesh keeps a fresh route back to the BBS. The immediate first tick
+    // is consumed via `reset()` so it does not fire right at startup and double
     // up with the on-connect advert.
-    let mut advert_tick = tokio::time::interval(Duration::from_secs(advert_interval_secs.max(1)));
+    let mut advert_tick = tokio::time::interval(ADVERT_INTERVAL);
     advert_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     advert_tick.reset();
 
@@ -1034,7 +1031,7 @@ async fn event_loop(
                     debug!("mesh: persisting delivery sample failed: {e}");
                 }
             }
-            _ = advert_tick.tick(), if advert_interval_secs > 0 => {
+            _ = advert_tick.tick() => {
                 broadcast_self_advert(&cmd_tx, &host, true).await;
                 last_advert_at = Some(Instant::now());
             }

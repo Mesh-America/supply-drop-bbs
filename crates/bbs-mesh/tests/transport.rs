@@ -291,7 +291,6 @@ async fn make_transport_with(
         // connect/idle command stream that the handshake assertions don't expect.
         // Tests that exercise adverts opt in explicitly via `customize`.
         advert_on_connect: false,
-        advert_interval_secs: 0,
         ..MeshConfig::default()
     };
     customize(&mut config);
@@ -983,7 +982,6 @@ async fn self_advert_broadcast_on_connect() {
     let host = Arc::new(MockHost::new());
     let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
         cfg.advert_on_connect = true;
-        cfg.advert_interval_secs = 0; // isolate the on-connect advert
     })
     .await;
 
@@ -1006,45 +1004,18 @@ async fn self_advert_broadcast_on_connect() {
     transport.stop().await.unwrap();
 }
 
-/// With `advert_interval_secs` set, the transport broadcasts a self-advert on the
-/// periodic tick. Uses a 1s interval so the test is fast; `advert_on_connect` is
-/// off so the only advert seen is the periodic one.
+// The periodic self-advert fires on a fixed 24h timer (ADVERT_INTERVAL), which is
+// impractical to exercise in real time. It reuses the same broadcast path as the
+// on-connect advert (asserted above) and the web-UI trigger.
+
+/// With `advert_on_connect` off, NO self-advert appears in the connect burst.
+/// (The 24h periodic advert is far outside the test window.) Guards the strict
+/// handshake assertions and the on-connect off-switch.
 #[tokio::test]
-async fn periodic_self_advert_fires() {
-    let host = Arc::new(MockHost::new());
-    let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
-        cfg.advert_on_connect = false; // isolate the periodic advert
-        cfg.advert_interval_secs = 1;
-    })
-    .await;
-    // No connect advert (advert_on_connect = false), so the fixed handshake holds.
-    bridge.complete_handshake("Node").await;
-
-    // The immediate first tick is skipped, so the first periodic advert lands
-    // ~1s after start. Generous timeout to avoid CI flake.
-    let advert = tokio::time::timeout(
-        Duration::from_secs(3),
-        bridge.read_until_cmd(CMD_SEND_SELF_ADVERT),
-    )
-    .await
-    .expect("expected a periodic self-advert within the interval window");
-    assert_eq!(
-        advert[1], 1,
-        "periodic advert should flood (flood byte = 1)"
-    );
-
-    transport.stop().await.unwrap();
-}
-
-/// With both advert knobs off, NO self-advert is ever emitted — not in the
-/// connect burst, not on a timer. Guards the invariant the strict handshake
-/// assertions rely on (and the production off-switch).
-#[tokio::test]
-async fn no_self_advert_when_disabled() {
+async fn no_connect_advert_when_disabled() {
     let host = Arc::new(MockHost::new());
     let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
         cfg.advert_on_connect = false;
-        cfg.advert_interval_secs = 0;
     })
     .await;
 
@@ -1059,7 +1030,7 @@ async fn no_self_advert_when_disabled() {
         let cmd = bridge.read_command().await;
         assert_ne!(
             cmd[0], CMD_SEND_SELF_ADVERT,
-            "no self-advert must be emitted when adverts are disabled"
+            "no self-advert in the connect burst when advert_on_connect is off"
         );
         if cmd[0] == CMD_SYNC_NEXT_MESSAGE {
             bridge
@@ -1510,7 +1481,6 @@ async fn real_host_interactive_register_prompt_reply_advances() {
         reconnect_delay_max_ms: 50,
         reply_max_attempts: 1, // disable retransmission noise for this test
         advert_on_connect: false,
-        advert_interval_secs: 0,
         ..MeshConfig::default()
     };
     let transport = MeshTransport::init(config, host).await.unwrap();
@@ -1575,7 +1545,6 @@ async fn real_host_register_double_send_then_password() {
         reconnect_delay_max_ms: 50,
         reply_max_attempts: 1,
         advert_on_connect: false,
-        advert_interval_secs: 0,
         ..MeshConfig::default()
     };
     let transport = MeshTransport::init(config, host).await.unwrap();
@@ -1650,7 +1619,6 @@ async fn real_host_logout_then_register_prompt_reply_advances() {
         reconnect_delay_max_ms: 50,
         reply_max_attempts: 1,
         advert_on_connect: false,
-        advert_interval_secs: 0,
         ..MeshConfig::default()
     };
     let transport = MeshTransport::init(config, host).await.unwrap();
@@ -1728,7 +1696,6 @@ async fn real_host_oneshot_login_after_logout_yields_live_session() {
         reconnect_delay_max_ms: 50,
         reply_max_attempts: 1,
         advert_on_connect: false,
-        advert_interval_secs: 0,
         ..MeshConfig::default()
     };
     let transport = MeshTransport::init(config, host).await.unwrap();
@@ -1830,7 +1797,6 @@ async fn real_host_retransmitted_login_is_not_reprocessed() {
         reconnect_delay_max_ms: 50,
         reply_max_attempts: 1,
         advert_on_connect: false,
-        advert_interval_secs: 0,
         ..MeshConfig::default()
     };
     let transport = MeshTransport::init(config, host).await.unwrap();

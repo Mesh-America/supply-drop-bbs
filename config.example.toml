@@ -219,12 +219,9 @@
 # workflow_timeout_secs = 300
 # Broadcast a self-advert whenever the radio (re)connects, so repeaters across
 # the mesh (re)learn a route back to the BBS promptly instead of waiting for the
-# firmware's own advert schedule. Default true.
+# firmware's own advert schedule. Default true. (A periodic flood advert also
+# goes out once every 24h on a fixed schedule — not configurable.)
 # advert_on_connect = true
-# Seconds between periodic self-adverts that keep the mesh's route to the BBS
-# fresh. 0 disables (the firmware may still advertise on its own). Adverts are
-# flooded, so keep this generous. Default 3600 (once per hour).
-# advert_interval_secs = 3600
 
 
 # ─── Plugin: Meshtastic transport ─────────────────────────────────

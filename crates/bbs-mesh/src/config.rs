@@ -258,19 +258,12 @@ pub struct MeshConfig {
     /// radio firmware's own advert schedule (which a companion device may run
     /// rarely or not at all). Adverts are flooded so they propagate mesh-wide.
     /// Defaults to `true`.
+    ///
+    /// In addition, the BBS broadcasts a periodic flood advert on a fixed
+    /// once-per-24h schedule (not configurable) to keep routes fresh at minimal
+    /// airtime cost.
     #[serde(default = "default_true")]
     pub advert_on_connect: bool,
-
-    /// Interval, in seconds, at which the BBS broadcasts a periodic self-advert to
-    /// keep the mesh's routes back to it fresh.
-    ///
-    /// `0` disables periodic adverts (the radio firmware may still advertise on
-    /// its own schedule). An advert is a small packet but is flooded — every
-    /// in-range repeater rebroadcasts it once — so keep this generous to limit
-    /// airtime; there is rarely any need to advertise more than a few times an
-    /// hour. Defaults to `3600` (once per hour).
-    #[serde(default = "default_advert_interval_secs")]
-    pub advert_interval_secs: u64,
 
     /// Radio parameter configuration.
     ///
@@ -317,7 +310,6 @@ impl Default for MeshConfig {
             reply_max_attempts: default_reply_max_attempts(),
             workflow_timeout_secs: default_workflow_timeout_secs(),
             advert_on_connect: true,
-            advert_interval_secs: default_advert_interval_secs(),
             radio: None,
         }
     }
@@ -365,10 +357,6 @@ fn default_workflow_timeout_secs() -> u64 {
     300
 }
 
-fn default_advert_interval_secs() -> u64 {
-    3600
-}
-
 fn default_true() -> bool {
     true
 }
@@ -389,17 +377,14 @@ mod tests {
         assert_eq!(cfg.reply_max_attempts, 1);
     }
 
-    /// The BBS should announce itself by default: advertise on connect and once
-    /// an hour, so the mesh keeps a fresh route back to it. Guards the defaults
-    /// (and the serde wiring for omitted keys).
+    /// The BBS should advertise on connect by default so the mesh keeps a fresh
+    /// route back to it (the periodic advert is a fixed 24h schedule in the
+    /// transport, not a config knob). Guards the default and the serde wiring.
     #[test]
-    fn adverts_are_on_by_default() {
-        let d = MeshConfig::default();
-        assert!(d.advert_on_connect);
-        assert_eq!(d.advert_interval_secs, 3600);
+    fn advert_on_connect_is_on_by_default() {
+        assert!(MeshConfig::default().advert_on_connect);
 
         let cfg: MeshConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.advert_on_connect);
-        assert_eq!(cfg.advert_interval_secs, 3600);
     }
 }
