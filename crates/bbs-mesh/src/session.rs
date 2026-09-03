@@ -28,6 +28,14 @@ use std::time::{Duration, Instant};
 
 use bbs_plugin_api::SessionId;
 
+/// How long an unresolved pending-protect entry is remembered before being
+/// swept, per `specs/001-persist-mesh-contacts/research.md` Decision 3's
+/// round-21/26 fixes. Generous enough to comfortably outlast any commonly-
+/// configured advertising interval, while still bounding memory against a
+/// hostile peer manufacturing many never-resolving identities (each pending
+/// entry is a few bytes; the sweep is what keeps this from growing forever).
+const PENDING_PROTECT_TTL_SECS: u64 = 86_400; // 24 hours
+
 /// How long a workflow reply is remembered for deduplication.
 /// Meshtastic retransmissions happen within a few seconds; 10 s is generous.
 /// 60 s caused false-positive drops when a user typed a short string (e.g. "h")
@@ -131,6 +139,12 @@ pub struct SessionState {
     pub by_prefix: HashMap<[u8; 6], SessionEntry>,
     /// Session ID → pubkey prefix (6 bytes).
     pub by_session: HashMap<SessionId, [u8; 6]>,
+    /// Senders whose contact-protection decision is still pending more data
+    /// (an unresolved identity or an incomplete `AdvertBus` record) — see
+    /// `specs/001-persist-mesh-contacts/research.md` Decision 3. Value is
+    /// insertion time, used only for the TTL sweep in
+    /// [`Self::mark_pending_protect`].
+    pending_protect: HashMap<[u8; 6], Instant>,
 }
 
 impl SessionState {
@@ -170,6 +184,7 @@ impl SessionState {
     /// Remove the session for `prefix` (e.g. on explicit logout or expiry).
     /// Returns the removed `SessionId` if one existed.
     pub fn remove_by_prefix(&mut self, prefix: &[u8; 6]) -> Option<SessionId> {
+        self.pending_protect.remove(prefix);
         if let Some(entry) = self.by_prefix.remove(prefix) {
             self.by_session.remove(&entry.session_id);
             Some(entry.session_id)
@@ -359,6 +374,39 @@ impl SessionState {
             entry.last_message = Some((text.to_owned(), Instant::now()));
         }
         false
+    }
+
+    /// Mark `prefix` as pending a contact-protection decision — an
+    /// unconditional insert, idempotent regardless of whether it was already
+    /// pending (see research.md Decision 3's round-21 correction: this must
+    /// be a plain re-insert, not a conditional one, since a concurrent
+    /// resolver could have raced it in between). Sweeps entries older than
+    /// `PENDING_PROTECT_TTL_SECS` first — lazy, O(n) over the (small,
+    /// TTL-bounded) pending set, no separate timer needed.
+    pub fn mark_pending_protect(&mut self, prefix: [u8; 6]) {
+        self.mark_pending_protect_at(prefix, Instant::now());
+    }
+
+    /// [`Self::mark_pending_protect`] with an injectable `now`, so the TTL
+    /// sweep is unit-testable without sleeping for real hours.
+    fn mark_pending_protect_at(&mut self, prefix: [u8; 6], now: Instant) {
+        let ttl = Duration::from_secs(PENDING_PROTECT_TTL_SECS);
+        self.pending_protect
+            .retain(|_, inserted_at| now.saturating_duration_since(*inserted_at) < ttl);
+        self.pending_protect.insert(prefix, now);
+    }
+
+    /// Clear `prefix`'s pending-protect mark — called once a protection
+    /// attempt reaches a terminal outcome (`Protected`, `ProtectedWithEviction`,
+    /// `AlreadyProtected`, `Ineligible`, or `CapReached`).
+    pub fn clear_pending_protect(&mut self, prefix: &[u8; 6]) {
+        self.pending_protect.remove(prefix);
+    }
+
+    /// Return `true` if `prefix` is currently marked as pending a
+    /// contact-protection decision.
+    pub fn is_pending_protect(&self, prefix: &[u8; 6]) -> bool {
+        self.pending_protect.contains_key(prefix)
     }
 }
 
@@ -570,6 +618,72 @@ mod tests {
         assert!(
             !st.dedup_by_timestamp_at(&PREFIX, 1_000, "login bob", outside),
             "a resend after the window expires is processed as new"
+        );
+    }
+
+    #[test]
+    fn pending_protect_marks_and_clears() {
+        let mut st = SessionState::default();
+        assert!(!st.is_pending_protect(&PREFIX));
+        st.mark_pending_protect(PREFIX);
+        assert!(st.is_pending_protect(&PREFIX));
+        st.clear_pending_protect(&PREFIX);
+        assert!(!st.is_pending_protect(&PREFIX));
+    }
+
+    #[test]
+    fn pending_protect_mark_is_idempotent_and_reentrant() {
+        let mut st = SessionState::default();
+        // Re-marking an already-pending entry (round-21 fix: must be an
+        // unconditional re-insert, not a conditional one) must not error or
+        // clear it.
+        st.mark_pending_protect(PREFIX);
+        st.mark_pending_protect(PREFIX);
+        assert!(st.is_pending_protect(&PREFIX));
+        // Clearing an entry that was never marked is a no-op, not a panic.
+        let other: [u8; 6] = [9, 9, 9, 9, 9, 9];
+        st.clear_pending_protect(&other);
+        assert!(!st.is_pending_protect(&other));
+    }
+
+    /// Cross-transport audit regression (Phase 4 verifier): Meshtastic's
+    /// sibling `remove_by_node` clears `pending_protect` on removal; this
+    /// method didn't. Low impact (a stale mark self-heals via the 24h TTL
+    /// sweep), but the two transports' equivalent methods should behave the
+    /// same way rather than silently drift apart.
+    #[test]
+    fn remove_by_prefix_clears_pending_protect() {
+        let mut st = SessionState::default();
+        st.get_or_insert(PREFIX, SessionId::__internal_new(1));
+        st.mark_pending_protect(PREFIX);
+        assert!(st.is_pending_protect(&PREFIX));
+        st.remove_by_prefix(&PREFIX);
+        assert!(!st.is_pending_protect(&PREFIX));
+    }
+
+    #[test]
+    fn pending_protect_ttl_sweeps_stale_entries() {
+        let mut st = SessionState::default();
+        let t0 = Instant::now();
+        let other: [u8; 6] = [9, 9, 9, 9, 9, 9];
+        st.mark_pending_protect_at(PREFIX, t0);
+
+        // Still within the TTL: a later insert for a different prefix must
+        // not sweep the first one away.
+        let inside = t0 + Duration::from_secs(PENDING_PROTECT_TTL_SECS - 1);
+        st.mark_pending_protect_at(other, inside);
+        assert!(
+            st.is_pending_protect(&PREFIX),
+            "an entry still within its TTL must survive another insert's sweep"
+        );
+
+        // Past the TTL: the next insert's lazy sweep must evict the stale one.
+        let outside = t0 + Duration::from_secs(PENDING_PROTECT_TTL_SECS + 1);
+        let third: [u8; 6] = [7, 7, 7, 7, 7, 7];
+        st.mark_pending_protect_at(third, outside);
+        assert!(
+            !st.is_pending_protect(&PREFIX),
+            "an entry past its TTL must be swept by the next insert"
         );
     }
 }

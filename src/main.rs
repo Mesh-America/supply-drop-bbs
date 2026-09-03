@@ -128,6 +128,58 @@ enum Commands {
         #[command(subcommand)]
         action: NodeAction,
     },
+
+    /// Manage protected mesh contacts via a running BBS's web admin API.
+    ///
+    /// Unlike every other subcommand in this file, this one does NOT work
+    /// standalone against the local database — it requires a running,
+    /// reachable BBS instance with the `admin-web` feature enabled, and
+    /// authenticates against it exactly like the web UI does (a session
+    /// login, not a separate mechanism).
+    Contacts {
+        #[command(subcommand)]
+        action: ContactsAction,
+
+        /// Base URL of the running BBS's web admin API.
+        #[arg(
+            long,
+            env = "SUPPLY_DROP_BBS_URL",
+            default_value = "http://127.0.0.1:8080"
+        )]
+        url: String,
+
+        /// Username to authenticate as. The web admin API's login itself
+        /// requires Aide or Sysop (level 50+) for every action here,
+        /// including `list`/`discovered` — a plain User account cannot log
+        /// in at all and gets the same "invalid credentials" error a wrong
+        /// password would.
+        #[arg(long, env = "SUPPLY_DROP_BBS_USERNAME")]
+        username: String,
+
+        /// Password to authenticate with. Prompted interactively (hidden
+        /// input) if omitted — pass this flag or set the env var for
+        /// non-interactive/scripted use.
+        #[arg(long, env = "SUPPLY_DROP_BBS_PASSWORD")]
+        password: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ContactsAction {
+    /// List protected contacts (mirrors the web UI's "Contacts" page).
+    List,
+    /// List every discovered contact, protected or not (mirrors the web
+    /// UI's "Discovered Contacts" page).
+    Discovered,
+    /// Delete a single protected contact by its 64-character hex-encoded
+    /// public key, as shown by `list` (mirrors the web UI's delete button).
+    /// Only *protected* contacts can be deleted this way — a pubkey that
+    /// only appears in `discovered` (never protected) has nothing to
+    /// delete and the server responds 404.
+    Delete {
+        /// The contact's 64-character hex-encoded public key.
+        pubkey: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -454,6 +506,12 @@ async fn main() {
         Some(Commands::Plugin { action }) => cmd_plugin(config_path.as_deref(), action),
         Some(Commands::Metrics) => cmd_metrics(),
         Some(Commands::Node { action }) => cmd_node(config_path.as_deref(), action).await,
+        Some(Commands::Contacts {
+            action,
+            url,
+            username,
+            password,
+        }) => cmd_contacts(&action, &url, &username, password).await,
     }
 }
 
@@ -2636,4 +2694,407 @@ fn init_tracing(cfg: &config::LoggingConfig) -> LogReloadFn {
             .reload(new_filter)
             .map_err(|e| format!("reload failed: {e}"))
     })
+}
+
+// ── Contacts (web admin API client) ─────────────────────────────────────────
+
+/// One entry from `GET /api/v1/adverts` or `GET /api/v1/contacts` — mirrors
+/// `bbs-web`'s `AdvertResponse` shape.
+#[derive(serde::Deserialize)]
+struct CliContact {
+    ts: i64,
+    pubkey: String,
+    name: String,
+    type_name: String,
+    transport: String,
+    protected: bool,
+}
+
+#[derive(serde::Serialize)]
+struct CliLoginRequest<'a> {
+    username: &'a str,
+    password: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct CliErrorBody {
+    error: CliErrorDetail,
+}
+
+#[derive(serde::Deserialize)]
+struct CliErrorDetail {
+    message: String,
+}
+
+/// Print a connection-level failure (refused, timeout, DNS, TLS) as a clear,
+/// actionable error and exit non-zero — FR-013: never print an empty list or
+/// otherwise appear to succeed when the BBS isn't actually reachable.
+fn exit_not_reachable(url: &str, e: &reqwest::Error) -> ! {
+    eprintln!("error: BBS not reachable at {url}: {e}");
+    eprintln!(
+        "  Check that the BBS is running with the admin-web feature enabled \
+         and that --url points at it."
+    );
+    std::process::exit(1);
+}
+
+/// Extract `{"error":{"message":...}}` from a failed response body, falling
+/// back to the bare status line when the body isn't that shape (e.g. a
+/// proxy's own error page).
+async fn error_detail(status: reqwest::StatusCode, resp: reqwest::Response) -> String {
+    resp.json::<CliErrorBody>()
+        .await
+        .map(|b| b.error.message)
+        .unwrap_or_else(|_| status.to_string())
+}
+
+/// `pubkey` reaches here as free-form CLI argument text and is about to be
+/// interpolated into a URL path via `format!` — reject anything that isn't
+/// exactly the 64 hex characters the server expects *before* building that
+/// URL, so a value like `../../whatever` or one containing `?`/`#` can never
+/// redirect the (authenticated) request to an unintended path or query.
+fn is_valid_pubkey_hex(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+async fn cmd_contacts(
+    action: &ContactsAction,
+    url: &str,
+    username: &str,
+    password: Option<String>,
+) {
+    if let ContactsAction::Delete { pubkey } = action {
+        if !is_valid_pubkey_hex(pubkey) {
+            eprintln!("error: invalid pubkey {pubkey:?} — expected 64 hex characters");
+            std::process::exit(1);
+        }
+    }
+
+    let password = password.unwrap_or_else(|| {
+        dialoguer::Password::new()
+            .with_prompt(format!("Password for {username}"))
+            .interact()
+            .unwrap_or_else(|e| {
+                eprintln!("error reading password: {e}");
+                std::process::exit(1);
+            })
+    });
+
+    let client = match reqwest::Client::builder()
+        .cookie_store(true)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to build HTTP client: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let base = url.trim_end_matches('/');
+
+    let login_resp = match client
+        .post(format!("{base}/api/v1/auth/login"))
+        .json(&CliLoginRequest {
+            username,
+            password: &password,
+        })
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => exit_not_reachable(url, &e),
+    };
+
+    if !login_resp.status().is_success() {
+        let status = login_resp.status();
+        let detail = error_detail(status, login_resp).await;
+        eprintln!("error: login failed ({status}): {detail}");
+        std::process::exit(1);
+    }
+
+    match action {
+        ContactsAction::List => list_contacts(&client, base, "/api/v1/contacts", url).await,
+        ContactsAction::Discovered => {
+            list_contacts(&client, base, "/api/v1/adverts", url).await;
+        }
+        ContactsAction::Delete { pubkey } => delete_contact(&client, base, pubkey, url).await,
+    }
+}
+
+async fn list_contacts(client: &reqwest::Client, base: &str, path: &str, url: &str) {
+    let resp = match client.get(format!("{base}{path}")).send().await {
+        Ok(r) => r,
+        Err(e) => exit_not_reachable(url, &e),
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let detail = error_detail(status, resp).await;
+        eprintln!("error: request failed ({status}): {detail}");
+        std::process::exit(1);
+    }
+    let contacts: Vec<CliContact> = match resp.json().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: failed to parse response: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    if contacts.is_empty() {
+        println!("(no contacts)");
+        return;
+    }
+
+    println!(
+        "{:<10} {:<24} {:<12} {:<10} {:<20} PUBKEY",
+        "PROTECTED", "NAME", "TRANSPORT", "TYPE", "LAST SEEN"
+    );
+    println!("{}", "-".repeat(100));
+    for c in &contacts {
+        let last_seen = time::OffsetDateTime::from_unix_timestamp(c.ts)
+            .map(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_else(|_| c.ts.to_string())
+            })
+            .unwrap_or_else(|_| c.ts.to_string());
+        println!(
+            "{:<10} {:<24} {:<12} {:<10} {:<20} {}",
+            if c.protected { "yes" } else { "no" },
+            truncate(&sanitize_for_terminal(&c.name), 24),
+            sanitize_for_terminal(&c.transport),
+            sanitize_for_terminal(&c.type_name),
+            last_seen,
+            c.pubkey,
+        );
+    }
+}
+
+async fn delete_contact(client: &reqwest::Client, base: &str, pubkey: &str, url: &str) {
+    // Validated by cmd_contacts before this is ever called, so it's safe to
+    // interpolate directly — a bare path segment, never `../`, `?`, or `#`.
+    let resp = match client
+        .delete(format!("{base}/api/v1/contacts/{pubkey}"))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => exit_not_reachable(url, &e),
+    };
+    let status = resp.status();
+    if status.is_success() {
+        println!("deleted: {pubkey}");
+        return;
+    }
+    let detail = error_detail(status, resp).await;
+    eprintln!("error: delete failed ({status}): {detail}");
+    std::process::exit(1);
+}
+
+/// Replace control characters and explicit Unicode bidi-override characters
+/// with `U+FFFD` before printing text that originates from an untrusted
+/// mesh peer (contact names/types/transports) — otherwise a hostile advert
+/// could inject ANSI/CSI/OSC escapes or right-to-left overrides into the
+/// sysop's own terminal.
+fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            let unsafe_char =
+                c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}');
+            if unsafe_char {
+                '\u{fffd}'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if max == 0 {
+        String::new()
+    } else if s.chars().count() <= max {
+        s.to_owned()
+    } else {
+        s.chars().take(max - 1).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod contacts_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_leaves_short_strings_untouched() {
+        assert_eq!(truncate("basecamp", 24), "basecamp");
+        assert_eq!(truncate("exact-len", 9), "exact-len");
+    }
+
+    #[test]
+    fn truncate_shortens_long_strings_with_ellipsis() {
+        assert_eq!(truncate("basecamp-node-north-ridge", 10), "basecamp-…");
+    }
+
+    #[test]
+    fn truncate_counts_unicode_scalars_not_bytes() {
+        // "café-node-north" has one multi-byte char; a byte-counting
+        // truncate would slice mid-character and panic or corrupt output.
+        let out = truncate("café-node-north", 5);
+        assert_eq!(out.chars().count(), 5);
+        assert!(out.ends_with('…'));
+    }
+
+    #[test]
+    fn truncate_handles_max_zero() {
+        // max is a hard ceiling on the *output* length — "…" alone would
+        // already violate a max of 0.
+        assert_eq!(truncate("anything", 0), "");
+    }
+
+    #[test]
+    fn pubkey_hex_accepts_64_char_hex_either_case() {
+        assert!(is_valid_pubkey_hex(&"ab".repeat(32)));
+        assert!(is_valid_pubkey_hex(&"AB".repeat(32)));
+    }
+
+    #[test]
+    fn pubkey_hex_rejects_wrong_length() {
+        assert!(!is_valid_pubkey_hex("ab12"));
+        assert!(!is_valid_pubkey_hex(&"ab".repeat(33)));
+        assert!(!is_valid_pubkey_hex(""));
+    }
+
+    #[test]
+    fn pubkey_hex_rejects_path_traversal_and_url_special_chars() {
+        // These are exactly the values that would otherwise get spliced
+        // into a URL path via format!() and could redirect the request to
+        // an unintended endpoint.
+        assert!(!is_valid_pubkey_hex("../../../etc/passwd"));
+        assert!(!is_valid_pubkey_hex(&format!("{}?x=1", "a".repeat(60))));
+        assert!(!is_valid_pubkey_hex(&format!("{}#frag", "a".repeat(59))));
+    }
+
+    #[test]
+    fn sanitize_for_terminal_leaves_plain_text_untouched() {
+        assert_eq!(
+            sanitize_for_terminal("basecamp-node café"),
+            "basecamp-node café"
+        );
+    }
+
+    #[test]
+    fn sanitize_for_terminal_replaces_control_and_bidi_override_chars() {
+        // ESC (start of ANSI/CSI/OSC sequences) and an explicit
+        // right-to-left override, both reachable from a mesh peer's
+        // self-reported name.
+        let input = "safe\u{1b}[31mred\u{202e}gnidaelsim";
+        let out = sanitize_for_terminal(input);
+        assert!(!out.contains('\u{1b}'));
+        assert!(!out.contains('\u{202e}'));
+        assert!(out.starts_with("safe"));
+    }
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("expected args to parse")
+    }
+
+    #[test]
+    fn contacts_list_parses_with_required_flags_and_default_url() {
+        // Flags declared alongside `#[command(subcommand)]` on `Contacts`
+        // belong to the parent and must precede the action token (`list`);
+        // clap treats everything after it as the subcommand's own args.
+        let cli = parse(&[
+            "supply-drop-bbs",
+            "contacts",
+            "--username",
+            "alice",
+            "--password",
+            "hunter2",
+            "list",
+        ]);
+        match cli.command {
+            Some(Commands::Contacts {
+                action,
+                url,
+                username,
+                password,
+            }) => {
+                assert!(matches!(action, ContactsAction::List));
+                assert_eq!(url, "http://127.0.0.1:8080");
+                assert_eq!(username, "alice");
+                assert_eq!(password.as_deref(), Some("hunter2"));
+            }
+            _ => panic!("expected Commands::Contacts"),
+        }
+    }
+
+    #[test]
+    fn contacts_discovered_parses_with_explicit_url() {
+        let cli = parse(&[
+            "supply-drop-bbs",
+            "contacts",
+            "--url",
+            "http://192.168.1.50:8080",
+            "--username",
+            "alice",
+            "discovered",
+        ]);
+        match cli.command {
+            Some(Commands::Contacts {
+                action,
+                url,
+                password,
+                ..
+            }) => {
+                assert!(matches!(action, ContactsAction::Discovered));
+                assert_eq!(url, "http://192.168.1.50:8080");
+                // Not supplied on the command line — prompted interactively later.
+                assert_eq!(password, None);
+            }
+            _ => panic!("expected Commands::Contacts"),
+        }
+    }
+
+    #[test]
+    fn contacts_delete_captures_the_pubkey_argument() {
+        let cli = parse(&[
+            "supply-drop-bbs",
+            "contacts",
+            "--username",
+            "alice",
+            "--password",
+            "hunter2",
+            "delete",
+            "ab12cd34ef56",
+        ]);
+        match cli.command {
+            Some(Commands::Contacts { action, .. }) => match action {
+                ContactsAction::Delete { pubkey } => assert_eq!(pubkey, "ab12cd34ef56"),
+                _ => panic!("expected ContactsAction::Delete"),
+            },
+            _ => panic!("expected Commands::Contacts"),
+        }
+    }
+
+    #[test]
+    fn contacts_requires_username() {
+        // Checked via clap's own command metadata rather than by actually
+        // parsing argv without --username: a real parse would silently pass
+        // whenever SUPPLY_DROP_BBS_USERNAME happens to be set in the
+        // ambient test-process environment (plausible, since that's this
+        // flag's own env var), which would make this assertion a silent
+        // no-op instead of a hard requirement check.
+        use clap::CommandFactory;
+        let command = Cli::command();
+        let contacts = command
+            .get_subcommands()
+            .find(|c| c.get_name() == "contacts")
+            .expect("contacts subcommand exists");
+        let username_arg = contacts
+            .get_arguments()
+            .find(|a| a.get_id() == "username")
+            .expect("username arg exists");
+        assert!(username_arg.is_required_set());
+    }
 }

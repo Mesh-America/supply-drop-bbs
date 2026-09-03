@@ -737,6 +737,32 @@ impl Host for BbsHost {
             .map_err(bbs_plugin_api::HostError::Internal)
     }
 
+    async fn admin_remove_meshcore_contact(
+        &self,
+        pubkey: [u8; 32],
+    ) -> Result<(), bbs_plugin_api::HostError> {
+        let tx = self
+            .mesh_key_tx
+            .read()
+            .expect("mesh_key_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("mesh transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshKeyRequest::RemoveContact {
+            pubkey,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| bbs_plugin_api::HostError::Internal("mesh transport disconnected".into()))?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| bbs_plugin_api::HostError::Internal("contact removal timed out".into()))?
+            .map_err(|_| bbs_plugin_api::HostError::Internal("contact removal cancelled".into()))?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
     fn register_meshtastic_admin_ops(
         &self,
         sender: tokio::sync::mpsc::Sender<bbs_plugin_api::MeshtasticAdminRequest>,
@@ -948,6 +974,38 @@ impl Host for BbsHost {
             .await
             .map_err(|_| bbs_plugin_api::HostError::Internal("meshtastic reboot timed out".into()))?
             .map_err(|_| bbs_plugin_api::HostError::Internal("meshtastic reboot cancelled".into()))?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
+    async fn admin_remove_meshtastic_favorite(
+        &self,
+        node_num: u32,
+    ) -> Result<(), bbs_plugin_api::HostError> {
+        let tx = self
+            .meshtastic_admin_tx
+            .read()
+            .expect("meshtastic_admin_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshtasticAdminRequest::RemoveFavoriteNode {
+            node_num,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| {
+            bbs_plugin_api::HostError::Internal("meshtastic transport disconnected".into())
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic favorite removal timed out".into())
+            })?
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic favorite removal cancelled".into())
+            })?
             .map_err(bbs_plugin_api::HostError::Internal)
     }
 

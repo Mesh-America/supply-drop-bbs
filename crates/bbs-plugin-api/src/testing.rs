@@ -77,6 +77,15 @@ struct MockHostState {
     /// Artificial delay applied inside `process_command` before recording and
     /// responding, to exercise slow-host / backpressure paths. Zero by default.
     process_delay: Duration,
+    /// Every `admin_remove_meshcore_contact` call, in order — lets tests
+    /// verify the *correct* pubkey was passed, not just that a removal
+    /// error was swallowed (both the argument and whether it was called at
+    /// all are otherwise invisible to a caller that only inspects the HTTP
+    /// response, since this feature's own admin actions are best-effort).
+    removed_meshcore_contacts: Vec<[u8; 32]>,
+    /// Every `admin_remove_meshtastic_favorite` call, in order — same
+    /// rationale as `removed_meshcore_contacts`.
+    removed_meshtastic_favorites: Vec<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +126,8 @@ impl MockHost {
                 default_response: Response::Text("(unscripted)".to_owned()),
                 commands_received: Vec::new(),
                 process_delay: Duration::ZERO,
+                removed_meshcore_contacts: Vec::new(),
+                removed_meshtastic_favorites: Vec::new(),
             }),
             events: tx,
             advert_bus: Arc::new(AdvertBus::new()),
@@ -194,6 +205,26 @@ impl MockHost {
         event: DomainEvent,
     ) -> Result<usize, broadcast::error::SendError<DomainEvent>> {
         self.events.send(event)
+    }
+
+    /// Every `admin_remove_meshcore_contact` pubkey passed so far, in order.
+    #[must_use]
+    pub fn removed_meshcore_contacts(&self) -> Vec<[u8; 32]> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .removed_meshcore_contacts
+            .clone()
+    }
+
+    /// Every `admin_remove_meshtastic_favorite` node_num passed so far, in order.
+    #[must_use]
+    pub fn removed_meshtastic_favorites(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .removed_meshtastic_favorites
+            .clone()
     }
 }
 
@@ -275,6 +306,34 @@ impl Host for MockHost {
 
     fn advert_bus(&self) -> Arc<AdvertBus> {
         Arc::clone(&self.advert_bus)
+    }
+
+    /// Records the pubkey and succeeds, unlike the trait's default
+    /// `NotSupported` body — so tests exercising a delete/removal flow can
+    /// assert the *correct* pubkey was actually passed via
+    /// [`MockHost::removed_meshcore_contacts`], not just that a removal
+    /// error was silently swallowed by a caller that only inspects the
+    /// HTTP-visible outcome (found by the Phase 6 hostile audit's Hostile
+    /// QA persona: the default `NotSupported` body made two removal tests
+    /// pass for the wrong reason).
+    async fn admin_remove_meshcore_contact(&self, pubkey: [u8; 32]) -> Result<(), HostError> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .removed_meshcore_contacts
+            .push(pubkey);
+        Ok(())
+    }
+
+    /// [`admin_remove_meshcore_contact`](Self::admin_remove_meshcore_contact)'s
+    /// Meshtastic sibling.
+    async fn admin_remove_meshtastic_favorite(&self, node_num: u32) -> Result<(), HostError> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .removed_meshtastic_favorites
+            .push(node_num);
+        Ok(())
     }
 }
 

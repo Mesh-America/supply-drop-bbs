@@ -70,10 +70,13 @@ const groups = computed<NavGroup[]>(() => {
     },
   ]
 
-  if (transports.meshcore) {
+  if (transports.meshcore || transports.meshtastic) {
     g.push({
       title: 'mesh',
-      items: [{ to: '/adverts', label: 'adverts' }],
+      items: [
+        { to: '/adverts', label: 'discovered contacts' },
+        { to: '/contacts', label: 'contacts' },
+      ],
     })
   }
 

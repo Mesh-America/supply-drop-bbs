@@ -45,6 +45,15 @@ pub enum MeshKeyRequest {
         /// One-shot channel to deliver the result back to the caller.
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
+    /// Remove a contact from the device's own contact table — the native
+    /// removal half of the "Persist Mesh Contacts" delete/eviction flow
+    /// (`specs/001-persist-mesh-contacts/research.md` Decision 12).
+    RemoveContact {
+        /// Full 32-byte public key of the contact to remove.
+        pubkey: [u8; 32],
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// Request sent from [`Host`] to the Meshtastic transport's admin channel.
@@ -92,6 +101,18 @@ pub enum MeshtasticAdminRequest {
     Reboot {
         /// Seconds until reboot.
         seconds: i32,
+        /// One-shot channel to deliver the result back to the caller.
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    /// Un-favorite a node — the native removal half of the "Persist Mesh
+    /// Contacts" delete/eviction flow
+    /// (`specs/001-persist-mesh-contacts/research.md` Decision 12). No-reply
+    /// on the wire (fire-and-forget, mirroring `set_favorite_node`), but this
+    /// admin-request variant still carries a `reply` so the caller can be
+    /// told the write was queued (or why it couldn't be).
+    RemoveFavoriteNode {
+        /// The Meshtastic node number to un-favorite.
+        node_num: u32,
         /// One-shot channel to deliver the result back to the caller.
         reply: tokio::sync::oneshot::Sender<Result<(), String>>,
     },
@@ -529,6 +550,23 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_apply_mesh_radio".into()))
     }
 
+    /// Remove a contact from the connected MeshCore device's own contact
+    /// table. Best-effort, fire-and-forget on the wire — a failure here does
+    /// not undo the caller's own local `AdvertBus::unprotect`, which already
+    /// took effect before this was called (see
+    /// `specs/001-persist-mesh-contacts/research.md` Decision 12). If the
+    /// wire write itself is lost, though, a later device sync reporting the
+    /// contact as still-favourited *can* silently re-protect it once
+    /// `AdvertBus`'s grace window has elapsed — a disclosed, time-bounded
+    /// tradeoff (Decision 12a), not a claim that a lost write has zero
+    /// downstream effect.
+    async fn admin_remove_meshcore_contact(&self, pubkey: [u8; 32]) -> Result<(), HostError> {
+        let _ = pubkey;
+        Err(HostError::NotSupported(
+            "admin_remove_meshcore_contact".into(),
+        ))
+    }
+
     /// Register the Meshtastic transport's admin command channel.
     fn register_meshtastic_admin_ops(
         &self,
@@ -591,6 +629,23 @@ pub trait Host: Send + Sync {
     async fn admin_reboot_meshtastic(&self, seconds: i32) -> Result<(), HostError> {
         let _ = seconds;
         Err(HostError::NotSupported("admin_reboot_meshtastic".into()))
+    }
+
+    /// Un-favorite a node on the connected Meshtastic radio's own NodeDB.
+    /// Best-effort, fire-and-forget on the wire — a failure here does not
+    /// undo the caller's own local `AdvertBus::unprotect`, which already
+    /// took effect before this was called (see
+    /// `specs/001-persist-mesh-contacts/research.md` Decision 12). If the
+    /// wire write itself is lost, though, a later device sync reporting the
+    /// node as still-favorited *can* silently re-protect it once
+    /// `AdvertBus`'s grace window has elapsed — a disclosed, time-bounded
+    /// tradeoff (Decision 12a), not a claim that a lost write has zero
+    /// downstream effect.
+    async fn admin_remove_meshtastic_favorite(&self, node_num: u32) -> Result<(), HostError> {
+        let _ = node_num;
+        Err(HostError::NotSupported(
+            "admin_remove_meshtastic_favorite".into(),
+        ))
     }
 
     // ── Mesh node credentials ────────────────────────────────────────────────────

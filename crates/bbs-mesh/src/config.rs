@@ -295,6 +295,26 @@ pub struct MeshConfig {
     /// ```
     #[serde(default)]
     pub radio: Option<RadioConfig>,
+
+    /// Maximum number of contacts that may be protected (favourited) at
+    /// once — see the "Persist Mesh Contacts" feature
+    /// (`specs/001-persist-mesh-contacts/research.md` Decision 5b).
+    ///
+    /// Once this many contacts are protected, a newly-eligible sender's
+    /// first DM evicts the oldest-protected, currently session-inactive
+    /// contact to make room, rather than growing the protected set further.
+    /// Set this to your device's real contact-table capacity (MeshCore's
+    /// `max_contacts` varies by hardware — check your device). Defaults to
+    /// `350`, a common companion-radio figure, but is not authoritative for
+    /// every board. `0` disables protection entirely on this transport (no
+    /// new contact is ever protected).
+    ///
+    /// Enforced in `dispatch_message`'s call to
+    /// `AdvertBus::mark_favourite_if_eligible`. (Meshtastic's equivalent
+    /// default is `100`, not `350` — the two are intentionally different,
+    /// not drifted; real device capacity varies by transport and hardware.)
+    #[serde(default = "default_protected_contact_cap")]
+    pub protected_contact_cap: usize,
 }
 
 impl MeshConfig {
@@ -336,6 +356,7 @@ impl Default for MeshConfig {
             workflow_timeout_secs: default_workflow_timeout_secs(),
             advert_on_connect: true,
             radio: None,
+            protected_contact_cap: default_protected_contact_cap(),
         }
     }
 }
@@ -388,6 +409,10 @@ fn default_workflow_timeout_secs() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_protected_contact_cap() -> usize {
+    350
 }
 
 #[cfg(test)]
