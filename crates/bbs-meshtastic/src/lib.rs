@@ -13,7 +13,7 @@ use std::{
         atomic::{AtomicU32, Ordering},
         Arc, Mutex,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -27,6 +27,10 @@ use bbs_plugin_api::{
 use prost::Message as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
+// tokio's Instant (not std's) so the ~30s session-key timeout respects
+// `tokio::time::pause`/`advance` under `#[tokio::test(start_paused = true)]`
+// — see the session_key_request_abandoned_after_30s_permits_a_fresh_request test.
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use bbs_plugin_api::MeshtasticAdminRequest;
@@ -971,9 +975,7 @@ async fn event_loop(
                     warn!("meshtastic: clearing abandoned pending admin GET (no device response)");
                     pending_admin = None;
                 }
-                if session_requested
-                    && session_requested_at.is_some_and(|at| at.elapsed() > Duration::from_secs(30))
-                {
+                if session_requested && session_key_request_abandoned(session_requested_at) {
                     warn!("meshtastic: session-key request abandoned (no device response) — will retry on next write");
                     session_requested = false;
                     session_requested_at = None;
@@ -1375,6 +1377,14 @@ fn enqueue_auto_apply(
             deferred.push(DeferredWrite::Owner { user, reply: None });
         }
     }
+}
+
+/// True once an outstanding session-key request has gone unanswered for more
+/// than 30s — the device is presumed gone (or the response was lost), so
+/// `event_loop`'s reap tick clears the flag and lets the next write attempt
+/// issue a fresh request rather than waiting forever.
+fn session_key_request_abandoned(session_requested_at: Option<Instant>) -> bool {
+    session_requested_at.is_some_and(|at| at.elapsed() > Duration::from_secs(30))
 }
 
 /// Request a session key from the device (to authorize queued writes), unless a
@@ -2783,6 +2793,7 @@ fn format_node_id(node_num: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::CONFIG_TYPE_SESSIONKEY;
 
     #[test]
     fn default_config_is_disabled_but_serial_ready() {
@@ -3049,6 +3060,116 @@ serial_port = "/dev/ttyAMA0"
     }
 
     const CAP: usize = 100;
+
+    // T035a: a session-key request that never gets a device response must
+    // not permanently wedge future writes — event_loop's reap tick clears it
+    // after ~30s so the next write attempt issues a fresh request. Uses
+    // `#[tokio::test(start_paused = true)]` + `tokio::time::advance` rather
+    // than a real 30s sleep, which `session_key_request_abandoned`'s use of
+    // `tokio::time::Instant` (not `std::time::Instant`) makes possible.
+    //
+    // IMPORTANT SCOPE NOTE: this test does NOT drive `event_loop`'s real
+    // `reap.tick()` select arm (event_loop is only ever spawned from
+    // `start()`, which needs a live connection — no test harness drives it
+    // directly). It calls `session_key_request_abandoned` — the real
+    // extracted predicate, so the 30s threshold itself IS shared/tested —
+    // but then manually reproduces the reap arm's own two-line state reset
+    // (`session_requested = false; session_requested_at = None;`) rather
+    // than exercising that reset through the real code path. If a future
+    // edit changes what the real reap arm does on abandonment (e.g. also
+    // reverting a deferred write, the way the disconnect handler already
+    // does), this test can keep passing while providing zero coverage of
+    // that change. Closing this gap for real needs the same wire-level
+    // fake-radio harness this crate deliberately doesn't have (research.md
+    // Decision 9) — see T035b.
+    #[tokio::test(start_paused = true)]
+    async fn session_key_request_abandoned_after_30s_permits_a_fresh_request() {
+        let mut ctx = TestCtx::new();
+        ctx.deferred_writes.push(DeferredWrite::SetFavoriteNode {
+            node_num: 42,
+            expected_generation: 1,
+        });
+
+        request_session_key(
+            &ctx.cmd_tx,
+            42,
+            &mut ctx.session_requested,
+            &mut ctx.session_requested_at,
+            &ctx.deferred_writes,
+        );
+        assert!(ctx.session_requested);
+        assert!(ctx.session_requested_at.is_some());
+        assert!(!session_key_request_abandoned(ctx.session_requested_at));
+        let first = ctx.drain_admin();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(
+            first[0].1.payload_variant,
+            Some(admin_message::PayloadVariant::GetConfigRequest(v)) if v == CONFIG_TYPE_SESSIONKEY
+        ));
+
+        // While the first request is still outstanding, a second attempt is
+        // a no-op — request_session_key's own `if *session_requested { return }`
+        // guard, unrelated to the timeout this test targets.
+        request_session_key(
+            &ctx.cmd_tx,
+            42,
+            &mut ctx.session_requested,
+            &mut ctx.session_requested_at,
+            &ctx.deferred_writes,
+        );
+        assert!(ctx.drain_admin().is_empty());
+
+        // No response ever arrives. Advance past the ~30s abandonment
+        // threshold used by event_loop's reap.tick() arm.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(session_key_request_abandoned(ctx.session_requested_at));
+
+        // Reproduce exactly what the reap.tick() arm does on abandonment.
+        ctx.session_requested = false;
+        ctx.session_requested_at = None;
+
+        // A subsequent protect/delete attempt (any caller of
+        // request_session_key) now issues a genuinely fresh request rather
+        // than silently declining forever.
+        request_session_key(
+            &ctx.cmd_tx,
+            42,
+            &mut ctx.session_requested,
+            &mut ctx.session_requested_at,
+            &ctx.deferred_writes,
+        );
+        assert!(ctx.session_requested);
+        let second = ctx.drain_admin();
+        assert_eq!(
+            second.len(),
+            1,
+            "timeout must not permanently wedge session-key requests"
+        );
+        assert!(matches!(
+            second[0].1.payload_variant,
+            Some(admin_message::PayloadVariant::GetConfigRequest(v)) if v == CONFIG_TYPE_SESSIONKEY
+        ));
+    }
+
+    #[test]
+    fn session_key_request_abandoned_is_false_when_nothing_was_ever_requested() {
+        assert!(!session_key_request_abandoned(None));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn session_key_request_abandoned_boundary_is_strictly_greater_than_30s() {
+        let requested_at = Some(Instant::now());
+        tokio::time::advance(Duration::from_secs(30)).await;
+        assert!(
+            !session_key_request_abandoned(requested_at),
+            "exactly 30s elapsed must not yet count as abandoned — the real check is `>`, not `>=`"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            session_key_request_abandoned(requested_at),
+            "one tick past 30s must count as abandoned"
+        );
+    }
 
     // T023: a set_favorite_node admin write is queued the first time a
     // TextMessage from a CLIENT-role node is dispatched.

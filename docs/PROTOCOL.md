@@ -347,6 +347,37 @@ attacker who already knows or can observe a target's 6-byte prefix. This is
 a known, accepted, unmitigated-in-code limitation — documented here rather
 than silently carried, alongside the Meshtastic firmware-crash risk above.
 
+### MeshCore: self-identification requires `CMD_APP_START` support
+
+The BBS learns its own MeshCore public key exactly once, from the
+`SelfInfo` the device returns in response to `CMD_APP_START` at connect
+time — nothing else in the wire protocol sets it. On firmware that
+responds `ERR_CODE_UNSUPPORTED_CMD` to `CMD_APP_START`, the BBS's own
+public key is never learned for the life of that connection.
+
+This matters because both the eviction path (`ContactsFull`) and the
+new-protection eviction-exclusion list build their "never evict this"
+set from the BBS's own known pubkey. Without it, the BBS's own
+self-registered contact entry is not excluded from eviction-candidate
+selection — worst case, the BBS could select its own entry as the
+`ContactsFull` eviction victim and send `RemoveContact` against itself.
+
+**No clean fix exists today.** The BBS's own contact entry, when it does
+end up in `AdvertBus` on unsupported-`CMD_APP_START` firmware (via an
+ordinary contact sync or an echoed self-advert), carries no marker
+distinguishing it from any other real contact — there is currently no
+protocol-level signal that says "this record is me" independent of
+`CMD_APP_START`'s `SelfInfo`. The one other command that returns
+key material, `ExportPrivateKey` (used on-demand by `node export-key`),
+was considered and rejected as an automatic fallback: its firmware
+support isn't independently verified either, and routinely invoking it
+on every connection just to self-identify would mean materializing the
+node's *private* key far more often than necessary, for a security-
+sensitive operation currently gated behind an explicit sysop CLI action —
+a worse trade than the gap it would close. This is a known, accepted,
+unmitigated-in-code limitation on the affected firmware, documented here
+rather than silently carried, alongside the two limitations above.
+
 ### Discovered Contacts vs. Contacts, and delete semantics
 
 The web admin UI and API distinguish two views over the same underlying
