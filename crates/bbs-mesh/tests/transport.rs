@@ -129,6 +129,15 @@ fn path_updated_frame(pubkey: [u8; 32]) -> Vec<u8> {
     radio_frame(&payload)
 }
 
+/// PUSH_CODE_ADVERT: the lightweight, pubkey-only advert a device sends for
+/// an already-known contact (as opposed to `PUSH_CODE_NEW_ADVERT`'s full
+/// 147-byte record) — see `meshcore_companion::frame::decode`'s `PUSH_CODE_ADVERT` arm.
+fn short_advert_frame(pubkey: [u8; 32]) -> Vec<u8> {
+    let mut payload = vec![PUSH_CODE_ADVERT];
+    payload.extend_from_slice(&pubkey);
+    radio_frame(&payload)
+}
+
 /// Build a 32-byte pubkey whose first 6 bytes are `prefix` (the wire-level
 /// identity a `ContactMsgRecv` carries) so a seeded advert record and a DM
 /// from the same node resolve to the same identity in tests.
@@ -2279,6 +2288,90 @@ async fn protection_deferred_until_full_contact_data_cached() {
     .await
     .expect("expected retroactive protection once the full contact record arrived");
     assert_eq!(&add_update[1..33], &pubkey[..]);
+
+    transport.stop().await.unwrap();
+}
+
+/// supply-drop-bbs-9vt: the real-world failure sequence is a DM arriving
+/// *before* the BBS has ever heard anything about the sender — so
+/// `get_or_create_session`'s seed-from-AdvertBus never finds a record, and
+/// `dispatch_message`'s own protect attempt is skipped entirely (no
+/// `full_pubkey` to work with). A short advert arriving afterward is often
+/// the first identity data the BBS ever gets for that sender; it must retry
+/// the pending protect (mirroring `NewAdvert`/`Contact`'s hook), which then
+/// finds only a short (`has_full_record: false`) record and hits
+/// `NoRecordYet` — which must in turn trigger a catch-up `GetContacts`,
+/// since the one-time connect-time `GetContacts` (drained by
+/// `complete_handshake` below) already ran before this sender existed.
+#[tokio::test]
+async fn short_advert_after_unresolved_dm_retries_and_triggers_contacts_catchup() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0x51u8, 0x52, 0x53, 0x54, 0x55, 0x56];
+    let pubkey = pubkey_for_prefix(sender);
+
+    // The DM arrives with no cached advert data and no resolved identity —
+    // dispatch_message's own protect attempt is skipped, but the pending
+    // mark is still set unconditionally.
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(300)).await;
+    assert!(
+        !types.contains(&CMD_ADD_UPDATE_CONTACT) && !types.contains(&CMD_GET_CONTACTS),
+        "no protect attempt should have run yet — identity is still unresolved; saw: {types:?}"
+    );
+
+    // A short (pubkey-only) advert now resolves the sender's identity —
+    // this must retry the pending protect and, finding only a short record,
+    // request a contacts catch-up.
+    bridge.send(&short_advert_frame(pubkey)).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_GET_CONTACTS),
+    )
+    .await
+    .expect(
+        "expected a catch-up GetContacts request once the short advert \
+             resolved this sender's identity but not their full record",
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// The catch-up trigger is a single, connection-wide cooldown (matching
+/// `MIN_ADVERT_SPACING`'s scale) — it must not fire again for a second
+/// sender whose identity resolves (via a short advert) moments later.
+#[tokio::test]
+async fn contacts_catchup_request_is_cooldown_gated_across_senders() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let first_sender = [0x61u8, 0x62, 0x63, 0x64, 0x65, 0x66];
+    let first_pubkey = pubkey_for_prefix(first_sender);
+    bridge.send(&contact_msg_frame(first_sender, "help")).await;
+    bridge.send(&short_advert_frame(first_pubkey)).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_GET_CONTACTS),
+    )
+    .await
+    .expect("expected the first resolved sender to trigger a catch-up request");
+
+    let second_sender = [0x71u8, 0x72, 0x73, 0x74, 0x75, 0x76];
+    let second_pubkey = pubkey_for_prefix(second_sender);
+    bridge.send(&contact_msg_frame(second_sender, "help")).await;
+    bridge.send(&short_advert_frame(second_pubkey)).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_GET_CONTACTS),
+        "a second sender resolved within the cooldown window must not trigger \
+         another catch-up request; saw: {types:?}"
+    );
 
     transport.stop().await.unwrap();
 }

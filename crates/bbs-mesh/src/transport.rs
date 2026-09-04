@@ -904,6 +904,7 @@ async fn event_loop(
         Arc::clone(&host),
         cmd_tx.clone(),
         Arc::clone(&state),
+        Arc::clone(&draining),
         command_prefix,
         welcome_message,
         node_credential_ttl_days,
@@ -1368,7 +1369,36 @@ async fn handle_frame(
         // Sessions are minted on first DM, not on advert.
         InboundFrame::Advert { pubkey } => {
             host.advert_bus().upsert_short(pubkey, TRANSPORT_NAME);
+            let prefix: [u8; 6] = pubkey[..6].try_into().expect("pubkey is 32 bytes");
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_full_pubkey(&prefix, pubkey);
             debug!(prefix = ?&pubkey[..6], "mesh: short advert received");
+
+            // Persist Mesh Contacts / supply-drop-bbs-9vt: a sender who DMs
+            // before ever advertising gets no full_pubkey at session-creation
+            // time (get_or_create_session's seed only runs for a brand-new
+            // session), so dispatch_message's own protect attempt is skipped
+            // entirely — this short advert, arriving after, is often the
+            // FIRST identity data the BBS ever gets for them. Retry now,
+            // mirroring NewAdvert/Contact's identical hook below.
+            let pending = state
+                .lock()
+                .expect("state mutex poisoned")
+                .is_pending_protect(&prefix);
+            if pending {
+                attempt_protect_and_update_pending(
+                    host,
+                    cmd_tx,
+                    state,
+                    draining,
+                    prefix,
+                    pubkey,
+                    protected_contact_cap,
+                )
+                .await;
+            }
         }
         InboundFrame::NewAdvert(contact) => {
             // When the radio echoes our own advert back, its GPS fields reflect
@@ -1416,6 +1446,7 @@ async fn handle_frame(
                     host,
                     cmd_tx,
                     state,
+                    draining,
                     prefix,
                     contact.pubkey,
                     protected_contact_cap,
@@ -1467,6 +1498,7 @@ async fn handle_frame(
                     host,
                     cmd_tx,
                     state,
+                    draining,
                     prefix,
                     contact.pubkey,
                     protected_contact_cap,
@@ -1714,11 +1746,15 @@ async fn handle_frame(
         // lost on a stale multi-hop direct path) is done with `ResetPath`, which
         // needs the full key — but an inbound DM only carries the 6-byte prefix,
         // and `GetContacts` runs once on connect, before first-contact sessions
-        // exist. Without this the full key stays unknown for exactly the far
-        // nodes that need flooding, so `flood_after_send`'s post-reply ResetPath
-        // is silently skipped (`get_full_pubkey` returns None) and every reply
-        // goes direct. `set_full_pubkey` no-ops until a session exists; PathUpdated
-        // arrives after the inbound DM created it, so it lands.
+        // exist. Advert/NewAdvert/Contact frames can also resolve the full key
+        // (see their handlers above), but none of those is guaranteed to arrive
+        // for a given far node — real radio propagation decides that, not this
+        // code — so without ALSO capturing it here, a multi-hop node that never
+        // happens to (re)advertise stays without a full key indefinitely, and
+        // `flood_after_send`'s post-reply ResetPath is silently skipped
+        // (`get_full_pubkey` returns None), leaving every reply direct.
+        // `set_full_pubkey` no-ops until a session exists; PathUpdated typically
+        // arrives after the inbound DM already created one, so it lands.
         InboundFrame::PathUpdated { pubkey } => {
             let prefix: [u8; 6] = pubkey[..6].try_into().expect("pubkey is 32 bytes");
             state
@@ -1729,6 +1765,27 @@ async fn handle_frame(
                 prefix = prefix[0],
                 "mesh: PathUpdated — captured full pubkey (enables flood-after-send for this node)"
             );
+
+            // Persist Mesh Contacts / supply-drop-bbs-9vt: same reachability
+            // gap as the short-advert hook above — PathUpdated can likewise
+            // be the first frame that ever resolves this sender's identity
+            // after a DM whose own protect attempt found no full_pubkey yet.
+            let pending = state
+                .lock()
+                .expect("state mutex poisoned")
+                .is_pending_protect(&prefix);
+            if pending {
+                attempt_protect_and_update_pending(
+                    host,
+                    cmd_tx,
+                    state,
+                    draining,
+                    prefix,
+                    pubkey,
+                    protected_contact_cap,
+                )
+                .await;
+            }
         }
 
         // ── Everything else ───────────────────────────────────────────────────
@@ -1762,6 +1819,7 @@ async fn command_worker(
     host: Arc<dyn Host>,
     cmd_tx: mpsc::Sender<OutboundFrame>,
     state: Arc<Mutex<SessionState>>,
+    draining: Arc<AtomicBool>,
     command_prefix: Option<char>,
     welcome_message: String,
     node_credential_ttl_days: u32,
@@ -1779,6 +1837,7 @@ async fn command_worker(
             &host,
             &cmd_tx,
             &state,
+            &draining,
             command_prefix,
             &welcome_message,
             node_credential_ttl_days,
@@ -1931,6 +1990,7 @@ async fn attempt_protect_and_update_pending(
     host: &Arc<dyn Host>,
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
+    draining: &Arc<AtomicBool>,
     prefix: [u8; 6],
     pubkey: [u8; 32],
     protected_contact_cap: usize,
@@ -1950,6 +2010,42 @@ async fn attempt_protect_and_update_pending(
     let mut st = state.lock().expect("state mutex poisoned");
     if matches!(outcome, FavouriteOutcome::NoRecordYet) {
         st.mark_pending_protect(prefix);
+        // The one-time, connect-time GetContacts (see `transport.rs`'s
+        // `event_loop` — its `ClientEvent::Connected` handler) only ever
+        // captures contacts the device already knew about at that exact
+        // moment — a sender who first DMs the BBS afterward is stuck with
+        // `NoRecordYet` forever otherwise, since the device's own later
+        // adverts for an already-known contact are the lightweight,
+        // name/type-less kind (confirmed via live hardware testing,
+        // supply-drop-bbs-9vt). Cooldown-gated and non-blocking (`try_send`,
+        // FR-006) so this never delays the reply this DM is also waiting on.
+        //
+        // Skipped entirely while `draining`: the connect-time GetContacts
+        // above is itself a stateful, single-outstanding-iterator device
+        // command — a second one issued before the first finishes is
+        // rejected (ERR_CODE_BAD_STATE), and that error frame would be
+        // misattributed by the drain-recovery handler below as "the device
+        // doesn't support SyncNextMessage," clearing `draining` early and
+        // silently dropping the rest of the real backlog. The retry hooks on
+        // NewAdvert/Contact/Advert/PathUpdated cover this sender again once
+        // draining clears, so nothing is permanently lost by waiting.
+        if st.should_request_contacts_catchup() && !draining.load(Ordering::Relaxed) {
+            match cmd_tx.try_send(OutboundFrame::GetContacts { since: 0 }) {
+                Ok(()) => {
+                    st.mark_contacts_catchup_requested();
+                    info!(
+                        "mesh: requesting a contact-list catch-up — a sender's full \
+                         record is still missing after their identity resolved"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!("mesh: contact-list catch-up request dropped — outbound channel full");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!("mesh: contact-list catch-up request dropped — outbound channel closed");
+                }
+            }
+        }
     } else {
         st.clear_pending_protect(&prefix);
     }
@@ -1964,6 +2060,7 @@ async fn dispatch_message(
     host: &Arc<dyn Host>,
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
+    draining: &Arc<AtomicBool>,
     command_prefix: Option<char>,
     welcome_message: &str,
     node_credential_ttl_days: u32,
@@ -2024,6 +2121,7 @@ async fn dispatch_message(
             host,
             cmd_tx,
             state,
+            draining,
             sender_prefix,
             pubkey,
             protected_contact_cap,

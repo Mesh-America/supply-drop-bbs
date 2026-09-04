@@ -36,6 +36,12 @@ use bbs_plugin_api::SessionId;
 /// entry is a few bytes; the sweep is what keeps this from growing forever).
 const PENDING_PROTECT_TTL_SECS: u64 = 86_400; // 24 hours
 
+/// Minimum gap between targeted `GetContacts` catch-up requests (see
+/// [`SessionState::should_request_contacts_catchup`]). Matches
+/// `MIN_ADVERT_SPACING` in transport.rs — the same "don't hammer the radio
+/// with a background maintenance request" scale, not a real-time retry.
+const CONTACTS_CATCHUP_COOLDOWN_SECS: u64 = 60;
+
 /// How long a workflow reply is remembered for deduplication.
 /// Meshtastic retransmissions happen within a few seconds; 10 s is generous.
 /// 60 s caused false-positive drops when a user typed a short string (e.g. "h")
@@ -110,8 +116,9 @@ pub struct SessionEntry {
     /// `RECENT_MSG_CAP`.
     pub recent_msgs: VecDeque<(u32, String, Instant)>,
 
-    /// Full 32-byte public key for this node, populated the first time a
-    /// `NewAdvert` frame arrives from this node.  `None` until that happens.
+    /// Full 32-byte public key for this node, populated the first time any
+    /// identity-bearing frame arrives from it — `NewAdvert`, `Contact`,
+    /// `PathUpdated`, or the lightweight `Advert`.  `None` until then.
     /// Used to send `ResetPath` after delivering a message so the next
     /// outbound message floods rather than using a potentially-stale path.
     pub full_pubkey: Option<[u8; 32]>,
@@ -145,6 +152,15 @@ pub struct SessionState {
     /// insertion time, used only for the TTL sweep in
     /// [`Self::mark_pending_protect`].
     pending_protect: HashMap<[u8; 6], Instant>,
+    /// The last time a targeted `GetContacts` catch-up request was sent —
+    /// see [`Self::should_request_contacts_catchup`]. A single cooldown
+    /// shared by every sender rather than one per sender, since `GetContacts`
+    /// fetches every contact the device knows about at once, not one contact
+    /// at a time. `SessionState` (and this field with it) lives for the
+    /// whole transport's lifetime, not just one physical connection — it is
+    /// never reset on reconnect, so the cooldown persists across reconnects
+    /// too.
+    contacts_catchup_requested_at: Option<Instant>,
 }
 
 impl SessionState {
@@ -407,6 +423,46 @@ impl SessionState {
     /// contact-protection decision.
     pub fn is_pending_protect(&self, prefix: &[u8; 6]) -> bool {
         self.pending_protect.contains_key(prefix)
+    }
+
+    /// True when a targeted `GetContacts` catch-up request should be sent —
+    /// more than `CONTACTS_CATCHUP_COOLDOWN_SECS` have passed since the last
+    /// one (or none has ever been sent for the lifetime of this transport).
+    ///
+    /// Why this exists: the one-time, connect-time `GetContacts` (see
+    /// `transport.rs`'s `event_loop` — its `ClientEvent::Connected` handler)
+    /// only captures contacts the device already knew about at that exact
+    /// moment. A sender who first DMs the BBS
+    /// afterward — the common case, since BBS uptime and a given user's
+    /// first contact are unrelated — gets a `NoRecordYet` protection outcome
+    /// forever: the device now knows this contact internally (it routed the
+    /// DM reply), but its own subsequent adverts for an already-known
+    /// contact come through as the lightweight, name/type-less kind, not a
+    /// full re-send. Nothing else in this transport re-asks the device for
+    /// full contact details once the initial connect-time sync has passed,
+    /// so without this, such a sender can never become eligible for
+    /// protection no matter how many times they advert.
+    pub fn should_request_contacts_catchup(&self) -> bool {
+        self.should_request_contacts_catchup_at(Instant::now())
+    }
+
+    /// [`Self::should_request_contacts_catchup`] with an injectable `now`,
+    /// so the cooldown is unit-testable without sleeping for real.
+    fn should_request_contacts_catchup_at(&self, now: Instant) -> bool {
+        let cooldown = Duration::from_secs(CONTACTS_CATCHUP_COOLDOWN_SECS);
+        self.contacts_catchup_requested_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= cooldown)
+    }
+
+    /// Record that a `GetContacts` catch-up request was just sent, starting
+    /// the cooldown before another one will be considered.
+    pub fn mark_contacts_catchup_requested(&mut self) {
+        self.mark_contacts_catchup_requested_at(Instant::now());
+    }
+
+    /// [`Self::mark_contacts_catchup_requested`] with an injectable `now`.
+    fn mark_contacts_catchup_requested_at(&mut self, now: Instant) {
+        self.contacts_catchup_requested_at = Some(now);
     }
 }
 
@@ -684,6 +740,41 @@ mod tests {
         assert!(
             !st.is_pending_protect(&PREFIX),
             "an entry past its TTL must be swept by the next insert"
+        );
+    }
+
+    #[test]
+    fn contacts_catchup_is_allowed_before_any_request_and_blocked_right_after() {
+        let mut st = SessionState::default();
+        assert!(
+            st.should_request_contacts_catchup(),
+            "nothing sent yet — a first catch-up must be allowed"
+        );
+        let t0 = Instant::now();
+        st.mark_contacts_catchup_requested_at(t0);
+        assert!(
+            !st.should_request_contacts_catchup_at(t0),
+            "immediately after a request, the cooldown must block another"
+        );
+    }
+
+    #[test]
+    fn contacts_catchup_cooldown_boundary_is_at_least_not_strictly_greater() {
+        let mut st = SessionState::default();
+        let t0 = Instant::now();
+        st.mark_contacts_catchup_requested_at(t0);
+
+        let just_inside = t0 + Duration::from_secs(CONTACTS_CATCHUP_COOLDOWN_SECS - 1);
+        assert!(
+            !st.should_request_contacts_catchup_at(just_inside),
+            "still within the cooldown window must stay blocked"
+        );
+
+        // The real check is `>=`, not `>` — exactly at the boundary is allowed.
+        let at_boundary = t0 + Duration::from_secs(CONTACTS_CATCHUP_COOLDOWN_SECS);
+        assert!(
+            st.should_request_contacts_catchup_at(at_boundary),
+            "exactly at the cooldown boundary must be allowed again"
         );
     }
 }
