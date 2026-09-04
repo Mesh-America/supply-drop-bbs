@@ -2832,7 +2832,8 @@ impl BbsHost {
 
             // ── Message reading ──────────────────────────────────────────────
             Workflow::Reading => {
-                match reply.trim().to_uppercase().as_str() {
+                let upper = reply.trim().to_uppercase();
+                match upper.as_str() {
                     "F" => self.handle_read_forward(session, None).await,
                     "R" => self.handle_read_reverse(session).await,
                     "E" => self.handle_reply_from_reading(session).await,
@@ -2841,6 +2842,44 @@ impl BbsHost {
                     // than bouncing the user out (issue #109).
                     "H" | "?" => Ok(Response::Text(HELP_READING_MODE.into())),
                     _ => {
+                        // D [<id>] deletes without leaving reading mode (issue
+                        // #184) -- previously any input other than F/R/E/H
+                        // fell straight to the catch-all below, so "D <id>"
+                        // just exited reading mode instead of deleting; only
+                        // a second, out-of-reading-mode "D <id>" worked.
+                        // Bare "D" targets whatever message is on screen.
+                        let delete_id = if upper == "D" {
+                            let sessions = self.sessions.read().await;
+                            sessions
+                                .get(&session)
+                                .and_then(|r| r.current_message_id)
+                                .map(MessageId::as_i64)
+                        } else {
+                            upper
+                                .strip_prefix("D ")
+                                .and_then(|rest| rest.trim().parse::<i64>().ok())
+                        };
+
+                        if let Some(id) = delete_id {
+                            let current = {
+                                let sessions = self.sessions.read().await;
+                                sessions.get(&session).and_then(|r| r.current_message_id)
+                            };
+                            let response = self.handle_delete(session, id).await;
+                            // Deleting the message on screen (or a bare "D")
+                            // leaves nothing left to show -- exit reading
+                            // mode. Deleting some other id read earlier
+                            // leaves the current message intact; stay put.
+                            if current.map(MessageId::as_i64) == Some(id) {
+                                let mut sessions = self.sessions.write().await;
+                                if let Some(r) = sessions.get_mut(&session) {
+                                    r.workflow = Workflow::None;
+                                    r.current_message_id = None;
+                                }
+                            }
+                            return response;
+                        }
+
                         // Any other input exits reading mode.
                         {
                             let mut sessions = self.sessions.write().await;
@@ -5503,6 +5542,7 @@ Reading mode:\n\
  F  next message (forward)\n\
  R  previous message (back)\n\
  E  reply to this message\n\
+ D  delete message\n\
  H  this help\n\
  X  exit reading";
 
@@ -8015,6 +8055,199 @@ mod tests {
                 "H should keep the user in reading mode"
             );
         }
+    }
+
+    /// Issue #184: `D <#>` inside reading mode previously fell through to the
+    /// catch-all "any other input exits reading mode" arm instead of being
+    /// recognised as a delete — the message survived, and only a *second*,
+    /// out-of-reading-mode `D <#>` actually deleted it. A single `D <#>`
+    /// while reading must delete immediately.
+    #[tokio::test]
+    async fn reading_mode_d_with_id_deletes_immediately() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("delete me".into()),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+
+        // First F shows the reading-mode intro (no message yet); the second
+        // actually loads and displays the first message.
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: "F".into() })
+            .await
+            .unwrap();
+        let msg_id = {
+            let sessions = host.sessions.read().await;
+            sessions[&sid]
+                .current_message_id
+                .expect("reading mode must track the displayed message")
+                .as_i64()
+        };
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: format!("D {msg_id}"),
+                },
+            )
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::Text(t) => t,
+            other => panic!("expected a deletion confirmation, got {other:?}"),
+        };
+        assert!(
+            text.contains("deleted"),
+            "a single D <#> in reading mode should delete immediately, got: {text:?}"
+        );
+        assert!(
+            !text.to_lowercase().contains("exited"),
+            "a successful delete should not be reported as merely exiting, got: {text:?}"
+        );
+        assert!(
+            MessageStore::get_by_id(&host.db, crate::ids::MessageId::new(msg_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the message must actually be gone after one D <#>"
+        );
+
+        // Deleting the on-screen message leaves nothing to keep reading.
+        let sessions = host.sessions.read().await;
+        assert!(
+            matches!(sessions[&sid].workflow, Workflow::None),
+            "reading mode should end once its message is deleted"
+        );
+    }
+
+    /// Bare `D` (no id) targets whatever message reading mode currently has
+    /// on screen, without the caller needing to know its numeric id.
+    #[tokio::test]
+    async fn reading_mode_bare_d_deletes_current_message() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("delete me too".into()),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: "F".into() })
+            .await
+            .unwrap();
+        let msg_id = {
+            let sessions = host.sessions.read().await;
+            sessions[&sid].current_message_id.unwrap().as_i64()
+        };
+
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "D".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("deleted")),
+            "bare D should delete the on-screen message, got: {resp:?}"
+        );
+        assert!(
+            MessageStore::get_by_id(&host.db, crate::ids::MessageId::new(msg_id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Deleting a message OTHER than the one currently on screen (e.g. one
+    /// read earlier in the same session) must not disturb the in-progress
+    /// reading flow — only deleting the displayed message ends it.
+    #[tokio::test]
+    async fn reading_mode_d_with_other_id_stays_in_reading_mode() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        for body in ["first", "second"] {
+            host.process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some(body.into()),
+                },
+            )
+            .await
+            .unwrap();
+            host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+                .await
+                .unwrap();
+        }
+
+        // Enter reading mode (intro only), then F loads the first message,
+        // then a second F advances to the second message.
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: "F".into() })
+            .await
+            .unwrap();
+        let first_id = {
+            let sessions = host.sessions.read().await;
+            sessions[&sid].current_message_id.unwrap().as_i64()
+        };
+        host.process_command(sid, Command::WorkflowReply { reply: "F".into() })
+            .await
+            .unwrap();
+        let second_id = {
+            let sessions = host.sessions.read().await;
+            sessions[&sid].current_message_id.unwrap().as_i64()
+        };
+        assert_ne!(first_id, second_id);
+
+        // Delete the FIRST message while the SECOND is on screen.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: format!("D {first_id}"),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Text(t) if t.contains("deleted")));
+
+        // Still reading the second message — its own delete didn't fire.
+        let sessions = host.sessions.read().await;
+        assert!(
+            matches!(sessions[&sid].workflow, Workflow::Reading),
+            "deleting an earlier message must not exit the current reading session"
+        );
+        assert_eq!(
+            sessions[&sid].current_message_id.map(|m| m.as_i64()),
+            Some(second_id)
+        );
     }
 
     /// After pointer reset, pressing N should return "No new messages" rather
