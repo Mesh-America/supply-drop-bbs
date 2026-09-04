@@ -100,7 +100,7 @@ use bbs_plugin_api::plugin::Plugin;
 use bbs_plugin_api::registry::{PluginRegistryApi, ProcessPluginConfig, RegistryError};
 use bbs_plugin_api::transport::TransportStats;
 use rust_embed::RustEmbed;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::BroadcastStream;
@@ -1617,7 +1617,12 @@ async fn api_create_room(
 
 #[derive(Deserialize)]
 struct UpdateRoomBody {
-    description: Option<serde_json::Value>, // null = clear, string = set, absent = leave
+    // Absent key → leave unchanged, null → clear, string → set. See
+    // `deserialize_some` (issue #194's twin bug: a plain `Option<Value>`
+    // here could not tell "absent" from "explicit null", so clearing a
+    // room's description via the web UI silently no-opped).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    description: Option<Option<String>>,
     read_only: Option<bool>,
     min_permission_level: Option<u8>,
 }
@@ -1647,24 +1652,14 @@ async fn api_update_room(
             .into_response();
     }
 
-    // Convert JSON Value for description: absent key → None (leave), null → Some(None) (clear),
-    // string → Some(Some(s)) (set).
-    let description: Option<Option<String>> = match body.description {
-        None => None,
-        Some(serde_json::Value::Null) => Some(None),
-        Some(serde_json::Value::String(s)) => Some(Some(s)),
-        Some(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json_error("description must be a string or null")),
-            )
-                .into_response()
-        }
-    };
-
     match state
         .host
-        .admin_update_room(id, description, body.read_only, body.min_permission_level)
+        .admin_update_room(
+            id,
+            body.description,
+            body.read_only,
+            body.min_permission_level,
+        )
         .await
     {
         Ok(room) => {
@@ -1963,24 +1958,34 @@ struct RadioConfigResponse {
 }
 
 /// Patch body for `PATCH /api/v1/radio-config`.
-/// `None` means "leave unchanged"; for optional fields, JSON `null` clears the value.
+/// Absent key → leave unchanged, `null` → clear, a value → set. See
+/// `deserialize_some` (same issue #194 bug: a plain `Option<Value>` here
+/// could not tell "absent" from "explicit null", so clearing any of these
+/// fields via the web UI silently no-opped).
 #[derive(Debug, Deserialize)]
 struct RadioConfigPatch {
-    /// Named preset. JSON null clears it; a string sets it.
-    preset: Option<serde_json::Value>,
-    /// Carrier frequency in Hz. JSON null clears it.
-    frequency_hz: Option<serde_json::Value>,
-    /// Channel bandwidth in Hz. JSON null clears it.
-    bandwidth_hz: Option<serde_json::Value>,
-    /// LoRa spreading factor (7–12). JSON null clears it.
-    spreading_factor: Option<serde_json::Value>,
-    /// Coding rate denominator (5–8). JSON null clears it.
-    coding_rate: Option<serde_json::Value>,
-    /// TX power in dBm. JSON null clears it.
-    tx_power_dbm: Option<serde_json::Value>,
-    /// Routing path-hash width in bytes: `2` or `3`. JSON null clears it (falls
+    /// Named preset. `null` clears it; a string sets it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    preset: Option<Option<String>>,
+    /// Carrier frequency in Hz. `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    frequency_hz: Option<Option<u64>>,
+    /// Channel bandwidth in Hz. `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    bandwidth_hz: Option<Option<u64>>,
+    /// LoRa spreading factor (7–12). `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    spreading_factor: Option<Option<u64>>,
+    /// Coding rate denominator (5–8). `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    coding_rate: Option<Option<u64>>,
+    /// TX power in dBm. `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    tx_power_dbm: Option<Option<i64>>,
+    /// Routing path-hash width in bytes: `2` or `3`. `null` clears it (falls
     /// back to the transport's default of 3).
-    path_bytes: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    path_bytes: Option<Option<i64>>,
 }
 
 /// Editable subset of the BBS configuration, returned by GET /api/v1/config.
@@ -2020,8 +2025,14 @@ struct ConfigPatch {
     bbs_starting_room: Option<String>,
     bbs_welcome_msg: Option<String>,
     bbs_timezone: Option<String>,
-    location_latitude: Option<serde_json::Value>, // null clears, number sets
-    location_longitude: Option<serde_json::Value>,
+    // Absent key → leave unchanged, `null` → clear, a number → set. See
+    // `deserialize_some` (same issue #194 bug: a plain `Option<Value>` here
+    // could not tell "absent" from "explicit null", so unchecking "use my
+    // location" in the web UI silently no-opped).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    location_latitude: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    location_longitude: Option<Option<f64>>,
     backup_enabled: Option<bool>,
     backup_interval_hours: Option<u32>,
     backup_keep_daily: Option<u32>,
@@ -2544,20 +2555,19 @@ async fn api_patch_config(
     if let Some(v) = patch.bbs_timezone {
         doc["bbs"]["timezone"] = toml_edit::value(v);
     }
-    // Latitude/longitude: JSON null removes the key; a number sets it.
+    // Latitude/longitude: absent → leave unchanged, `null` → remove the key,
+    // a number → set it.
     let location_touched = patch.location_latitude.is_some() || patch.location_longitude.is_some();
     if let Some(v) = patch.location_latitude {
-        if v.is_null() {
-            doc_remove_key(&mut doc, "location", "latitude");
-        } else if let Some(f) = v.as_f64() {
-            doc["location"]["latitude"] = toml_edit::value(f);
+        match v {
+            None => doc_remove_key(&mut doc, "location", "latitude"),
+            Some(f) => doc["location"]["latitude"] = toml_edit::value(f),
         }
     }
     if let Some(v) = patch.location_longitude {
-        if v.is_null() {
-            doc_remove_key(&mut doc, "location", "longitude");
-        } else if let Some(f) = v.as_f64() {
-            doc["location"]["longitude"] = toml_edit::value(f);
+        match v {
+            None => doc_remove_key(&mut doc, "location", "longitude"),
+            Some(f) => doc["location"]["longitude"] = toml_edit::value(f),
         }
     }
     if let Some(v) = patch.backup_enabled {
@@ -2670,9 +2680,12 @@ struct AccessPolicyResponse {
 struct AccessPolicyPatch {
     /// When present, sets `require_verify`.
     require_verify: Option<bool>,
-    /// When present, sets the guest-room name.
-    /// Send `null` (JSON null) to disable the guest room.
-    guest_room: Option<serde_json::Value>,
+    /// Absent key → leave unchanged. `null` → disable the guest room.
+    /// A string → set the guest-room name. See `deserialize_some` (issue
+    /// #194: a plain `Option<Value>` here could not tell "absent" from
+    /// "explicit null", so disabling the guest room silently no-opped).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    guest_room: Option<Option<String>>,
 }
 
 async fn api_get_access_policy(
@@ -2716,18 +2729,7 @@ async fn api_patch_access_policy(
         }
     }
 
-    if let Some(gr) = patch.guest_room {
-        let name: Option<String> = if gr.is_null() {
-            None
-        } else if let Some(s) = gr.as_str() {
-            Some(s.to_owned())
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json_error("guest_room must be a string or null")),
-            )
-                .into_response();
-        };
+    if let Some(name) = patch.guest_room {
         if let Err(e) = state.host.admin_set_guest_room(name).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2853,58 +2855,61 @@ async fn api_patch_radio_config(
         }
     };
 
-    // Apply patches — null clears the key; a value sets it.
+    // Apply patches — absent → leave unchanged, `null` → clear the key, a
+    // value → set it.
     if let Some(v) = patch.preset {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "preset");
-        } else if let Some(s) = v.as_str() {
-            doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "preset"),
+            Some(s) => doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s)),
         }
     }
     if let Some(v) = patch.frequency_hz {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "frequency_hz");
-        } else if let Some(n) = v.as_u64() {
-            doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "frequency_hz"),
+            Some(n) => {
+                doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64))
+            }
         }
     }
     if let Some(v) = patch.bandwidth_hz {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "bandwidth_hz");
-        } else if let Some(n) = v.as_u64() {
-            doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "bandwidth_hz"),
+            Some(n) => {
+                doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64))
+            }
         }
     }
     if let Some(v) = patch.spreading_factor {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "spreading_factor");
-        } else if let Some(n) = v.as_u64() {
-            doc_set_radio_field(
+        match v {
+            None => doc_remove_radio_field(&mut doc, "spreading_factor"),
+            Some(n) => doc_set_radio_field(
                 &mut doc,
                 "spreading_factor",
                 toml_edit::Value::from(n as i64),
-            );
+            ),
         }
     }
     if let Some(v) = patch.coding_rate {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "coding_rate");
-        } else if let Some(n) = v.as_u64() {
-            doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "coding_rate"),
+            Some(n) => {
+                doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64))
+            }
         }
     }
     if let Some(v) = patch.tx_power_dbm {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "tx_power_dbm");
-        } else if let Some(n) = v.as_i64() {
-            doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "tx_power_dbm"),
+            Some(n) => doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n)),
         }
     }
     if let Some(v) = patch.path_bytes {
-        if v.is_null() {
-            doc_remove_mesh_field(&mut doc, "path_bytes");
-        } else if let Some(n) = v.as_i64().filter(|n| *n == 2 || *n == 3) {
-            doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n));
+        match v {
+            None => doc_remove_mesh_field(&mut doc, "path_bytes"),
+            Some(n) if n == 2 || n == 3 => {
+                doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n))
+            }
+            Some(_) => {} // out-of-range value: silently ignored, same as before
         }
     }
 
@@ -3901,6 +3906,25 @@ fn atomic_write_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result
     Ok(())
 }
 
+// ── Serde helpers ─────────────────────────────────────────────────────────────
+
+/// Deserializer for a PATCH field that must distinguish "omitted" from
+/// "explicitly null" — e.g. `Option<Option<T>>` fields where `null` means
+/// "clear this value" and an absent key means "leave it unchanged" (issue
+/// #194). A plain `Option<T>` field cannot make this distinction: serde_json
+/// maps both an absent key and an explicit JSON `null` to Rust `None`. Paired
+/// with `#[serde(default, deserialize_with = "deserialize_some")]`, this
+/// produces `None` when the key is absent (via `#[serde(default)]`) and
+/// `Some(inner)` — where `inner` is itself `None` for JSON `null` or
+/// `Some(value)` for a present value — whenever the key is present at all.
+fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 // ── Error helpers ─────────────────────────────────────────────────────────────
 
 fn json_error(msg: &str) -> serde_json::Value {
@@ -4181,6 +4205,130 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = n;
         k
+    }
+
+    // Issue #194: PATCH bodies that need to distinguish "field omitted" from
+    // "field explicitly null" must actually make that distinction through
+    // real JSON deserialization — a bug here lives at the serde boundary, so
+    // these tests go through `serde_json::from_str`, not a hand-built struct.
+    #[test]
+    fn access_policy_patch_distinguishes_absent_null_and_present_guest_room() {
+        let absent: AccessPolicyPatch = serde_json::from_str(r#"{"require_verify":true}"#)
+            .expect("omitting guest_room must still parse");
+        assert_eq!(
+            absent.guest_room, None,
+            "an omitted guest_room must leave the setting unchanged"
+        );
+
+        let explicit_null: AccessPolicyPatch =
+            serde_json::from_str(r#"{"guest_room":null}"#).expect("explicit null must parse");
+        assert_eq!(
+            explicit_null.guest_room,
+            Some(None),
+            "an explicit JSON null must be distinguishable from an omitted \
+             key, so the disable-guest-room request actually reaches \
+             admin_set_guest_room instead of being silently dropped"
+        );
+
+        let set: AccessPolicyPatch = serde_json::from_str(r#"{"guest_room":"Lobby Overflow"}"#)
+            .expect("a string value must parse");
+        assert_eq!(set.guest_room, Some(Some("Lobby Overflow".to_owned())));
+    }
+
+    // Same latent bug, same fix, applied to room descriptions (issue #194's
+    // twin case, found during the same investigation).
+    #[test]
+    fn update_room_body_distinguishes_absent_null_and_present_description() {
+        let absent: UpdateRoomBody =
+            serde_json::from_str(r#"{"read_only":true}"#).expect("omitting description must parse");
+        assert_eq!(absent.description, None);
+
+        let explicit_null: UpdateRoomBody =
+            serde_json::from_str(r#"{"description":null}"#).expect("explicit null must parse");
+        assert_eq!(
+            explicit_null.description,
+            Some(None),
+            "clearing a room's description must reach admin_update_room as \
+             Some(None), not be indistinguishable from an omitted field"
+        );
+
+        let set: UpdateRoomBody = serde_json::from_str(r#"{"description":"Ops channel"}"#)
+            .expect("a string value must parse");
+        assert_eq!(set.description, Some(Some("Ops channel".to_owned())));
+    }
+
+    // Same bug, same fix, applied to the two GPS location fields in
+    // PATCH /api/v1/config (issue #194's other twin).
+    #[test]
+    fn config_patch_distinguishes_absent_null_and_present_location() {
+        let absent: ConfigPatch =
+            serde_json::from_str(r#"{"bbs_name":"Node"}"#).expect("omitting location must parse");
+        assert_eq!(absent.location_latitude, None);
+        assert_eq!(absent.location_longitude, None);
+
+        let explicit_null: ConfigPatch =
+            serde_json::from_str(r#"{"location_latitude":null,"location_longitude":null}"#)
+                .expect("explicit null must parse");
+        assert_eq!(
+            explicit_null.location_latitude,
+            Some(None),
+            "unchecking \"use my location\" must reach the handler as Some(None), \
+             not be indistinguishable from an omitted field"
+        );
+        assert_eq!(explicit_null.location_longitude, Some(None));
+
+        let set: ConfigPatch =
+            serde_json::from_str(r#"{"location_latitude":45.5,"location_longitude":-122.6}"#)
+                .expect("numeric values must parse");
+        assert_eq!(set.location_latitude, Some(Some(45.5)));
+        assert_eq!(set.location_longitude, Some(Some(-122.6)));
+    }
+
+    // Same bug, same fix, applied to all seven fields of PATCH
+    // /api/v1/radio-config (issue #194's other twin).
+    #[test]
+    fn radio_config_patch_distinguishes_absent_null_and_present_fields() {
+        let absent: RadioConfigPatch =
+            serde_json::from_str(r#"{}"#).expect("an empty body must parse");
+        assert_eq!(absent.preset, None);
+        assert_eq!(absent.frequency_hz, None);
+        assert_eq!(absent.bandwidth_hz, None);
+        assert_eq!(absent.spreading_factor, None);
+        assert_eq!(absent.coding_rate, None);
+        assert_eq!(absent.tx_power_dbm, None);
+        assert_eq!(absent.path_bytes, None);
+
+        let explicit_null: RadioConfigPatch = serde_json::from_str(
+            r#"{"preset":null,"frequency_hz":null,"bandwidth_hz":null,
+                "spreading_factor":null,"coding_rate":null,"tx_power_dbm":null,
+                "path_bytes":null}"#,
+        )
+        .expect("explicit null must parse for every field");
+        assert_eq!(
+            explicit_null.preset,
+            Some(None),
+            "clearing a radio-config field must reach the handler as Some(None), \
+             not be indistinguishable from an omitted field"
+        );
+        assert_eq!(explicit_null.frequency_hz, Some(None));
+        assert_eq!(explicit_null.bandwidth_hz, Some(None));
+        assert_eq!(explicit_null.spreading_factor, Some(None));
+        assert_eq!(explicit_null.coding_rate, Some(None));
+        assert_eq!(explicit_null.tx_power_dbm, Some(None));
+        assert_eq!(explicit_null.path_bytes, Some(None));
+
+        let set: RadioConfigPatch = serde_json::from_str(
+            r#"{"preset":"LongFast","frequency_hz":915000000,"bandwidth_hz":125000,
+                "spreading_factor":9,"coding_rate":5,"tx_power_dbm":20,"path_bytes":2}"#,
+        )
+        .expect("concrete values must parse");
+        assert_eq!(set.preset, Some(Some("LongFast".to_owned())));
+        assert_eq!(set.frequency_hz, Some(Some(915_000_000)));
+        assert_eq!(set.bandwidth_hz, Some(Some(125_000)));
+        assert_eq!(set.spreading_factor, Some(Some(9)));
+        assert_eq!(set.coding_rate, Some(Some(5)));
+        assert_eq!(set.tx_power_dbm, Some(Some(20)));
+        assert_eq!(set.path_bytes, Some(Some(2)));
     }
 
     // T039b: api_adverts's `protected` field reflects AdvertRecord.flags bit 0.
