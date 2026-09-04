@@ -9,7 +9,7 @@ const router = useRouter()
 const route = useRoute()
 const auth = useAuthStore()
 
-const username = ref('admin')
+const username = ref('')
 const password = ref('')
 const error = ref<string | null>(null)
 const loading = ref(false)
