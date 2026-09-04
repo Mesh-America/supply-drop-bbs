@@ -2048,11 +2048,8 @@ async fn real_host_retransmitted_login_is_not_reprocessed() {
 /// can.
 async fn drain_command_types(bridge: &mut Bridge, per_read_timeout: Duration) -> Vec<u8> {
     let mut types = Vec::new();
-    loop {
-        match tokio::time::timeout(per_read_timeout, bridge.read_command()).await {
-            Ok(cmd) => types.push(cmd[0]),
-            Err(_) => break,
-        }
+    while let Ok(cmd) = tokio::time::timeout(per_read_timeout, bridge.read_command()).await {
+        types.push(cmd[0]);
     }
     types
 }
