@@ -250,6 +250,157 @@ failures (insufficient permission level) respond with a clear
 "you can't do that" message - no information leak about the action
 that would have happened.
 
+## Protected contacts
+
+Both transports' radios (the MeshCore companion device and a Meshtastic
+radio) keep their own bounded, on-device contact/node table. When that table
+fills, the firmware evicts entries to make room for new ones — which is fine
+for a hobbyist client but a problem for the BBS: if the entry the BBS itself
+needs to reply to a user (or the entry a returning user needs to reach the
+BBS) gets evicted at the wrong moment, replies silently fail to route. The
+BBS mitigates this by marking a bounded set of contacts **protected**
+("favorited" on the radio), which most firmware treats as ineligible for its
+own eviction sweeps — trading a small amount of on-device favourite-slots for
+reliable delivery to the users who actually talk to the BBS.
+
+### Eligibility and the protection mechanism
+
+A contact becomes eligible for protection the first time it exchanges a
+real DM with the BBS (a chat-type message on MeshCore; a person-role node —
+`CLIENT`/`CLIENT_MUTE`/`CLIENT_HIDDEN`/`CLIENT_BASE` — on Meshtastic; a
+router/repeater is never protected). On MeshCore this is a full-record
+`AddUpdateContact` write with the `is_favourite` flag set; on Meshtastic
+it's a `set_favorite_node` admin-message write (protobuf tag `39`). Both
+writes go through a deferred-write queue gated on a live session/passkey,
+not sent inline with the reply — a failed or reverted write never blocks
+the user's actual message from being answered.
+
+### Capacity and eviction
+
+Each transport has its own `protected_contact_cap` config key
+(`[plugins.mesh]`/`[plugins.meshtastic]`, see [CONFIG.md](CONFIG.md)) —
+MeshCore defaults to `350`, Meshtastic to `100`; the two are intentionally
+different, tracking real device capacity rather than tracking each other.
+`0` disables protection entirely on that transport. Once the cap is reached,
+a newly-eligible sender's first DM evicts the **oldest-protected,
+currently session-inactive** contact on that transport to make room, rather
+than growing the protected set further — the contact with the earliest
+`protected_at` timestamp among those with no active session and outside a
+brief post-protection grace window. If every protected contact is currently
+mid-session (so none is a safe eviction candidate), the new contact is
+simply not protected and the BBS logs a distinct warning; nothing crashes
+or silently loses state either way.
+
+### MeshCore: saturated contact table
+
+If MeshCore's own contact table is completely full — no further contact,
+protected or not, fits — the BBS's own eviction above can't help (there's
+no room even for the entry replacing an evicted one), and the transport
+logs a clear, distinct warning rather than failing silently. This is a
+refusal, not a crash: MeshCore firmware's own node-database code skips
+favourited entries when it looks for something to evict but degrades
+gracefully when nothing qualifies.
+
+### Meshtastic: saturated node database is a firmware crash risk, not a refusal
+
+Meshtastic's failure mode here is more severe, and the BBS has no way to
+detect or warn about it in advance. Meshtastic firmware's node-database
+eviction search (`NodeDB::getOrCreateMeshNode`, `NodeDB.cpp`) does not
+gracefully refuse when no evictable candidate is found — it falls through
+to an out-of-bounds write against a fixed-size vector, which on a typical
+embedded build (no C++ exception support) crashes or reboots the radio.
+**No BBS-side warning is possible for this case**: by the time the BBS
+could observe a saturated table, the device may have already crashed. This
+finding rests on a single external firmware-source read, not yet
+corroborated by a second independent source — treat it as "verified once,"
+not settled fact, and keep `protected_contact_cap` at or below your
+device's real `MAX_NUM_NODES` as the only available mitigation.
+
+### Path-replay tradeoff
+
+Protecting a MeshCore contact means writing its full record
+(`AddUpdateContact` has no partial/flags-only variant), which necessarily
+touches the device's cached routing path for that contact alongside the
+favourite flag — there's no option that leaves the path provably untouched.
+The BBS replays the contact's own last-known cached path rather than
+resetting it to "unknown": firmware source confirms an explicit path reset
+has the *more* destructive effect of guaranteeing a full rediscovery flood
+on the next send, every time, whereas replaying the cached path is only
+occasionally stale (and self-corrects on the next real exchange). Between
+"occasionally stale but usually valid" and "always destructive," the BBS
+deliberately chooses the former.
+
+### MeshCore prefix-collision limitation
+
+MeshCore contacts are resolved from a DM's 6-byte pubkey prefix, not the
+full 32-byte key — a pre-existing wire-protocol characteristic this feature
+does not introduce. A prefix collision between two distinct real contacts
+was always possible (roughly 2⁻⁴⁸ per pair) and previously caused, at
+worst, a transient misrouted session that self-corrected. This feature
+attaches a more consequential outcome to the same limitation: since
+protecting or deleting a contact is now a full-record radio-side write (not
+just a session mixup), a resolved-by-prefix collision could direct that
+write at the wrong contact's persistent device state. A passive collision
+is still astronomically unlikely; a *deliberate* one is a large but
+not-astronomical computation (roughly 2⁴⁸ Ed25519 keypairs to grind) for an
+attacker who already knows or can observe a target's 6-byte prefix. This is
+a known, accepted, unmitigated-in-code limitation — documented here rather
+than silently carried, alongside the Meshtastic firmware-crash risk above.
+
+### MeshCore: self-identification requires `CMD_APP_START` support
+
+The BBS learns its own MeshCore public key exactly once, from the
+`SelfInfo` the device returns in response to `CMD_APP_START` at connect
+time — nothing else in the wire protocol sets it. On firmware that
+responds `ERR_CODE_UNSUPPORTED_CMD` to `CMD_APP_START`, the BBS's own
+public key is never learned for the life of that connection.
+
+This matters because both the eviction path (`ContactsFull`) and the
+new-protection eviction-exclusion list build their "never evict this"
+set from the BBS's own known pubkey. Without it, the BBS's own
+self-registered contact entry is not excluded from eviction-candidate
+selection — worst case, the BBS could select its own entry as the
+`ContactsFull` eviction victim and send `RemoveContact` against itself.
+
+**No clean fix exists today.** The BBS's own contact entry, when it does
+end up in `AdvertBus` on unsupported-`CMD_APP_START` firmware (via an
+ordinary contact sync or an echoed self-advert), carries no marker
+distinguishing it from any other real contact — there is currently no
+protocol-level signal that says "this record is me" independent of
+`CMD_APP_START`'s `SelfInfo`. The one other command that returns
+key material, `ExportPrivateKey` (used on-demand by `node export-key`),
+was considered and rejected as an automatic fallback: its firmware
+support isn't independently verified either, and routinely invoking it
+on every connection just to self-identify would mean materializing the
+node's *private* key far more often than necessary, for a security-
+sensitive operation currently gated behind an explicit sysop CLI action —
+a worse trade than the gap it would close. This is a known, accepted,
+unmitigated-in-code limitation on the affected firmware, documented here
+rather than silently carried, alongside the two limitations above.
+
+### Discovered Contacts vs. Contacts, and delete semantics
+
+The web admin UI and API distinguish two views over the same underlying
+advert data:
+
+- **Discovered Contacts** (`GET /api/v1/adverts`) — every mesh node the BBS
+  has ever seen, protected or not.
+- **Contacts** (`GET /api/v1/contacts`) — only the currently-protected
+  subset; mirrors the CLI's `contacts list` (see [CLI.md](CLI.md)).
+
+Deleting a contact (`DELETE /api/v1/contacts/:pubkey`, Aide/Sysop only) is
+**not a permanent block**. It clears the BBS's own local protection state
+immediately, then best-effort asks the radio to remove the matching native
+favourite/contact entry (a `remove_favorite_node` admin write on Meshtastic,
+a native contact removal on MeshCore) — a failure on that native-removal
+side is logged but doesn't fail the request, since the local state change
+is what actually matters for the BBS's own eviction bookkeeping. Nothing
+prevents the same contact from becoming protected again later if it's still
+eligible (e.g. it DMs the BBS again) — this is a delete of the *protection*,
+not a permanent deny-list entry. A pubkey that only ever appears in
+Discovered Contacts (never protected) has nothing to delete; the endpoint
+responds `404`.
+
 ## Part 3: Internal command schema
 
 The `Command` and `Response` enums in `bbs-core` are the canonical

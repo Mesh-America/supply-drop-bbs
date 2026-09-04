@@ -621,6 +621,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/adverts", get(api_adverts))
         .route("/adverts", delete(api_adverts_clear))
         .route("/adverts/send", post(api_adverts_send))
+        .route("/contacts", get(api_contacts))
+        .route("/contacts/:pubkey", delete(api_delete_contact))
         .route("/sessions", get(api_list_sessions))
         .route("/sessions/:id", delete(api_kill_session))
         .route("/users", get(api_list_users))
@@ -1117,34 +1119,160 @@ struct AdvertResponse {
     lat: f64,
     lon: f64,
     transport: String,
+    protected: bool,
 }
 
+fn to_advert_response(r: bbs_plugin_api::AdvertRecord) -> AdvertResponse {
+    let protected = r.is_currently_protected();
+    AdvertResponse {
+        ts: r.last_seen_secs,
+        pubkey: r.pubkey_hex,
+        name: r.name,
+        adv_type: r.adv_type,
+        type_name: adv_type_name(&r.transport, r.adv_type).to_owned(),
+        lat: r.lat,
+        lon: r.lon,
+        protected,
+        transport: r.transport,
+    }
+}
+
+/// `GET /api/v1/adverts` — "Discovered Contacts": every record the bus has
+/// ever seen, protected or not.
 async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let records = state.host.advert_bus().list();
-    let out: Vec<AdvertResponse> = records
-        .into_iter()
-        .map(|r| AdvertResponse {
-            ts: r.last_seen_secs,
-            pubkey: r.pubkey_hex,
-            name: r.name,
-            adv_type: r.adv_type,
-            type_name: adv_type_name(&r.transport, r.adv_type).to_owned(),
-            lat: r.lat,
-            lon: r.lon,
-            transport: r.transport,
-        })
-        .collect();
+    let out: Vec<AdvertResponse> = records.into_iter().map(to_advert_response).collect();
     Json(out)
 }
 
-/// `DELETE /api/v1/adverts` — flush all in-memory advert records.
+/// `GET /api/v1/contacts` — "Contacts": only currently-protected records.
+async fn api_contacts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let records = state.host.advert_bus().list_protected();
+    let out: Vec<AdvertResponse> = records.into_iter().map(to_advert_response).collect();
+    Json(out)
+}
+
+/// Decode a hex pubkey (as emitted by `AdvertResponse.pubkey`, always
+/// lowercase, though this function itself accepts either case since
+/// `is_ascii_hexdigit`/`from_str_radix` both do) back into the raw 32 bytes
+/// `AdvertBus` keys records by. `None` for anything not exactly 64 valid
+/// hex characters.
+fn decode_pubkey_hex(s: &str) -> Option<[u8; 32]> {
+    // `u8::from_str_radix` accepts a leading `+` for unsigned types (e.g.
+    // "+1" parses as 1), which isn't a hex digit — reject anything that
+    // isn't purely `[0-9a-fA-F]` up front (found by audit) so this
+    // function's contract ("64 valid hex characters") actually holds.
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let byte_str = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(byte_str, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// `DELETE /api/v1/contacts/:pubkey` — manually delete a single protected
+/// contact.
 ///
-/// Useful after correcting device clocks or clearing stale contacts.
-/// The bus repopulates automatically as adverts arrive or on the next
-/// BBS reconnect (which triggers a fresh `GetContacts` scan).
-async fn api_adverts_clear(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    state.host.advert_bus().clear();
-    axum::http::StatusCode::NO_CONTENT
+/// Clears local protection immediately (`AdvertBus::unprotect`) and
+/// best-effort attempts the matching native radio-side removal for the
+/// record's transport. A removal failure is logged but does not fail the
+/// request — the local unprotect has already succeeded, matching this
+/// feature's existing best-effort framing for the delete direction
+/// (specs/001-persist-mesh-contacts/research.md Decision 12). Aide access
+/// required (permission level >= 50) — a new precedent for this crate
+/// (Decision 11).
+async fn api_delete_contact(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(pubkey_hex): Path<String>,
+) -> Response {
+    if caller.permission_level < 50 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("aide access required")),
+        )
+            .into_response();
+    }
+    let Some(pubkey) = decode_pubkey_hex(&pubkey_hex) else {
+        return (StatusCode::BAD_REQUEST, Json(json_error("invalid pubkey"))).into_response();
+    };
+    let Some(record) = state.host.advert_bus().unprotect(&pubkey) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json_error("contact not found or not protected")),
+        )
+            .into_response();
+    };
+
+    // Use the record's own canonical (always-lowercase, `hex_encode`-produced)
+    // pubkey_hex for logging/audit rather than the raw path param, whose
+    // casing a caller controls (found by the Phase 6 hostile audit).
+    let canonical_pubkey_hex = &record.pubkey_hex;
+
+    let removal_result = if record.transport == "meshtastic" {
+        match record.node_num {
+            Some(node_num) => state.host.admin_remove_meshtastic_favorite(node_num).await,
+            None => Err(HostError::NotSupported(
+                "meshtastic contact has no node_num on record".into(),
+            )),
+        }
+    } else {
+        state.host.admin_remove_meshcore_contact(pubkey).await
+    };
+    if let Err(e) = removal_result {
+        warn!(pubkey = %canonical_pubkey_hex, transport = %record.transport, "native contact removal failed: {e}");
+    }
+
+    let actor_str = format!("web:{}", caller.username);
+    if let Err(e) = state
+        .host
+        .admin_write_audit(
+            &actor_str,
+            "delete_contact",
+            Some(canonical_pubkey_hex),
+            None,
+        )
+        .await
+    {
+        warn!("audit write failed: {e}");
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `DELETE /api/v1/adverts` — flush unprotected in-memory advert records.
+///
+/// Useful after correcting device clocks or clearing stale, never-messaged
+/// discovered contacts. Protected contacts (visible in `GET /api/v1/contacts`)
+/// survive this call — see `AdvertBus::clear_unprotected`'s own doc comment
+/// for why. The bus repopulates automatically as adverts arrive or on the
+/// next BBS reconnect (which triggers a fresh `GetContacts` scan). Sysop-only
+/// — this previously had no permission check at all.
+async fn api_adverts_clear(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let removed = state.host.advert_bus().clear_unprotected();
+    let actor_str = format!("web:{}", caller.username);
+    if let Err(e) = state
+        .host
+        .admin_write_audit(
+            &actor_str,
+            "clear_unprotected_adverts",
+            None,
+            Some(&format!("{removed} record(s) removed")),
+        )
+        .await
+    {
+        warn!("audit write failed: {e}");
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Human-readable advert "type", interpreted per transport.
@@ -1179,6 +1307,7 @@ fn meshtastic_role_name(role: u8) -> &'static str {
         9 => "lost_and_found",
         10 => "tak_tracker",
         11 => "router_late",
+        12 => "client_base",
         _ => "unknown",
     }
 }
@@ -4012,5 +4141,396 @@ async fn api_plugin_logs(
     match registry.get_logs(&name, q.lines.min(500)).await {
         Ok(lines) => Json(serde_json::json!({ "lines": lines })).into_response(),
         Err(e) => registry_err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bbs_plugin_api::testing::MockHost;
+
+    fn test_state() -> (Arc<AppState>, Arc<MockHost>) {
+        let mock = Arc::new(MockHost::new());
+        let host: Arc<dyn Host> = mock.clone();
+        let state = Arc::new(AppState::new(host, WebConfig::default()));
+        (state, mock)
+    }
+
+    fn sysop() -> CurrentUser {
+        CurrentUser {
+            username: "sysop".into(),
+            permission_level: 100,
+        }
+    }
+
+    fn regular_user() -> CurrentUser {
+        CurrentUser {
+            username: "alice".into(),
+            permission_level: 10,
+        }
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("reading response body");
+        serde_json::from_slice(&bytes).expect("response body is valid JSON")
+    }
+
+    fn dummy_key(n: u8) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[0] = n;
+        k
+    }
+
+    // T039b: api_adverts's `protected` field reflects AdvertRecord.flags bit 0.
+    #[tokio::test]
+    async fn api_adverts_reports_protected_field() {
+        let (state, mock) = test_state();
+        let bus = mock.advert_bus();
+        let protected_key = dummy_key(1);
+        let unprotected_key = dummy_key(2);
+        bus.upsert_contact(
+            protected_key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        bus.upsert(unprotected_key, "Unprotected".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+
+        let resp = api_adverts(State(state)).await.into_response();
+        let body = body_json(resp).await;
+        let entries = body.as_array().expect("array response");
+        assert_eq!(entries.len(), 2);
+
+        let by_name: std::collections::HashMap<&str, bool> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap(),
+                    e["protected"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_name.get("Protected"), Some(&true));
+        assert_eq!(by_name.get("Unprotected"), Some(&false));
+    }
+
+    // T039b: GET /api/v1/contacts returns only protected records.
+    #[tokio::test]
+    async fn api_contacts_returns_only_protected_records() {
+        let (state, mock) = test_state();
+        let bus = mock.advert_bus();
+        let protected_key = dummy_key(3);
+        let unprotected_key = dummy_key(4);
+        bus.upsert_contact(
+            protected_key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        bus.upsert(unprotected_key, "Unprotected".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+
+        let resp = api_contacts(State(state)).await.into_response();
+        let body = body_json(resp).await;
+        let entries = body.as_array().expect("array response");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"].as_str(), Some("Protected"));
+        assert_eq!(entries[0]["protected"].as_bool(), Some(true));
+    }
+
+    // T039b: DELETE /api/v1/adverts rejects a non-Sysop caller.
+    #[tokio::test]
+    async fn api_adverts_clear_rejects_non_sysop() {
+        let (state, _mock) = test_state();
+        let resp = api_adverts_clear(State(state), Extension(regular_user()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // T039b (round-19 addition): DELETE /api/v1/adverts removes an
+    // unprotected record but leaves a protected one in place — it still
+    // appears in GET /api/v1/contacts afterward.
+    #[tokio::test]
+    async fn api_adverts_clear_preserves_protected_contacts() {
+        let (state, mock) = test_state();
+        let bus = mock.advert_bus();
+        let protected_key = dummy_key(5);
+        let unprotected_key = dummy_key(6);
+        bus.upsert_contact(
+            protected_key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        bus.upsert(unprotected_key, "Unprotected".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+
+        let resp = api_adverts_clear(State(Arc::clone(&state)), Extension(sysop()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let adverts = body_json(api_adverts(State(Arc::clone(&state))).await.into_response()).await;
+        assert_eq!(
+            adverts.as_array().unwrap().len(),
+            1,
+            "the unprotected record must be gone"
+        );
+
+        let contacts = body_json(api_contacts(State(state)).await.into_response()).await;
+        let contacts = contacts.as_array().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts[0]["name"].as_str(),
+            Some("Protected"),
+            "the protected record must survive and still appear in Contacts"
+        );
+    }
+
+    fn aide() -> CurrentUser {
+        CurrentUser {
+            username: "aide".into(),
+            permission_level: 50,
+        }
+    }
+
+    async fn seed_protected_contact(state: &Arc<AppState>) -> String {
+        let bus = state.host.advert_bus();
+        let key = dummy_key(7);
+        bus.upsert_contact(
+            key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+        bus.list_protected()[0].pubkey_hex.clone()
+    }
+
+    // T048: refuses a User-tier caller. Constructed as a direct handler call
+    // with a synthetic CurrentUser rather than through the real login flow —
+    // bbs-web's own login already rejects anything below Aide before a
+    // session can exist, so there is no way to obtain a User-tier session to
+    // present to this endpoint through the live API. This is defense-in-depth
+    // coverage of the in-handler check, not evidence the boundary is
+    // reachable via a real request.
+    #[tokio::test]
+    async fn api_delete_contact_rejects_below_aide() {
+        let (state, _mock) = test_state();
+        let resp = api_delete_contact(
+            State(state),
+            Extension(regular_user()),
+            Path("0".repeat(64)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // T048: succeeds for Aide/Sysop; a successful delete clears the
+    // protected flag and removes the entry from GET /api/v1/contacts.
+    #[tokio::test]
+    async fn api_delete_contact_succeeds_for_aide() {
+        let (state, mock) = test_state();
+        let pubkey_hex = seed_protected_contact(&state).await;
+
+        let resp = api_delete_contact(
+            State(Arc::clone(&state)),
+            Extension(aide()),
+            Path(pubkey_hex),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let contacts = body_json(api_contacts(State(state)).await.into_response()).await;
+        assert_eq!(
+            contacts.as_array().unwrap().len(),
+            0,
+            "the deleted contact must no longer appear in Contacts"
+        );
+        // Phase 6 hostile-audit regression (Hostile QA persona): the
+        // default MockHost previously discarded this argument and always
+        // returned NotSupported, so a 204 alone didn't prove the CORRECT
+        // pubkey was ever actually passed to the native removal call.
+        assert_eq!(
+            mock.removed_meshcore_contacts(),
+            vec![dummy_key(7)],
+            "the native removal must be called with the deleted contact's own pubkey"
+        );
+    }
+
+    // T048: deleting an unknown/unprotected pubkey returns 404.
+    #[tokio::test]
+    async fn api_delete_contact_returns_404_for_unknown_pubkey() {
+        let (state, _mock) = test_state();
+        let resp =
+            api_delete_contact(State(state), Extension(sysop()), Path("ab".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // T048: an invalid (wrong-length/non-hex) pubkey path param is rejected
+    // as a client error, not a panic or a 500.
+    #[tokio::test]
+    async fn api_delete_contact_rejects_malformed_pubkey() {
+        let (state, _mock) = test_state();
+        let resp =
+            api_delete_contact(State(state), Extension(sysop()), Path("not-hex".into())).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // Phase 6 hostile-audit regression (Security persona): `u8::from_str_radix`
+    // accepts a leading `+` for unsigned types (e.g. "+1" parses as 1), which
+    // isn't a hex digit — decode_pubkey_hex must not silently accept a
+    // 64-character string built from `+`-prefixed chunks as valid hex.
+    #[tokio::test]
+    async fn api_delete_contact_rejects_plus_prefixed_non_hex() {
+        let (state, _mock) = test_state();
+        let resp =
+            api_delete_contact(State(state), Extension(sysop()), Path("+1".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // T048a (round-13 regression): after a delete, a stale full-sync report
+    // still showing the device's old favourited state must not resurrect
+    // the contact — covered at the AdvertBus level by
+    // `lost_removal_write_lets_stale_favorited_resync_re_adopt_after_grace_window`
+    // in crates/bbs-plugin-api/src/advert.rs (this handler calls
+    // AdvertBus::unprotect directly, so that test's coverage of the
+    // grace-window merge applies unchanged here). This test confirms the
+    // HTTP-layer half: immediately after a delete, the contact is gone from
+    // GET /api/v1/contacts (already covered above); no separate coverage
+    // needed at this layer for the grace-window mechanics themselves.
+    #[tokio::test]
+    async fn api_delete_contact_removal_is_immediate_at_the_http_layer() {
+        let (state, _mock) = test_state();
+        let pubkey_hex = seed_protected_contact(&state).await;
+        let resp = api_delete_contact(
+            State(Arc::clone(&state)),
+            Extension(sysop()),
+            Path(pubkey_hex),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            !state
+                .host
+                .advert_bus()
+                .is_currently_favourited(&dummy_key(7)),
+            "the contact must be unprotected immediately, not deferred"
+        );
+    }
+
+    // Phase 6 hostile-audit regression (Hostile QA persona): deleting the
+    // same pubkey twice must 404 the second time, not panic or
+    // double-decrement anything.
+    #[tokio::test]
+    async fn api_delete_contact_is_not_idempotent_second_call_404s() {
+        let (state, _mock) = test_state();
+        let pubkey_hex = seed_protected_contact(&state).await;
+
+        let first = api_delete_contact(
+            State(Arc::clone(&state)),
+            Extension(sysop()),
+            Path(pubkey_hex.clone()),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+        let second = api_delete_contact(State(state), Extension(sysop()), Path(pubkey_hex)).await;
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Phase 6 hostile-audit regression (Hostile QA persona): a record whose
+    // transport is "meshtastic" but whose node_num is None (a malformed/
+    // incomplete record — not reachable via the normal upsert_meshtastic_node
+    // ingest path, but not ruled out by the type system either) must be
+    // handled gracefully, not panic.
+    #[tokio::test]
+    async fn api_delete_contact_handles_meshtastic_record_with_no_node_num() {
+        let (state, mock) = test_state();
+        let bus = state.host.advert_bus();
+        let key = dummy_key(9);
+        // Deliberately go through upsert_contact (which sets has_full_record,
+        // required for mark_favourite_if_eligible to proceed past
+        // NoRecordYet) with transport = "meshtastic" rather than
+        // upsert_meshtastic_node, which always sets node_num — this is the
+        // only way to construct the malformed shape this test targets.
+        bus.upsert_contact(
+            key,
+            "Malformed".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshtastic",
+        );
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+        let pubkey_hex = bus.list_protected()[0].pubkey_hex.clone();
+
+        let resp = api_delete_contact(State(state), Extension(sysop()), Path(pubkey_hex)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "local unprotect must still succeed even though the native removal can't be attempted"
+        );
+        assert!(
+            mock.removed_meshtastic_favorites().is_empty(),
+            "no removal call should be attempted without a node_num to target"
+        );
     }
 }

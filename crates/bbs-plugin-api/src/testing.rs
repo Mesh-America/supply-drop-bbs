@@ -41,7 +41,7 @@ use crate::error::HostError;
 use crate::event::DomainEvent;
 use crate::identity::{SessionId, Username};
 use crate::permissions::{PermissionCtx, PermissionLevel};
-use crate::Host;
+use crate::{Host, MeshKeyRequest};
 
 /// Type alias for a command-matcher predicate. A boxed `Fn` so
 /// matchers can capture state.
@@ -77,6 +77,24 @@ struct MockHostState {
     /// Artificial delay applied inside `process_command` before recording and
     /// responding, to exercise slow-host / backpressure paths. Zero by default.
     process_delay: Duration,
+    /// Every `admin_remove_meshcore_contact` call, in order — lets tests
+    /// verify the *correct* pubkey was passed, not just that a removal
+    /// error was swallowed (both the argument and whether it was called at
+    /// all are otherwise invisible to a caller that only inspects the HTTP
+    /// response, since this feature's own admin actions are best-effort).
+    removed_meshcore_contacts: Vec<[u8; 32]>,
+    /// Every `admin_remove_meshtastic_favorite` call, in order — same
+    /// rationale as `removed_meshcore_contacts`.
+    removed_meshtastic_favorites: Vec<u32>,
+    /// The MeshCore transport's key-ops channel, captured by
+    /// `register_mesh_key_ops` when a real transport (e.g. `MeshTransport`)
+    /// registers itself against this mock during a test. `None` until then.
+    /// Exposed via [`MockHost::mesh_key_tx`] so a test can send a
+    /// `MeshKeyRequest` (e.g. `RemoveContact`) directly into the transport's
+    /// own `key_rx` handler — the same channel `BbsHost::admin_remove_meshcore_contact`
+    /// routes through in production, unlike this mock's own short-circuiting
+    /// override of that method (which never touches this channel at all).
+    mesh_key_tx: Option<tokio::sync::mpsc::Sender<MeshKeyRequest>>,
 }
 
 #[derive(Debug, Clone)]
@@ -117,6 +135,9 @@ impl MockHost {
                 default_response: Response::Text("(unscripted)".to_owned()),
                 commands_received: Vec::new(),
                 process_delay: Duration::ZERO,
+                removed_meshcore_contacts: Vec::new(),
+                removed_meshtastic_favorites: Vec::new(),
+                mesh_key_tx: None,
             }),
             events: tx,
             advert_bus: Arc::new(AdvertBus::new()),
@@ -194,6 +215,42 @@ impl MockHost {
         event: DomainEvent,
     ) -> Result<usize, broadcast::error::SendError<DomainEvent>> {
         self.events.send(event)
+    }
+
+    /// Every `admin_remove_meshcore_contact` pubkey passed so far, in order.
+    #[must_use]
+    pub fn removed_meshcore_contacts(&self) -> Vec<[u8; 32]> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .removed_meshcore_contacts
+            .clone()
+    }
+
+    /// Every `admin_remove_meshtastic_favorite` node_num passed so far, in order.
+    #[must_use]
+    pub fn removed_meshtastic_favorites(&self) -> Vec<u32> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .removed_meshtastic_favorites
+            .clone()
+    }
+
+    /// The MeshCore transport's key-ops channel, if a real transport has
+    /// called `register_mesh_key_ops` against this mock (e.g. after
+    /// `MeshTransport::start`). Lets a test drive `key_rx`'s handler
+    /// directly — send a `MeshKeyRequest` here and await its `reply` —
+    /// exercising the real transport-level TOCTOU re-checks that this
+    /// mock's own `admin_remove_meshcore_contact` override bypasses
+    /// entirely (it short-circuits and never touches this channel).
+    #[must_use]
+    pub fn mesh_key_tx(&self) -> Option<tokio::sync::mpsc::Sender<MeshKeyRequest>> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .mesh_key_tx
+            .clone()
     }
 }
 
@@ -275,6 +332,42 @@ impl Host for MockHost {
 
     fn advert_bus(&self) -> Arc<AdvertBus> {
         Arc::clone(&self.advert_bus)
+    }
+
+    /// Stores the sender, unlike the trait's default no-op body — so a test
+    /// starting a real transport (e.g. `MeshTransport::start`) against this
+    /// mock can retrieve it via [`MockHost::mesh_key_tx`] and drive the
+    /// transport's `key_rx` handler directly.
+    fn register_mesh_key_ops(&self, sender: tokio::sync::mpsc::Sender<MeshKeyRequest>) {
+        self.state.lock().expect("mock poisoned").mesh_key_tx = Some(sender);
+    }
+
+    /// Records the pubkey and succeeds, unlike the trait's default
+    /// `NotSupported` body — so tests exercising a delete/removal flow can
+    /// assert the *correct* pubkey was actually passed via
+    /// [`MockHost::removed_meshcore_contacts`], not just that a removal
+    /// error was silently swallowed by a caller that only inspects the
+    /// HTTP-visible outcome (found by the Phase 6 hostile audit's Hostile
+    /// QA persona: the default `NotSupported` body made two removal tests
+    /// pass for the wrong reason).
+    async fn admin_remove_meshcore_contact(&self, pubkey: [u8; 32]) -> Result<(), HostError> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .removed_meshcore_contacts
+            .push(pubkey);
+        Ok(())
+    }
+
+    /// [`admin_remove_meshcore_contact`](Self::admin_remove_meshcore_contact)'s
+    /// Meshtastic sibling.
+    async fn admin_remove_meshtastic_favorite(&self, node_num: u32) -> Result<(), HostError> {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .removed_meshtastic_favorites
+            .push(node_num);
+        Ok(())
     }
 }
 

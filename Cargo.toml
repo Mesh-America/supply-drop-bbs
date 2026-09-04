@@ -51,6 +51,7 @@ sysinfo.workspace            = true
 dialoguer.workspace          = true
 tokio-serial.workspace       = true
 time.workspace               = true
+reqwest.workspace            = true
 
 [lints]
 workspace = true
@@ -113,6 +114,12 @@ tower-http  = { version = "0.5", features = ["cors", "set-header"] }
 rust-embed  = { version = "8" }
 mime_guess  = "2"
 tokio-stream = { version = "0.1", features = ["sync"] }
+# Minimal feature set (see specs/001-persist-mesh-contacts/research.md
+# Decision 13): JSON bodies + an automatic cookie jar for session auth
+# against a running bbs-web instance (the `contacts` CLI subcommand).
+# rustls-tls avoids an OpenSSL system dependency, consistent with this
+# project's portability goals.
+reqwest     = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
 zip         = { version = "2", default-features = false, features = ["deflate"] }
 toml_edit   = { version = "0.22", features = ["serde"] }
 sysinfo     = { version = "0.33", default-features = false, features = ["system", "disk", "network"] }

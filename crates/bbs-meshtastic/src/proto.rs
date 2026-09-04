@@ -183,6 +183,13 @@ pub struct NodeInfo {
     pub snr: f32,
     #[prost(fixed32, tag = "5")]
     pub last_heard: u32,
+    /// Whether the device's own NodeDB currently favorites this node (exempts
+    /// it from database-full eviction). Only meaningful on a genuine
+    /// connect-time NodeDB sync — a live `PORT_NODEINFO_APP` self-announce
+    /// carries no such bit; see `record_node_advert`'s `is_full_sync`
+    /// parameter for how callers must gate reading this field.
+    #[prost(bool, tag = "10")]
+    pub is_favorite: bool,
 }
 
 /// Meshtastic node owner/user info (`mesh.proto User`).
@@ -202,7 +209,8 @@ pub struct User {
     pub short_name: String,
     /// Device role (`Config.DeviceConfig.Role`): 0=CLIENT, 1=CLIENT_MUTE,
     /// 2=ROUTER, 3=ROUTER_CLIENT, 4=REPEATER, 5=TRACKER, 6=SENSOR, 7=TAK,
-    /// 8=CLIENT_HIDDEN, 9=LOST_AND_FOUND, 10=TAK_TRACKER, 11=ROUTER_LATE.
+    /// 8=CLIENT_HIDDEN, 9=LOST_AND_FOUND, 10=TAK_TRACKER, 11=ROUTER_LATE,
+    /// 12=CLIENT_BASE.
     #[prost(int32, tag = "7")]
     pub role: i32,
     /// Node's Curve25519 public key (32 bytes), broadcast on the mesh for PKC DMs.
@@ -334,7 +342,10 @@ pub struct SecurityConfig {
 /// response and the client must echo it back in SET commands within 300 s.
 #[derive(Clone, PartialEq, Message)]
 pub struct AdminMessage {
-    #[prost(oneof = "admin_message::PayloadVariant", tags = "3, 4, 5, 6, 32, 34")]
+    #[prost(
+        oneof = "admin_message::PayloadVariant",
+        tags = "3, 4, 5, 6, 32, 34, 39, 40"
+    )]
     pub payload_variant: Option<admin_message::PayloadVariant>,
     /// Replay-attack guard — echo back in all SET commands.
     #[prost(bytes = "vec", tag = "101")]
@@ -376,6 +387,31 @@ pub mod admin_message {
         /// Update a config section.
         #[prost(message, tag = "34")]
         SetConfig(super::MtConfig),
+        /// Favorite a node (exempt it from NodeDB eviction on the device).
+        /// Payload: the node number to favorite. Write-only — added to the
+        /// decode-routing `tags` list on `AdminMessage` (above) defensively,
+        /// since nothing in this codebase currently needs to decode it back
+        /// out. Tag confirmed against a vendored copy of upstream
+        /// `admin.proto` — see `.audit/repros/admin.proto` (T028b).
+        #[prost(uint32, tag = "39")]
+        SetFavoriteNode(u32),
+        /// Un-favorite a node (clear the flag that exempts it from NodeDB
+        /// eviction). Payload: the node number to un-favorite. Write-only —
+        /// added to the decode-routing `tags` list on `AdminMessage` (above)
+        /// defensively, since nothing in this codebase currently needs to
+        /// decode it back out. **Correction**: an earlier version of this
+        /// comment claimed this "matches the existing write-only variants
+        /// above" — false as written: `SetFixedPosition`/`RemoveFixedPosition`/
+        /// `SetTimeOnly`/`RebootSeconds` (tags 41/42/43/97) are write-only
+        /// too but are *not* in that tags list (a real, pre-existing decode
+        /// gap this addition doesn't introduce and isn't positioned to fix).
+        /// This variant (tag 40) is deliberately included, unlike those. See
+        /// specs/001-persist-mesh-contacts/research.md Decision 12 for the
+        /// removal mechanism this serves. Tag confirmed against a vendored
+        /// copy of upstream `admin.proto` — see `.audit/repros/admin.proto`
+        /// (T028b); no longer resting on live-fetch citations alone.
+        #[prost(uint32, tag = "40")]
+        RemoveFavoriteNode(u32),
     }
 }
 
@@ -660,6 +696,45 @@ pub fn admin_remove_fixed_position(
     )
 }
 
+/// Build a `SetFavoriteNode` admin command (favorite `node_num` on the
+/// connected radio's own NodeDB, exempting it from database-full eviction),
+/// echoing back the session passkey. No-reply, no reboot — see
+/// [`admin_message::PayloadVariant::SetFavoriteNode`].
+pub fn admin_set_favorite_node(
+    to_node: u32,
+    request_id: u32,
+    node_num: u32,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::SetFavoriteNode(node_num)),
+            session_passkey,
+        },
+    )
+}
+
+/// Build a `RemoveFavoriteNode` admin command (un-favorite `node_num` on the
+/// connected radio's own NodeDB), echoing back the session passkey. No-reply,
+/// no reboot — see [`admin_message::PayloadVariant::RemoveFavoriteNode`].
+pub fn admin_remove_favorite_node(
+    to_node: u32,
+    request_id: u32,
+    node_num: u32,
+    session_passkey: Vec<u8>,
+) -> ToRadio {
+    admin_packet(
+        to_node,
+        request_id,
+        AdminMessage {
+            payload_variant: Some(admin_message::PayloadVariant::RemoveFavoriteNode(node_num)),
+            session_passkey,
+        },
+    )
+}
+
 /// Build a `RebootSeconds` admin command (reboot the node after `secs`),
 /// echoing back the session passkey. On reboot the firmware re-broadcasts its
 /// NodeInfo, which is how neighbours re-acquire the node.
@@ -729,5 +804,29 @@ mod tests {
         };
         assert_eq!(data.portnum, PORT_TEXT_MESSAGE_APP);
         assert_eq!(data.payload, b"H");
+    }
+
+    /// The new `remove_favorite_node` (tag 40) admin variant round-trips
+    /// through prost's own encode/decode, and echoes the session passkey —
+    /// self-consistency of this repo's own wire model, not a claim about
+    /// upstream firmware compatibility (see the field's own doc comment for
+    /// that residual risk).
+    #[test]
+    fn remove_favorite_node_round_trips_and_carries_passkey() {
+        let msg = admin_remove_favorite_node(0xAABB_CCDD, 7, 424_242, vec![1, 2, 3, 4]);
+        let Some(to_radio::PayloadVariant::Packet(packet)) = msg.payload_variant else {
+            panic!("expected packet");
+        };
+        let Some(mesh_packet::PayloadVariant::Decoded(data)) = packet.payload_variant else {
+            panic!("expected decoded payload");
+        };
+        assert_eq!(data.portnum, PORT_ADMIN_APP);
+
+        let decoded = AdminMessage::decode(data.payload.as_slice()).unwrap();
+        assert_eq!(decoded.session_passkey, vec![1, 2, 3, 4]);
+        assert_eq!(
+            decoded.payload_variant,
+            Some(admin_message::PayloadVariant::RemoveFavoriteNode(424_242))
+        );
     }
 }
