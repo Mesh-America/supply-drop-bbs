@@ -2869,10 +2869,16 @@ impl BbsHost {
                     }
                     return Ok(Response::Text("Cancelled.".into()));
                 }
-                // Numeric index into the list shown by K
-                if let Ok(n) = trimmed.parse::<usize>() {
-                    if n >= 1 && n <= room_ids.len() {
-                        let target_id = room_ids[n - 1];
+                // A room's real id, as displayed by K (issue #187: this used
+                // to be a 1-based POSITION in `room_ids`, which silently
+                // diverged from the real id whenever a permission-gated room
+                // was missing from this session's filtered list — the same
+                // number then meant a different room depending on whether it
+                // came from K's listing or from `C <number>`). Only ids K
+                // actually showed this session are accepted, same as before.
+                if let Ok(n) = trimmed.parse::<i64>() {
+                    let target_id = RoomId::new(n);
+                    if room_ids.contains(&target_id) {
                         {
                             let mut sessions = self.sessions.write().await;
                             if let Some(r) = sessions.get_mut(&session) {
@@ -3123,12 +3129,19 @@ impl BbsHost {
             return Ok(Response::Text("No accessible rooms.".into()));
         }
 
-        // Prefix each line with its 1-based index so the user can type a
-        // number to jump in (handled by Workflow::Rooms).
-        let numbered: Vec<String> = lines
+        // Prefix each line with the room's real id (not its position in this
+        // filtered list) so the number shown here means the same thing as
+        // `C <number>`, the web admin UI's room table, and the database
+        // itself — all of which already treat "room number" as the literal
+        // `rooms.id` (issue #187: with position-based numbering, a
+        // permission-gated room like Aides silently missing from a User's
+        // list would shift every later room's displayed number, so a custom
+        // room could display under a number that belongs to a different,
+        // hidden room).
+        let numbered: Vec<String> = rooms
             .iter()
-            .enumerate()
-            .map(|(i, l)| format!("{}. {}", i + 1, l))
+            .zip(lines.iter())
+            .map(|(room, l)| format!("{}. {}", room.id.as_i64(), l))
             .collect();
 
         let room_ids: Vec<RoomId> = rooms.iter().map(|r| r.id).collect();
@@ -8119,6 +8132,84 @@ mod tests {
             assert!(
                 matches!(sessions[&sid].workflow, Workflow::None),
                 "room selection should be auto-cancelled after running the command"
+            );
+        }
+    }
+
+    // ── Issue #187: K lists rooms by real id, not filtered-list position ──────
+
+    /// A room's default `min_permission_level` (User) means every custom
+    /// room a Sysop creates ends up ABOVE the built-in Aide/Sysop/System
+    /// rooms in real id, but below them in a User's *filtered* list (they
+    /// don't see Aides/Sysop/System at all). K must display and accept the
+    /// room's real id — not its position in that filtered list, which would
+    /// silently collide with a different, hidden room's real id.
+    #[tokio::test]
+    async fn list_rooms_shows_real_id_not_filtered_position() {
+        let (host, _db) = make_host().await;
+
+        // A custom room created after the built-in Lobby/Mail/Aides/Sysop/
+        // System rooms gets the next real id after them.
+        let custom_id = RoomStore::create(
+            &host.db,
+            "BAYCO ARES",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // A User-level session doesn't see Aides/Sysop/System (all gated
+        // above User), so BAYCO ARES is only the THIRD room in this
+        // session's filtered list (after Lobby, Mail) — position 3 would
+        // collide with Aides' real id if K numbered by position.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        let text = match resp {
+            Response::Prompt { text, .. } => text,
+            other => panic!("expected Prompt, got {other:?}"),
+        };
+        let bayco_line = text
+            .lines()
+            .find(|l| l.contains("BAYCO ARES"))
+            .unwrap_or_else(|| panic!("BAYCO ARES missing from room list, got: {text:?}"));
+        let displayed_number = bayco_line
+            .trim_start()
+            .split('.')
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            displayed_number,
+            custom_id.as_i64().to_string(),
+            "K must number BAYCO ARES by its real id ({}), not its position \
+             in this session's filtered list, got line: {bayco_line:?}",
+            custom_id.as_i64()
+        );
+
+        // Selecting by that real id must actually land in BAYCO ARES.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: custom_id.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t.to_uppercase().contains("BAYCO ARES")),
+            "selecting K's displayed number for BAYCO ARES must join BAYCO ARES, got: {resp:?}"
+        );
+        {
+            let sessions = host.sessions.read().await;
+            assert_eq!(
+                sessions[&sid].current_room, custom_id,
+                "current room must be BAYCO ARES, not whatever sat at position 3"
             );
         }
     }
