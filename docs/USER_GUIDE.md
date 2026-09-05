@@ -307,19 +307,34 @@ Your room list (`K`) only shows rooms you have access to.
 K
 ```
 
-Output shows each room with an unread-message indicator:
+Output shows each room with its number and an unread-message indicator:
 
 ```
 Rooms:
-* General (3 new) [here]
-  Announcements
-* Tech Talk (1 new)
-  Off Topic
+1. * General (3 new) [here]
+2.   Announcements
+3. * Tech Talk (1 new)
+4.   Off Topic
 ```
 
 - `*` means there are unread messages
 - `[here]` marks your current room
 - `(3 new)` shows the unread count
+- The leading number is the room's real id — the same number `C <number>`
+  (see [Change room](#change-room)), the web admin UI's room table, and the
+  database itself all use. It stays the same for a given room across every
+  page and every session; it's never based on the room's position in this
+  particular list.
+
+If the list doesn't fit in a single mesh reply, it's paginated with a
+trailer:
+
+```
+(more — press K again for the next page)
+```
+
+Press `K` again to see the next page; it keeps paging until every room
+you have access to has been shown once.
 
 ### Change room
 

@@ -85,9 +85,16 @@ enum Workflow {
     /// E replies to the current message; any other input exits.
     Reading,
     /// Choosing a room from the numbered list produced by K.
-    /// Stores the ordered room IDs so the user can type a number to jump in.
+    /// Stores the ordered room IDs so the user can type a number to jump in
+    /// (any id K has ever shown this session remains selectable, regardless
+    /// of which page is currently displayed). `next_page_start` is the index
+    /// into the (unpaginated) numbered-line list where the next page should
+    /// begin if the user presses K again — `None` once the last page has
+    /// been shown (issue #193: a long room list would silently truncate
+    /// mid-mesh-frame past ~12 rooms; K now pages instead).
     Rooms {
         room_ids: Vec<RoomId>,
+        next_page_start: Option<usize>,
     },
     /// Stepping through unvalidated accounts one-at-a-time (LP queue).
     /// `pending` is the list of usernames still to review; `index` is the
@@ -2896,7 +2903,10 @@ impl BbsHost {
             }
 
             // ── Room selection ────────────────────────────────────────────────
-            Workflow::Rooms { room_ids } => {
+            Workflow::Rooms {
+                room_ids,
+                next_page_start,
+            } => {
                 let trimmed = reply.trim();
                 // X or empty → cancel
                 if trimmed.eq_ignore_ascii_case("x") || trimmed.is_empty() {
@@ -2907,6 +2917,18 @@ impl BbsHost {
                         }
                     }
                     return Ok(Response::Text("Cancelled.".into()));
+                }
+                // K again while a further page remains continues pagination
+                // (issue #193) — checked before the generic command-fallback
+                // below, which would otherwise just re-run K from page one.
+                if trimmed.eq_ignore_ascii_case("k") {
+                    if let Some(next) = next_page_start {
+                        return self.handle_list_rooms_from(session, next).await;
+                    }
+                    // No further page: fall through to the generic
+                    // command-fallback below, which re-lists from the start
+                    // — the same behaviour K already had before pagination
+                    // existed, for a room list that fit on one page anyway.
                 }
                 // A room's real id, as displayed by K (issue #187: this used
                 // to be a 1-based POSITION in `room_ids`, which silently
@@ -3115,6 +3137,56 @@ impl BbsHost {
     }
 
     async fn handle_list_rooms(&self, session: SessionId) -> Result<Response, HostError> {
+        self.handle_list_rooms_from(session, 0).await
+    }
+
+    /// Split a room-listing line slice into one mesh-safe page, starting at
+    /// absolute index `start` within the full numbered-line list — so the
+    /// returned `next_page_start`, if any, is directly usable as the next
+    /// call's `start`. Builds the page by accumulating lines until the next
+    /// one would push it over a conservative byte budget, rather than a
+    /// fixed room count: room names have no length limit, so a count-based
+    /// page could itself overflow a mesh frame for long enough names
+    /// (issue #193: `K`'s single-frame `Response::Prompt` was silently
+    /// truncated by the transport once enough short-named rooms pushed it
+    /// past MeshCore's ~156-byte frame ceiling — see `MAX_REPLY_BYTES` in
+    /// `crates/bbs-mesh/src/transport.rs`; Meshtastic's default ceiling is
+    /// looser at ~220 bytes, but nothing here is transport-aware, so the
+    /// tighter MeshCore-safe budget is used for every caller — CLI/web have
+    /// no such ceiling, and seeing rooms across a couple of short pages
+    /// instead of one long one is harmless there).
+    fn paginate_room_lines(remaining: &[String], start: usize) -> (Vec<&str>, Option<usize>) {
+        // Conservative: MeshCore's real ceiling is ~156 bytes total,
+        // including the "Rooms:\n" header (~7 bytes), the "\nEnter # to
+        // join, X to cancel" footer (~30 bytes), and the "\n(more — press K
+        // again for the next page)" continuation trailer (~44 bytes) when
+        // one is shown — leaving roughly this much headroom for the room
+        // lines themselves, worst case (trailer present).
+        const LINE_BUDGET: usize = 70;
+        let mut page = Vec::new();
+        let mut used = 0usize;
+        for line in remaining {
+            let cost = line.len() + 1; // +1 for the '\n' joining lines
+            if !page.is_empty() && used + cost > LINE_BUDGET {
+                let next = start + page.len();
+                return (page, Some(next));
+            }
+            page.push(line.as_str());
+            used += cost;
+        }
+        (page, None)
+    }
+
+    /// Render room-list page starting at `start` (an index into the
+    /// unpaginated numbered-line list, not a room id) — see
+    /// `Workflow::Rooms::next_page_start`. `handle_list_rooms` always starts
+    /// at 0; pressing K again while already paging resumes from the stored
+    /// offset.
+    async fn handle_list_rooms_from(
+        &self,
+        session: SessionId,
+        start: usize,
+    ) -> Result<Response, HostError> {
         let (username, user_id, level, current_room) =
             match self.session_auth_or_guest(session).await {
                 Ok(t) => t,
@@ -3184,17 +3256,32 @@ impl BbsHost {
             .collect();
 
         let room_ids: Vec<RoomId> = rooms.iter().map(|r| r.id).collect();
+
+        // Clamp: the room list may have shrunk since an earlier page was
+        // shown (e.g. a room was deleted); fall back to the first page
+        // rather than showing nothing.
+        let start = if start < numbered.len() { start } else { 0 };
+        let (page, next_page_start) = Self::paginate_room_lines(&numbered[start..], start);
+
         {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
-                r.workflow = Workflow::Rooms { room_ids };
+                r.workflow = Workflow::Rooms {
+                    room_ids,
+                    next_page_start,
+                };
             }
         }
 
+        let trailer = if next_page_start.is_some() {
+            "\n(more — press K again for the next page)"
+        } else {
+            ""
+        };
         Ok(Response::Prompt {
             text: format!(
-                "Rooms:\n{}\nEnter # to join, X to cancel",
-                numbered.join("\n")
+                "Rooms:\n{}{trailer}\nEnter # to join, X to cancel",
+                page.join("\n")
             ),
             hide_input: false,
         })
@@ -8398,19 +8485,38 @@ mod tests {
         let uname = Username::new("alice").unwrap();
         register_and_login(&host, sid, &uname, "pass1234").await;
 
-        // A User-level session doesn't see Aides/Sysop/System (all gated
-        // above User), so BAYCO ARES is only the THIRD room in this
-        // session's filtered list (after Lobby, Mail) — position 3 would
-        // collide with Aides' real id if K numbered by position.
+        // A User-level session that doesn't see Aides/Sysop/System (all
+        // gated above User) would put BAYCO ARES at filtered-list position
+        // 3 — colliding with Aides' real id if K numbered by position
+        // rather than real id. Page forward if needed (issue #193: K now
+        // pages a room list too long for one mesh frame) to find whichever
+        // page BAYCO ARES lands on.
         let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
-        let text = match resp {
+        let mut text = match resp {
             Response::Prompt { text, .. } => text,
             other => panic!("expected Prompt, got {other:?}"),
         };
-        let bayco_line = text
-            .lines()
-            .find(|l| l.contains("BAYCO ARES"))
-            .unwrap_or_else(|| panic!("BAYCO ARES missing from room list, got: {text:?}"));
+        let mut pages = 0;
+        let bayco_line = loop {
+            if let Some(l) = text.lines().find(|l| l.contains("BAYCO ARES")) {
+                break l.to_owned();
+            }
+            pages += 1;
+            assert!(
+                pages < 15 && text.contains("more"),
+                "BAYCO ARES missing from the room list across all pages, \
+                 last page: {text:?}"
+            );
+            let resp = host
+                .process_command(sid, Command::WorkflowReply { reply: "K".into() })
+                .await
+                .unwrap();
+            text = match resp {
+                Response::Prompt { text, .. } => text,
+                other => panic!("expected Prompt on continued page, got {other:?}"),
+            };
+        };
+        let bayco_line = bayco_line.as_str();
         let displayed_number = bayco_line
             .trim_start()
             .split('.')
@@ -8444,6 +8550,126 @@ mod tests {
                 sessions[&sid].current_room, custom_id,
                 "current room must be BAYCO ARES, not whatever sat at position 3"
             );
+        }
+    }
+
+    // ── Issue #193: K pages a long room list instead of overflowing a frame ──
+
+    /// A room list too long to fit one mesh frame must be paged, not
+    /// silently truncated by the transport partway through a room's line —
+    /// K on its own shows the first page with a "more" trailer; K again
+    /// continues to the next page; every room appears exactly once across
+    /// the full sequence of pages; and a room number from an earlier page
+    /// is still selectable while a later page is on screen (room_ids holds
+    /// every accessible id all along, independent of which page is shown).
+    #[tokio::test]
+    async fn list_rooms_pages_a_long_list_and_covers_every_room_once() {
+        let (host, _db) = make_host().await;
+
+        // Enough short, fixed-width custom rooms to force at least two
+        // pages under the ~70-byte-per-page line budget (each line here is
+        // a handful of bytes, so this comfortably forces a 3rd+ page too).
+        let mut created_ids = Vec::new();
+        for i in 0..15u8 {
+            let id = RoomStore::create(
+                &host.db,
+                &format!("R{i:02}"),
+                None,
+                false,
+                PermissionLevel::User,
+                Timestamp::now(),
+            )
+            .await
+            .unwrap();
+            created_ids.push(id);
+        }
+
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pages = 0;
+        let mut first_page_ids: Vec<i64> = Vec::new();
+
+        // First K.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        let mut text = match resp {
+            Response::Prompt { text, .. } => text,
+            other => panic!("expected Prompt, got {other:?}"),
+        };
+
+        loop {
+            pages += 1;
+            for line in text.lines() {
+                if let Some((num, rest)) = line.split_once(". ") {
+                    if let Ok(id) = num.parse::<i64>() {
+                        if pages == 1 {
+                            first_page_ids.push(id);
+                        }
+                        if created_ids.iter().any(|r| r.as_i64() == id) {
+                            // rest is "<marker> RNN[...]"; the room name has
+                            // no spaces, so its own trailing token is safe
+                            // to key on even with unread/[here] suffixes.
+                            let name = rest.split_whitespace().next().unwrap();
+                            seen_names.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+
+            if !text.contains("more") {
+                break;
+            }
+            assert!(
+                pages < 15,
+                "pagination did not terminate after {pages} pages — got: {text:?}"
+            );
+
+            let resp = host
+                .process_command(sid, Command::WorkflowReply { reply: "K".into() })
+                .await
+                .unwrap();
+            text = match resp {
+                Response::Prompt { text, .. } => text,
+                other => panic!("expected Prompt on continued page, got {other:?}"),
+            };
+        }
+
+        assert!(
+            pages >= 2,
+            "expected the 15 extra rooms to force at least 2 pages, got {pages}"
+        );
+        assert_eq!(
+            seen_names.len(),
+            15,
+            "every created room must appear exactly once across all pages, saw: {seen_names:?}"
+        );
+        assert!(
+            !first_page_ids.is_empty(),
+            "the first page must show at least one room (built-in or custom)"
+        );
+
+        // A room id from the FIRST page must still be selectable even though
+        // the workflow has since advanced through further pages — proving
+        // `room_ids` tracks every accessible id, not just the current page.
+        let first_id = first_page_ids[0];
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: first_id.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Text(_)),
+            "a first-page room id must still be selectable from a later page, got: {resp:?}"
+        );
+        {
+            let sessions = host.sessions.read().await;
+            assert_eq!(sessions[&sid].current_room.as_i64(), first_id);
         }
     }
 
