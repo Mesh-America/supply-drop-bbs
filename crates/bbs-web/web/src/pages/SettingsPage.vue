@@ -378,31 +378,43 @@ const radioSaving = ref(false)
 const radioSaveOk = ref<string | null>(null)
 const radioSaveError = ref<string | null>(null)
 
-// Working copy — always show all fields; preset just fills them in
+// Working copy: always show all fields, preset just fills them in.
+// Typed string | number, not string: Vue's v-model casts to a number for any
+// <input type="number">, with or without the .number modifier, so these hold
+// a real number once the operator types into them and only start out as ''.
 const radioPreset = ref<string>('')  // '' means no preset selected
-const radioFrequencyHz = ref<string>('')
-const radioBandwidthHz = ref<string>('')
-const radioSpreadingFactor = ref<string>('')
-const radioCodingRate = ref<string>('')
-const radioTxPowerDbm = ref<string>('')
+const radioFrequencyHz = ref<string | number>('')
+const radioBandwidthHz = ref<string | number>('')
+const radioSpreadingFactor = ref<string | number>('')
+const radioCodingRate = ref<string | number>('')
+const radioTxPowerDbm = ref<string | number>('')
 // Routing path-hash width (companion-protocol setting, not a physical radio
-// param — applies to every connection type). Always 2 or 3; default 3.
+// param; applies to every connection type). Always 2 or 3; default 3.
 const radioPathBytes = ref<number>(3)
 
-function applyPreset(name: string) {
+// A blank <input type="number"> stays the empty string (never NaN or 0) per
+// Vue's numeric cast, so this correctly distinguishes "not entered" from a
+// legitimately-zero value like 0 dBm TX power. Don't use a truthy check
+// (`!x.value`) for this - 0 is falsy too.
+function isBlank(v: string | number): boolean {
+  return v === ''
+}
+
+function applyPreset(name: string): boolean {
   const p = radioPresets.value.find(p => p.name === name)
-  if (!p) return
+  if (!p) return false
   radioFrequencyHz.value     = String(p.frequency_hz)
   radioBandwidthHz.value     = String(p.bandwidth_hz)
   radioSpreadingFactor.value = String(p.spreading_factor)
   radioCodingRate.value      = String(p.coding_rate)
   radioTxPowerDbm.value      = String(p.tx_power_dbm)
+  return true
 }
 
-// Fired only by the operator picking a preset from the dropdown — NOT a
-// watch() on radioPreset. loadRadioConfig() also sets radioPreset.value (to
-// reflect a stored preset name), and a watch() would fire from that too,
-// clobbering individually-overridden fields loaded moments earlier with the
+// Fired only by the operator picking a preset from the dropdown, not a
+// watch() on radioPreset. loadRadioConfig() also sets radioPreset.value to
+// reflect a stored preset name; a watch() would fire from that too and
+// clobber individually-overridden fields loaded moments earlier with the
 // preset's raw defaults every time the page loads.
 function onRadioPresetChange() {
   if (radioPreset.value) applyPreset(radioPreset.value)
@@ -425,8 +437,8 @@ async function loadRadioConfig() {
       radioSpreadingFactor.value = r.spreading_factor != null ? String(r.spreading_factor) : ''
       radioCodingRate.value      = r.coding_rate      != null ? String(r.coding_rate)      : ''
       radioTxPowerDbm.value      = r.tx_power_dbm     != null ? String(r.tx_power_dbm)     : ''
-    } else if (r.preset) {
-      applyPreset(r.preset)
+    } else if (r.preset && !applyPreset(r.preset)) {
+      radioError.value = `Saved preset "${r.preset}" is not in the current preset list. Pick a preset or enter values manually.`
     }
   } catch (e: any) {
     radioError.value = e?.message ?? 'failed to load radio config'
@@ -442,11 +454,11 @@ async function saveRadioConfig() {
   try {
     const patch: Record<string, unknown> = {
       preset:           radioPreset.value || null,
-      frequency_hz:     radioFrequencyHz.value     ? parseInt(radioFrequencyHz.value, 10)     : null,
-      bandwidth_hz:     radioBandwidthHz.value     ? parseInt(radioBandwidthHz.value, 10)     : null,
-      spreading_factor: radioSpreadingFactor.value ? parseInt(radioSpreadingFactor.value, 10) : null,
-      coding_rate:      radioCodingRate.value      ? parseInt(radioCodingRate.value, 10)      : null,
-      tx_power_dbm:     radioTxPowerDbm.value      ? parseInt(radioTxPowerDbm.value, 10)      : null,
+      frequency_hz:     !isBlank(radioFrequencyHz.value)     ? parseInt(String(radioFrequencyHz.value), 10)     : null,
+      bandwidth_hz:     !isBlank(radioBandwidthHz.value)     ? parseInt(String(radioBandwidthHz.value), 10)     : null,
+      spreading_factor: !isBlank(radioSpreadingFactor.value) ? parseInt(String(radioSpreadingFactor.value), 10) : null,
+      coding_rate:      !isBlank(radioCodingRate.value)      ? parseInt(String(radioCodingRate.value), 10)      : null,
+      tx_power_dbm:     !isBlank(radioTxPowerDbm.value)      ? parseInt(String(radioTxPowerDbm.value), 10)      : null,
       path_bytes:       radioPathBytes.value,
     }
     const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
@@ -467,13 +479,20 @@ async function applyRadioConfig() {
   radioApplying.value  = true
   radioApplyOk.value   = null
   radioApplyError.value = null
+  if (isBlank(radioFrequencyHz.value) || isBlank(radioBandwidthHz.value) ||
+      isBlank(radioSpreadingFactor.value) || isBlank(radioCodingRate.value) ||
+      isBlank(radioTxPowerDbm.value)) {
+    radioApplyError.value = 'All five fields must be set before applying to the device.'
+    radioApplying.value = false
+    return
+  }
   try {
     await api.post('/api/v1/radio-config/apply', {
-      frequency_hz:     radioFrequencyHz.value     ? parseInt(radioFrequencyHz.value, 10)     : 0,
-      bandwidth_hz:     radioBandwidthHz.value     ? parseInt(radioBandwidthHz.value, 10)     : 0,
-      spreading_factor: radioSpreadingFactor.value ? parseInt(radioSpreadingFactor.value, 10) : 0,
-      coding_rate:      radioCodingRate.value      ? parseInt(radioCodingRate.value, 10)      : 0,
-      tx_power_dbm:     radioTxPowerDbm.value      ? parseInt(radioTxPowerDbm.value, 10)      : 0,
+      frequency_hz:     parseInt(String(radioFrequencyHz.value), 10),
+      bandwidth_hz:     parseInt(String(radioBandwidthHz.value), 10),
+      spreading_factor: parseInt(String(radioSpreadingFactor.value), 10),
+      coding_rate:      parseInt(String(radioCodingRate.value), 10),
+      tx_power_dbm:     parseInt(String(radioTxPowerDbm.value), 10),
     })
     radioApplyOk.value = 'Radio parameters applied to device.'
   } catch (e: any) {
@@ -604,6 +623,14 @@ const meshtasticFreqInput = computed<number>({
   },
 })
 
+// Called from three places (initial load, snapshot refresh, post-save device
+// confirm) to write these refs programmatically. Do not add a watch() on any
+// of them: a watch() can't tell a programmatic assignment here from the
+// operator changing a dropdown, and the MeshCore radio-preset section hit
+// exactly that bug (see onRadioPresetChange above) - a watch fired from this
+// kind of load-time assignment and overwrote values that had just been set
+// correctly. Wire any "reapply on selection change" behavior through an
+// explicit @change handler instead.
 function applyMeshtasticRadioFields(r: any) {
   meshtasticUsePreset.value         = r.use_preset ?? false
   meshtasticModemPreset.value       = r.modem_preset ?? 0
@@ -1233,35 +1260,37 @@ chmod g+w {{ configFile }}</pre>
             Bytes each hop adds to a flooded packet's routing path. More bytes make
             path-hash collisions (mis-routes) less likely on a dense mesh, at a little
             more airtime per packet. Applied to the device on every connect,
-            regardless of connection type.
+            regardless of connection type. Has no effect on firmware too old to report
+            SelfInfo on connect; the device keeps its own default in that case.
           </p>
         </div>
 
         <div class="field-row">
           <div class="field">
             <label>Frequency (Hz)</label>
-            <input v-model="radioFrequencyHz" type="number" min="1" placeholder="e.g. 910525000" :disabled="radioLoading" />
+            <input v-model.number="radioFrequencyHz" type="number" min="1" placeholder="e.g. 910525000" :disabled="radioLoading" />
             <p class="hint">e.g. 910525000 for 910.525 MHz</p>
           </div>
           <div class="field">
             <label>Bandwidth (Hz)</label>
-            <input v-model="radioBandwidthHz" type="number" min="1" placeholder="e.g. 62500" :disabled="radioLoading" />
+            <input v-model.number="radioBandwidthHz" type="number" min="1" placeholder="e.g. 62500" :disabled="radioLoading" />
             <p class="hint">e.g. 62500 for 62.5 kHz</p>
           </div>
         </div>
         <div class="field-row">
           <div class="field">
             <label>Spreading factor (7–12)</label>
-            <input v-model="radioSpreadingFactor" type="number" min="7" max="12" :disabled="radioLoading" />
+            <input v-model.number="radioSpreadingFactor" type="number" min="7" max="12" :disabled="radioLoading" />
           </div>
           <div class="field">
             <label>Coding rate (5–8)</label>
-            <input v-model="radioCodingRate" type="number" min="5" max="8" :disabled="radioLoading" />
+            <input v-model.number="radioCodingRate" type="number" min="5" max="8" :disabled="radioLoading" />
             <p class="hint">Denominator: 5 = 4/5, 8 = 4/8</p>
           </div>
           <div class="field">
             <label>TX power (dBm)</label>
-            <input v-model="radioTxPowerDbm" type="number" min="-10" max="30" :disabled="radioLoading" />
+            <input v-model.number="radioTxPowerDbm" type="number" min="-10" max="30" :disabled="radioLoading" />
+            <p class="hint">-10 to 30 is a UI guardrail, not a verified limit for every MeshCore device. Check your radio's documentation for its actual range.</p>
           </div>
         </div>
 
@@ -1293,6 +1322,10 @@ chmod g+w {{ configFile }}</pre>
           <div class="field">
             <label>Region</label>
             <select v-model.number="meshtasticRegion" :disabled="meshtasticRadioLoading">
+              <option
+                v-if="!MESHTASTIC_REGIONS.some(r => r.value === meshtasticRegion)"
+                :value="meshtasticRegion"
+              >Unknown region ({{ meshtasticRegion }})</option>
               <option v-for="r in MESHTASTIC_REGIONS" :key="r.value" :value="r.value">
                 {{ r.label }}
               </option>
@@ -1301,6 +1334,10 @@ chmod g+w {{ configFile }}</pre>
           <div class="field">
             <label>Modem preset</label>
             <select v-model.number="meshtasticModemPreset" :disabled="meshtasticRadioLoading">
+              <option
+                v-if="!MESHTASTIC_PRESETS.some(p => p.value === meshtasticModemPreset)"
+                :value="meshtasticModemPreset"
+              >Unknown preset ({{ meshtasticModemPreset }})</option>
               <option v-for="p in MESHTASTIC_PRESETS" :key="p.value" :value="p.value">
                 {{ p.label }}
               </option>
