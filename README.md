@@ -78,13 +78,13 @@ Pre-built packages and binaries for Raspberry Pi (aarch64, armv7) and x86-64
 Linux are attached to each
 [GitHub Release](https://github.com/Mesh-America/supply-drop-bbs/releases).
 
-### Option 1 — Debian package (recommended)
+### Option 1: Debian package (recommended)
 
 The `.deb` is the easiest way to install on Raspberry Pi OS, Ubuntu, or any
 Debian-based system. It handles user creation, directory layout, and systemd
 service registration automatically.
 
-Run this on your Pi or Linux box — it auto-detects your architecture:
+Run this on your Pi or Linux box. It auto-detects your architecture:
 
 ```sh
 ARCH=$(dpkg --print-architecture)   # arm64, armhf, or amd64
@@ -104,7 +104,7 @@ Or download manually from the [latest release](https://github.com/Mesh-America/s
 | Raspberry Pi 2/3/Zero 2 (32-bit) | `supply-drop-bbs_armhf.deb` |
 | x86-64 Linux | `supply-drop-bbs_amd64.deb` |
 
-### Option 2 — Raw binary
+### Option 2: Raw binary
 
 Download the binary directly and verify the checksum before running it.
 
@@ -123,7 +123,7 @@ Other available targets: `armv7-unknown-linux-gnueabihf` (armhf),
 `x86_64-unknown-linux-gnu` (amd64). Append `-headless` for a smaller build
 without the admin web UI.
 
-### Option 3 — Guided setup script
+### Option 3: Guided setup script
 
 If you prefer a wizard that handles everything (including optional
 [pymc-companion](contrib/pymc-companion/) HAT configuration), download
