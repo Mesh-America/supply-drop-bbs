@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# pre-commit: enforce the full CLAUDE.md pre-commit checklist using the
+# pinned toolchain from rust-toolchain.toml.
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+pass() { echo -e "${GREEN}✓${NC} $1"; }
+fail() { echo -e "${RED}✗${NC} $1"; exit 1; }
+step() { echo -e "\n${YELLOW}▶${NC} $1"; }
+
+TOOLCHAIN=$(grep '^channel' rust-toolchain.toml 2>/dev/null | sed 's/.*"\(.*\)".*/\1/' || echo "stable")
+echo "pre-commit checks (toolchain: $TOOLCHAIN)"
+
+step "Format"
+rustup run "$TOOLCHAIN" cargo fmt --all --check \
+  && pass "cargo fmt" \
+  || fail "cargo fmt failed — run: rustup run $TOOLCHAIN cargo fmt --all"
+
+step "Clippy"
+rustup run "$TOOLCHAIN" cargo clippy --workspace -- -D warnings \
+  && pass "cargo clippy" \
+  || fail "cargo clippy failed"
+
+step "Tests"
+rustup run "$TOOLCHAIN" cargo test --workspace \
+  && pass "cargo test" \
+  || fail "cargo test failed"
+
+step "Docs"
+rustup run "$TOOLCHAIN" cargo doc --workspace --no-deps --all-features \
+  && pass "cargo doc" \
+  || fail "cargo doc failed"
+
+echo -e "\n${GREEN}All pre-commit checks passed.${NC}\n"
+
+# --- BEGIN BEADS INTEGRATION v1.2.2 ---
+# This section is managed by beads. Do not remove these markers.
+if command -v bd >/dev/null 2>&1; then
+  export BD_GIT_HOOK=1
+  _bd_timeout=${BEADS_HOOK_TIMEOUT:-300}
+  _bd_used_perl=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$_bd_timeout" bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$_bd_timeout" bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  elif command -v perl >/dev/null 2>&1; then
+    _bd_used_perl=1
+    perl -e 'alarm shift; exec @ARGV' "$_bd_timeout" bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  else
+    echo >&2 "beads: hook 'pre-commit' running without timeout; install coreutils or perl to enable BEADS_HOOK_TIMEOUT"
+    bd hooks run pre-commit "$@"
+    _bd_exit=$?
+  fi
+  if [ $_bd_exit -eq 124 ] || { [ $_bd_used_perl -eq 1 ] && [ $_bd_exit -eq 142 ]; }; then
+    echo >&2 "beads: hook 'pre-commit' timed out after ${_bd_timeout}s — continuing without beads"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -eq 3 ]; then
+    echo >&2 "beads: database not initialized — skipping hook 'pre-commit'"
+    _bd_exit=0
+  fi
+  if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
+fi
+# --- END BEADS INTEGRATION v1.2.2 ---

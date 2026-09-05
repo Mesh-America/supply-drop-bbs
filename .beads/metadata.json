@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "supply_drop_bbs",
+  "project_id": "ed81bac6-2362-484e-a5ee-22bcbd63283b"
+}
