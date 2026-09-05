@@ -88,6 +88,35 @@ impl Database {
         })
     }
 
+    /// Force a WAL checkpoint on the database at `path`, folding any
+    /// committed-but-not-yet-checkpointed transactions from its `-wal`
+    /// sidecar into the main file. A no-op if `path` doesn't exist yet.
+    ///
+    /// Call this before taking a plain-file copy of a database that might
+    /// still be running (e.g. a pre-restore safety snapshot in `main.rs`):
+    /// `std::fs::copy` of the main file alone can silently miss recent
+    /// commits still sitting only in the WAL. This is not a rare edge case
+    /// for this project — `apply_pragmas` raises `wal_autocheckpoint` to
+    /// 10000 pages, and every restart path here goes through
+    /// `std::process::exit`, which (per its own contract) runs no
+    /// destructors and therefore skips the checkpoint a clean connection
+    /// close would otherwise perform.
+    pub async fn checkpoint_wal(path: &str) -> Result<(), DbOpenError> {
+        if !std::path::Path::new(path).exists() {
+            return Ok(());
+        }
+        let opts = base_opts(path).create_if_missing(false);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&pool)
+            .await?;
+        pool.close().await;
+        Ok(())
+    }
+
     /// Borrow the internal credential store.
     ///
     /// Only `bbs-core`'s own auth flow should call this. Plugins have

@@ -95,6 +95,21 @@ enum Commands {
     /// Trigger an immediate database backup.
     Backup,
 
+    /// Validate and apply a database restore from a backup file.
+    ///
+    /// Works directly against the local database and data directory, like
+    /// `backup`/`user`/`room` — no running BBS instance or web admin API
+    /// required (unlike `contacts`). Deliberately does NOT require the
+    /// live database to open cleanly: restoring is often needed exactly
+    /// because the live database is broken, so `stage`/`apply` never touch
+    /// it directly. Mirrors the web UI's Backups page restore flow —
+    /// `stage` then `apply` are the same two deliberately-separate steps
+    /// as upload-then-confirm there.
+    Restore {
+        #[command(subcommand)]
+        action: RestoreAction,
+    },
+
     /// Manage user accounts.
     User {
         #[command(subcommand)]
@@ -161,6 +176,36 @@ enum Commands {
         /// non-interactive/scripted use.
         #[arg(long, env = "SUPPLY_DROP_BBS_PASSWORD")]
         password: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RestoreAction {
+    /// Validate a backup file and stage it for restore, without touching
+    /// the live database.
+    ///
+    /// Accepts either a raw `.db` file or the `.zip` bundle the `backup`
+    /// subcommand (and the web UI's "create backup" button) produces —
+    /// both are validated the same way `stage_restore` validates a web
+    /// upload: SQLite-format check, migration-history check, migrating in
+    /// place, and a room-structure check. Staging never applies anything;
+    /// run `apply` afterward to confirm it.
+    Stage {
+        /// Path to a `.db` or `.zip` backup file.
+        path: PathBuf,
+    },
+
+    /// Confirm a previously staged restore.
+    ///
+    /// The database is actually swapped in the next time the BBS process
+    /// starts — this command does not restart anything itself. If the BBS
+    /// runs as a service, restart it afterward (e.g. `sudo systemctl
+    /// restart supply-drop-bbs`) to apply the restore.
+    Apply {
+        /// Skip the interactive "type yes to continue" confirmation
+        /// prompt — for scripted/non-interactive use.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -500,6 +545,7 @@ async fn main() {
         Some(Commands::Config { action }) => cmd_config(config_path.as_deref(), action),
         Some(Commands::Migrate) => cmd_migrate(&cli).await,
         Some(Commands::Backup) => cmd_backup(&cli).await,
+        Some(Commands::Restore { ref action }) => cmd_restore(&cli, action).await,
         Some(Commands::User { ref action }) => cmd_user(&cli, action).await,
         Some(Commands::Room { ref action }) => cmd_room(&cli, action).await,
         #[cfg(feature = "transport-process")]
@@ -571,6 +617,32 @@ async fn open_database(path: &std::path::Path) -> Database {
                      sudo supply-drop-bbs --data-dir /var/lib/supply-drop-bbs <subcommand> ..."
             );
             std::process::exit(1);
+        }
+    }
+}
+
+/// Delete every `pre-restore-safety-*.db` file in `data_dir` except `keep`,
+/// so repeated restores don't accumulate an unbounded number of
+/// full-database-sized snapshots on disk — a real concern on the
+/// SD-card-class storage this project targets.
+fn prune_old_restore_safety_snapshots(data_dir: &std::path::Path, keep: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep {
+            continue;
+        }
+        let is_old_snapshot = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with("pre-restore-safety-") && n.ends_with(".db"))
+            .unwrap_or(false);
+        if is_old_snapshot {
+            if let Err(e) = std::fs::remove_file(&path) {
+                warn!(path = %path.display(), "could not prune old restore safety snapshot: {e}");
+            }
         }
     }
 }
@@ -709,6 +781,95 @@ async fn cmd_run(cli: &Cli) {
     if let Err(e) = std::fs::create_dir_all(data_dir) {
         error!(path = %data_dir.display(), "could not create data directory: {e}");
         std::process::exit(1);
+    }
+
+    // ── 3b. Apply a staged database restore, if one is pending ─────────────────
+    // Must run before Database::open (below): this fresh process has no live
+    // connections to the database file yet, so swapping it is safe.
+    //
+    // `pending_restore.db`'s mere presence here is deliberately the ONLY
+    // signal for "the sysop confirmed this restore" — api_upload_restore
+    // (crates/bbs-web/src/lib.rs, issue #195) validates an uploaded file and
+    // stages it under a separate, inert name (`pending_restore.staged.db`)
+    // that this check never looks at; only api_apply_restore promotes it to
+    // this name, then exits so systemd's `Restart=always` brings this
+    // instance back up to perform the swap below. Do not stage directly
+    // under this name from anywhere: doing so would mean ANY unrelated
+    // restart between upload and confirmation (a crash, an operator
+    // restarting the service for an unrelated reason, systemd firing
+    // `Restart=always` after any exit) silently applies an unconfirmed
+    // restore.
+    let db_path_for_restore = cfg
+        .database
+        .path
+        .as_ref()
+        .expect("database.path set by resolve()");
+    let pending_restore = data_dir.join("pending_restore.db");
+    if pending_restore.exists() {
+        info!(path = %pending_restore.display(), "applying staged database restore");
+
+        // Safety net: snapshot the current live database before overwriting
+        // it, so a bad or wrong-system upload doesn't destroy data with no
+        // way back. No live connection exists yet in THIS process, but that
+        // doesn't mean the file is checkpoint-clean: every restart path in
+        // this binary (this restore flow and the pre-existing api_restart
+        // alike) exits via std::process::exit, which skips the checkpoint a
+        // clean connection close would otherwise run, and this project
+        // raises wal_autocheckpoint to 10000 pages — so a live,
+        // un-checkpointed WAL sidecar next to db_path is the normal case
+        // here, not a rare one. Checkpoint it into the main file first, or
+        // a plain file copy could silently miss recently committed messages.
+        if db_path_for_restore.exists() {
+            if let Err(e) = Database::checkpoint_wal(&db_path_for_restore.to_string_lossy()).await {
+                warn!(
+                    "could not checkpoint the live database's WAL before \
+                     snapshotting it — proceeding with a plain file copy \
+                     anyway, which may miss very recent messages: {e}"
+                );
+            }
+
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let safety_path = data_dir.join(format!("pre-restore-safety-{stamp}.db"));
+            if let Err(e) = std::fs::copy(db_path_for_restore, &safety_path) {
+                let _ = std::fs::remove_file(&safety_path);
+                error!("could not snapshot the live database before restoring — aborting restore, database left untouched: {e}");
+                std::process::exit(1);
+            }
+            info!(path = %safety_path.display(), "pre-restore safety snapshot saved");
+
+            // Keep only the snapshot just taken — an unbounded number of
+            // full-database-sized files would otherwise accumulate across
+            // repeated restores.
+            prune_old_restore_safety_snapshots(data_dir, &safety_path);
+        }
+
+        if let Err(e) = std::fs::rename(&pending_restore, db_path_for_restore) {
+            // `rename` can fail across filesystems (EXDEV) — data_dir and
+            // database.path are configured independently and aren't
+            // guaranteed to share one. Fall back to copy+delete, matching
+            // the identical fallback `stage_restore`'s own rename already
+            // has for the same reason.
+            if let Err(copy_err) = std::fs::copy(&pending_restore, db_path_for_restore) {
+                error!(
+                    "could not apply staged restore (rename failed: {e}; \
+                     copy fallback also failed: {copy_err})"
+                );
+                std::process::exit(1);
+            }
+            let _ = std::fs::remove_file(&pending_restore);
+        }
+        // The old live database's WAL/SHM sidecars (if any) now refer to
+        // data that no longer exists at this path — remove them so the
+        // restored file starts clean rather than SQLite trying to replay a
+        // stale WAL against it.
+        for ext in ["-wal", "-shm"] {
+            let sidecar = PathBuf::from(format!("{}{ext}", db_path_for_restore.display()));
+            let _ = std::fs::remove_file(sidecar);
+        }
+        info!("database restore applied — continuing startup with the restored database");
     }
 
     // ── 4. Database ───────────────────────────────────────────────────────────
@@ -904,6 +1065,7 @@ async fn cmd_run(cli: &Cli) {
                 .as_ref()
                 .map(|d| d.to_string_lossy().into_owned());
             plugin.set_backup_dir(backup_dir);
+            plugin.set_data_dir(Some(data_dir.to_string_lossy().into_owned()));
         }
         #[cfg(feature = "transport-process")]
         if let Some(ref plugin) = wp {
@@ -1729,6 +1891,89 @@ async fn cmd_backup(cli: &Cli) {
         Err(e) => {
             eprintln!("error creating backup: {e}");
             std::process::exit(1);
+        }
+    }
+}
+
+async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
+    let cfg = load_config(cli);
+    let data_dir = cfg
+        .bbs
+        .data_dir
+        .as_ref()
+        .expect("data_dir set by resolve()");
+
+    if let Err(e) = tokio::fs::create_dir_all(data_dir).await {
+        eprintln!("error creating data directory: {e}");
+        std::process::exit(1);
+    }
+
+    match action {
+        RestoreAction::Stage { path } => {
+            if !path.is_file() {
+                eprintln!("error: {} is not a file", path.display());
+                std::process::exit(1);
+            }
+
+            // Copy into data_dir itself rather than pointing stage_restore
+            // at the operator's own file directly — stage_restore may
+            // overwrite its input in place (e.g. extracting a zip), and
+            // the operator's source file must never be touched.
+            let tmp_path = data_dir.join("restore_cli_upload.tmp");
+            if let Err(e) = tokio::fs::copy(path, &tmp_path).await {
+                eprintln!("error copying {}: {e}", path.display());
+                std::process::exit(1);
+            }
+
+            let result = Database::stage_restore(&tmp_path, data_dir).await;
+            if result.is_err() {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+            }
+
+            match result {
+                Ok(()) => {
+                    println!("Restore staged from {}.", path.display());
+                    println!(
+                        "Run `supply-drop-bbs restore apply` to confirm it, then restart the \
+                         BBS to apply it."
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error staging restore: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+        RestoreAction::Apply { yes } => {
+            if !*yes {
+                let confirmed = dialoguer::Confirm::new()
+                    .with_prompt(
+                        "This will replace the live database the next time the BBS starts. \
+                         A safety snapshot of the current database is taken first, but this \
+                         is still a destructive operation. Continue?",
+                    )
+                    .default(false)
+                    .interact()
+                    .unwrap_or(false);
+                if !confirmed {
+                    println!("Aborted — nothing was confirmed.");
+                    return;
+                }
+            }
+
+            match Database::admin_apply_staged_restore(data_dir).await {
+                Ok(()) => {
+                    println!("Restore confirmed.");
+                    println!(
+                        "Restart the BBS to apply it, e.g.: sudo systemctl restart \
+                         supply-drop-bbs"
+                    );
+                }
+                Err(e) => {
+                    eprintln!("error confirming restore: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

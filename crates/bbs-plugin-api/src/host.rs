@@ -384,6 +384,28 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_delete_backup".into()))
     }
 
+    /// Validate `uploaded_path` as a restorable database WITHOUT touching
+    /// the live one, then stage it in `data_dir` for restore-on-next-startup.
+    /// Returns an error (and leaves the live database untouched) if the
+    /// file isn't a real, migration-compatible copy of this BBS's schema.
+    async fn admin_stage_restore(
+        &self,
+        uploaded_path: &str,
+        data_dir: &str,
+    ) -> Result<(), HostError> {
+        let _ = (uploaded_path, data_dir);
+        Err(HostError::NotSupported("admin_stage_restore".into()))
+    }
+
+    /// Confirm a previously staged restore (see `admin_stage_restore`) by
+    /// promoting it from its inert staged name to the name that actually
+    /// triggers the database swap on next startup. Returns an error if
+    /// nothing is currently staged in `data_dir`.
+    async fn admin_apply_staged_restore(&self, data_dir: &str) -> Result<(), HostError> {
+        let _ = data_dir;
+        Err(HostError::NotSupported("admin_apply_staged_restore".into()))
+    }
+
     // ── Audit log ────────────────────────────────────────────────────────────────
 
     /// Append one entry to the durable audit log.

@@ -244,6 +244,67 @@ Backup created: backup_20260511_142301.db
   location: /var/lib/supply-drop-bbs/backups
 ```
 
+> Produces a raw `.db` file. The web UI's "create backup" button produces a
+> `.zip` bundling the same `.db` with `config.toml` — `restore stage` below
+> accepts either.
+
+---
+
+### `restore stage` / `restore apply`
+
+```
+supply-drop-bbs restore stage <PATH>
+supply-drop-bbs restore apply [--yes]
+```
+
+Validate and apply a database restore from a backup file — the CLI
+equivalent of the web UI's Backups page restore flow. Works directly
+against the local database and data directory; no running BBS instance is
+required (unlike `contacts`). Staging and confirming are deliberately two
+separate steps, mirroring the web UI's upload-then-confirm flow: staging
+alone never changes anything, and confirming only takes effect the next
+time the BBS process starts.
+
+`stage` accepts either a raw `.db` file or the `.zip` bundle `backup`/the
+web UI produce, and runs the same validation the web upload endpoint does:
+a SQLite-format check, a check that the file has this application's own
+migration history, migrating it in place if it's an older schema, and a
+room-structure check. A file that fails any of these is rejected and
+nothing is staged.
+
+```sh
+supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/backup_20260511_142301.db
+# Restore staged from /var/lib/supply-drop-bbs/backups/backup_20260511_142301.db.
+# Run `supply-drop-bbs restore apply` to confirm it, then restart the BBS to apply it.
+
+supply-drop-bbs restore apply
+# This will replace the live database the next time the BBS starts. A safety
+# snapshot of the current database is taken first, but this is still a
+# destructive operation. Continue? [y/N] y
+# Restore confirmed.
+# Restart the BBS to apply it, e.g.: sudo systemctl restart supply-drop-bbs
+```
+
+Pass `--yes` to `apply` to skip the interactive confirmation prompt for
+scripted/non-interactive use:
+
+```sh
+supply-drop-bbs restore apply --yes
+```
+
+`apply` only promotes a previously staged file to the name the BBS's
+startup check looks for — it does not restart the service itself. The
+actual database swap happens the next time the BBS process starts, after a
+safety snapshot of the current database is taken automatically.
+
+**Exit codes:** `0` on success (including a user-declined confirmation
+prompt, which prints "Aborted" rather than treating it as an error);
+non-zero if the source path in `stage` isn't a file, the file fails
+validation, or `apply` is run with nothing staged.
+
+> **Web admin:** The same upload/validate/stage/confirm flow is available
+> in the web UI under **Backups** → restore.
+
 ---
 
 ### `node show-key`

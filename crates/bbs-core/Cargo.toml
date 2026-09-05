@@ -24,6 +24,7 @@ time.workspace        = true
 tokio.workspace       = true
 toml_edit.workspace   = true
 tracing.workspace     = true
+zip.workspace         = true
 
 [dev-dependencies]
 proptest    = { workspace = true }
