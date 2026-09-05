@@ -183,10 +183,10 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
             <label class="field">
               <span>minimum permission level</span>
               <select v-model="editMinLevel">
-                <option :value="0">0 — unvalidated</option>
-                <option :value="10">10 — user</option>
-                <option :value="50">50 — aide</option>
-                <option :value="100">100 — sysop</option>
+                <option :value="0">0: unvalidated</option>
+                <option :value="10">10: user</option>
+                <option :value="50">50: aide</option>
+                <option :value="100">100: sysop</option>
               </select>
             </label>
           </template>

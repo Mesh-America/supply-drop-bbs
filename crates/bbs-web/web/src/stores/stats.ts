@@ -6,6 +6,8 @@ interface Stats {
   pending_users: number
   active_users: number
   active_sessions: number
+  discovered_contacts: number
+  protected_contacts: number
   [key: string]: unknown
 }
 
@@ -13,6 +15,8 @@ export const useStatsStore = defineStore('stats', () => {
   const pendingUsers = ref(0)
   const activeUsers = ref(0)
   const activeSessions = ref(0)
+  const discoveredContacts = ref(0)
+  const protectedContacts = ref(0)
   const errorAlerts = ref(0)
   const rssAlertActive = ref(false)
   const rssGrowthBytes = ref(0)
@@ -27,6 +31,8 @@ export const useStatsStore = defineStore('stats', () => {
       pendingUsers.value = s.pending_users
       activeUsers.value = s.active_users
       activeSessions.value = s.active_sessions
+      discoveredContacts.value = s.discovered_contacts
+      protectedContacts.value = s.protected_contacts
     } catch {
       // non-fatal — badge just won't update
     }
@@ -89,6 +95,8 @@ export const useStatsStore = defineStore('stats', () => {
     pendingUsers,
     activeUsers,
     activeSessions,
+    discoveredContacts,
+    protectedContacts,
     errorAlerts,
     rssAlertActive,
     rssGrowthBytes,

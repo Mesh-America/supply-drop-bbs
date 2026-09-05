@@ -126,9 +126,9 @@ const columns = computed(() => {
 <template>
   <div class="page">
     <header class="page-header">
-      <h1>contacts</h1>
+      <h1>contacts <span class="count-badge">{{ rows.length }}</span></h1>
       <p class="muted small">
-        Protected contacts only — these survive node-database flooding on the
+        Protected contacts only. These survive node-database flooding on the
         radio and stay favorited across a BBS restart. See
         <router-link to="/adverts">discovered contacts</router-link> for
         every node heard, protected or not.
@@ -201,6 +201,12 @@ const columns = computed(() => {
 .page-header { display: flex; flex-direction: column; gap: 0.2rem; }
 h1 { margin: 0; }
 .small { font-size: 0.85em; }
+.count-badge {
+  display: inline-block; font-size: 0.55em; font-weight: 600;
+  background: var(--row-alt); color: var(--muted); border-radius: 999px;
+  padding: 0.15em 0.65em; vertical-align: middle; letter-spacing: 0.02em;
+  border: 1px solid var(--border);
+}
 
 .contact-filters {
   display: flex;

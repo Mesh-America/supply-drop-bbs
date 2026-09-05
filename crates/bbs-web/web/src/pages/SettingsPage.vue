@@ -173,7 +173,7 @@ function validate(): boolean {
     // UTF-8 bytes, not characters — a flag emoji is 8 bytes.
     const bytes = new TextEncoder().encode(form.value.bbs_name).length
     if (bytes > 31)
-      errs.bbs_name = `Name is ${bytes} bytes; maximum is 31 (MeshCore advert limit — emoji count as several bytes each).`
+      errs.bbs_name = `Name is ${bytes} bytes; maximum is 31 (MeshCore advert limit; emoji count as several bytes each).`
     else if ([...form.value.bbs_name].some((ch) => { const c = ch.codePointAt(0) ?? 0; return c < 0x20 || (c >= 0x7f && c <= 0x9f) }))
       errs.bbs_name = 'Name must not contain control characters.'
   }
@@ -481,41 +481,41 @@ async function applyRadioConfig() {
 // ── Meshtastic region / modem preset constants ────────────────────────────────
 
 const MESHTASTIC_REGIONS = [
-  { value: 0,  label: 'UNSET — not configured' },
-  { value: 1,  label: 'US — United States (902–928 MHz)' },
-  { value: 2,  label: 'EU_433 — Europe 433 MHz' },
-  { value: 3,  label: 'EU_868 — Europe 868 MHz' },
-  { value: 4,  label: 'CN — China 470–510 MHz' },
-  { value: 5,  label: 'JP — Japan 920–923 MHz' },
-  { value: 6,  label: 'ANZ — Australia/New Zealand 915–928 MHz' },
-  { value: 7,  label: 'KR — South Korea 920–923 MHz' },
-  { value: 8,  label: 'TW — Taiwan 920–925 MHz' },
-  { value: 9,  label: 'RU — Russia 868 MHz' },
-  { value: 10, label: 'IN — India 865–867 MHz' },
-  { value: 11, label: 'NZ_865 — New Zealand 865 MHz' },
-  { value: 12, label: 'TH — Thailand 920–925 MHz' },
-  { value: 13, label: 'LORA_24 — 2.4 GHz (SX128x)' },
-  { value: 14, label: 'UA_433 — Ukraine 433 MHz' },
-  { value: 15, label: 'UA_868 — Ukraine 868 MHz' },
-  { value: 16, label: 'MY_433 — Malaysia 433 MHz' },
-  { value: 17, label: 'MY_919 — Malaysia 919 MHz' },
-  { value: 18, label: 'SG_923 — Singapore 923 MHz' },
+  { value: 0,  label: 'UNSET: not configured' },
+  { value: 1,  label: 'US: United States (902–928 MHz)' },
+  { value: 2,  label: 'EU_433: Europe 433 MHz' },
+  { value: 3,  label: 'EU_868: Europe 868 MHz' },
+  { value: 4,  label: 'CN: China 470–510 MHz' },
+  { value: 5,  label: 'JP: Japan 920–923 MHz' },
+  { value: 6,  label: 'ANZ: Australia/New Zealand 915–928 MHz' },
+  { value: 7,  label: 'KR: South Korea 920–923 MHz' },
+  { value: 8,  label: 'TW: Taiwan 920–925 MHz' },
+  { value: 9,  label: 'RU: Russia 868 MHz' },
+  { value: 10, label: 'IN: India 865–867 MHz' },
+  { value: 11, label: 'NZ_865: New Zealand 865 MHz' },
+  { value: 12, label: 'TH: Thailand 920–925 MHz' },
+  { value: 13, label: 'LORA_24: 2.4 GHz (SX128x)' },
+  { value: 14, label: 'UA_433: Ukraine 433 MHz' },
+  { value: 15, label: 'UA_868: Ukraine 868 MHz' },
+  { value: 16, label: 'MY_433: Malaysia 433 MHz' },
+  { value: 17, label: 'MY_919: Malaysia 919 MHz' },
+  { value: 18, label: 'SG_923: Singapore 923 MHz' },
 ]
 
 const MESHTASTIC_PRESETS = [
-  { value: 0, label: 'LONG_FAST — long range, fast (default)' },
-  { value: 1, label: 'LONG_SLOW — long range, slow (deprecated in 2.7)' },
-  { value: 3, label: 'MEDIUM_SLOW — medium range, slow' },
-  { value: 4, label: 'MEDIUM_FAST — medium range, fast' },
-  { value: 5, label: 'SHORT_SLOW — short range, slow' },
-  { value: 6, label: 'SHORT_FAST — short range, fast' },
-  { value: 7, label: 'LONG_MODERATE — long range, moderate (125 kHz)' },
-  { value: 8, label: 'SHORT_TURBO — fastest (500 kHz, not legal everywhere)' },
-  { value: 9, label: 'LONG_TURBO — long range, 500 kHz' },
-  { value: 10, label: 'LITE_FAST — EU_866 compliant, ~MEDIUM_FAST range' },
-  { value: 11, label: 'LITE_SLOW — EU_866 compliant, ~LONG_FAST range' },
-  { value: 12, label: 'NARROW_FAST — EU_868 62.5 kHz, ~SHORT_SLOW range' },
-  { value: 13, label: 'NARROW_SLOW — EU_868 62.5 kHz, ~LONG_FAST range' },
+  { value: 0, label: 'LONG_FAST: long range, fast (default)' },
+  { value: 1, label: 'LONG_SLOW: long range, slow (deprecated in 2.7)' },
+  { value: 3, label: 'MEDIUM_SLOW: medium range, slow' },
+  { value: 4, label: 'MEDIUM_FAST: medium range, fast' },
+  { value: 5, label: 'SHORT_SLOW: short range, slow' },
+  { value: 6, label: 'SHORT_FAST: short range, fast' },
+  { value: 7, label: 'LONG_MODERATE: long range, moderate (125 kHz)' },
+  { value: 8, label: 'SHORT_TURBO: fastest (500 kHz, not legal everywhere)' },
+  { value: 9, label: 'LONG_TURBO: long range, 500 kHz' },
+  { value: 10, label: 'LITE_FAST: EU_866 compliant, ~MEDIUM_FAST range' },
+  { value: 11, label: 'LITE_SLOW: EU_866 compliant, ~LONG_FAST range' },
+  { value: 12, label: 'NARROW_FAST: EU_868 62.5 kHz, ~SHORT_SLOW range' },
+  { value: 13, label: 'NARROW_SLOW: EU_868 62.5 kHz, ~LONG_FAST range' },
 ]
 
 // Region frequency ranges (MHz) and preset bandwidths (kHz), used to show the
@@ -658,13 +658,13 @@ async function saveMeshtasticRadio() {
       ignore_mqtt:        meshtasticIgnoreMqtt.value,
     })
     if (res?.applied === false) {
-      meshtasticRadioOk.value = 'Saved. The device is not connected right now — these settings will be applied automatically the next time the BBS connects to it.'
+      meshtasticRadioOk.value = 'Saved. The device is not connected right now; these settings will be applied automatically the next time the BBS connects to it.'
     } else if (res?.confirmed && res?.device_config) {
       // Update the form to reflect the device's actual current values.
       applyMeshtasticRadioFields(res.device_config)
-      meshtasticRadioOk.value = 'Applied — confirmed on device.'
+      meshtasticRadioOk.value = 'Applied and confirmed on device.'
     } else {
-      meshtasticRadioOk.value = res?.message ?? 'Settings sent — use "Load from device" shortly to confirm.'
+      meshtasticRadioOk.value = res?.message ?? 'Settings sent. Use "Load from device" shortly to confirm.'
     }
   } catch (e: any) {
     meshtasticRadioError.value = e?.message ?? 'failed to save meshtastic radio config'
@@ -728,14 +728,14 @@ async function saveMeshtasticOwner() {
       short_name: meshtasticShortName.value || null,
     })
     if (res?.applied === false) {
-      meshtasticOwnerOk.value = 'Saved. The device is not connected right now — this name will be applied automatically the next time the BBS connects to it.'
+      meshtasticOwnerOk.value = 'Saved. The device is not connected right now; this name will be applied automatically the next time the BBS connects to it.'
     } else if (res?.confirmed && res?.device_owner) {
       meshtasticOwner.value = res.device_owner
       meshtasticLongName.value = res.device_owner.long_name
       meshtasticShortName.value = res.device_owner.short_name
-      meshtasticOwnerOk.value = 'Applied — confirmed on device.'
+      meshtasticOwnerOk.value = 'Applied and confirmed on device.'
     } else {
-      meshtasticOwnerOk.value = res?.message ?? 'Name sent — use "Load from device" shortly to confirm.'
+      meshtasticOwnerOk.value = res?.message ?? 'Name sent. Use "Load from device" shortly to confirm.'
     }
   } catch (e: any) {
     meshtasticOwnerError.value = e?.message ?? 'failed to save device owner info'
@@ -847,7 +847,7 @@ function cancelEditNodeKey() {
 function validateHex64(value: string): string | null {
   const h = value.trim()
   if (h.length !== 64) return `Must be exactly 64 hex characters (${h.length} given).`
-  if (!/^[0-9a-fA-F]+$/.test(h)) return 'Contains invalid characters — only 0-9 and a-f are allowed.'
+  if (!/^[0-9a-fA-F]+$/.test(h)) return 'Contains invalid characters. Only 0-9 and a-f are allowed.'
   return null
 }
 
@@ -1032,7 +1032,7 @@ chmod g+w {{ configFile }}</pre>
         <p class="hint">
           When set, the mesh transport sends your coordinates to the radio on connect so your
           node appears on the map in LoRa adverts.
-          <strong>Takes effect on the next mesh transport reconnect — no restart needed.</strong>
+          <strong>Takes effect on the next mesh transport reconnect. No restart needed.</strong>
         </p>
         <div class="field checkbox-field">
           <label>
@@ -1097,7 +1097,7 @@ chmod g+w {{ configFile }}</pre>
             <label>Mesh session lifetime (days)</label>
             <input v-model.number="form.security_session_mesh_days" type="number" min="1" max="365" />
             <p v-if="validationErrors.security_session_mesh_days" class="field-error">{{ validationErrors.security_session_mesh_days }}</p>
-            <p v-else class="hint">Mesh sessions persist longer — radio users disconnect frequently.</p>
+            <p v-else class="hint">Mesh sessions persist longer, since radio users disconnect frequently.</p>
           </div>
         </div>
         <div class="field-row">
@@ -1122,7 +1122,7 @@ chmod g+w {{ configFile }}</pre>
           <select v-model="form.logging_level">
             <option v-for="l in LOG_LEVELS" :key="l" :value="l">{{ l }}</option>
           </select>
-          <p class="hint">Takes effect immediately — no restart needed.</p>
+          <p class="hint">Takes effect immediately. No restart needed.</p>
         </div>
       </section>
 
@@ -1131,7 +1131,7 @@ chmod g+w {{ configFile }}</pre>
         <h2>Access policy</h2>
         <p class="hint">
           Controls how new registrations are handled. Changes take effect
-          immediately — no restart required. See also the in-BBS
+          immediately, no restart required. See also the in-BBS
           <code>OPENACCESS</code> / <code>CLOSEACCESS</code> / <code>GUESTROOM</code> commands.
         </p>
 
@@ -1145,7 +1145,7 @@ chmod g+w {{ configFile }}</pre>
             Require sysop verification before users can access rooms
           </label>
           <p class="hint">
-            Uncheck for SHTF mode — new users get full access immediately on
+            Uncheck for SHTF mode: new users get full access immediately on
             registration. When unchecked, the guest room (below) still exists but
             has no access restriction.
           </p>
@@ -1192,7 +1192,7 @@ chmod g+w {{ configFile }}</pre>
         <h2>MeshCore radio</h2>
         <p class="hint">
           LoRa parameters and routing settings for the MeshCore companion device.
-          <strong>Save</strong> records them in config.toml — the BBS applies them to
+          <strong>Save</strong> records them in config.toml. The BBS applies them to
           the device automatically on every connect (skipped when they already
           match, so a restart with no changes is a no-op). Use
           <strong>Apply to device</strong> to push the LoRa parameters immediately,
@@ -1223,7 +1223,7 @@ chmod g+w {{ configFile }}</pre>
           <p class="hint">
             Bytes each hop adds to a flooded packet's routing path. More bytes make
             path-hash collisions (mis-routes) less likely on a dense mesh, at a little
-            more airtime per packet. Applied to the device on every connect —
+            more airtime per packet. Applied to the device on every connect,
             regardless of connection type.
           </p>
         </div>
@@ -1418,7 +1418,7 @@ chmod g+w {{ configFile }}</pre>
           </p>
         </div>
         <div v-else class="muted" style="margin:0.5rem 0;">
-          {{ meshtasticSecurityLoading ? 'Loading…' : 'Not available — device not connected, or use "Refresh from device" above.' }}
+          {{ meshtasticSecurityLoading ? 'Loading…' : 'Not available. Device not connected, or use "Refresh from device" above.' }}
         </div>
 
         <h3 style="margin: 1.5rem 0 0.5rem">Re-announce</h3>
@@ -1455,7 +1455,7 @@ chmod g+w {{ configFile }}</pre>
           <div v-if="!editingNodeKey" class="key-display">
             <code v-if="nodeIdentity?.pubkey" class="key-hex">{{ nodeIdentity.pubkey }}</code>
             <span v-else-if="nodeIdentityLoading" class="muted">loading…</span>
-            <span v-else class="muted">not connected — start the mesh transport to read the device key</span>
+            <span v-else class="muted">not connected, start the mesh transport to read the device key</span>
             <button
               v-if="nodeIdentity?.pubkey"
               type="button"

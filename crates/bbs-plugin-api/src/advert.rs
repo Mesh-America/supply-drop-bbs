@@ -782,6 +782,28 @@ impl AdvertBus {
         v
     }
 
+    /// Total number of records the bus has ever seen (protected or not) —
+    /// backs the web UI's "Discovered Contacts" nav badge. Cheaper than
+    /// `list().len()`: no clone, no sort.
+    pub fn count(&self) -> usize {
+        let inner = self.inner.lock().expect("advert bus poisoned");
+        inner.records.len()
+    }
+
+    /// Count of currently-protected records — backs the web UI's "Contacts"
+    /// nav badge. See [`list_protected`](Self::list_protected) for what
+    /// "currently protected" means; cheaper than `list_protected().len()`:
+    /// no clone, no sort.
+    pub fn count_protected(&self) -> usize {
+        let inner = self.inner.lock().expect("advert bus poisoned");
+        let now = unix_now_u64();
+        inner
+            .records
+            .values()
+            .filter(|r| is_effectively_protected(r, now))
+            .count()
+    }
+
     /// [`list`](Self::list), filtered to currently-protected records — backs
     /// the web UI's "Contacts" view (as distinct from "Discovered Contacts",
     /// which shows everything via `list`).
@@ -1397,6 +1419,30 @@ mod tests {
         let protected = bus.list_protected();
         assert_eq!(protected.len(), 1);
         assert_eq!(protected[0].pubkey_hex, hex_encode(&protected_key));
+    }
+
+    /// `count()`/`count_protected()` must agree with `list().len()`/
+    /// `list_protected().len()` for the same bus state — they exist only to
+    /// avoid the clone+sort those do, not to define a different answer.
+    #[test]
+    fn count_and_count_protected_match_list_lengths() {
+        let bus = AdvertBus::new();
+        assert_eq!(bus.count(), 0);
+        assert_eq!(bus.count_protected(), 0);
+
+        let protected_key = dummy_key(117);
+        let unprotected_key = dummy_key(118);
+        seed_meshcore_contact(&bus, protected_key);
+        bus.upsert(unprotected_key, "U".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, always_eligible, 350, &[]),
+            FavouriteOutcome::Protected(_)
+        ));
+
+        assert_eq!(bus.count(), bus.list().len());
+        assert_eq!(bus.count(), 2);
+        assert_eq!(bus.count_protected(), bus.list_protected().len());
+        assert_eq!(bus.count_protected(), 1);
     }
 
     /// Phase 5 hostile-audit regression (Extractor pass): `AdvertRecord::

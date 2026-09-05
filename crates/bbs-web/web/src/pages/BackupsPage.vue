@@ -115,7 +115,7 @@ async function uploadRestoreFile() {
     restoreFile.value = null
     if (fileInput.value) fileInput.value.value = ''
   } catch (e: any) {
-    error.value = e?.message ?? 'upload failed — the file was not staged'
+    error.value = e?.message ?? 'upload failed: the file was not staged'
   } finally {
     uploading.value = false
   }
@@ -135,7 +135,7 @@ async function applyRestore() {
   actionOk.value = null
   try {
     await api.post('/api/v1/backups/restore/apply')
-    actionOk.value = 'Restore applying — the service is restarting. This page will stop responding for a few seconds.'
+    actionOk.value = 'Restore applying. The service is restarting, and this page will stop responding for a few seconds.'
     restoreStaged.value = false
   } catch (e: any) {
     error.value = e?.message ?? 'restore failed to apply'
@@ -176,8 +176,8 @@ onMounted(load)
     <section class="restore-panel">
       <h2>restore from backup</h2>
       <p class="muted small">
-        Upload a <code>.db</code> or <code>.zip</code> backup — from this system or another —
-        to replace the current database. The file is validated before anything changes; nothing
+        Upload a <code>.db</code> or <code>.zip</code> backup, from this system or another, to
+        replace the current database. The file is validated before anything changes; nothing
         is applied until you confirm below.
       </p>
       <div class="restore-controls">
@@ -195,7 +195,7 @@ onMounted(load)
       <div v-if="restoreStaged" class="restore-staged">
         <p>
           A validated backup is staged and ready. Applying it <strong>replaces the current
-          database</strong> and restarts the service — a safety snapshot of the current
+          database</strong> and restarts the service. A safety snapshot of the current
           database is taken automatically first.
         </p>
         <button class="danger" @click="applyRestore" :disabled="applying">
