@@ -70,10 +70,13 @@ const groups = computed<NavGroup[]>(() => {
     },
   ]
 
-  if (transports.meshcore) {
+  if (transports.meshcore || transports.meshtastic) {
     g.push({
       title: 'mesh',
-      items: [{ to: '/adverts', label: 'adverts' }],
+      items: [
+        { to: '/adverts', label: 'discovered contacts', count: () => stats.discoveredContacts },
+        { to: '/contacts', label: 'contacts', count: () => stats.protectedContacts },
+      ],
     })
   }
 
@@ -201,7 +204,7 @@ const groups = computed<NavGroup[]>(() => {
               <span
                 v-if="item.rssBadge && stats.rssAlertActive"
                 class="nav-badge rss-badge"
-                title="RSS memory growing — possible leak"
+                title="RSS memory growing (possible leak)"
               >mem↑</span>
             </router-link>
           </li>

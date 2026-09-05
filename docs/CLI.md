@@ -244,6 +244,67 @@ Backup created: backup_20260511_142301.db
   location: /var/lib/supply-drop-bbs/backups
 ```
 
+> Produces a raw `.db` file. The web UI's "create backup" button produces a
+> `.zip` bundling the same `.db` with `config.toml` — `restore stage` below
+> accepts either.
+
+---
+
+### `restore stage` / `restore apply`
+
+```
+supply-drop-bbs restore stage <PATH>
+supply-drop-bbs restore apply [--yes]
+```
+
+Validate and apply a database restore from a backup file — the CLI
+equivalent of the web UI's Backups page restore flow. Works directly
+against the local database and data directory; no running BBS instance is
+required (unlike `contacts`). Staging and confirming are deliberately two
+separate steps, mirroring the web UI's upload-then-confirm flow: staging
+alone never changes anything, and confirming only takes effect the next
+time the BBS process starts.
+
+`stage` accepts either a raw `.db` file or the `.zip` bundle `backup`/the
+web UI produce, and runs the same validation the web upload endpoint does:
+a SQLite-format check, a check that the file has this application's own
+migration history, migrating it in place if it's an older schema, and a
+room-structure check. A file that fails any of these is rejected and
+nothing is staged.
+
+```sh
+supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/backup_20260511_142301.db
+# Restore staged from /var/lib/supply-drop-bbs/backups/backup_20260511_142301.db.
+# Run `supply-drop-bbs restore apply` to confirm it, then restart the BBS to apply it.
+
+supply-drop-bbs restore apply
+# This will replace the live database the next time the BBS starts. A safety
+# snapshot of the current database is taken first, but this is still a
+# destructive operation. Continue? [y/N] y
+# Restore confirmed.
+# Restart the BBS to apply it, e.g.: sudo systemctl restart supply-drop-bbs
+```
+
+Pass `--yes` to `apply` to skip the interactive confirmation prompt for
+scripted/non-interactive use:
+
+```sh
+supply-drop-bbs restore apply --yes
+```
+
+`apply` only promotes a previously staged file to the name the BBS's
+startup check looks for — it does not restart the service itself. The
+actual database swap happens the next time the BBS process starts, after a
+safety snapshot of the current database is taken automatically.
+
+**Exit codes:** `0` on success (including a user-declined confirmation
+prompt, which prints "Aborted" rather than treating it as an error);
+non-zero if the source path in `stage` isn't a file, the file fails
+validation, or `apply` is run with nothing staged.
+
+> **Web admin:** The same upload/validate/stage/confirm flow is available
+> in the web UI under **Backups** → restore.
+
 ---
 
 ### `node show-key`
@@ -450,6 +511,88 @@ sudo supply-drop-bbs user set-password alice \
 The new password must be at least 6 characters. The same operation is available in the **web admin UI** — open the user's detail drawer on the Users page and click **reset password** (sysop-only; requires the BBS to be running).
 
 **Exit codes:** `0` on success; `1` if the user is not found, the password is too short, or the database cannot be opened.
+
+---
+
+### `contacts list` / `contacts discovered` / `contacts delete`
+
+```
+supply-drop-bbs contacts <list|discovered|delete> [OPTIONS]
+```
+
+Manage protected mesh contacts against a **running** BBS's web admin API.
+Unlike every other subcommand, `contacts` does not touch the local database or
+config file directly — it requires a reachable BBS instance with the
+`admin-web` feature enabled, and logs in exactly like the web UI (a session
+cookie, not a separate mechanism). Mirrors the web UI's **Contacts** and
+**Discovered Contacts** pages, including the same permission requirements.
+
+| Flag | Env override | Default | Description |
+|------|-------------|---------|-------------|
+| `--url <URL>` | `SUPPLY_DROP_BBS_URL` | `http://127.0.0.1:8080` | Base URL of the running BBS's web admin API |
+| `--username <NAME>` | `SUPPLY_DROP_BBS_USERNAME` | - | BBS account to authenticate as |
+| `--password <PASSWORD>` | `SUPPLY_DROP_BBS_PASSWORD` | - | Password to authenticate with. Prompted interactively (hidden input) if omitted |
+
+**Login itself requires Aide or Sysop (level 50+)** — the web admin API
+rejects a plain User account before a session can even exist, with the same
+"invalid credentials" error a wrong password would give. This applies to
+`list` and `discovered` too, not just `delete`.
+
+| Action | Description |
+|--------|-------------|
+| `list` | Protected contacts only (mirrors the **Contacts** page) |
+| `discovered` | Every discovered contact, protected or not (mirrors the **Discovered Contacts** page) |
+| `delete <PUBKEY>` | Remove a single **protected** contact by its 64-character hex public key, as shown by `list`. A pubkey that only appears in `discovered` (never protected) has nothing to delete and the server responds 404. |
+
+> **Flag order:** `--url`/`--username`/`--password` belong to `contacts`
+> itself, not to `list`/`discovered`/`delete` — put them **before** the
+> action, e.g. `contacts --username alice delete <PUBKEY>`.
+
+```sh
+supply-drop-bbs contacts --username alice list
+# Password for alice: ••••••••
+# PROTECTED  NAME                     TRANSPORT    TYPE       LAST SEEN            PUBKEY
+# ----------------------------------------------------------------------------------------------------
+# yes        basecamp-node            meshtastic   client     2026-09-01T12:03:11Z ab12cd34ef56...
+
+supply-drop-bbs contacts \
+  --url http://192.168.1.50:8080 --username alice --password hunter2 discovered
+
+supply-drop-bbs contacts --username alice --password hunter2 \
+  delete ab12cd34ef56...
+# deleted: ab12cd34ef56...
+```
+
+> **Non-loopback HTTP:** the session cookie the CLI relies on is marked
+> `Secure` by default (`cookie_secure = true`, see below), and a compliant
+> cookie jar only sends a `Secure` cookie back over `https://` **or** a
+> loopback address (`127.0.0.1`/`localhost`). A `--url` pointing at a LAN
+> address like `http://192.168.1.50:8080` — as in the `discovered` example
+> above — will log in successfully but then silently fail every following
+> request with `401 Unauthorized`, since the cookie never gets sent back.
+> Either set `cookie_secure = false` under `[plugins.web]` (see
+> [CONFIG.md](CONFIG.md), local/dev deployments only) on the server, or put
+> the web admin behind TLS before using `contacts` against a non-loopback
+> `--url`.
+
+For scripted/non-interactive use, set `SUPPLY_DROP_BBS_USERNAME` and
+`SUPPLY_DROP_BBS_PASSWORD` instead of passing `--password` on the command
+line (which would otherwise be visible in shell history and `ps`):
+
+```sh
+export SUPPLY_DROP_BBS_URL=http://127.0.0.1:8080
+export SUPPLY_DROP_BBS_USERNAME=alice
+export SUPPLY_DROP_BBS_PASSWORD=hunter2
+supply-drop-bbs contacts list
+```
+
+**Exit codes:** `0` on success; non-zero on any failure — the BBS not being
+reachable, a failed or under-privileged login, an invalid `--password`
+prompt, a malformed pubkey passed to `delete`, or the pubkey not matching
+any protected contact.
+
+> **Web admin:** The same data and delete action are available in the web UI
+> under **Contacts** (protected) and **Discovered Contacts** (all).
 
 ---
 

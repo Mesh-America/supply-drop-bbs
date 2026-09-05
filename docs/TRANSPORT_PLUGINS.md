@@ -46,7 +46,7 @@ transport at it from your dev machine. See
 [Installation & Operations](OPERATIONS.md) for the full install
 guide.
 
-The current workspace version is **0.6.2**. See the
+The current workspace version is **0.12.0**. See the
 [Plugin API guide § Versioning](PLUGIN_API.md#versioning) for the
 version history and migration notes for existing plugins.
 
@@ -161,8 +161,11 @@ via `[[plugins.process]]`.
 
 ### 2.1 Wiring two transports together: step-by-step
 
-Suppose you are adding a Meshtastic transport (`bbs-meshtastic`) alongside the
-existing MeshCore transport (`bbs-mesh`). Here is exactly what you change.
+This walks through adding a second mesh transport, using Meshtastic
+(`bbs-meshtastic`) alongside the existing MeshCore transport (`bbs-mesh`)
+as the worked example - this is, in fact, exactly how the real
+`bbs-meshtastic` transport that ships today was integrated. Here is
+exactly what changes to add a transport of your own.
 
 #### Step 1 — `Cargo.toml` (workspace root)
 
@@ -1361,8 +1364,11 @@ async fn real_radio_round_trip() { ... }
 
 ## 14. Complete worked example
 
-Below is a minimal skeleton for a hypothetical Meshtastic transport. It is
-not production-ready but demonstrates every integration point.
+Below is a minimal skeleton demonstrating every integration point a new
+transport needs to touch. It's intentionally simplified for illustration -
+the real `bbs-meshtastic` crate that ships in this workspace today is a
+full implementation with its own protocol framing, session handling, and
+tests. Don't confuse this teaching skeleton with it.
 
 ### `crates/bbs-meshtastic/Cargo.toml`
 
@@ -1383,15 +1389,15 @@ thiserror                = "1"
 ```
 
 ::: tip Current version
-The workspace version is **0.6.2**. Out-of-tree plugins (not inside
+The workspace version is **0.12.0**. Out-of-tree plugins (not inside
 this workspace) reference the crate directly:
 
 ```toml
 [dependencies]
-bbs-plugin-api = { git = "https://github.com/Mesh-America/supply-drop-bbs", version = "0.6" }
+bbs-plugin-api = { git = "https://github.com/Mesh-America/supply-drop-bbs", version = "0.12" }
 ```
 
-Use the `"0.6"` range rather than pinning to an exact patch version.
+Use the `"0.12"` range rather than pinning to an exact patch version.
 :::
 
 ### `crates/bbs-meshtastic/src/lib.rs`

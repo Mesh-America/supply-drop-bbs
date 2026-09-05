@@ -25,7 +25,7 @@ use bbs_plugin_api::{
     plugin::Plugin,
     testing::MockHost,
     transport::TransportEngine,
-    Command, Response,
+    Command, Host, MeshKeyRequest, Response,
 };
 use meshcore_companion::constants::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -127,6 +127,57 @@ fn path_updated_frame(pubkey: [u8; 32]) -> Vec<u8> {
     let mut payload = vec![PUSH_CODE_PATH_UPDATED];
     payload.extend_from_slice(&pubkey);
     radio_frame(&payload)
+}
+
+/// PUSH_CODE_ADVERT: the lightweight, pubkey-only advert a device sends for
+/// an already-known contact (as opposed to `PUSH_CODE_NEW_ADVERT`'s full
+/// 147-byte record) — see `meshcore_companion::frame::decode`'s `PUSH_CODE_ADVERT` arm.
+fn short_advert_frame(pubkey: [u8; 32]) -> Vec<u8> {
+    let mut payload = vec![PUSH_CODE_ADVERT];
+    payload.extend_from_slice(&pubkey);
+    radio_frame(&payload)
+}
+
+/// Build a 32-byte pubkey whose first 6 bytes are `prefix` (the wire-level
+/// identity a `ContactMsgRecv` carries) so a seeded advert record and a DM
+/// from the same node resolve to the same identity in tests.
+fn pubkey_for_prefix(prefix: [u8; 6]) -> [u8; 32] {
+    let mut pk = [0xEEu8; 32];
+    pk[..6].copy_from_slice(&prefix);
+    pk
+}
+
+/// PUSH_CODE_NEW_ADVERT: a full 147-byte contact record — see
+/// `meshcore_companion::frame::parse_contact` for the exact layout this
+/// mirrors (pubkey[32] + adv_type[1] + flags[1] + out_path_len[1] +
+/// out_path[64] + name[32] + last_advert_timestamp[4] + gps_lat[4] +
+/// gps_lon[4] + lastmod[4] = 147 bytes).
+fn new_advert_frame(pubkey: [u8; 32], name: &str, adv_type: u8) -> Vec<u8> {
+    let mut body = Vec::with_capacity(147);
+    body.extend_from_slice(&pubkey);
+    body.push(adv_type);
+    body.push(0u8); // flags — not yet favourited
+    body.push(0xFFu8); // out_path_len: unknown
+    body.extend_from_slice(&[0u8; 64]); // out_path
+    let mut name_buf = [0u8; 32];
+    let nb = name.as_bytes();
+    let n = nb.len().min(32);
+    name_buf[..n].copy_from_slice(&nb[..n]);
+    body.extend_from_slice(&name_buf);
+    body.extend_from_slice(&0u32.to_le_bytes()); // last_advert_timestamp
+    body.extend_from_slice(&0i32.to_le_bytes()); // gps_lat
+    body.extend_from_slice(&0i32.to_le_bytes()); // gps_lon
+    body.extend_from_slice(&0u32.to_le_bytes()); // lastmod
+    assert_eq!(body.len(), 147, "Contact body must be exactly 147 bytes");
+
+    let mut payload = vec![PUSH_CODE_NEW_ADVERT];
+    payload.extend_from_slice(&body);
+    radio_frame(&payload)
+}
+
+/// PUSH_CODE_CONTACTS_FULL: the radio's contact table is at capacity.
+fn contacts_full_frame() -> Vec<u8> {
+    radio_frame(&[PUSH_CODE_CONTACTS_FULL])
 }
 
 // ── Test harness ──────────────────────────────────────────────────────────────
@@ -1984,6 +2035,647 @@ async fn real_host_retransmitted_login_is_not_reprocessed() {
             "retransmitted login was reprocessed by the host: {t:?}"
         );
     }
+
+    transport.stop().await.unwrap();
+}
+
+// ── Persist Mesh Contacts (User Story 1: MeshCore) ──────────────────────────
+
+/// Read command-frame type bytes until `per_read_timeout` elapses with
+/// nothing new arriving. Used to assert a command was NOT sent — reading a
+/// single frame with a timeout can't distinguish "never coming" from "not
+/// here yet"; draining for a bounded window and checking the collected set
+/// can.
+async fn drain_command_types(bridge: &mut Bridge, per_read_timeout: Duration) -> Vec<u8> {
+    let mut types = Vec::new();
+    while let Ok(cmd) = tokio::time::timeout(per_read_timeout, bridge.read_command()).await {
+        types.push(cmd[0]);
+    }
+    types
+}
+
+/// User Story 1, Acceptance Scenario 1: a node whose full contact record is
+/// already cached (e.g. from an earlier advert) gets protected on its first
+/// DM — `AddUpdateContact` with the protect bit set, addressed to the
+/// sender's own pubkey.
+#[tokio::test]
+async fn protects_contact_on_first_dm_from_cache() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0x21u8, 0x22, 0x23, 0x24, 0x25, 0x26];
+    let pubkey = pubkey_for_prefix(sender);
+    host.advert_bus().upsert_contact(
+        pubkey,
+        "Alice".into(),
+        ADV_TYPE_CHAT,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+
+    let add_update = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_ADD_UPDATE_CONTACT),
+    )
+    .await
+    .expect("expected AddUpdateContact on first DM from a cached, eligible contact");
+    assert_eq!(
+        &add_update[1..33],
+        &pubkey[..],
+        "AddUpdateContact must address the sender's own pubkey"
+    );
+    assert_eq!(add_update[34] & 1, 1, "protect bit must be set");
+    assert!(
+        host.advert_bus().is_currently_favourited(&pubkey),
+        "AdvertBus must reflect the protection locally"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// User Story 1, Acceptance Scenario 3: a second DM from an already-protected
+/// sender must not trigger a redundant `AddUpdateContact`.
+#[tokio::test]
+async fn does_not_reprotect_already_favourited_contact() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0x31u8, 0x32, 0x33, 0x34, 0x35, 0x36];
+    let pubkey = pubkey_for_prefix(sender);
+    host.advert_bus().upsert_contact(
+        pubkey,
+        "Bob".into(),
+        ADV_TYPE_CHAT,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_ADD_UPDATE_CONTACT),
+    )
+    .await
+    .expect("expected the first DM to protect the contact");
+
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_ADD_UPDATE_CONTACT),
+        "an already-protected contact must not be re-protected on a second DM; saw: {types:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// T048b: `key_rx`'s `RemoveContact` handler re-checks `is_currently_favourited`
+/// immediately before sending the wire removal, protecting a contact that
+/// was re-protected after a delete-triggered removal was requested but
+/// before that request was actually processed (Decision 12c). Unlike the
+/// analogous Meshtastic regression test (where `key_rx` and message
+/// dispatch genuinely do share one task), MeshCore's `key_rx` is owned
+/// solely by `event_loop`, while a DM's own protect decision runs on the
+/// separate `command_worker` task (see the production `RemoveContact` arm's
+/// own comment: the re-check exists specifically because of "a concurrent
+/// re-DM on command_worker") — a real cross-task race is architecturally
+/// possible here. This test does not attempt to force that race
+/// deterministically (real inter-task timing, not something a test should
+/// depend on); instead it drives the re-protecting DM to full completion
+/// (confirmed via the wire) before ever sending the stale removal request,
+/// proving the guard is correct against pre-processing settled state — a
+/// real but narrower property than a genuine interleaving would prove.
+#[tokio::test]
+async fn stale_removal_via_key_rx_is_skipped_when_a_fresher_protect_landed() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0x81u8, 0x82, 0x83, 0x84, 0x85, 0x86];
+    let pubkey = pubkey_for_prefix(sender);
+    host.advert_bus().upsert_contact(
+        pubkey,
+        "Dave".into(),
+        ADV_TYPE_CHAT,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+
+    // First DM protects it.
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_ADD_UPDATE_CONTACT),
+    )
+    .await
+    .expect("expected the first DM to protect the contact");
+    assert!(host.advert_bus().is_currently_favourited(&pubkey));
+
+    // Simulate the delete flow's own first step — bbs-web's
+    // api_delete_contact calls AdvertBus::unprotect locally before
+    // best-effort asking the radio to remove the contact.
+    host.advert_bus().unprotect(&pubkey);
+    assert!(!host.advert_bus().is_currently_favourited(&pubkey));
+
+    // Before the (not-yet-sent) native removal request is processed, the
+    // same identity DMs the BBS again — a fresh, valid re-protect.
+    bridge.send(&contact_msg_frame(sender, "help again")).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_ADD_UPDATE_CONTACT),
+    )
+    .await
+    .expect("expected the second DM to re-protect the contact");
+    assert!(host.advert_bus().is_currently_favourited(&pubkey));
+
+    // Only now send the stale removal request through key_rx — the same
+    // channel `admin_remove_meshcore_contact` sends through in production.
+    // (This mock's own override of that method short-circuits and never
+    // touches key_rx, so the request is sent directly here to actually
+    // exercise transport.rs's TOCTOU re-check rather than bypassing it.)
+    let key_tx = host
+        .mesh_key_tx()
+        .expect("MeshTransport::start must have registered its key_tx by now");
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    key_tx
+        .send(MeshKeyRequest::RemoveContact {
+            pubkey,
+            reply: reply_tx,
+        })
+        .await
+        .expect("transport's key_rx must still be alive");
+    tokio::time::timeout(Duration::from_secs(2), reply_rx)
+        .await
+        .expect("transport must reply to the RemoveContact request within 2s")
+        .expect("reply sender must not be dropped without a value")
+        .expect("a skipped removal is still Ok(()), not an error");
+
+    // The re-check must have declined to send the removal, and the contact
+    // must remain protected.
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_REMOVE_CONTACT),
+        "a stale removal must not undo a fresher protect; saw: {types:?}"
+    );
+    assert!(
+        host.advert_bus().is_currently_favourited(&pubkey),
+        "contact must remain protected after the stale removal was correctly declined"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// FR-004: if the BBS doesn't yet know a sender's full contact record at the
+/// moment of their first DM, protection must apply retroactively once that
+/// record becomes available — not be silently skipped forever.
+#[tokio::test]
+async fn protection_deferred_until_full_contact_data_cached() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0x41u8, 0x42, 0x43, 0x44, 0x45, 0x46];
+    let pubkey = pubkey_for_prefix(sender);
+
+    // The DM arrives with no cached advert data at all yet.
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_ADD_UPDATE_CONTACT),
+        "must not protect before the full contact record is known; saw: {types:?}"
+    );
+
+    // The node's own advert now arrives, supplying the missing data.
+    bridge
+        .send(&new_advert_frame(pubkey, "Carol", ADV_TYPE_CHAT))
+        .await;
+
+    let add_update = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_ADD_UPDATE_CONTACT),
+    )
+    .await
+    .expect("expected retroactive protection once the full contact record arrived");
+    assert_eq!(&add_update[1..33], &pubkey[..]);
+
+    transport.stop().await.unwrap();
+}
+
+/// supply-drop-bbs-9vt: the real-world failure sequence is a DM arriving
+/// *before* the BBS has ever heard anything about the sender — so
+/// `get_or_create_session`'s seed-from-AdvertBus never finds a record, and
+/// `dispatch_message`'s own protect attempt is skipped entirely (no
+/// `full_pubkey` to work with). A short advert arriving afterward is often
+/// the first identity data the BBS ever gets for that sender; it must retry
+/// the pending protect (mirroring `NewAdvert`/`Contact`'s hook), which then
+/// finds only a short (`has_full_record: false`) record and hits
+/// `NoRecordYet` — which must in turn trigger a catch-up `GetContacts`,
+/// since the one-time connect-time `GetContacts` (drained by
+/// `complete_handshake` below) already ran before this sender existed.
+#[tokio::test]
+async fn short_advert_after_unresolved_dm_retries_and_triggers_contacts_catchup() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0x51u8, 0x52, 0x53, 0x54, 0x55, 0x56];
+    let pubkey = pubkey_for_prefix(sender);
+
+    // The DM arrives with no cached advert data and no resolved identity —
+    // dispatch_message's own protect attempt is skipped, but the pending
+    // mark is still set unconditionally.
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(300)).await;
+    assert!(
+        !types.contains(&CMD_ADD_UPDATE_CONTACT) && !types.contains(&CMD_GET_CONTACTS),
+        "no protect attempt should have run yet — identity is still unresolved; saw: {types:?}"
+    );
+
+    // A short (pubkey-only) advert now resolves the sender's identity —
+    // this must retry the pending protect and, finding only a short record,
+    // request a contacts catch-up.
+    bridge.send(&short_advert_frame(pubkey)).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_GET_CONTACTS),
+    )
+    .await
+    .expect(
+        "expected a catch-up GetContacts request once the short advert \
+             resolved this sender's identity but not their full record",
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// The catch-up trigger is a single, connection-wide cooldown (matching
+/// `MIN_ADVERT_SPACING`'s scale) — it must not fire again for a second
+/// sender whose identity resolves (via a short advert) moments later.
+#[tokio::test]
+async fn contacts_catchup_request_is_cooldown_gated_across_senders() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let first_sender = [0x61u8, 0x62, 0x63, 0x64, 0x65, 0x66];
+    let first_pubkey = pubkey_for_prefix(first_sender);
+    bridge.send(&contact_msg_frame(first_sender, "help")).await;
+    bridge.send(&short_advert_frame(first_pubkey)).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_GET_CONTACTS),
+    )
+    .await
+    .expect("expected the first resolved sender to trigger a catch-up request");
+
+    let second_sender = [0x71u8, 0x72, 0x73, 0x74, 0x75, 0x76];
+    let second_pubkey = pubkey_for_prefix(second_sender);
+    bridge.send(&contact_msg_frame(second_sender, "help")).await;
+    bridge.send(&short_advert_frame(second_pubkey)).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_GET_CONTACTS),
+        "a second sender resolved within the cooldown window must not trigger \
+         another catch-up request; saw: {types:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// T012a (round-14 regression): a resync frame reporting the pre-protect
+/// (unfavourited) state, arriving within `PROTECT_GRACE_SECS` of a protect,
+/// must not clear the cached protected flag — and a subsequent DM from the
+/// same sender must not trigger a redundant `AddUpdateContact` (Decision
+/// 7a's round-14 correction: the write-layer fix, T004, is symmetric with
+/// the read-side one, not narrowed back to a read-only patch).
+#[tokio::test]
+async fn stale_resync_within_grace_window_does_not_clear_protection() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0x91u8, 0x92, 0x93, 0x94, 0x95, 0x96];
+    let pubkey = pubkey_for_prefix(sender);
+    host.advert_bus().upsert_contact(
+        pubkey,
+        "Eve".into(),
+        ADV_TYPE_CHAT,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_ADD_UPDATE_CONTACT),
+    )
+    .await
+    .expect("expected the DM to protect the contact");
+    assert!(host.advert_bus().is_currently_favourited(&pubkey));
+
+    // A resync frame lands within the grace window, reporting the
+    // pre-protect (unfavourited) state — e.g. a device sync that started
+    // before the protect committed.
+    bridge
+        .send(&new_advert_frame(pubkey, "Eve", ADV_TYPE_CHAT))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        host.advert_bus().is_currently_favourited(&pubkey),
+        "a stale resync within the grace window must not clear an already-protected flag"
+    );
+
+    // A subsequent DM from the same sender must not trigger a second protect.
+    bridge.send(&contact_msg_frame(sender, "help again")).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_ADD_UPDATE_CONTACT),
+        "must not re-send AddUpdateContact for an already-protected contact; saw: {types:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// T012b (round-17 regression, the grace-window overlap case): delete a
+/// protected contact, then have the same identity DM again within
+/// `PROTECT_GRACE_SECS` — both the delete's `unprotected_at` and the
+/// re-DM's `protected_at` are now simultaneously "live" grace-window
+/// timestamps — then a resync frame reports the pre-write unfavourited
+/// state. Confirms the contact stays protected rather than being silently
+/// reverted by an order-dependent merge bug (Decision 7a's round-17
+/// correction; neither T012a alone, protect-then-stale-sync with no prior
+/// delete, nor T048a, delete-then-stale-sync with no subsequent re-protect,
+/// exercises this specific overlap where both grace windows are live at once).
+#[tokio::test]
+async fn resync_during_delete_then_reprotect_overlap_does_not_revert_protection() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0xA1u8, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6];
+    let pubkey = pubkey_for_prefix(sender);
+    host.advert_bus().upsert_contact(
+        pubkey,
+        "Frank".into(),
+        ADV_TYPE_CHAT,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+
+    // Protect it (T1 window opens).
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_ADD_UPDATE_CONTACT),
+    )
+    .await
+    .expect("expected the first DM to protect the contact");
+
+    // Delete it — unprotected_at = T1.
+    host.advert_bus().unprotect(&pubkey);
+    assert!(!host.advert_bus().is_currently_favourited(&pubkey));
+
+    // The same identity DMs again within the grace window — protected_at =
+    // T2 > T1; both timestamps are now simultaneously "live".
+    bridge.send(&contact_msg_frame(sender, "help again")).await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_ADD_UPDATE_CONTACT),
+    )
+    .await
+    .expect("expected the second DM to re-protect the contact");
+    assert!(host.advert_bus().is_currently_favourited(&pubkey));
+
+    // A resync frame now reports the pre-write (unfavourited) state — the
+    // device's own report predates both the delete and the re-protect.
+    bridge
+        .send(&new_advert_frame(pubkey, "Frank", ADV_TYPE_CHAT))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert!(
+        host.advert_bus().is_currently_favourited(&pubkey),
+        "the overlap between a live unprotected_at (T1) and a live protected_at (T2) \
+         must resolve to protected — the resync must not silently revert it"
+    );
+
+    // A follow-up assertion that doesn't depend on the sleep's timing being
+    // exactly right: if the resync HAD silently reverted protection, a
+    // third DM from the same sender would show up as a fresh
+    // CMD_ADD_UPDATE_CONTACT (re-protecting from scratch) rather than being
+    // recognized as already-protected.
+    bridge
+        .send(&contact_msg_frame(sender, "help a third time"))
+        .await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_ADD_UPDATE_CONTACT),
+        "must not re-protect a contact the resync should have left already-protected; saw: {types:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// T017 (FR-009): when the radio table is full and every remaining contact
+/// is already favourited (nothing this BBS can safely evict), the BBS must
+/// not send a removal for any of them — the distinct `all_remaining_favourited`
+/// warning path exists precisely so an operator can distinguish "no
+/// evictable candidate" from "every remaining contact is protected". This
+/// asserts the observable behavior a caller can actually depend on (no
+/// removal is ever sent); distinguishing *which* of the two `warn!`
+/// branches fired at the log-message level would need a tracing capture
+/// layer, which nothing in this test suite has — the only existing capture
+/// layer in the codebase (`bbs-web`'s `LogBuffer`) is production admin-UI
+/// code, not test infrastructure, and wiring it in as a dependency here
+/// would be a backwards (bbs-mesh depending on bbs-web) layering violation.
+#[tokio::test]
+async fn contacts_full_with_all_favourited_sends_no_removal() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0xB1u8, 0xB2, 0xB3, 0xB4, 0xB5, 0xB6];
+    let pubkey = pubkey_for_prefix(sender);
+    host.advert_bus().upsert_contact(
+        pubkey,
+        "Grace".into(),
+        ADV_TYPE_CHAT,
+        0,
+        0,
+        1_700_000_000,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+    assert!(matches!(
+        host.advert_bus()
+            .mark_favourite_if_eligible(pubkey, |t| t == ADV_TYPE_CHAT, 350, &[]),
+        bbs_plugin_api::FavouriteOutcome::Protected(_)
+    ));
+
+    bridge.send(&contacts_full_frame()).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_REMOVE_CONTACT),
+        "must never remove a favourited-only contact set; saw: {types:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// FR-003: a repeater-type node must never be protected through this
+/// mechanism, even if it sends a message-like frame.
+#[tokio::test]
+async fn never_protects_non_chat_contact() {
+    let host = Arc::new(MockHost::new());
+    host.set_default_response(Response::Text("hi".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let sender = [0x51u8, 0x52, 0x53, 0x54, 0x55, 0x56];
+    let pubkey = pubkey_for_prefix(sender);
+    host.advert_bus().upsert_contact(
+        pubkey,
+        "Repeater1".into(),
+        ADV_TYPE_REPEATER,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+
+    bridge.send(&contact_msg_frame(sender, "help")).await;
+    let types = drain_command_types(&mut bridge, Duration::from_millis(500)).await;
+    assert!(
+        !types.contains(&CMD_ADD_UPDATE_CONTACT),
+        "a repeater-type contact must never be protected; saw: {types:?}"
+    );
+    assert!(!host.advert_bus().is_currently_favourited(&pubkey));
+
+    transport.stop().await.unwrap();
+}
+
+/// User Story 1, Acceptance Scenario 2: when the contact table fills up, the
+/// BBS's own `ContactsFull` eviction handler must skip protected contacts
+/// and evict an unprotected one instead.
+#[tokio::test]
+async fn protected_contact_excluded_from_contacts_full_eviction() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("TestNode").await;
+
+    let protected_prefix = [0x61u8, 0x62, 0x63, 0x64, 0x65, 0x66];
+    let protected_pubkey = pubkey_for_prefix(protected_prefix);
+    let stale_prefix = [0x71u8, 0x72, 0x73, 0x74, 0x75, 0x76];
+    let stale_pubkey = pubkey_for_prefix(stale_prefix);
+
+    host.advert_bus().upsert_contact(
+        protected_pubkey,
+        "Protected".into(),
+        ADV_TYPE_CHAT,
+        0,
+        0,
+        1_700_000_000,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+    assert!(matches!(
+        host.advert_bus().mark_favourite_if_eligible(
+            protected_pubkey,
+            |t| t == ADV_TYPE_CHAT,
+            350,
+            &[]
+        ),
+        bbs_plugin_api::FavouriteOutcome::Protected(_)
+    ));
+    host.advert_bus().upsert_contact(
+        stale_pubkey,
+        "Stale".into(),
+        ADV_TYPE_CHAT,
+        0,
+        0,
+        1_600_000_000,
+        0,
+        0,
+        0,
+        Vec::new(),
+        -1,
+        "meshcore",
+    );
+
+    bridge.send(&contacts_full_frame()).await;
+
+    let remove = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_REMOVE_CONTACT),
+    )
+    .await
+    .expect("expected a RemoveContact for the stale, unprotected contact");
+    assert_eq!(
+        &remove[1..33],
+        &stale_pubkey[..],
+        "must evict the stale, unprotected contact, never the protected one"
+    );
 
     transport.stop().await.unwrap();
 }

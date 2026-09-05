@@ -26,16 +26,22 @@
 Supply Drop BBS is the BBS half of a mesh-radio operator's stack. It speaks
 to:
 
-- **Mesh radios**, via a pluggable transport architecture. v1 supports
-  [MeshCore](https://meshcore.dev) (through
+- **Mesh radios**, via a pluggable transport architecture, with both
+  [MeshCore](https://meshcore.dev) and [Meshtastic](https://meshtastic.org)
+  shipping today. MeshCore connects either directly over USB serial to a
+  device running the MeshCore companion firmware (no Python, no bridge
+  process), or over TCP to
   [`pymc_core`](https://github.com/meshcore-dev/pymc_core)'s
-  CompanionFrameServer running as a separate radio-bridge process).
-  Other LoRa mesh protocols - [Meshtastic](https://meshtastic.org)
-  most notably - are explicitly on the roadmap as sibling transport
-  plugins. The BBS-core itself is protocol-agnostic; see
-  [ADR-0011](docs/adr/0011-transport-protocol-agnostic-core.md).
-- **CLI clients** over a Unix-domain socket, for local administration and
-  scripting.
+  CompanionFrameServer, which also covers Raspberry Pi HAT radios as a
+  special case. A third transport lets an operator run any executable
+  (Telnet, Slack, Discord, APRS, SMS, ...) as a BBS transport over a
+  simple JSON IPC protocol. The BBS-core itself is protocol-agnostic;
+  see [ADR-0011](docs/adr/0011-transport-protocol-agnostic-core.md).
+- **CLI clients**, either an interactive session over a Unix-domain
+  socket for local administration and scripting, or one-shot
+  subcommands (`backup`/`restore`, user and room management, node key
+  management, and more) run directly against the database and data
+  directory.
 - **An optional admin web UI** (off by default), purely for sysop
   maintenance - not for end-user message reading.
 
@@ -63,7 +69,8 @@ Specifically, this project bakes in from day 1:
 - Compile-time-checked SQL via `sqlx`
 - Logging that respects config (no silent `--debug` overrides)
 - Audit-logged sysop actions
-- Single static binary, single TOML config file
+- Single self-contained binary (the web UI's frontend is embedded, not
+  shipped separately), single TOML config file
 
 ## Installation
 
@@ -71,13 +78,13 @@ Pre-built packages and binaries for Raspberry Pi (aarch64, armv7) and x86-64
 Linux are attached to each
 [GitHub Release](https://github.com/Mesh-America/supply-drop-bbs/releases).
 
-### Option 1 — Debian package (recommended)
+### Option 1: Debian package (recommended)
 
 The `.deb` is the easiest way to install on Raspberry Pi OS, Ubuntu, or any
 Debian-based system. It handles user creation, directory layout, and systemd
 service registration automatically.
 
-Run this on your Pi or Linux box — it auto-detects your architecture:
+Run this on your Pi or Linux box. It auto-detects your architecture:
 
 ```sh
 ARCH=$(dpkg --print-architecture)   # arm64, armhf, or amd64
@@ -97,13 +104,13 @@ Or download manually from the [latest release](https://github.com/Mesh-America/s
 | Raspberry Pi 2/3/Zero 2 (32-bit) | `supply-drop-bbs_armhf.deb` |
 | x86-64 Linux | `supply-drop-bbs_amd64.deb` |
 
-### Option 2 — Raw binary
+### Option 2: Raw binary
 
 Download the binary directly and verify the checksum before running it.
 
 ```sh
 # Example for Raspberry Pi 4 (arm64):
-TAG=v0.6.2   # replace with the latest release tag
+TAG=v0.12.0   # replace with the latest release tag
 curl -fsSL "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/supply-drop-bbs-${TAG}-aarch64-unknown-linux-gnu" \
      -o supply-drop-bbs
 curl -fsSL "https://github.com/Mesh-America/supply-drop-bbs/releases/download/${TAG}/SHA256SUMS" \
@@ -116,11 +123,11 @@ Other available targets: `armv7-unknown-linux-gnueabihf` (armhf),
 `x86_64-unknown-linux-gnu` (amd64). Append `-headless` for a smaller build
 without the admin web UI.
 
-### Option 3 — Guided setup script
+### Option 3: Guided setup script
 
 If you prefer a wizard that handles everything (including optional
-[pymc-companion](https://github.com/Mesh-America/pymc-companion) HAT
-configuration), download and review the script first, then run it:
+[pymc-companion](contrib/pymc-companion/) HAT configuration), download
+and review the script first, then run it:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \

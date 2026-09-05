@@ -159,7 +159,7 @@ verify its checksum, then install it and the service unit manually.
 
 ```sh
 # Set these for your system
-TAG=v0.6.2   # replace with the latest release tag
+TAG=v0.12.0   # replace with the latest release tag
 ARCH=$(uname -m)
 case "$ARCH" in
   aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
@@ -537,6 +537,25 @@ Or use the **Trigger backup** button in the web admin UI.
               backup-host:/srv/bbs-backups/$(hostname)/
 ```
 
+### Restoring from a backup
+
+```sh
+supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/<file>.db
+supply-drop-bbs restore apply
+sudo systemctl restart supply-drop-bbs
+```
+
+Or use the **Backups** page in the web admin UI: upload the backup file
+(a raw `.db` or the `.zip` the web UI's own "create backup" button
+produces), then confirm the restore once it validates. Either way,
+staging and confirming are deliberately separate steps — nothing changes
+until you confirm, and the database is only actually swapped the next
+time the BBS process starts. A safety snapshot of the current database is
+taken automatically before the swap; see [Disaster recovery](#disaster-recovery)
+if you need to roll back to it. This works even when the live database is
+broken (see [Corrupted database](#corrupted-database)) — staging and
+confirming never require the live database to open successfully.
+
 ## Rooms and access control
 
 ### Built-in rooms
@@ -666,6 +685,20 @@ The options are independent and compose naturally:
 
 ### Corrupted database
 
+Preferred: `restore stage`/`restore apply` work even when the live database
+won't open — staging and confirming never touch it directly, and a safety
+snapshot of whatever's currently at the live path is taken automatically
+before the swap.
+
+```sh
+sudo -u supply-drop supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/<file>.db
+sudo -u supply-drop supply-drop-bbs restore apply --yes
+sudo systemctl restart supply-drop-bbs
+```
+
+Fallback if the CLI itself won't run (e.g. the binary is missing or the
+data directory is inaccessible to the `supply-drop` account):
+
 ```sh
 sudo systemctl stop supply-drop-bbs
 sudo mv /var/lib/supply-drop-bbs/bbs.sqlite /var/lib/supply-drop-bbs/bbs.sqlite.corrupt
@@ -675,6 +708,10 @@ sudo cp /var/lib/supply-drop-bbs/backups/<latest>.sqlite /var/lib/supply-drop-bb
 sudo chown supply-drop:supply-drop /var/lib/supply-drop-bbs/bbs.sqlite
 sudo systemctl start supply-drop-bbs
 ```
+
+The fallback skips all of `restore`'s validation (SQLite-format check,
+migration-history check, room-structure check) — only use it when the CLI
+path genuinely isn't available.
 
 ### Lost sysop access
 

@@ -47,6 +47,8 @@
 //! │  │  GET  /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups/:filename    (auth)       │    │
 //! │  │  DELETE /api/v1/backups/:filename  (auth)       │    │
+//! │  │  POST /api/v1/backups/restore      (auth)       │    │
+//! │  │  POST /api/v1/backups/restore/apply(auth)       │    │
 //! │  │  GET  /api/v1/plugins              (auth)       │    │
 //! │  │  POST /api/v1/plugins              (auth)       │    │
 //! │  │  DELETE /api/v1/plugins/:name      (auth)       │    │
@@ -83,7 +85,7 @@ use error_tracker::{ErrorEntry, ErrorStore};
 use rss_monitor::RssAlert;
 
 use async_trait::async_trait;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -100,7 +102,7 @@ use bbs_plugin_api::plugin::Plugin;
 use bbs_plugin_api::registry::{PluginRegistryApi, ProcessPluginConfig, RegistryError};
 use bbs_plugin_api::transport::TransportStats;
 use rust_embed::RustEmbed;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::BroadcastStream;
@@ -241,6 +243,17 @@ struct AppState {
     /// by the host binary after plugin init via [`WebPlugin::set_backup_dir`].
     /// When `None` the backup endpoints return 503.
     backup_dir: std::sync::Mutex<Option<String>>,
+    /// The BBS's data directory, sourced from `[bbs] data_dir` and injected
+    /// by the host binary after plugin init via [`WebPlugin::set_data_dir`].
+    /// Used to stage an uploaded restore file where `main.rs`'s startup
+    /// check will find it (issue #195).
+    data_dir: std::sync::Mutex<Option<String>>,
+    /// Serializes the whole validate-and-stage / confirm sequence for a
+    /// restore so two concurrent uploads (or an upload racing a confirm)
+    /// can't clobber the shared `pending_restore*.db` paths — an async
+    /// mutex, not `std::sync::Mutex`, since the guard must be held across
+    /// `.await` points (file I/O, running migrations against the upload).
+    restore_lock: tokio::sync::Mutex<()>,
     sessions: Mutex<HashMap<String, WebSession>>,
     started_at: Instant,
     log_tx: broadcast::Sender<String>,
@@ -270,6 +283,8 @@ impl AppState {
             host,
             config,
             backup_dir: std::sync::Mutex::new(None),
+            data_dir: std::sync::Mutex::new(None),
+            restore_lock: tokio::sync::Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             log_tx,
@@ -289,6 +304,11 @@ impl AppState {
     /// Return the configured backup directory, if any.
     fn backup_dir(&self) -> Option<String> {
         self.backup_dir.lock().expect("backup_dir poisoned").clone()
+    }
+
+    /// Return the BBS's data directory, if injected.
+    fn data_dir(&self) -> Option<String> {
+        self.data_dir.lock().expect("data_dir poisoned").clone()
     }
 
     fn create_session(&self, username: String, permission_level: u8) -> String {
@@ -559,10 +579,20 @@ impl WebPlugin {
     /// Set the directory where backup files are stored.
     ///
     /// Always sourced from `[backup] directory` in the operator config —
-    /// there is no separate `[plugins.web] backup_dir` setting.  Must be
-    /// called before `start()`.
+    /// there is no separate `[plugins.web] backup_dir` setting. Safe to call
+    /// at any time, including after `start()`: request handlers read this
+    /// value live from its `Mutex` rather than caching it at startup.
     pub fn set_backup_dir(&self, dir: Option<String>) {
         *self.state.backup_dir.lock().expect("backup_dir poisoned") = dir;
+    }
+
+    /// Set the BBS's data directory, used to stage restore uploads where
+    /// `main.rs`'s startup check will find them. Sourced from `[bbs]
+    /// data_dir`. Safe to call at any time, including after `start()`: request
+    /// handlers read this value live from its `Mutex` rather than caching it
+    /// at startup.
+    pub fn set_data_dir(&self, dir: Option<String>) {
+        *self.state.data_dir.lock().expect("data_dir poisoned") = dir;
     }
 }
 
@@ -621,6 +651,8 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/adverts", get(api_adverts))
         .route("/adverts", delete(api_adverts_clear))
         .route("/adverts/send", post(api_adverts_send))
+        .route("/contacts", get(api_contacts))
+        .route("/contacts/:pubkey", delete(api_delete_contact))
         .route("/sessions", get(api_list_sessions))
         .route("/sessions/:id", delete(api_kill_session))
         .route("/users", get(api_list_users))
@@ -671,6 +703,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/backups/:filename",
             get(api_download_backup).delete(api_delete_backup),
         )
+        .route(
+            "/backups/restore",
+            post(api_upload_restore).layer(DefaultBodyLimit::max(RESTORE_UPLOAD_MAX_BYTES)),
+        )
+        .route("/backups/restore/apply", post(api_apply_restore))
         .route("/plugins", get(api_list_plugins).post(api_add_plugin))
         .route(
             "/plugins/:name",
@@ -1117,34 +1154,160 @@ struct AdvertResponse {
     lat: f64,
     lon: f64,
     transport: String,
+    protected: bool,
 }
 
+fn to_advert_response(r: bbs_plugin_api::AdvertRecord) -> AdvertResponse {
+    let protected = r.is_currently_protected();
+    AdvertResponse {
+        ts: r.last_seen_secs,
+        pubkey: r.pubkey_hex,
+        name: r.name,
+        adv_type: r.adv_type,
+        type_name: adv_type_name(&r.transport, r.adv_type).to_owned(),
+        lat: r.lat,
+        lon: r.lon,
+        protected,
+        transport: r.transport,
+    }
+}
+
+/// `GET /api/v1/adverts` — "Discovered Contacts": every record the bus has
+/// ever seen, protected or not.
 async fn api_adverts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let records = state.host.advert_bus().list();
-    let out: Vec<AdvertResponse> = records
-        .into_iter()
-        .map(|r| AdvertResponse {
-            ts: r.last_seen_secs,
-            pubkey: r.pubkey_hex,
-            name: r.name,
-            adv_type: r.adv_type,
-            type_name: adv_type_name(&r.transport, r.adv_type).to_owned(),
-            lat: r.lat,
-            lon: r.lon,
-            transport: r.transport,
-        })
-        .collect();
+    let out: Vec<AdvertResponse> = records.into_iter().map(to_advert_response).collect();
     Json(out)
 }
 
-/// `DELETE /api/v1/adverts` — flush all in-memory advert records.
+/// `GET /api/v1/contacts` — "Contacts": only currently-protected records.
+async fn api_contacts(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let records = state.host.advert_bus().list_protected();
+    let out: Vec<AdvertResponse> = records.into_iter().map(to_advert_response).collect();
+    Json(out)
+}
+
+/// Decode a hex pubkey (as emitted by `AdvertResponse.pubkey`, always
+/// lowercase, though this function itself accepts either case since
+/// `is_ascii_hexdigit`/`from_str_radix` both do) back into the raw 32 bytes
+/// `AdvertBus` keys records by. `None` for anything not exactly 64 valid
+/// hex characters.
+fn decode_pubkey_hex(s: &str) -> Option<[u8; 32]> {
+    // `u8::from_str_radix` accepts a leading `+` for unsigned types (e.g.
+    // "+1" parses as 1), which isn't a hex digit — reject anything that
+    // isn't purely `[0-9a-fA-F]` up front (found by audit) so this
+    // function's contract ("64 valid hex characters") actually holds.
+    if s.len() != 64 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, chunk) in s.as_bytes().chunks(2).enumerate() {
+        let byte_str = std::str::from_utf8(chunk).ok()?;
+        out[i] = u8::from_str_radix(byte_str, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// `DELETE /api/v1/contacts/:pubkey` — manually delete a single protected
+/// contact.
 ///
-/// Useful after correcting device clocks or clearing stale contacts.
-/// The bus repopulates automatically as adverts arrive or on the next
-/// BBS reconnect (which triggers a fresh `GetContacts` scan).
-async fn api_adverts_clear(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    state.host.advert_bus().clear();
-    axum::http::StatusCode::NO_CONTENT
+/// Clears local protection immediately (`AdvertBus::unprotect`) and
+/// best-effort attempts the matching native radio-side removal for the
+/// record's transport. A removal failure is logged but does not fail the
+/// request — the local unprotect has already succeeded, matching this
+/// feature's existing best-effort framing for the delete direction
+/// (specs/001-persist-mesh-contacts/research.md Decision 12). Aide access
+/// required (permission level >= 50) — a new precedent for this crate
+/// (Decision 11).
+async fn api_delete_contact(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(pubkey_hex): Path<String>,
+) -> Response {
+    if caller.permission_level < 50 {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json_error("aide access required")),
+        )
+            .into_response();
+    }
+    let Some(pubkey) = decode_pubkey_hex(&pubkey_hex) else {
+        return (StatusCode::BAD_REQUEST, Json(json_error("invalid pubkey"))).into_response();
+    };
+    let Some(record) = state.host.advert_bus().unprotect(&pubkey) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json_error("contact not found or not protected")),
+        )
+            .into_response();
+    };
+
+    // Use the record's own canonical (always-lowercase, `hex_encode`-produced)
+    // pubkey_hex for logging/audit rather than the raw path param, whose
+    // casing a caller controls (found by the Phase 6 hostile audit).
+    let canonical_pubkey_hex = &record.pubkey_hex;
+
+    let removal_result = if record.transport == "meshtastic" {
+        match record.node_num {
+            Some(node_num) => state.host.admin_remove_meshtastic_favorite(node_num).await,
+            None => Err(HostError::NotSupported(
+                "meshtastic contact has no node_num on record".into(),
+            )),
+        }
+    } else {
+        state.host.admin_remove_meshcore_contact(pubkey).await
+    };
+    if let Err(e) = removal_result {
+        warn!(pubkey = %canonical_pubkey_hex, transport = %record.transport, "native contact removal failed: {e}");
+    }
+
+    let actor_str = format!("web:{}", caller.username);
+    if let Err(e) = state
+        .host
+        .admin_write_audit(
+            &actor_str,
+            "delete_contact",
+            Some(canonical_pubkey_hex),
+            None,
+        )
+        .await
+    {
+        warn!("audit write failed: {e}");
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// `DELETE /api/v1/adverts` — flush unprotected in-memory advert records.
+///
+/// Useful after correcting device clocks or clearing stale, never-messaged
+/// discovered contacts. Protected contacts (visible in `GET /api/v1/contacts`)
+/// survive this call — see `AdvertBus::clear_unprotected`'s own doc comment
+/// for why. The bus repopulates automatically as adverts arrive or on the
+/// next BBS reconnect (which triggers a fresh `GetContacts` scan). Sysop-only
+/// — this previously had no permission check at all.
+async fn api_adverts_clear(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let removed = state.host.advert_bus().clear_unprotected();
+    let actor_str = format!("web:{}", caller.username);
+    if let Err(e) = state
+        .host
+        .admin_write_audit(
+            &actor_str,
+            "clear_unprotected_adverts",
+            None,
+            Some(&format!("{removed} record(s) removed")),
+        )
+        .await
+    {
+        warn!("audit write failed: {e}");
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// Human-readable advert "type", interpreted per transport.
@@ -1179,6 +1342,7 @@ fn meshtastic_role_name(role: u8) -> &'static str {
         9 => "lost_and_found",
         10 => "tak_tracker",
         11 => "router_late",
+        12 => "client_base",
         _ => "unknown",
     }
 }
@@ -1488,7 +1652,12 @@ async fn api_create_room(
 
 #[derive(Deserialize)]
 struct UpdateRoomBody {
-    description: Option<serde_json::Value>, // null = clear, string = set, absent = leave
+    // Absent key → leave unchanged, null → clear, string → set. See
+    // `deserialize_some` (issue #194's twin bug: a plain `Option<Value>`
+    // here could not tell "absent" from "explicit null", so clearing a
+    // room's description via the web UI silently no-opped).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    description: Option<Option<String>>,
     read_only: Option<bool>,
     min_permission_level: Option<u8>,
 }
@@ -1518,24 +1687,14 @@ async fn api_update_room(
             .into_response();
     }
 
-    // Convert JSON Value for description: absent key → None (leave), null → Some(None) (clear),
-    // string → Some(Some(s)) (set).
-    let description: Option<Option<String>> = match body.description {
-        None => None,
-        Some(serde_json::Value::Null) => Some(None),
-        Some(serde_json::Value::String(s)) => Some(Some(s)),
-        Some(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json_error("description must be a string or null")),
-            )
-                .into_response()
-        }
-    };
-
     match state
         .host
-        .admin_update_room(id, description, body.read_only, body.min_permission_level)
+        .admin_update_room(
+            id,
+            body.description,
+            body.read_only,
+            body.min_permission_level,
+        )
         .await
     {
         Ok(room) => {
@@ -1834,24 +1993,34 @@ struct RadioConfigResponse {
 }
 
 /// Patch body for `PATCH /api/v1/radio-config`.
-/// `None` means "leave unchanged"; for optional fields, JSON `null` clears the value.
+/// Absent key → leave unchanged, `null` → clear, a value → set. See
+/// `deserialize_some` (same issue #194 bug: a plain `Option<Value>` here
+/// could not tell "absent" from "explicit null", so clearing any of these
+/// fields via the web UI silently no-opped).
 #[derive(Debug, Deserialize)]
 struct RadioConfigPatch {
-    /// Named preset. JSON null clears it; a string sets it.
-    preset: Option<serde_json::Value>,
-    /// Carrier frequency in Hz. JSON null clears it.
-    frequency_hz: Option<serde_json::Value>,
-    /// Channel bandwidth in Hz. JSON null clears it.
-    bandwidth_hz: Option<serde_json::Value>,
-    /// LoRa spreading factor (7–12). JSON null clears it.
-    spreading_factor: Option<serde_json::Value>,
-    /// Coding rate denominator (5–8). JSON null clears it.
-    coding_rate: Option<serde_json::Value>,
-    /// TX power in dBm. JSON null clears it.
-    tx_power_dbm: Option<serde_json::Value>,
-    /// Routing path-hash width in bytes: `2` or `3`. JSON null clears it (falls
+    /// Named preset. `null` clears it; a string sets it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    preset: Option<Option<String>>,
+    /// Carrier frequency in Hz. `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    frequency_hz: Option<Option<u64>>,
+    /// Channel bandwidth in Hz. `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    bandwidth_hz: Option<Option<u64>>,
+    /// LoRa spreading factor (7–12). `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    spreading_factor: Option<Option<u64>>,
+    /// Coding rate denominator (5–8). `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    coding_rate: Option<Option<u64>>,
+    /// TX power in dBm. `null` clears it.
+    #[serde(default, deserialize_with = "deserialize_some")]
+    tx_power_dbm: Option<Option<i64>>,
+    /// Routing path-hash width in bytes: `2` or `3`. `null` clears it (falls
     /// back to the transport's default of 3).
-    path_bytes: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    path_bytes: Option<Option<i64>>,
 }
 
 /// Editable subset of the BBS configuration, returned by GET /api/v1/config.
@@ -1891,8 +2060,14 @@ struct ConfigPatch {
     bbs_starting_room: Option<String>,
     bbs_welcome_msg: Option<String>,
     bbs_timezone: Option<String>,
-    location_latitude: Option<serde_json::Value>, // null clears, number sets
-    location_longitude: Option<serde_json::Value>,
+    // Absent key → leave unchanged, `null` → clear, a number → set. See
+    // `deserialize_some` (same issue #194 bug: a plain `Option<Value>` here
+    // could not tell "absent" from "explicit null", so unchecking "use my
+    // location" in the web UI silently no-opped).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    location_latitude: Option<Option<f64>>,
+    #[serde(default, deserialize_with = "deserialize_some")]
+    location_longitude: Option<Option<f64>>,
     backup_enabled: Option<bool>,
     backup_interval_hours: Option<u32>,
     backup_keep_daily: Option<u32>,
@@ -2415,20 +2590,19 @@ async fn api_patch_config(
     if let Some(v) = patch.bbs_timezone {
         doc["bbs"]["timezone"] = toml_edit::value(v);
     }
-    // Latitude/longitude: JSON null removes the key; a number sets it.
+    // Latitude/longitude: absent → leave unchanged, `null` → remove the key,
+    // a number → set it.
     let location_touched = patch.location_latitude.is_some() || patch.location_longitude.is_some();
     if let Some(v) = patch.location_latitude {
-        if v.is_null() {
-            doc_remove_key(&mut doc, "location", "latitude");
-        } else if let Some(f) = v.as_f64() {
-            doc["location"]["latitude"] = toml_edit::value(f);
+        match v {
+            None => doc_remove_key(&mut doc, "location", "latitude"),
+            Some(f) => doc["location"]["latitude"] = toml_edit::value(f),
         }
     }
     if let Some(v) = patch.location_longitude {
-        if v.is_null() {
-            doc_remove_key(&mut doc, "location", "longitude");
-        } else if let Some(f) = v.as_f64() {
-            doc["location"]["longitude"] = toml_edit::value(f);
+        match v {
+            None => doc_remove_key(&mut doc, "location", "longitude"),
+            Some(f) => doc["location"]["longitude"] = toml_edit::value(f),
         }
     }
     if let Some(v) = patch.backup_enabled {
@@ -2541,9 +2715,12 @@ struct AccessPolicyResponse {
 struct AccessPolicyPatch {
     /// When present, sets `require_verify`.
     require_verify: Option<bool>,
-    /// When present, sets the guest-room name.
-    /// Send `null` (JSON null) to disable the guest room.
-    guest_room: Option<serde_json::Value>,
+    /// Absent key → leave unchanged. `null` → disable the guest room.
+    /// A string → set the guest-room name. See `deserialize_some` (issue
+    /// #194: a plain `Option<Value>` here could not tell "absent" from
+    /// "explicit null", so disabling the guest room silently no-opped).
+    #[serde(default, deserialize_with = "deserialize_some")]
+    guest_room: Option<Option<String>>,
 }
 
 async fn api_get_access_policy(
@@ -2587,18 +2764,7 @@ async fn api_patch_access_policy(
         }
     }
 
-    if let Some(gr) = patch.guest_room {
-        let name: Option<String> = if gr.is_null() {
-            None
-        } else if let Some(s) = gr.as_str() {
-            Some(s.to_owned())
-        } else {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json_error("guest_room must be a string or null")),
-            )
-                .into_response();
-        };
+    if let Some(name) = patch.guest_room {
         if let Err(e) = state.host.admin_set_guest_room(name).await {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -2724,58 +2890,61 @@ async fn api_patch_radio_config(
         }
     };
 
-    // Apply patches — null clears the key; a value sets it.
+    // Apply patches — absent → leave unchanged, `null` → clear the key, a
+    // value → set it.
     if let Some(v) = patch.preset {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "preset");
-        } else if let Some(s) = v.as_str() {
-            doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "preset"),
+            Some(s) => doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s)),
         }
     }
     if let Some(v) = patch.frequency_hz {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "frequency_hz");
-        } else if let Some(n) = v.as_u64() {
-            doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "frequency_hz"),
+            Some(n) => {
+                doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64))
+            }
         }
     }
     if let Some(v) = patch.bandwidth_hz {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "bandwidth_hz");
-        } else if let Some(n) = v.as_u64() {
-            doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "bandwidth_hz"),
+            Some(n) => {
+                doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64))
+            }
         }
     }
     if let Some(v) = patch.spreading_factor {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "spreading_factor");
-        } else if let Some(n) = v.as_u64() {
-            doc_set_radio_field(
+        match v {
+            None => doc_remove_radio_field(&mut doc, "spreading_factor"),
+            Some(n) => doc_set_radio_field(
                 &mut doc,
                 "spreading_factor",
                 toml_edit::Value::from(n as i64),
-            );
+            ),
         }
     }
     if let Some(v) = patch.coding_rate {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "coding_rate");
-        } else if let Some(n) = v.as_u64() {
-            doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "coding_rate"),
+            Some(n) => {
+                doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64))
+            }
         }
     }
     if let Some(v) = patch.tx_power_dbm {
-        if v.is_null() {
-            doc_remove_radio_field(&mut doc, "tx_power_dbm");
-        } else if let Some(n) = v.as_i64() {
-            doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n));
+        match v {
+            None => doc_remove_radio_field(&mut doc, "tx_power_dbm"),
+            Some(n) => doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n)),
         }
     }
     if let Some(v) = patch.path_bytes {
-        if v.is_null() {
-            doc_remove_mesh_field(&mut doc, "path_bytes");
-        } else if let Some(n) = v.as_i64().filter(|n| *n == 2 || *n == 3) {
-            doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n));
+        match v {
+            None => doc_remove_mesh_field(&mut doc, "path_bytes"),
+            Some(n) if n == 2 || n == 3 => {
+                doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n))
+            }
+            Some(_) => {} // out-of-range value: silently ignored, same as before
         }
     }
 
@@ -3682,6 +3851,203 @@ async fn api_delete_backup(
     }
 }
 
+/// axum's own default multipart/request body limit is 2 MiB — far too small
+/// for a real database backup. This route raises it just for itself (not
+/// the whole API) to a generous ceiling; the endpoint is sysop-gated, so the
+/// only downside of a large cap is disk/memory use by an already-trusted
+/// operator, not an unauthenticated DoS surface.
+const RESTORE_UPLOAD_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// `POST /api/v1/backups/restore` — accepts a multipart file upload,
+/// validates it as a restorable database WITHOUT touching the live one, and
+/// stages it for restore on next startup. Does NOT restart the process —
+/// call `api_apply_restore` (`POST /api/v1/backups/restore/apply`)
+/// separately once the sysop has confirmed (issue #195: upload and the
+/// destructive restart are deliberately two separate steps).
+///
+/// Accepts either a raw `.db` file or the `.zip` bundle `api_trigger_backup`
+/// produces (single `.db` entry, optional `config.toml`) — `api_trigger_backup`
+/// never offers a raw `.db` for download, only the zip, so a zip-only
+/// validator would reject every backup this same page ever produces.
+/// Zip detection and extraction live in `Database::stage_restore` (bbs-core)
+/// rather than here, so the CLI `restore` subcommand shares the same logic
+/// without depending on bbs-web.
+async fn api_upload_restore(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    mut multipart: Multipart,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let data_dir = match state.data_dir() {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("data_dir not configured")),
+            )
+                .into_response()
+        }
+    };
+    // Held for the rest of this handler so a second concurrent upload (or a
+    // confirm) can't interleave with this one's validate-then-rename onto
+    // the shared pending_restore.staged.db path.
+    let _restore_guard = state.restore_lock.lock().await;
+
+    let field = match multipart.next_field().await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("no file in upload")),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error(&format!("reading upload: {e}"))),
+            )
+                .into_response()
+        }
+    };
+    let bytes = match field.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error(&format!("reading upload: {e}"))),
+            )
+                .into_response()
+        }
+    };
+
+    // Write into data_dir itself (not the system temp dir) so the rename
+    // stage_restore performs on success lands on the same filesystem and
+    // is a fast, atomic move rather than a copy. stage_restore itself
+    // detects and extracts a zip upload, so the raw bytes are written
+    // as-is here regardless of format.
+    let tmp_path =
+        std::path::Path::new(&data_dir).join(format!("restore_upload_{}.tmp", Uuid::new_v4()));
+    if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+        return server_error(&format!("saving upload: {e}"));
+    }
+
+    let result = state
+        .host
+        .admin_stage_restore(&tmp_path.to_string_lossy(), &data_dir)
+        .await;
+    // On failure stage_restore never moves the file — clean it up here so
+    // a rejected upload doesn't leave junk in data_dir.
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+
+    match result {
+        Ok(()) => {
+            let _ = state
+                .host
+                .admin_write_audit(
+                    &format!("web:{}", caller.username),
+                    "restore_staged",
+                    None,
+                    None,
+                )
+                .await;
+            Json(serde_json::json!({
+                "message": "upload validated and staged — call restore to apply it"
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json_error(&e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/backups/restore/apply` — confirms a previously-staged
+/// restore (see `api_upload_restore`) by promoting it from its inert staged
+/// name to the name `main.rs`'s startup check actually looks for
+/// (`admin_apply_staged_restore`), then exits the process so systemd's
+/// `Restart=always` brings up a fresh instance that performs the swap.
+/// Reuses `api_restart`'s exact systemd-presence gate and delayed-exit
+/// pattern, since the safe way to apply a restore and the safe way to
+/// restart the service are the same mechanism (issue #195).
+///
+/// Confirming and staging are deliberately two different filesystem states:
+/// an earlier version of this feature staged directly under the name
+/// `main.rs` watches for, which meant ANY unrelated restart between upload
+/// and confirmation — a crash, an operator restarting the service for an
+/// unrelated reason, systemd firing `Restart=always` after any exit —
+/// silently applied a restore nobody had confirmed yet.
+async fn api_apply_restore(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let data_dir = match state.data_dir() {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("data_dir not configured")),
+            )
+                .into_response()
+        }
+    };
+    // Same lock api_upload_restore holds, so a confirm can't run while an
+    // upload is still mid-validate/rename against the same staged path.
+    let _restore_guard = state.restore_lock.lock().await;
+
+    if std::env::var("INVOCATION_ID").is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "not running under systemd — restart manually to apply the \
+                 staged restore: sudo systemctl restart supply-drop-bbs",
+            )),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = state.host.admin_apply_staged_restore(&data_dir).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(&format!(
+                "no restore is staged, or it could not be confirmed: {e}"
+            ))),
+        )
+            .into_response();
+    }
+
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", caller.username),
+            "restore_applied",
+            None,
+            None,
+        )
+        .await;
+
+    tracing::warn!("web admin: database restore confirmed — exiting to apply it on restart");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        std::process::exit(1);
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "message": "restore applying — service is restarting" })),
+    )
+        .into_response()
+}
+
 // ── Domain event formatting ───────────────────────────────────────────────────
 
 fn format_domain_event(event: &DomainEvent) -> String {
@@ -3770,6 +4136,25 @@ fn atomic_write_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result
         return Err(e);
     }
     Ok(())
+}
+
+// ── Serde helpers ─────────────────────────────────────────────────────────────
+
+/// Deserializer for a PATCH field that must distinguish "omitted" from
+/// "explicitly null" — e.g. `Option<Option<T>>` fields where `null` means
+/// "clear this value" and an absent key means "leave it unchanged" (issue
+/// #194). A plain `Option<T>` field cannot make this distinction: serde_json
+/// maps both an absent key and an explicit JSON `null` to Rust `None`. Paired
+/// with `#[serde(default, deserialize_with = "deserialize_some")]`, this
+/// produces `None` when the key is absent (via `#[serde(default)]`) and
+/// `Some(inner)` — where `inner` is itself `None` for JSON `null` or
+/// `Some(value)` for a present value — whenever the key is present at all.
+fn deserialize_some<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
 }
 
 // ── Error helpers ─────────────────────────────────────────────────────────────
@@ -4012,5 +4397,520 @@ async fn api_plugin_logs(
     match registry.get_logs(&name, q.lines.min(500)).await {
         Ok(lines) => Json(serde_json::json!({ "lines": lines })).into_response(),
         Err(e) => registry_err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bbs_plugin_api::testing::MockHost;
+
+    fn test_state() -> (Arc<AppState>, Arc<MockHost>) {
+        let mock = Arc::new(MockHost::new());
+        let host: Arc<dyn Host> = mock.clone();
+        let state = Arc::new(AppState::new(host, WebConfig::default()));
+        (state, mock)
+    }
+
+    fn sysop() -> CurrentUser {
+        CurrentUser {
+            username: "sysop".into(),
+            permission_level: 100,
+        }
+    }
+
+    fn regular_user() -> CurrentUser {
+        CurrentUser {
+            username: "alice".into(),
+            permission_level: 10,
+        }
+    }
+
+    async fn body_json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("reading response body");
+        serde_json::from_slice(&bytes).expect("response body is valid JSON")
+    }
+
+    fn dummy_key(n: u8) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[0] = n;
+        k
+    }
+
+    // Issue #194: PATCH bodies that need to distinguish "field omitted" from
+    // "field explicitly null" must actually make that distinction through
+    // real JSON deserialization — a bug here lives at the serde boundary, so
+    // these tests go through `serde_json::from_str`, not a hand-built struct.
+    #[test]
+    fn access_policy_patch_distinguishes_absent_null_and_present_guest_room() {
+        let absent: AccessPolicyPatch = serde_json::from_str(r#"{"require_verify":true}"#)
+            .expect("omitting guest_room must still parse");
+        assert_eq!(
+            absent.guest_room, None,
+            "an omitted guest_room must leave the setting unchanged"
+        );
+
+        let explicit_null: AccessPolicyPatch =
+            serde_json::from_str(r#"{"guest_room":null}"#).expect("explicit null must parse");
+        assert_eq!(
+            explicit_null.guest_room,
+            Some(None),
+            "an explicit JSON null must be distinguishable from an omitted \
+             key, so the disable-guest-room request actually reaches \
+             admin_set_guest_room instead of being silently dropped"
+        );
+
+        let set: AccessPolicyPatch = serde_json::from_str(r#"{"guest_room":"Lobby Overflow"}"#)
+            .expect("a string value must parse");
+        assert_eq!(set.guest_room, Some(Some("Lobby Overflow".to_owned())));
+    }
+
+    // Same latent bug, same fix, applied to room descriptions (issue #194's
+    // twin case, found during the same investigation).
+    #[test]
+    fn update_room_body_distinguishes_absent_null_and_present_description() {
+        let absent: UpdateRoomBody =
+            serde_json::from_str(r#"{"read_only":true}"#).expect("omitting description must parse");
+        assert_eq!(absent.description, None);
+
+        let explicit_null: UpdateRoomBody =
+            serde_json::from_str(r#"{"description":null}"#).expect("explicit null must parse");
+        assert_eq!(
+            explicit_null.description,
+            Some(None),
+            "clearing a room's description must reach admin_update_room as \
+             Some(None), not be indistinguishable from an omitted field"
+        );
+
+        let set: UpdateRoomBody = serde_json::from_str(r#"{"description":"Ops channel"}"#)
+            .expect("a string value must parse");
+        assert_eq!(set.description, Some(Some("Ops channel".to_owned())));
+    }
+
+    // Same bug, same fix, applied to the two GPS location fields in
+    // PATCH /api/v1/config (issue #194's other twin).
+    #[test]
+    fn config_patch_distinguishes_absent_null_and_present_location() {
+        let absent: ConfigPatch =
+            serde_json::from_str(r#"{"bbs_name":"Node"}"#).expect("omitting location must parse");
+        assert_eq!(absent.location_latitude, None);
+        assert_eq!(absent.location_longitude, None);
+
+        let explicit_null: ConfigPatch =
+            serde_json::from_str(r#"{"location_latitude":null,"location_longitude":null}"#)
+                .expect("explicit null must parse");
+        assert_eq!(
+            explicit_null.location_latitude,
+            Some(None),
+            "unchecking \"use my location\" must reach the handler as Some(None), \
+             not be indistinguishable from an omitted field"
+        );
+        assert_eq!(explicit_null.location_longitude, Some(None));
+
+        let set: ConfigPatch =
+            serde_json::from_str(r#"{"location_latitude":45.5,"location_longitude":-122.6}"#)
+                .expect("numeric values must parse");
+        assert_eq!(set.location_latitude, Some(Some(45.5)));
+        assert_eq!(set.location_longitude, Some(Some(-122.6)));
+    }
+
+    // Same bug, same fix, applied to all seven fields of PATCH
+    // /api/v1/radio-config (issue #194's other twin).
+    #[test]
+    fn radio_config_patch_distinguishes_absent_null_and_present_fields() {
+        let absent: RadioConfigPatch =
+            serde_json::from_str(r#"{}"#).expect("an empty body must parse");
+        assert_eq!(absent.preset, None);
+        assert_eq!(absent.frequency_hz, None);
+        assert_eq!(absent.bandwidth_hz, None);
+        assert_eq!(absent.spreading_factor, None);
+        assert_eq!(absent.coding_rate, None);
+        assert_eq!(absent.tx_power_dbm, None);
+        assert_eq!(absent.path_bytes, None);
+
+        let explicit_null: RadioConfigPatch = serde_json::from_str(
+            r#"{"preset":null,"frequency_hz":null,"bandwidth_hz":null,
+                "spreading_factor":null,"coding_rate":null,"tx_power_dbm":null,
+                "path_bytes":null}"#,
+        )
+        .expect("explicit null must parse for every field");
+        assert_eq!(
+            explicit_null.preset,
+            Some(None),
+            "clearing a radio-config field must reach the handler as Some(None), \
+             not be indistinguishable from an omitted field"
+        );
+        assert_eq!(explicit_null.frequency_hz, Some(None));
+        assert_eq!(explicit_null.bandwidth_hz, Some(None));
+        assert_eq!(explicit_null.spreading_factor, Some(None));
+        assert_eq!(explicit_null.coding_rate, Some(None));
+        assert_eq!(explicit_null.tx_power_dbm, Some(None));
+        assert_eq!(explicit_null.path_bytes, Some(None));
+
+        let set: RadioConfigPatch = serde_json::from_str(
+            r#"{"preset":"LongFast","frequency_hz":915000000,"bandwidth_hz":125000,
+                "spreading_factor":9,"coding_rate":5,"tx_power_dbm":20,"path_bytes":2}"#,
+        )
+        .expect("concrete values must parse");
+        assert_eq!(set.preset, Some(Some("LongFast".to_owned())));
+        assert_eq!(set.frequency_hz, Some(Some(915_000_000)));
+        assert_eq!(set.bandwidth_hz, Some(Some(125_000)));
+        assert_eq!(set.spreading_factor, Some(Some(9)));
+        assert_eq!(set.coding_rate, Some(Some(5)));
+        assert_eq!(set.tx_power_dbm, Some(Some(20)));
+        assert_eq!(set.path_bytes, Some(Some(2)));
+    }
+
+    // T039b: api_adverts's `protected` field reflects AdvertRecord.flags bit 0.
+    #[tokio::test]
+    async fn api_adverts_reports_protected_field() {
+        let (state, mock) = test_state();
+        let bus = mock.advert_bus();
+        let protected_key = dummy_key(1);
+        let unprotected_key = dummy_key(2);
+        bus.upsert_contact(
+            protected_key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        bus.upsert(unprotected_key, "Unprotected".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+
+        let resp = api_adverts(State(state)).await.into_response();
+        let body = body_json(resp).await;
+        let entries = body.as_array().expect("array response");
+        assert_eq!(entries.len(), 2);
+
+        let by_name: std::collections::HashMap<&str, bool> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e["name"].as_str().unwrap(),
+                    e["protected"].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_name.get("Protected"), Some(&true));
+        assert_eq!(by_name.get("Unprotected"), Some(&false));
+    }
+
+    // T039b: GET /api/v1/contacts returns only protected records.
+    #[tokio::test]
+    async fn api_contacts_returns_only_protected_records() {
+        let (state, mock) = test_state();
+        let bus = mock.advert_bus();
+        let protected_key = dummy_key(3);
+        let unprotected_key = dummy_key(4);
+        bus.upsert_contact(
+            protected_key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        bus.upsert(unprotected_key, "Unprotected".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+
+        let resp = api_contacts(State(state)).await.into_response();
+        let body = body_json(resp).await;
+        let entries = body.as_array().expect("array response");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["name"].as_str(), Some("Protected"));
+        assert_eq!(entries[0]["protected"].as_bool(), Some(true));
+    }
+
+    // T039b: DELETE /api/v1/adverts rejects a non-Sysop caller.
+    #[tokio::test]
+    async fn api_adverts_clear_rejects_non_sysop() {
+        let (state, _mock) = test_state();
+        let resp = api_adverts_clear(State(state), Extension(regular_user()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // T039b (round-19 addition): DELETE /api/v1/adverts removes an
+    // unprotected record but leaves a protected one in place — it still
+    // appears in GET /api/v1/contacts afterward.
+    #[tokio::test]
+    async fn api_adverts_clear_preserves_protected_contacts() {
+        let (state, mock) = test_state();
+        let bus = mock.advert_bus();
+        let protected_key = dummy_key(5);
+        let unprotected_key = dummy_key(6);
+        bus.upsert_contact(
+            protected_key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        bus.upsert(unprotected_key, "Unprotected".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+
+        let resp = api_adverts_clear(State(Arc::clone(&state)), Extension(sysop()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let adverts = body_json(api_adverts(State(Arc::clone(&state))).await.into_response()).await;
+        assert_eq!(
+            adverts.as_array().unwrap().len(),
+            1,
+            "the unprotected record must be gone"
+        );
+
+        let contacts = body_json(api_contacts(State(state)).await.into_response()).await;
+        let contacts = contacts.as_array().unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(
+            contacts[0]["name"].as_str(),
+            Some("Protected"),
+            "the protected record must survive and still appear in Contacts"
+        );
+    }
+
+    fn aide() -> CurrentUser {
+        CurrentUser {
+            username: "aide".into(),
+            permission_level: 50,
+        }
+    }
+
+    async fn seed_protected_contact(state: &Arc<AppState>) -> String {
+        let bus = state.host.advert_bus();
+        let key = dummy_key(7);
+        bus.upsert_contact(
+            key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+        bus.list_protected()[0].pubkey_hex.clone()
+    }
+
+    // T048: refuses a User-tier caller. Constructed as a direct handler call
+    // with a synthetic CurrentUser rather than through the real login flow —
+    // bbs-web's own login already rejects anything below Aide before a
+    // session can exist, so there is no way to obtain a User-tier session to
+    // present to this endpoint through the live API. This is defense-in-depth
+    // coverage of the in-handler check, not evidence the boundary is
+    // reachable via a real request.
+    #[tokio::test]
+    async fn api_delete_contact_rejects_below_aide() {
+        let (state, _mock) = test_state();
+        let resp = api_delete_contact(
+            State(state),
+            Extension(regular_user()),
+            Path("0".repeat(64)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // T048: succeeds for Aide/Sysop; a successful delete clears the
+    // protected flag and removes the entry from GET /api/v1/contacts.
+    #[tokio::test]
+    async fn api_delete_contact_succeeds_for_aide() {
+        let (state, mock) = test_state();
+        let pubkey_hex = seed_protected_contact(&state).await;
+
+        let resp = api_delete_contact(
+            State(Arc::clone(&state)),
+            Extension(aide()),
+            Path(pubkey_hex),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let contacts = body_json(api_contacts(State(state)).await.into_response()).await;
+        assert_eq!(
+            contacts.as_array().unwrap().len(),
+            0,
+            "the deleted contact must no longer appear in Contacts"
+        );
+        // Phase 6 hostile-audit regression (Hostile QA persona): the
+        // default MockHost previously discarded this argument and always
+        // returned NotSupported, so a 204 alone didn't prove the CORRECT
+        // pubkey was ever actually passed to the native removal call.
+        assert_eq!(
+            mock.removed_meshcore_contacts(),
+            vec![dummy_key(7)],
+            "the native removal must be called with the deleted contact's own pubkey"
+        );
+    }
+
+    // T048: deleting an unknown/unprotected pubkey returns 404.
+    #[tokio::test]
+    async fn api_delete_contact_returns_404_for_unknown_pubkey() {
+        let (state, _mock) = test_state();
+        let resp =
+            api_delete_contact(State(state), Extension(sysop()), Path("ab".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // T048: an invalid (wrong-length/non-hex) pubkey path param is rejected
+    // as a client error, not a panic or a 500.
+    #[tokio::test]
+    async fn api_delete_contact_rejects_malformed_pubkey() {
+        let (state, _mock) = test_state();
+        let resp =
+            api_delete_contact(State(state), Extension(sysop()), Path("not-hex".into())).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // Phase 6 hostile-audit regression (Security persona): `u8::from_str_radix`
+    // accepts a leading `+` for unsigned types (e.g. "+1" parses as 1), which
+    // isn't a hex digit — decode_pubkey_hex must not silently accept a
+    // 64-character string built from `+`-prefixed chunks as valid hex.
+    #[tokio::test]
+    async fn api_delete_contact_rejects_plus_prefixed_non_hex() {
+        let (state, _mock) = test_state();
+        let resp =
+            api_delete_contact(State(state), Extension(sysop()), Path("+1".repeat(32))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // T048a (round-13 regression): after a delete, a stale full-sync report
+    // still showing the device's old favourited state must not resurrect
+    // the contact — covered at the AdvertBus level by
+    // `lost_removal_write_lets_stale_favorited_resync_re_adopt_after_grace_window`
+    // in crates/bbs-plugin-api/src/advert.rs (this handler calls
+    // AdvertBus::unprotect directly, so that test's coverage of the
+    // grace-window merge applies unchanged here). This test confirms the
+    // HTTP-layer half: immediately after a delete, the contact is gone from
+    // GET /api/v1/contacts (already covered above); no separate coverage
+    // needed at this layer for the grace-window mechanics themselves.
+    #[tokio::test]
+    async fn api_delete_contact_removal_is_immediate_at_the_http_layer() {
+        let (state, _mock) = test_state();
+        let pubkey_hex = seed_protected_contact(&state).await;
+        let resp = api_delete_contact(
+            State(Arc::clone(&state)),
+            Extension(sysop()),
+            Path(pubkey_hex),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(
+            !state
+                .host
+                .advert_bus()
+                .is_currently_favourited(&dummy_key(7)),
+            "the contact must be unprotected immediately, not deferred"
+        );
+    }
+
+    // Phase 6 hostile-audit regression (Hostile QA persona): deleting the
+    // same pubkey twice must 404 the second time, not panic or
+    // double-decrement anything.
+    #[tokio::test]
+    async fn api_delete_contact_is_not_idempotent_second_call_404s() {
+        let (state, _mock) = test_state();
+        let pubkey_hex = seed_protected_contact(&state).await;
+
+        let first = api_delete_contact(
+            State(Arc::clone(&state)),
+            Extension(sysop()),
+            Path(pubkey_hex.clone()),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::NO_CONTENT);
+
+        let second = api_delete_contact(State(state), Extension(sysop()), Path(pubkey_hex)).await;
+        assert_eq!(second.status(), StatusCode::NOT_FOUND);
+    }
+
+    // Phase 6 hostile-audit regression (Hostile QA persona): a record whose
+    // transport is "meshtastic" but whose node_num is None (a malformed/
+    // incomplete record — not reachable via the normal upsert_meshtastic_node
+    // ingest path, but not ruled out by the type system either) must be
+    // handled gracefully, not panic.
+    #[tokio::test]
+    async fn api_delete_contact_handles_meshtastic_record_with_no_node_num() {
+        let (state, mock) = test_state();
+        let bus = state.host.advert_bus();
+        let key = dummy_key(9);
+        // Deliberately go through upsert_contact (which sets has_full_record,
+        // required for mark_favourite_if_eligible to proceed past
+        // NoRecordYet) with transport = "meshtastic" rather than
+        // upsert_meshtastic_node, which always sets node_num — this is the
+        // only way to construct the malformed shape this test targets.
+        bus.upsert_contact(
+            key,
+            "Malformed".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshtastic",
+        );
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+        let pubkey_hex = bus.list_protected()[0].pubkey_hex.clone();
+
+        let resp = api_delete_contact(State(state), Extension(sysop()), Path(pubkey_hex)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::NO_CONTENT,
+            "local unprotect must still succeed even though the native removal can't be attempted"
+        );
+        assert!(
+            mock.removed_meshtastic_favorites().is_empty(),
+            "no removal call should be attempted without a node_num to target"
+        );
     }
 }

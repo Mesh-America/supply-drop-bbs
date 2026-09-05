@@ -28,6 +28,20 @@ use std::time::{Duration, Instant};
 
 use bbs_plugin_api::SessionId;
 
+/// How long an unresolved pending-protect entry is remembered before being
+/// swept, per `specs/001-persist-mesh-contacts/research.md` Decision 3's
+/// round-21/26 fixes. Generous enough to comfortably outlast any commonly-
+/// configured advertising interval, while still bounding memory against a
+/// hostile peer manufacturing many never-resolving identities (each pending
+/// entry is a few bytes; the sweep is what keeps this from growing forever).
+const PENDING_PROTECT_TTL_SECS: u64 = 86_400; // 24 hours
+
+/// Minimum gap between targeted `GetContacts` catch-up requests (see
+/// [`SessionState::should_request_contacts_catchup`]). Matches
+/// `MIN_ADVERT_SPACING` in transport.rs — the same "don't hammer the radio
+/// with a background maintenance request" scale, not a real-time retry.
+const CONTACTS_CATCHUP_COOLDOWN_SECS: u64 = 60;
+
 /// How long a workflow reply is remembered for deduplication.
 /// Meshtastic retransmissions happen within a few seconds; 10 s is generous.
 /// 60 s caused false-positive drops when a user typed a short string (e.g. "h")
@@ -102,8 +116,9 @@ pub struct SessionEntry {
     /// `RECENT_MSG_CAP`.
     pub recent_msgs: VecDeque<(u32, String, Instant)>,
 
-    /// Full 32-byte public key for this node, populated the first time a
-    /// `NewAdvert` frame arrives from this node.  `None` until that happens.
+    /// Full 32-byte public key for this node, populated the first time any
+    /// identity-bearing frame arrives from it — `NewAdvert`, `Contact`,
+    /// `PathUpdated`, or the lightweight `Advert`.  `None` until then.
     /// Used to send `ResetPath` after delivering a message so the next
     /// outbound message floods rather than using a potentially-stale path.
     pub full_pubkey: Option<[u8; 32]>,
@@ -131,6 +146,21 @@ pub struct SessionState {
     pub by_prefix: HashMap<[u8; 6], SessionEntry>,
     /// Session ID → pubkey prefix (6 bytes).
     pub by_session: HashMap<SessionId, [u8; 6]>,
+    /// Senders whose contact-protection decision is still pending more data
+    /// (an unresolved identity or an incomplete `AdvertBus` record) — see
+    /// `specs/001-persist-mesh-contacts/research.md` Decision 3. Value is
+    /// insertion time, used only for the TTL sweep in
+    /// [`Self::mark_pending_protect`].
+    pending_protect: HashMap<[u8; 6], Instant>,
+    /// The last time a targeted `GetContacts` catch-up request was sent —
+    /// see [`Self::should_request_contacts_catchup`]. A single cooldown
+    /// shared by every sender rather than one per sender, since `GetContacts`
+    /// fetches every contact the device knows about at once, not one contact
+    /// at a time. `SessionState` (and this field with it) lives for the
+    /// whole transport's lifetime, not just one physical connection — it is
+    /// never reset on reconnect, so the cooldown persists across reconnects
+    /// too.
+    contacts_catchup_requested_at: Option<Instant>,
 }
 
 impl SessionState {
@@ -170,6 +200,7 @@ impl SessionState {
     /// Remove the session for `prefix` (e.g. on explicit logout or expiry).
     /// Returns the removed `SessionId` if one existed.
     pub fn remove_by_prefix(&mut self, prefix: &[u8; 6]) -> Option<SessionId> {
+        self.pending_protect.remove(prefix);
         if let Some(entry) = self.by_prefix.remove(prefix) {
             self.by_session.remove(&entry.session_id);
             Some(entry.session_id)
@@ -359,6 +390,79 @@ impl SessionState {
             entry.last_message = Some((text.to_owned(), Instant::now()));
         }
         false
+    }
+
+    /// Mark `prefix` as pending a contact-protection decision — an
+    /// unconditional insert, idempotent regardless of whether it was already
+    /// pending (see research.md Decision 3's round-21 correction: this must
+    /// be a plain re-insert, not a conditional one, since a concurrent
+    /// resolver could have raced it in between). Sweeps entries older than
+    /// `PENDING_PROTECT_TTL_SECS` first — lazy, O(n) over the (small,
+    /// TTL-bounded) pending set, no separate timer needed.
+    pub fn mark_pending_protect(&mut self, prefix: [u8; 6]) {
+        self.mark_pending_protect_at(prefix, Instant::now());
+    }
+
+    /// [`Self::mark_pending_protect`] with an injectable `now`, so the TTL
+    /// sweep is unit-testable without sleeping for real hours.
+    fn mark_pending_protect_at(&mut self, prefix: [u8; 6], now: Instant) {
+        let ttl = Duration::from_secs(PENDING_PROTECT_TTL_SECS);
+        self.pending_protect
+            .retain(|_, inserted_at| now.saturating_duration_since(*inserted_at) < ttl);
+        self.pending_protect.insert(prefix, now);
+    }
+
+    /// Clear `prefix`'s pending-protect mark — called once a protection
+    /// attempt reaches a terminal outcome (`Protected`, `ProtectedWithEviction`,
+    /// `AlreadyProtected`, `Ineligible`, or `CapReached`).
+    pub fn clear_pending_protect(&mut self, prefix: &[u8; 6]) {
+        self.pending_protect.remove(prefix);
+    }
+
+    /// Return `true` if `prefix` is currently marked as pending a
+    /// contact-protection decision.
+    pub fn is_pending_protect(&self, prefix: &[u8; 6]) -> bool {
+        self.pending_protect.contains_key(prefix)
+    }
+
+    /// True when a targeted `GetContacts` catch-up request should be sent —
+    /// more than `CONTACTS_CATCHUP_COOLDOWN_SECS` have passed since the last
+    /// one (or none has ever been sent for the lifetime of this transport).
+    ///
+    /// Why this exists: the one-time, connect-time `GetContacts` (see
+    /// `transport.rs`'s `event_loop` — its `ClientEvent::Connected` handler)
+    /// only captures contacts the device already knew about at that exact
+    /// moment. A sender who first DMs the BBS
+    /// afterward — the common case, since BBS uptime and a given user's
+    /// first contact are unrelated — gets a `NoRecordYet` protection outcome
+    /// forever: the device now knows this contact internally (it routed the
+    /// DM reply), but its own subsequent adverts for an already-known
+    /// contact come through as the lightweight, name/type-less kind, not a
+    /// full re-send. Nothing else in this transport re-asks the device for
+    /// full contact details once the initial connect-time sync has passed,
+    /// so without this, such a sender can never become eligible for
+    /// protection no matter how many times they advert.
+    pub fn should_request_contacts_catchup(&self) -> bool {
+        self.should_request_contacts_catchup_at(Instant::now())
+    }
+
+    /// [`Self::should_request_contacts_catchup`] with an injectable `now`,
+    /// so the cooldown is unit-testable without sleeping for real.
+    fn should_request_contacts_catchup_at(&self, now: Instant) -> bool {
+        let cooldown = Duration::from_secs(CONTACTS_CATCHUP_COOLDOWN_SECS);
+        self.contacts_catchup_requested_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= cooldown)
+    }
+
+    /// Record that a `GetContacts` catch-up request was just sent, starting
+    /// the cooldown before another one will be considered.
+    pub fn mark_contacts_catchup_requested(&mut self) {
+        self.mark_contacts_catchup_requested_at(Instant::now());
+    }
+
+    /// [`Self::mark_contacts_catchup_requested`] with an injectable `now`.
+    fn mark_contacts_catchup_requested_at(&mut self, now: Instant) {
+        self.contacts_catchup_requested_at = Some(now);
     }
 }
 
@@ -570,6 +674,107 @@ mod tests {
         assert!(
             !st.dedup_by_timestamp_at(&PREFIX, 1_000, "login bob", outside),
             "a resend after the window expires is processed as new"
+        );
+    }
+
+    #[test]
+    fn pending_protect_marks_and_clears() {
+        let mut st = SessionState::default();
+        assert!(!st.is_pending_protect(&PREFIX));
+        st.mark_pending_protect(PREFIX);
+        assert!(st.is_pending_protect(&PREFIX));
+        st.clear_pending_protect(&PREFIX);
+        assert!(!st.is_pending_protect(&PREFIX));
+    }
+
+    #[test]
+    fn pending_protect_mark_is_idempotent_and_reentrant() {
+        let mut st = SessionState::default();
+        // Re-marking an already-pending entry (round-21 fix: must be an
+        // unconditional re-insert, not a conditional one) must not error or
+        // clear it.
+        st.mark_pending_protect(PREFIX);
+        st.mark_pending_protect(PREFIX);
+        assert!(st.is_pending_protect(&PREFIX));
+        // Clearing an entry that was never marked is a no-op, not a panic.
+        let other: [u8; 6] = [9, 9, 9, 9, 9, 9];
+        st.clear_pending_protect(&other);
+        assert!(!st.is_pending_protect(&other));
+    }
+
+    /// Cross-transport audit regression (Phase 4 verifier): Meshtastic's
+    /// sibling `remove_by_node` clears `pending_protect` on removal; this
+    /// method didn't. Low impact (a stale mark self-heals via the 24h TTL
+    /// sweep), but the two transports' equivalent methods should behave the
+    /// same way rather than silently drift apart.
+    #[test]
+    fn remove_by_prefix_clears_pending_protect() {
+        let mut st = SessionState::default();
+        st.get_or_insert(PREFIX, SessionId::__internal_new(1));
+        st.mark_pending_protect(PREFIX);
+        assert!(st.is_pending_protect(&PREFIX));
+        st.remove_by_prefix(&PREFIX);
+        assert!(!st.is_pending_protect(&PREFIX));
+    }
+
+    #[test]
+    fn pending_protect_ttl_sweeps_stale_entries() {
+        let mut st = SessionState::default();
+        let t0 = Instant::now();
+        let other: [u8; 6] = [9, 9, 9, 9, 9, 9];
+        st.mark_pending_protect_at(PREFIX, t0);
+
+        // Still within the TTL: a later insert for a different prefix must
+        // not sweep the first one away.
+        let inside = t0 + Duration::from_secs(PENDING_PROTECT_TTL_SECS - 1);
+        st.mark_pending_protect_at(other, inside);
+        assert!(
+            st.is_pending_protect(&PREFIX),
+            "an entry still within its TTL must survive another insert's sweep"
+        );
+
+        // Past the TTL: the next insert's lazy sweep must evict the stale one.
+        let outside = t0 + Duration::from_secs(PENDING_PROTECT_TTL_SECS + 1);
+        let third: [u8; 6] = [7, 7, 7, 7, 7, 7];
+        st.mark_pending_protect_at(third, outside);
+        assert!(
+            !st.is_pending_protect(&PREFIX),
+            "an entry past its TTL must be swept by the next insert"
+        );
+    }
+
+    #[test]
+    fn contacts_catchup_is_allowed_before_any_request_and_blocked_right_after() {
+        let mut st = SessionState::default();
+        assert!(
+            st.should_request_contacts_catchup(),
+            "nothing sent yet — a first catch-up must be allowed"
+        );
+        let t0 = Instant::now();
+        st.mark_contacts_catchup_requested_at(t0);
+        assert!(
+            !st.should_request_contacts_catchup_at(t0),
+            "immediately after a request, the cooldown must block another"
+        );
+    }
+
+    #[test]
+    fn contacts_catchup_cooldown_boundary_is_at_least_not_strictly_greater() {
+        let mut st = SessionState::default();
+        let t0 = Instant::now();
+        st.mark_contacts_catchup_requested_at(t0);
+
+        let just_inside = t0 + Duration::from_secs(CONTACTS_CATCHUP_COOLDOWN_SECS - 1);
+        assert!(
+            !st.should_request_contacts_catchup_at(just_inside),
+            "still within the cooldown window must stay blocked"
+        );
+
+        // The real check is `>=`, not `>` — exactly at the boundary is allowed.
+        let at_boundary = t0 + Duration::from_secs(CONTACTS_CATCHUP_COOLDOWN_SECS);
+        assert!(
+            st.should_request_contacts_catchup_at(at_boundary),
+            "exactly at the cooldown boundary must be allowed again"
         );
     }
 }

@@ -66,7 +66,7 @@ onUnmounted(() => {
     <header class="page-header">
       <div>
         <h1>errors</h1>
-        <p class="muted">Deduplicated WARN/ERROR log entries — sorted by frequency</p>
+        <p class="muted">Deduplicated WARN/ERROR log entries, sorted by frequency</p>
       </div>
       <button @click="load" :disabled="loading">refresh</button>
     </header>
@@ -77,7 +77,7 @@ onUnmounted(() => {
     <div v-if="!loading && entries.length === 0 && !error" class="empty-state">
       <p class="healthy-icon">✓</p>
       <p>No errors recorded</p>
-      <p class="muted">No WARN or ERROR events since the last restart — the server is healthy.</p>
+      <p class="muted">No WARN or ERROR events since the last restart. The server is healthy.</p>
     </div>
 
     <div v-if="entries.length > 0" class="table-wrap">

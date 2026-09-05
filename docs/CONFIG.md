@@ -298,6 +298,12 @@ arrive.
 > deduplicated separately. The per-attempt wait is the device's own timeout
 > hint, clamped to the 4–30 s range.
 
+### Contact protection
+
+| Key                     | Type    | Default | Required | Description                              |
+|--------------------------|---------|---------|----------|-------------------------------------------|
+| `protected_contact_cap` | integer | `350`   | no       | Maximum number of contacts that may be protected (favorited on the radio) at once. Once reached, a newly-eligible sender's first DM evicts the oldest-protected, currently session-inactive contact to make room. Set to your device's real contact-table capacity (MeshCore's `max_contacts` varies by hardware). `0` disables protection entirely on this transport. See [PROTOCOL.md](PROTOCOL.md#protected-contacts) for the full mechanism. |
+
 ### Serial mode (`connection_type = "serial"`)
 
 Used for USB-native MeshCore devices (Heltec V3, T-Beam, etc.) that
@@ -502,6 +508,7 @@ either via USB serial or TCP to a running `meshtasticd` instance.
 | `want_ack`         | bool   | `true`     | no       | Request Meshtastic radio-layer acknowledgements     |
 | `reconnect_delay_initial_ms` | integer | `1000` | no | Initial reconnect delay after disconnect           |
 | `reconnect_delay_max_ms`     | integer | `60000`| no | Maximum reconnect delay after repeated failures    |
+| `protected_contact_cap` | integer | `100` | no | Maximum number of nodes that may be protected (favorited) at once. Once reached, a newly-eligible sender's first DM evicts the oldest-protected, currently session-inactive node to make room. Set to your device's real `MAX_NUM_NODES` (firmware/hardware-dependent). `0` disables protection entirely on this transport. See [PROTOCOL.md](PROTOCOL.md#protected-contacts) for the full mechanism. |
 
 ### Serial mode (`connection_type = "serial"`)
 

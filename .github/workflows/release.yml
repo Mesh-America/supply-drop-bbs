@@ -67,7 +67,7 @@ jobs:
       # Both variants produce  target/<triple>/release-min/supply-drop-bbs;
       # the second build overwrites the first, so we must copy before building.
 
-      # 1. Full binary (default features = cli + mesh + admin-web)
+      # 1. Full binary (default features = cli + both mesh transports + process-transport + admin-web)
       - name: Build — full (default features)
         run: cargo build --profile release-min --target ${{ matrix.target }}
 

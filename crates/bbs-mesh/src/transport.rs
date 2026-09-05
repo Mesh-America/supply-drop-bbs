@@ -36,13 +36,13 @@ use bbs_plugin_api::{
     identity::SessionId,
     plugin::Plugin,
     transport::TransportEngine,
-    Command, Host, PermissionLevel, Response,
+    Command, FavouriteOutcome, FavouriteSnapshot, Host, PermissionLevel, Response,
 };
 use meshcore_companion::{
     client::{ClientConfig, ClientEvent, CompanionClient, SerialConfig},
-    constants::{MAX_FRAME_SIZE, TXT_TYPE_PLAIN},
+    constants::{ADV_TYPE_CHAT, MAX_FRAME_SIZE, MAX_PATH_SIZE, TXT_TYPE_PLAIN},
     frame::OutboundFrame,
-    types::SelfInfo,
+    types::{Contact, SelfInfo},
 };
 
 /// Maximum bytes of plain text that fit in one `SendTxtMsg` companion frame.
@@ -353,6 +353,9 @@ pub struct MeshTransport {
     /// Cumulative reply-delivery counters, surfaced to the admin UI. Shared with
     /// the event-loop and notification tasks; lock-free. See [`crate::metrics`].
     delivery_stats: Arc<DeliveryStats>,
+    /// Maximum simultaneously-protected contacts on this transport (see
+    /// [`MeshConfig::protected_contact_cap`]). `0` disables protection.
+    protected_contact_cap: usize,
 }
 
 impl MeshTransport {
@@ -447,6 +450,7 @@ impl Plugin for MeshTransport {
                 max_timeout: REPLY_ACK_MAX_WAIT,
             }))),
             delivery_stats: Arc::new(DeliveryStats::default()),
+            protected_contact_cap: config.protected_contact_cap,
         })
     }
 
@@ -560,6 +564,7 @@ impl Plugin for MeshTransport {
             send_tracker,
             delivery_stats,
             key_rx,
+            self.protected_contact_cap,
         ));
 
         info!("mesh transport started");
@@ -846,6 +851,7 @@ async fn event_loop(
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
     mut key_rx: tokio::sync::mpsc::Receiver<bbs_plugin_api::MeshKeyRequest>,
+    protected_contact_cap: usize,
 ) {
     // Pending one-shot key operation. At most one at a time.
     let mut pending_key_op: Option<PendingKeyOp> = None;
@@ -898,6 +904,7 @@ async fn event_loop(
         Arc::clone(&host),
         cmd_tx.clone(),
         Arc::clone(&state),
+        Arc::clone(&draining),
         command_prefix,
         welcome_message,
         node_credential_ttl_days,
@@ -905,6 +912,7 @@ async fn event_loop(
         workflow_timeout_secs,
         Arc::clone(&send_tracker),
         Arc::clone(&delivery_stats),
+        protected_contact_cap,
     ));
 
     loop {
@@ -1137,7 +1145,7 @@ async fn event_loop(
                             _ => false,
                         };
                         if !consumed {
-                            handle_frame(frame, &host, &cmd_tx, &state, &draining, &send_tracker, &delivery_stats, &cmd_worker_tx).await;
+                            handle_frame(frame, &host, &cmd_tx, &state, &draining, &send_tracker, &delivery_stats, &cmd_worker_tx, protected_contact_cap).await;
                         }
                     }
                 }
@@ -1194,6 +1202,29 @@ async fn event_loop(
                             });
                         }
                     }
+                    MeshKeyRequest::RemoveContact { pubkey, reply } => {
+                        // Fire-and-forget, unlike Export/Import/ApplyRadio above:
+                        // RemoveContact has no correlated wire response to wait
+                        // for, so it never touches `pending_key_op` (see
+                        // specs/001-persist-mesh-contacts/research.md Decision 12).
+                        //
+                        // Decision 12c: re-validate immediately before sending —
+                        // a fresher protect for the same identity may have landed
+                        // after the caller's own `unprotect()` call (e.g. a
+                        // concurrent re-DM on `command_worker`); sending a stale
+                        // removal in that case would silently undo it.
+                        if host.advert_bus().is_currently_favourited(&pubkey) {
+                            debug!(
+                                "mesh: skipping contact removal — a fresher protect landed since this delete was requested"
+                            );
+                            let _ = reply.send(Ok(()));
+                        } else {
+                            let result = cmd_tx
+                                .try_send(OutboundFrame::RemoveContact { pubkey })
+                                .map_err(|e| format!("failed to queue contact removal: {e}"));
+                            let _ = reply.send(result);
+                        }
+                    }
                 }
             }
             _ = shutdown_rx.changed() => {
@@ -1222,6 +1253,7 @@ async fn handle_frame(
     send_tracker: &Arc<Mutex<SendTracker>>,
     delivery_stats: &Arc<DeliveryStats>,
     cmd_worker_tx: &mpsc::Sender<InboundCommand>,
+    protected_contact_cap: usize,
 ) {
     use meshcore_companion::frame::InboundFrame;
 
@@ -1337,7 +1369,36 @@ async fn handle_frame(
         // Sessions are minted on first DM, not on advert.
         InboundFrame::Advert { pubkey } => {
             host.advert_bus().upsert_short(pubkey, TRANSPORT_NAME);
+            let prefix: [u8; 6] = pubkey[..6].try_into().expect("pubkey is 32 bytes");
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_full_pubkey(&prefix, pubkey);
             debug!(prefix = ?&pubkey[..6], "mesh: short advert received");
+
+            // Persist Mesh Contacts / supply-drop-bbs-9vt: a sender who DMs
+            // before ever advertising gets no full_pubkey at session-creation
+            // time (get_or_create_session's seed only runs for a brand-new
+            // session), so dispatch_message's own protect attempt is skipped
+            // entirely — this short advert, arriving after, is often the
+            // FIRST identity data the BBS ever gets for them. Retry now,
+            // mirroring NewAdvert/Contact's identical hook below.
+            let pending = state
+                .lock()
+                .expect("state mutex poisoned")
+                .is_pending_protect(&prefix);
+            if pending {
+                attempt_protect_and_update_pending(
+                    host,
+                    cmd_tx,
+                    state,
+                    draining,
+                    prefix,
+                    pubkey,
+                    protected_contact_cap,
+                )
+                .await;
+            }
         }
         InboundFrame::NewAdvert(contact) => {
             // When the radio echoes our own advert back, its GPS fields reflect
@@ -1352,12 +1413,18 @@ async fn handle_frame(
             } else {
                 (contact.gps_lat, contact.gps_lon)
             };
-            host.advert_bus().upsert(
+            host.advert_bus().upsert_contact(
                 contact.pubkey,
                 contact.name.clone(),
                 contact.adv_type,
                 gps_lat,
                 gps_lon,
+                contact.last_advert_timestamp as i64,
+                contact.flags,
+                contact.last_advert_timestamp,
+                contact.lastmod,
+                contact.out_path.to_vec(),
+                contact.out_path_len,
                 TRANSPORT_NAME,
             );
             // Record the full pubkey so we can send ResetPath after delivers.
@@ -1367,6 +1434,25 @@ async fn handle_frame(
                 .expect("state mutex poisoned")
                 .set_full_pubkey(&prefix, contact.pubkey);
             debug!(name = %contact.name, "mesh: full advert (new contact) received");
+
+            // Persist Mesh Contacts: retry a pending protect now that this
+            // identity's full record is available (research.md Decision 3).
+            let pending = state
+                .lock()
+                .expect("state mutex poisoned")
+                .is_pending_protect(&prefix);
+            if pending {
+                attempt_protect_and_update_pending(
+                    host,
+                    cmd_tx,
+                    state,
+                    draining,
+                    prefix,
+                    contact.pubkey,
+                    protected_contact_cap,
+                )
+                .await;
+            }
         }
 
         // ── Contact list sync (response to CMD_GET_CONTACTS) ─────────────────
@@ -1379,13 +1465,18 @@ async fn handle_frame(
             // real last-advert time stored on the device rather than the moment
             // we happened to run GetContacts (which would make every row show
             // the same timestamp).
-            host.advert_bus().upsert_with_timestamp(
+            host.advert_bus().upsert_contact(
                 contact.pubkey,
                 contact.name.clone(),
                 contact.adv_type,
                 contact.gps_lat,
                 contact.gps_lon,
                 contact.last_advert_timestamp as i64,
+                contact.flags,
+                contact.last_advert_timestamp,
+                contact.lastmod,
+                contact.out_path.to_vec(),
+                contact.out_path_len,
                 TRANSPORT_NAME,
             );
             // Record the full pubkey mapping so ResetPath can find the node.
@@ -1395,6 +1486,25 @@ async fn handle_frame(
                 .expect("state mutex poisoned")
                 .set_full_pubkey(&prefix, contact.pubkey);
             debug!(name = %contact.name, "mesh: contact list entry → advert bus");
+
+            // Persist Mesh Contacts: retry a pending protect now that this
+            // identity's full record is available (research.md Decision 3).
+            let pending = state
+                .lock()
+                .expect("state mutex poisoned")
+                .is_pending_protect(&prefix);
+            if pending {
+                attempt_protect_and_update_pending(
+                    host,
+                    cmd_tx,
+                    state,
+                    draining,
+                    prefix,
+                    contact.pubkey,
+                    protected_contact_cap,
+                )
+                .await;
+            }
         }
         InboundFrame::ContactsStart { count: _ } => {
             debug!("mesh: contact list sync started");
@@ -1565,28 +1675,67 @@ async fn handle_frame(
                     exclude.push(sp);
                 }
             }
-            match host.advert_bus().stalest_pubkey_excluding(&exclude) {
+            // `stalest_pubkey_excluding` already skips protected/favourited
+            // records (research.md Decision 6) — no separate favourite check
+            // is needed to select a candidate.
+            match host
+                .advert_bus()
+                .stalest_pubkey_excluding(&exclude, TRANSPORT_NAME)
+            {
                 Some(stale_pubkey) => {
                     let prefix_hex: String = stale_pubkey[..6]
                         .iter()
                         .map(|b| format!("{b:02x}"))
                         .collect();
-                    warn!(
-                        prefix = %prefix_hex,
-                        "mesh: removing stale contact from radio table to free a slot"
-                    );
-                    let _ = cmd_tx
-                        .send(OutboundFrame::RemoveContact {
+                    // Decision 6a: re-validate immediately before sending —
+                    // a concurrent protect for this exact pubkey (on
+                    // command_worker) could have committed in the window
+                    // since selection; sending the removal anyway would
+                    // silently undo it.
+                    if host.advert_bus().is_currently_favourited(&stale_pubkey) {
+                        debug!(
+                            prefix = %prefix_hex,
+                            "mesh: skipping stale-contact eviction — it was protected \
+                             since being selected"
+                        );
+                    } else {
+                        warn!(
+                            prefix = %prefix_hex,
+                            "mesh: removing stale contact from radio table to free a slot"
+                        );
+                        // try_send, not an awaited send (research.md Decision
+                        // 8/10): this handler's own trigger condition
+                        // (ContactsFull) is most likely to coincide with
+                        // exactly the burst traffic that also saturates
+                        // cmd_tx — an awaited send here would stall all
+                        // inbound frame processing, not just this eviction.
+                        let _ = cmd_tx.try_send(OutboundFrame::RemoveContact {
                             pubkey: stale_pubkey,
-                        })
-                        .await;
+                        });
+                    }
                 }
                 None => {
-                    warn!(
-                        "mesh: radio table full but no evictable stale contact found \
-                         (all known contacts have active sessions); \
-                         new nodes cannot be added until sessions close"
-                    );
+                    // FR-009: distinguish "every remaining contact is
+                    // favourited" (nothing this BBS can do — an operator
+                    // must manually free a slot) from the ordinary
+                    // "everything is session-active" case already logged by
+                    // the general warning below.
+                    if host
+                        .advert_bus()
+                        .all_remaining_favourited(&exclude, TRANSPORT_NAME)
+                    {
+                        warn!(
+                            "mesh: radio contact table is full and every remaining \
+                             contact is protected — no contact, protected or not, can \
+                             be added until an operator manually frees a slot"
+                        );
+                    } else {
+                        warn!(
+                            "mesh: radio table full but no evictable stale contact found \
+                             (all known contacts have active sessions); \
+                             new nodes cannot be added until sessions close"
+                        );
+                    }
                 }
             }
         }
@@ -1597,11 +1746,15 @@ async fn handle_frame(
         // lost on a stale multi-hop direct path) is done with `ResetPath`, which
         // needs the full key — but an inbound DM only carries the 6-byte prefix,
         // and `GetContacts` runs once on connect, before first-contact sessions
-        // exist. Without this the full key stays unknown for exactly the far
-        // nodes that need flooding, so `flood_after_send`'s post-reply ResetPath
-        // is silently skipped (`get_full_pubkey` returns None) and every reply
-        // goes direct. `set_full_pubkey` no-ops until a session exists; PathUpdated
-        // arrives after the inbound DM created it, so it lands.
+        // exist. Advert/NewAdvert/Contact frames can also resolve the full key
+        // (see their handlers above), but none of those is guaranteed to arrive
+        // for a given far node — real radio propagation decides that, not this
+        // code — so without ALSO capturing it here, a multi-hop node that never
+        // happens to (re)advertise stays without a full key indefinitely, and
+        // `flood_after_send`'s post-reply ResetPath is silently skipped
+        // (`get_full_pubkey` returns None), leaving every reply direct.
+        // `set_full_pubkey` no-ops until a session exists; PathUpdated typically
+        // arrives after the inbound DM already created one, so it lands.
         InboundFrame::PathUpdated { pubkey } => {
             let prefix: [u8; 6] = pubkey[..6].try_into().expect("pubkey is 32 bytes");
             state
@@ -1612,6 +1765,27 @@ async fn handle_frame(
                 prefix = prefix[0],
                 "mesh: PathUpdated — captured full pubkey (enables flood-after-send for this node)"
             );
+
+            // Persist Mesh Contacts / supply-drop-bbs-9vt: same reachability
+            // gap as the short-advert hook above — PathUpdated can likewise
+            // be the first frame that ever resolves this sender's identity
+            // after a DM whose own protect attempt found no full_pubkey yet.
+            let pending = state
+                .lock()
+                .expect("state mutex poisoned")
+                .is_pending_protect(&prefix);
+            if pending {
+                attempt_protect_and_update_pending(
+                    host,
+                    cmd_tx,
+                    state,
+                    draining,
+                    prefix,
+                    pubkey,
+                    protected_contact_cap,
+                )
+                .await;
+            }
         }
 
         // ── Everything else ───────────────────────────────────────────────────
@@ -1645,6 +1819,7 @@ async fn command_worker(
     host: Arc<dyn Host>,
     cmd_tx: mpsc::Sender<OutboundFrame>,
     state: Arc<Mutex<SessionState>>,
+    draining: Arc<AtomicBool>,
     command_prefix: Option<char>,
     welcome_message: String,
     node_credential_ttl_days: u32,
@@ -1652,6 +1827,7 @@ async fn command_worker(
     workflow_timeout_secs: u64,
     send_tracker: Arc<Mutex<SendTracker>>,
     delivery_stats: Arc<DeliveryStats>,
+    protected_contact_cap: usize,
 ) {
     while let Some(cmd) = rx.recv().await {
         dispatch_message(
@@ -1661,6 +1837,7 @@ async fn command_worker(
             &host,
             &cmd_tx,
             &state,
+            &draining,
             command_prefix,
             &welcome_message,
             node_credential_ttl_days,
@@ -1668,10 +1845,210 @@ async fn command_worker(
             workflow_timeout_secs,
             &send_tracker,
             &delivery_stats,
+            protected_contact_cap,
         )
         .await;
     }
     debug!("mesh: command worker stopped (queue closed)");
+}
+
+// ── Contact protection ("Persist Mesh Contacts" feature) ───────────────────
+
+/// Eligibility gate for protection: only a real chat/person contact, never a
+/// repeater/room-server/sensor (see `specs/001-persist-mesh-contacts/spec.md`
+/// FR-003). MeshCore's `adv_type` is an allow-list of exactly one value —
+/// unlike Meshtastic's multi-value role allow-list, since MeshCore only
+/// distinguishes chat from three non-person types.
+fn is_meshcore_chat_type(adv_type: u8) -> bool {
+    adv_type == ADV_TYPE_CHAT
+}
+
+/// Build the outbound `AddUpdateContact` frame from a protect snapshot,
+/// converting the cached `Vec<u8>` path into `Contact.out_path`'s
+/// fixed-size array (always exactly `MAX_PATH_SIZE` bytes in practice: any
+/// snapshot actually populated from a real `Contact` frame was itself
+/// decoded from that same fixed array — see research.md Decision 1's round-11
+/// simplification) and the cached `lat`/`lon` (`f64` decimal degrees) into
+/// `Contact.gps_lat`/`gps_lon` (`i32` degrees×1,000,000).
+fn protect_frame_for(snapshot: &FavouriteSnapshot) -> OutboundFrame {
+    let mut out_path = [0u8; MAX_PATH_SIZE];
+    let n = snapshot.out_path.len().min(MAX_PATH_SIZE);
+    out_path[..n].copy_from_slice(&snapshot.out_path[..n]);
+
+    OutboundFrame::AddUpdateContact(Contact {
+        pubkey: snapshot.pubkey,
+        adv_type: snapshot.adv_type,
+        flags: snapshot.flags,
+        out_path_len: snapshot.out_path_len,
+        out_path,
+        name: snapshot.name.clone(),
+        last_advert_timestamp: snapshot.last_advert_timestamp,
+        gps_lat: (snapshot.lat * 1_000_000.0) as i32,
+        gps_lon: (snapshot.lon * 1_000_000.0) as i32,
+        lastmod: snapshot.lastmod,
+    })
+}
+
+/// Attempt to protect `pubkey`'s contact entry, enforcing the configured
+/// per-transport cap (`specs/001-persist-mesh-contacts/research.md`
+/// Decision 5b). Fire-and-forget on the wire — never awaits a device
+/// response, never delays the caller (Decision 8): the outbound frame is
+/// sent via `try_send`, and a synchronously-detected failure reverts the
+/// local commit so the sender stays eligible for a retry on their next
+/// message (Decision 8a) rather than being permanently, silently
+/// unprotected while `AdvertBus` believes otherwise.
+async fn try_protect_contact(
+    host: &Arc<dyn Host>,
+    cmd_tx: &mpsc::Sender<OutboundFrame>,
+    state: &Arc<Mutex<SessionState>>,
+    pubkey: [u8; 32],
+    protected_contact_cap: usize,
+) -> FavouriteOutcome {
+    // Exclude active sessions (and our own node) from eviction — mirrors the
+    // ContactsFull handler's own exclusion list exactly (never evict someone
+    // mid-conversation).
+    let (active_prefixes, self_prefix) = {
+        let st = state.lock().expect("state mutex poisoned");
+        let active: Vec<[u8; 6]> = st.by_prefix.keys().copied().collect();
+        let sp = st
+            .self_pubkey
+            .map(|pk| pk[..6].try_into().expect("pubkey is 32 bytes"));
+        (active, sp)
+    };
+    let mut exclude = active_prefixes;
+    if let Some(sp) = self_prefix {
+        if !exclude.contains(&sp) {
+            exclude.push(sp);
+        }
+    }
+
+    let outcome = host.advert_bus().mark_favourite_if_eligible(
+        pubkey,
+        is_meshcore_chat_type,
+        protected_contact_cap,
+        &exclude,
+    );
+
+    match outcome {
+        FavouriteOutcome::Protected(snapshot) => {
+            if cmd_tx.try_send(protect_frame_for(&snapshot)).is_ok() {
+                FavouriteOutcome::Protected(snapshot)
+            } else {
+                host.advert_bus()
+                    .revert_protect(&pubkey, snapshot.generation);
+                FavouriteOutcome::NoRecordYet
+            }
+        }
+        FavouriteOutcome::ProtectedWithEviction(snapshot, evicted_pubkey, evicted_record) => {
+            if cmd_tx.try_send(protect_frame_for(&snapshot)).is_ok() {
+                // Best-effort native removal for the evicted contact, off the
+                // hot path — awaiting `admin_remove_meshcore_contact` here
+                // would block this task (command_worker) on a channel
+                // round-trip, exactly what FR-006/Decision 8 forbid. The
+                // send itself is re-validated (TOCTOU re-check) immediately
+                // before it reaches the radio — see the `key_rx` handler.
+                let host = Arc::clone(host);
+                tokio::spawn(async move {
+                    if let Err(e) = host.admin_remove_meshcore_contact(evicted_pubkey).await {
+                        warn!(
+                            evicted_pubkey = ?&evicted_pubkey[..6],
+                            "mesh: failed to remove evicted contact from radio: {e}"
+                        );
+                    }
+                });
+                FavouriteOutcome::ProtectedWithEviction(snapshot, evicted_pubkey, evicted_record)
+            } else {
+                // The new protect's send failed after the eviction already
+                // committed (both happened atomically inside decide_favourite,
+                // Decision 0) — reverting only undoes the new protect, not the
+                // already-applied eviction, so the protected count is
+                // transiently down by one. Accepted, not fixed: this requires
+                // channel saturation and a cap-eviction to coincide (an
+                // already-narrow window intersecting an already-rare one), and
+                // it self-heals on the sender's own retry (pending_protect
+                // keeps them eligible), which by then finds the freed slot
+                // still open with no eviction needed.
+                host.advert_bus()
+                    .revert_protect(&pubkey, snapshot.generation);
+                warn!(
+                    "mesh: evicted a protected contact to make room but the new \
+                     protect's send failed — the freed slot will be reclaimed on retry"
+                );
+                FavouriteOutcome::NoRecordYet
+            }
+        }
+        other => other,
+    }
+}
+
+/// Attempt protection for `pubkey` and update `prefix`'s pending-protect
+/// mark accordingly — shared by `dispatch_message`'s own first attempt and
+/// `handle_frame`'s retry-on-more-data-arrived hooks (research.md
+/// Decision 3): terminal outcomes clear the mark; `NoRecordYet`
+/// unconditionally re-inserts it (round-21 fix — see `try_protect_contact`).
+async fn attempt_protect_and_update_pending(
+    host: &Arc<dyn Host>,
+    cmd_tx: &mpsc::Sender<OutboundFrame>,
+    state: &Arc<Mutex<SessionState>>,
+    draining: &Arc<AtomicBool>,
+    prefix: [u8; 6],
+    pubkey: [u8; 32],
+    protected_contact_cap: usize,
+) {
+    let outcome = try_protect_contact(host, cmd_tx, state, pubkey, protected_contact_cap).await;
+    if matches!(outcome, FavouriteOutcome::CapReached) {
+        // FR-015: distinct warning when the cap is reached and nothing was
+        // evictable — an operator needs to know this sender was NOT
+        // protected, unlike every other terminal outcome, which is either
+        // success or a deliberate, silent exclusion (Ineligible).
+        warn!(
+            "mesh: protected-contact cap reached with nothing evictable (all \
+             protected contacts are either in an active session or were \
+             protected too recently) — this sender was not protected"
+        );
+    }
+    let mut st = state.lock().expect("state mutex poisoned");
+    if matches!(outcome, FavouriteOutcome::NoRecordYet) {
+        st.mark_pending_protect(prefix);
+        // The one-time, connect-time GetContacts (see `transport.rs`'s
+        // `event_loop` — its `ClientEvent::Connected` handler) only ever
+        // captures contacts the device already knew about at that exact
+        // moment — a sender who first DMs the BBS afterward is stuck with
+        // `NoRecordYet` forever otherwise, since the device's own later
+        // adverts for an already-known contact are the lightweight,
+        // name/type-less kind (confirmed via live hardware testing,
+        // supply-drop-bbs-9vt). Cooldown-gated and non-blocking (`try_send`,
+        // FR-006) so this never delays the reply this DM is also waiting on.
+        //
+        // Skipped entirely while `draining`: the connect-time GetContacts
+        // above is itself a stateful, single-outstanding-iterator device
+        // command — a second one issued before the first finishes is
+        // rejected (ERR_CODE_BAD_STATE), and that error frame would be
+        // misattributed by the drain-recovery handler below as "the device
+        // doesn't support SyncNextMessage," clearing `draining` early and
+        // silently dropping the rest of the real backlog. The retry hooks on
+        // NewAdvert/Contact/Advert/PathUpdated cover this sender again once
+        // draining clears, so nothing is permanently lost by waiting.
+        if st.should_request_contacts_catchup() && !draining.load(Ordering::Relaxed) {
+            match cmd_tx.try_send(OutboundFrame::GetContacts { since: 0 }) {
+                Ok(()) => {
+                    st.mark_contacts_catchup_requested();
+                    info!(
+                        "mesh: requesting a contact-list catch-up — a sender's full \
+                         record is still missing after their identity resolved"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    debug!("mesh: contact-list catch-up request dropped — outbound channel full");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    debug!("mesh: contact-list catch-up request dropped — outbound channel closed");
+                }
+            }
+        }
+    } else {
+        st.clear_pending_protect(&prefix);
+    }
 }
 
 /// Parse a direct message text, route it through the host, and send the reply.
@@ -1683,6 +2060,7 @@ async fn dispatch_message(
     host: &Arc<dyn Host>,
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     state: &Arc<Mutex<SessionState>>,
+    draining: &Arc<AtomicBool>,
     command_prefix: Option<char>,
     welcome_message: &str,
     node_credential_ttl_days: u32,
@@ -1690,7 +2068,31 @@ async fn dispatch_message(
     workflow_timeout_secs: u64,
     send_tracker: &Arc<Mutex<SendTracker>>,
     delivery_stats: &Arc<DeliveryStats>,
+    protected_contact_cap: usize,
 ) {
+    // Persist Mesh Contacts (research.md Decision 3's "Precise ordering
+    // requirement"): this MUST be the literal first statement this function
+    // executes — before get_or_create_session, before anything else. There
+    // is then no gap for a concurrently-resolving frame (on `event_loop`) to
+    // race into: either it finds the mark already set and retries
+    // correctly, or dispatch_message's own protect attempt below runs first
+    // and reaches a terminal outcome, in which case the concurrent retry
+    // (if any) will simply see `AlreadyProtected`/`Ineligible`.
+    //
+    // A third, benign case exists: attempt_protect_and_update_pending decides
+    // the outcome and later writes the pending-protect mark as two separate
+    // lock acquisitions, so a stale `NoRecordYet` write from one task can
+    // land after a concurrent task's terminal-outcome write already cleared
+    // the mark for the same prefix, leaving it spuriously set. This never
+    // undoes an actual protection or sends a duplicate frame — it self-heals
+    // on the next DM (this statement unconditionally re-marks and the
+    // subsequent attempt resolves to `AlreadyProtected`), on the next
+    // advert/contact retry hook, or via the 24h pending-protect TTL sweep.
+    state
+        .lock()
+        .expect("state mutex poisoned")
+        .mark_pending_protect(sender_prefix);
+
     // ── Get or create a session for this node ─────────────────────────────────
     let Some((session, is_new)) = get_or_create_session(sender_prefix, host, state).await else {
         // Session creation failed; the error was already logged inside
@@ -1709,6 +2111,23 @@ async fn dispatch_message(
         .lock()
         .expect("state mutex poisoned")
         .get_full_pubkey(&sender_prefix);
+
+    // ── Attempt contact protection (best-effort, never delays the reply) ─────
+    // If the identity itself isn't resolved yet (`full_pubkey` is `None`),
+    // the pending mark set above simply stays — `handle_frame`'s NewAdvert/
+    // Contact retry hook picks it up once the identity resolves.
+    if let Some(pubkey) = full_pubkey {
+        attempt_protect_and_update_pending(
+            host,
+            cmd_tx,
+            state,
+            draining,
+            sender_prefix,
+            pubkey,
+            protected_contact_cap,
+        )
+        .await;
+    }
 
     // ── Determine if we're awaiting a workflow reply ──────────────────────────
     let awaiting_reply = state
@@ -1931,6 +2350,22 @@ async fn dispatch_message(
                 .lock()
                 .expect("state mutex poisoned")
                 .get_or_insert(sender_prefix, fresh);
+            // Persist Mesh Contacts (research.md Decision 3's round-11 fix):
+            // this fresh SessionEntry starts with full_pubkey = None just
+            // like get_or_create_session's own slow path does — reseed it
+            // from AdvertBus here too, or a sender whose session happens to
+            // go stale (e.g. a BBS restart) loses first-message protection
+            // eligibility on their very next message for no reason AdvertBus
+            // itself would justify (it still has the full record).
+            if let Some(pubkey) = host
+                .advert_bus()
+                .full_pubkey_by_prefix(&sender_prefix, TRANSPORT_NAME)
+            {
+                state
+                    .lock()
+                    .expect("state mutex poisoned")
+                    .set_full_pubkey(&sender_prefix, pubkey);
+            }
             // Track the fresh session so credential operations below use it.
             active_sid = fresh_sid;
             // Attempt auto-login on the refreshed session before replaying the command.
@@ -2152,6 +2587,25 @@ async fn get_or_create_session(
         .lock()
         .expect("state mutex poisoned")
         .get_or_insert(prefix, new_id);
+
+    // Persist Mesh Contacts (research.md Decision 3's round-11 fix): seed
+    // this brand-new session's full pubkey from an already-known AdvertBus
+    // record, if one exists — a node whose full contact record predates its
+    // first-ever DM (the common case on an already-flooding mesh, exactly
+    // issue #185's premise) is otherwise stuck with an unresolved identity
+    // until a second, unrelated frame happens to arrive, blocking
+    // protection on the very first message that should trigger it.
+    if is_new {
+        if let Some(pubkey) = host
+            .advert_bus()
+            .full_pubkey_by_prefix(&prefix, TRANSPORT_NAME)
+        {
+            state
+                .lock()
+                .expect("state mutex poisoned")
+                .set_full_pubkey(&prefix, pubkey);
+        }
+    }
 
     Some((sid, is_new))
 }

@@ -85,9 +85,16 @@ enum Workflow {
     /// E replies to the current message; any other input exits.
     Reading,
     /// Choosing a room from the numbered list produced by K.
-    /// Stores the ordered room IDs so the user can type a number to jump in.
+    /// Stores the ordered room IDs so the user can type a number to jump in
+    /// (any id K has ever shown this session remains selectable, regardless
+    /// of which page is currently displayed). `next_page_start` is the index
+    /// into the (unpaginated) numbered-line list where the next page should
+    /// begin if the user presses K again — `None` once the last page has
+    /// been shown (issue #193: a long room list would silently truncate
+    /// mid-mesh-frame past ~12 rooms; K now pages instead).
     Rooms {
         room_ids: Vec<RoomId>,
+        next_page_start: Option<usize>,
     },
     /// Stepping through unvalidated accounts one-at-a-time (LP queue).
     /// `pending` is the list of usernames still to review; `index` is the
@@ -737,6 +744,32 @@ impl Host for BbsHost {
             .map_err(bbs_plugin_api::HostError::Internal)
     }
 
+    async fn admin_remove_meshcore_contact(
+        &self,
+        pubkey: [u8; 32],
+    ) -> Result<(), bbs_plugin_api::HostError> {
+        let tx = self
+            .mesh_key_tx
+            .read()
+            .expect("mesh_key_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("mesh transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshKeyRequest::RemoveContact {
+            pubkey,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| bbs_plugin_api::HostError::Internal("mesh transport disconnected".into()))?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| bbs_plugin_api::HostError::Internal("contact removal timed out".into()))?
+            .map_err(|_| bbs_plugin_api::HostError::Internal("contact removal cancelled".into()))?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
     fn register_meshtastic_admin_ops(
         &self,
         sender: tokio::sync::mpsc::Sender<bbs_plugin_api::MeshtasticAdminRequest>,
@@ -948,6 +981,38 @@ impl Host for BbsHost {
             .await
             .map_err(|_| bbs_plugin_api::HostError::Internal("meshtastic reboot timed out".into()))?
             .map_err(|_| bbs_plugin_api::HostError::Internal("meshtastic reboot cancelled".into()))?
+            .map_err(bbs_plugin_api::HostError::Internal)
+    }
+
+    async fn admin_remove_meshtastic_favorite(
+        &self,
+        node_num: u32,
+    ) -> Result<(), bbs_plugin_api::HostError> {
+        let tx = self
+            .meshtastic_admin_tx
+            .read()
+            .expect("meshtastic_admin_tx poisoned")
+            .clone()
+            .ok_or_else(|| {
+                bbs_plugin_api::HostError::Internal("meshtastic transport not connected".into())
+            })?;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        tx.send(bbs_plugin_api::MeshtasticAdminRequest::RemoveFavoriteNode {
+            node_num,
+            reply: reply_tx,
+        })
+        .await
+        .map_err(|_| {
+            bbs_plugin_api::HostError::Internal("meshtastic transport disconnected".into())
+        })?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), reply_rx)
+            .await
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic favorite removal timed out".into())
+            })?
+            .map_err(|_| {
+                bbs_plugin_api::HostError::Internal("meshtastic favorite removal cancelled".into())
+            })?
             .map_err(bbs_plugin_api::HostError::Internal)
     }
 
@@ -1310,8 +1375,10 @@ impl Host for BbsHost {
 
     async fn admin_stats(&self) -> Result<AdminStats, HostError> {
         let active_sessions = self.sessions.read().await.len();
+        let discovered_contacts = self.advert_bus.count();
+        let protected_contacts = self.advert_bus.count_protected();
         self.db
-            .admin_stats(active_sessions)
+            .admin_stats(active_sessions, discovered_contacts, protected_contacts)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
@@ -1391,6 +1458,25 @@ impl Host for BbsHost {
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
         self.db
             .admin_delete_backup(backup_dir, filename)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_stage_restore(
+        &self,
+        uploaded_path: &str,
+        data_dir: &str,
+    ) -> Result<(), HostError> {
+        crate::db::Database::stage_restore(
+            std::path::Path::new(uploaded_path),
+            std::path::Path::new(data_dir),
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_apply_staged_restore(&self, data_dir: &str) -> Result<(), HostError> {
+        crate::db::Database::admin_apply_staged_restore(std::path::Path::new(data_dir))
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
@@ -2774,7 +2860,8 @@ impl BbsHost {
 
             // ── Message reading ──────────────────────────────────────────────
             Workflow::Reading => {
-                match reply.trim().to_uppercase().as_str() {
+                let upper = reply.trim().to_uppercase();
+                match upper.as_str() {
                     "F" => self.handle_read_forward(session, None).await,
                     "R" => self.handle_read_reverse(session).await,
                     "E" => self.handle_reply_from_reading(session).await,
@@ -2783,6 +2870,44 @@ impl BbsHost {
                     // than bouncing the user out (issue #109).
                     "H" | "?" => Ok(Response::Text(HELP_READING_MODE.into())),
                     _ => {
+                        // D [<id>] deletes without leaving reading mode (issue
+                        // #184) -- previously any input other than F/R/E/H
+                        // fell straight to the catch-all below, so "D <id>"
+                        // just exited reading mode instead of deleting; only
+                        // a second, out-of-reading-mode "D <id>" worked.
+                        // Bare "D" targets whatever message is on screen.
+                        let delete_id = if upper == "D" {
+                            let sessions = self.sessions.read().await;
+                            sessions
+                                .get(&session)
+                                .and_then(|r| r.current_message_id)
+                                .map(MessageId::as_i64)
+                        } else {
+                            upper
+                                .strip_prefix("D ")
+                                .and_then(|rest| rest.trim().parse::<i64>().ok())
+                        };
+
+                        if let Some(id) = delete_id {
+                            let current = {
+                                let sessions = self.sessions.read().await;
+                                sessions.get(&session).and_then(|r| r.current_message_id)
+                            };
+                            let response = self.handle_delete(session, id).await;
+                            // Deleting the message on screen (or a bare "D")
+                            // leaves nothing left to show -- exit reading
+                            // mode. Deleting some other id read earlier
+                            // leaves the current message intact; stay put.
+                            if current.map(MessageId::as_i64) == Some(id) {
+                                let mut sessions = self.sessions.write().await;
+                                if let Some(r) = sessions.get_mut(&session) {
+                                    r.workflow = Workflow::None;
+                                    r.current_message_id = None;
+                                }
+                            }
+                            return response;
+                        }
+
                         // Any other input exits reading mode.
                         {
                             let mut sessions = self.sessions.write().await;
@@ -2799,7 +2924,10 @@ impl BbsHost {
             }
 
             // ── Room selection ────────────────────────────────────────────────
-            Workflow::Rooms { room_ids } => {
+            Workflow::Rooms {
+                room_ids,
+                next_page_start,
+            } => {
                 let trimmed = reply.trim();
                 // X or empty → cancel
                 if trimmed.eq_ignore_ascii_case("x") || trimmed.is_empty() {
@@ -2811,10 +2939,28 @@ impl BbsHost {
                     }
                     return Ok(Response::Text("Cancelled.".into()));
                 }
-                // Numeric index into the list shown by K
-                if let Ok(n) = trimmed.parse::<usize>() {
-                    if n >= 1 && n <= room_ids.len() {
-                        let target_id = room_ids[n - 1];
+                // K again while a further page remains continues pagination
+                // (issue #193) — checked before the generic command-fallback
+                // below, which would otherwise just re-run K from page one.
+                if trimmed.eq_ignore_ascii_case("k") {
+                    if let Some(next) = next_page_start {
+                        return self.handle_list_rooms_from(session, next).await;
+                    }
+                    // No further page: fall through to the generic
+                    // command-fallback below, which re-lists from the start
+                    // — the same behaviour K already had before pagination
+                    // existed, for a room list that fit on one page anyway.
+                }
+                // A room's real id, as displayed by K (issue #187: this used
+                // to be a 1-based POSITION in `room_ids`, which silently
+                // diverged from the real id whenever a permission-gated room
+                // was missing from this session's filtered list — the same
+                // number then meant a different room depending on whether it
+                // came from K's listing or from `C <number>`). Only ids K
+                // actually showed this session are accepted, same as before.
+                if let Ok(n) = trimmed.parse::<i64>() {
+                    let target_id = RoomId::new(n);
+                    if room_ids.contains(&target_id) {
                         {
                             let mut sessions = self.sessions.write().await;
                             if let Some(r) = sessions.get_mut(&session) {
@@ -3012,6 +3158,56 @@ impl BbsHost {
     }
 
     async fn handle_list_rooms(&self, session: SessionId) -> Result<Response, HostError> {
+        self.handle_list_rooms_from(session, 0).await
+    }
+
+    /// Split a room-listing line slice into one mesh-safe page, starting at
+    /// absolute index `start` within the full numbered-line list — so the
+    /// returned `next_page_start`, if any, is directly usable as the next
+    /// call's `start`. Builds the page by accumulating lines until the next
+    /// one would push it over a conservative byte budget, rather than a
+    /// fixed room count: room names have no length limit, so a count-based
+    /// page could itself overflow a mesh frame for long enough names
+    /// (issue #193: `K`'s single-frame `Response::Prompt` was silently
+    /// truncated by the transport once enough short-named rooms pushed it
+    /// past MeshCore's ~156-byte frame ceiling — see `MAX_REPLY_BYTES` in
+    /// `crates/bbs-mesh/src/transport.rs`; Meshtastic's default ceiling is
+    /// looser at ~220 bytes, but nothing here is transport-aware, so the
+    /// tighter MeshCore-safe budget is used for every caller — CLI/web have
+    /// no such ceiling, and seeing rooms across a couple of short pages
+    /// instead of one long one is harmless there).
+    fn paginate_room_lines(remaining: &[String], start: usize) -> (Vec<&str>, Option<usize>) {
+        // Conservative: MeshCore's real ceiling is ~156 bytes total,
+        // including the "Rooms:\n" header (~7 bytes), the "\nEnter # to
+        // join, X to cancel" footer (~30 bytes), and the "\n(more — press K
+        // again for the next page)" continuation trailer (~44 bytes) when
+        // one is shown — leaving roughly this much headroom for the room
+        // lines themselves, worst case (trailer present).
+        const LINE_BUDGET: usize = 70;
+        let mut page = Vec::new();
+        let mut used = 0usize;
+        for line in remaining {
+            let cost = line.len() + 1; // +1 for the '\n' joining lines
+            if !page.is_empty() && used + cost > LINE_BUDGET {
+                let next = start + page.len();
+                return (page, Some(next));
+            }
+            page.push(line.as_str());
+            used += cost;
+        }
+        (page, None)
+    }
+
+    /// Render room-list page starting at `start` (an index into the
+    /// unpaginated numbered-line list, not a room id) — see
+    /// `Workflow::Rooms::next_page_start`. `handle_list_rooms` always starts
+    /// at 0; pressing K again while already paging resumes from the stored
+    /// offset.
+    async fn handle_list_rooms_from(
+        &self,
+        session: SessionId,
+        start: usize,
+    ) -> Result<Response, HostError> {
         let (username, user_id, level, current_room) =
             match self.session_auth_or_guest(session).await {
                 Ok(t) => t,
@@ -3065,26 +3261,48 @@ impl BbsHost {
             return Ok(Response::Text("No accessible rooms.".into()));
         }
 
-        // Prefix each line with its 1-based index so the user can type a
-        // number to jump in (handled by Workflow::Rooms).
-        let numbered: Vec<String> = lines
+        // Prefix each line with the room's real id (not its position in this
+        // filtered list) so the number shown here means the same thing as
+        // `C <number>`, the web admin UI's room table, and the database
+        // itself — all of which already treat "room number" as the literal
+        // `rooms.id` (issue #187: with position-based numbering, a
+        // permission-gated room like Aides silently missing from a User's
+        // list would shift every later room's displayed number, so a custom
+        // room could display under a number that belongs to a different,
+        // hidden room).
+        let numbered: Vec<String> = rooms
             .iter()
-            .enumerate()
-            .map(|(i, l)| format!("{}. {}", i + 1, l))
+            .zip(lines.iter())
+            .map(|(room, l)| format!("{}. {}", room.id.as_i64(), l))
             .collect();
 
         let room_ids: Vec<RoomId> = rooms.iter().map(|r| r.id).collect();
+
+        // Clamp: the room list may have shrunk since an earlier page was
+        // shown (e.g. a room was deleted); fall back to the first page
+        // rather than showing nothing.
+        let start = if start < numbered.len() { start } else { 0 };
+        let (page, next_page_start) = Self::paginate_room_lines(&numbered[start..], start);
+
         {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
-                r.workflow = Workflow::Rooms { room_ids };
+                r.workflow = Workflow::Rooms {
+                    room_ids,
+                    next_page_start,
+                };
             }
         }
 
+        let trailer = if next_page_start.is_some() {
+            "\n(more — press K again for the next page)"
+        } else {
+            ""
+        };
         Ok(Response::Prompt {
             text: format!(
-                "Rooms:\n{}\nEnter # to join, X to cancel",
-                numbered.join("\n")
+                "Rooms:\n{}{trailer}\nEnter # to join, X to cancel",
+                page.join("\n")
             ),
             hide_input: false,
         })
@@ -5445,6 +5663,7 @@ Reading mode:\n\
  F  next message (forward)\n\
  R  previous message (back)\n\
  E  reply to this message\n\
+ D  delete message\n\
  H  this help\n\
  X  exit reading";
 
@@ -7959,6 +8178,199 @@ mod tests {
         }
     }
 
+    /// Issue #184: `D <#>` inside reading mode previously fell through to the
+    /// catch-all "any other input exits reading mode" arm instead of being
+    /// recognised as a delete — the message survived, and only a *second*,
+    /// out-of-reading-mode `D <#>` actually deleted it. A single `D <#>`
+    /// while reading must delete immediately.
+    #[tokio::test]
+    async fn reading_mode_d_with_id_deletes_immediately() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("delete me".into()),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+
+        // First F shows the reading-mode intro (no message yet); the second
+        // actually loads and displays the first message.
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: "F".into() })
+            .await
+            .unwrap();
+        let msg_id = {
+            let sessions = host.sessions.read().await;
+            sessions[&sid]
+                .current_message_id
+                .expect("reading mode must track the displayed message")
+                .as_i64()
+        };
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: format!("D {msg_id}"),
+                },
+            )
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::Text(t) => t,
+            other => panic!("expected a deletion confirmation, got {other:?}"),
+        };
+        assert!(
+            text.contains("deleted"),
+            "a single D <#> in reading mode should delete immediately, got: {text:?}"
+        );
+        assert!(
+            !text.to_lowercase().contains("exited"),
+            "a successful delete should not be reported as merely exiting, got: {text:?}"
+        );
+        assert!(
+            MessageStore::get_by_id(&host.db, crate::ids::MessageId::new(msg_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "the message must actually be gone after one D <#>"
+        );
+
+        // Deleting the on-screen message leaves nothing to keep reading.
+        let sessions = host.sessions.read().await;
+        assert!(
+            matches!(sessions[&sid].workflow, Workflow::None),
+            "reading mode should end once its message is deleted"
+        );
+    }
+
+    /// Bare `D` (no id) targets whatever message reading mode currently has
+    /// on screen, without the caller needing to know its numeric id.
+    #[tokio::test]
+    async fn reading_mode_bare_d_deletes_current_message() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("delete me too".into()),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: "F".into() })
+            .await
+            .unwrap();
+        let msg_id = {
+            let sessions = host.sessions.read().await;
+            sessions[&sid].current_message_id.unwrap().as_i64()
+        };
+
+        let resp = host
+            .process_command(sid, Command::WorkflowReply { reply: "D".into() })
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("deleted")),
+            "bare D should delete the on-screen message, got: {resp:?}"
+        );
+        assert!(
+            MessageStore::get_by_id(&host.db, crate::ids::MessageId::new(msg_id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Deleting a message OTHER than the one currently on screen (e.g. one
+    /// read earlier in the same session) must not disturb the in-progress
+    /// reading flow — only deleting the displayed message ends it.
+    #[tokio::test]
+    async fn reading_mode_d_with_other_id_stays_in_reading_mode() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        for body in ["first", "second"] {
+            host.process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some(body.into()),
+                },
+            )
+            .await
+            .unwrap();
+            host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+                .await
+                .unwrap();
+        }
+
+        // Enter reading mode (intro only), then F loads the first message,
+        // then a second F advances to the second message.
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        host.process_command(sid, Command::WorkflowReply { reply: "F".into() })
+            .await
+            .unwrap();
+        let first_id = {
+            let sessions = host.sessions.read().await;
+            sessions[&sid].current_message_id.unwrap().as_i64()
+        };
+        host.process_command(sid, Command::WorkflowReply { reply: "F".into() })
+            .await
+            .unwrap();
+        let second_id = {
+            let sessions = host.sessions.read().await;
+            sessions[&sid].current_message_id.unwrap().as_i64()
+        };
+        assert_ne!(first_id, second_id);
+
+        // Delete the FIRST message while the SECOND is on screen.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: format!("D {first_id}"),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Text(t) if t.contains("deleted")));
+
+        // Still reading the second message — its own delete didn't fire.
+        let sessions = host.sessions.read().await;
+        assert!(
+            matches!(sessions[&sid].workflow, Workflow::Reading),
+            "deleting an earlier message must not exit the current reading session"
+        );
+        assert_eq!(
+            sessions[&sid].current_message_id.map(|m| m.as_i64()),
+            Some(second_id)
+        );
+    }
+
     /// After pointer reset, pressing N should return "No new messages" rather
     /// than flooding the user with all historical messages.
     #[tokio::test]
@@ -8062,6 +8474,223 @@ mod tests {
                 matches!(sessions[&sid].workflow, Workflow::None),
                 "room selection should be auto-cancelled after running the command"
             );
+        }
+    }
+
+    // ── Issue #187: K lists rooms by real id, not filtered-list position ──────
+
+    /// A room's default `min_permission_level` (User) means every custom
+    /// room a Sysop creates ends up ABOVE the built-in Aide/Sysop/System
+    /// rooms in real id, but below them in a User's *filtered* list (they
+    /// don't see Aides/Sysop/System at all). K must display and accept the
+    /// room's real id — not its position in that filtered list, which would
+    /// silently collide with a different, hidden room's real id.
+    #[tokio::test]
+    async fn list_rooms_shows_real_id_not_filtered_position() {
+        let (host, _db) = make_host().await;
+
+        // A custom room created after the built-in Lobby/Mail/Aides/Sysop/
+        // System rooms gets the next real id after them.
+        let custom_id = RoomStore::create(
+            &host.db,
+            "BAYCO ARES",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        // A User-level session that doesn't see Aides/Sysop/System (all
+        // gated above User) would put BAYCO ARES at filtered-list position
+        // 3 — colliding with Aides' real id if K numbered by position
+        // rather than real id. Page forward if needed (issue #193: K now
+        // pages a room list too long for one mesh frame) to find whichever
+        // page BAYCO ARES lands on.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        let mut text = match resp {
+            Response::Prompt { text, .. } => text,
+            other => panic!("expected Prompt, got {other:?}"),
+        };
+        let mut pages = 0;
+        let bayco_line = loop {
+            if let Some(l) = text.lines().find(|l| l.contains("BAYCO ARES")) {
+                break l.to_owned();
+            }
+            pages += 1;
+            assert!(
+                pages < 15 && text.contains("more"),
+                "BAYCO ARES missing from the room list across all pages, \
+                 last page: {text:?}"
+            );
+            let resp = host
+                .process_command(sid, Command::WorkflowReply { reply: "K".into() })
+                .await
+                .unwrap();
+            text = match resp {
+                Response::Prompt { text, .. } => text,
+                other => panic!("expected Prompt on continued page, got {other:?}"),
+            };
+        };
+        let bayco_line = bayco_line.as_str();
+        let displayed_number = bayco_line
+            .trim_start()
+            .split('.')
+            .next()
+            .unwrap_or_default();
+        assert_eq!(
+            displayed_number,
+            custom_id.as_i64().to_string(),
+            "K must number BAYCO ARES by its real id ({}), not its position \
+             in this session's filtered list, got line: {bayco_line:?}",
+            custom_id.as_i64()
+        );
+
+        // Selecting by that real id must actually land in BAYCO ARES.
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: custom_id.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&resp, Response::Text(t) if t.to_uppercase().contains("BAYCO ARES")),
+            "selecting K's displayed number for BAYCO ARES must join BAYCO ARES, got: {resp:?}"
+        );
+        {
+            let sessions = host.sessions.read().await;
+            assert_eq!(
+                sessions[&sid].current_room, custom_id,
+                "current room must be BAYCO ARES, not whatever sat at position 3"
+            );
+        }
+    }
+
+    // ── Issue #193: K pages a long room list instead of overflowing a frame ──
+
+    /// A room list too long to fit one mesh frame must be paged, not
+    /// silently truncated by the transport partway through a room's line —
+    /// K on its own shows the first page with a "more" trailer; K again
+    /// continues to the next page; every room appears exactly once across
+    /// the full sequence of pages; and a room number from an earlier page
+    /// is still selectable while a later page is on screen (room_ids holds
+    /// every accessible id all along, independent of which page is shown).
+    #[tokio::test]
+    async fn list_rooms_pages_a_long_list_and_covers_every_room_once() {
+        let (host, _db) = make_host().await;
+
+        // Enough short, fixed-width custom rooms to force at least two
+        // pages under the ~70-byte-per-page line budget (each line here is
+        // a handful of bytes, so this comfortably forces a 3rd+ page too).
+        let mut created_ids = Vec::new();
+        for i in 0..15u8 {
+            let id = RoomStore::create(
+                &host.db,
+                &format!("R{i:02}"),
+                None,
+                false,
+                PermissionLevel::User,
+                Timestamp::now(),
+            )
+            .await
+            .unwrap();
+            created_ids.push(id);
+        }
+
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pages = 0;
+        let mut first_page_ids: Vec<i64> = Vec::new();
+
+        // First K.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        let mut text = match resp {
+            Response::Prompt { text, .. } => text,
+            other => panic!("expected Prompt, got {other:?}"),
+        };
+
+        loop {
+            pages += 1;
+            for line in text.lines() {
+                if let Some((num, rest)) = line.split_once(". ") {
+                    if let Ok(id) = num.parse::<i64>() {
+                        if pages == 1 {
+                            first_page_ids.push(id);
+                        }
+                        if created_ids.iter().any(|r| r.as_i64() == id) {
+                            // rest is "<marker> RNN[...]"; the room name has
+                            // no spaces, so its own trailing token is safe
+                            // to key on even with unread/[here] suffixes.
+                            let name = rest.split_whitespace().next().unwrap();
+                            seen_names.insert(name.to_owned());
+                        }
+                    }
+                }
+            }
+
+            if !text.contains("more") {
+                break;
+            }
+            assert!(
+                pages < 15,
+                "pagination did not terminate after {pages} pages — got: {text:?}"
+            );
+
+            let resp = host
+                .process_command(sid, Command::WorkflowReply { reply: "K".into() })
+                .await
+                .unwrap();
+            text = match resp {
+                Response::Prompt { text, .. } => text,
+                other => panic!("expected Prompt on continued page, got {other:?}"),
+            };
+        }
+
+        assert!(
+            pages >= 2,
+            "expected the 15 extra rooms to force at least 2 pages, got {pages}"
+        );
+        assert_eq!(
+            seen_names.len(),
+            15,
+            "every created room must appear exactly once across all pages, saw: {seen_names:?}"
+        );
+        assert!(
+            !first_page_ids.is_empty(),
+            "the first page must show at least one room (built-in or custom)"
+        );
+
+        // A room id from the FIRST page must still be selectable even though
+        // the workflow has since advanced through further pages — proving
+        // `room_ids` tracks every accessible id, not just the current page.
+        let first_id = first_page_ids[0];
+        let resp = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: first_id.to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Response::Text(_)),
+            "a first-page room id must still be selectable from a later page, got: {resp:?}"
+        );
+        {
+            let sessions = host.sessions.read().await;
+            assert_eq!(sessions[&sid].current_room.as_i64(), first_id);
         }
     }
 
@@ -8471,5 +9100,369 @@ mod tests {
             matches!(&resp, Response::Text(t) if t == "Mail sent to bob."),
             "multi-step mail send should confirm 'Mail sent to bob.', got: {resp:?}"
         );
+    }
+
+    // ── Issue #195: restore-upload staging (validate without touching live DB) ─
+
+    /// A genuine backup of this BBS's own schema (produced the same way
+    /// `admin_trigger_backup` does, via VACUUM INTO) must validate and land
+    /// at `<data_dir>/pending_restore.staged.db` — the inert staged name,
+    /// not the name that actually triggers a swap on next boot — without
+    /// touching the live database at all.
+    #[tokio::test]
+    async fn stage_restore_accepts_a_genuine_backup_and_leaves_live_db_untouched() {
+        let (host, live_db_file) = make_host().await;
+
+        // Confirm the live DB has real content before staging anything, so
+        // "untouched" below is a meaningful assertion, not a vacuous one.
+        RoomStore::create(
+            &host.db,
+            "Untouched Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        let live_before = tokio::fs::read(live_db_file.path()).await.unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backup_path = data_dir.path().join("source_backup.db");
+        host.db
+            .admin_backup(&backup_path.to_string_lossy())
+            .await
+            .expect("admin_backup should produce a valid backup file");
+
+        host.admin_stage_restore(
+            &backup_path.to_string_lossy(),
+            &data_dir.path().to_string_lossy(),
+        )
+        .await
+        .expect("a genuine backup of this schema must validate and stage");
+
+        let staged = data_dir.path().join("pending_restore.staged.db");
+        assert!(
+            staged.exists(),
+            "a valid upload must be staged at pending_restore.staged.db"
+        );
+        assert!(
+            !data_dir.path().join("pending_restore.db").exists(),
+            "staging alone must never create the confirmed name that \
+             actually triggers a swap on next boot — only \
+             admin_apply_staged_restore may do that"
+        );
+
+        let live_after = tokio::fs::read(live_db_file.path()).await.unwrap();
+        assert_eq!(
+            live_before, live_after,
+            "staging a restore must never modify the live database file"
+        );
+    }
+
+    /// `admin_backup`'s own zip-bundling caller never offers a raw `.db`
+    /// for download, only a `.zip` — so restore must accept that same zip
+    /// end to end, not just in the unit-level zip-extraction tests.
+    #[tokio::test]
+    async fn stage_restore_accepts_a_zip_wrapped_genuine_backup() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backup_path = data_dir.path().join("source_backup.db");
+        host.db
+            .admin_backup(&backup_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let zip_path = data_dir.path().join("source_backup.zip");
+        let db_bytes = tokio::fs::read(&backup_path).await.unwrap();
+        {
+            use std::io::Write as _;
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("source_backup.db", opts).unwrap();
+            zip.write_all(&db_bytes).unwrap();
+            zip.finish().unwrap();
+        }
+
+        host.admin_stage_restore(
+            &zip_path.to_string_lossy(),
+            &data_dir.path().to_string_lossy(),
+        )
+        .await
+        .expect("a zip-wrapped genuine backup must validate and stage");
+
+        assert!(
+            data_dir.path().join("pending_restore.staged.db").exists(),
+            "the extracted .db must be staged, not the zip itself"
+        );
+    }
+
+    /// A file that isn't a SQLite database at all must be rejected before
+    /// anything is staged or the live database is touched.
+    #[tokio::test]
+    async fn stage_restore_rejects_a_non_sqlite_file() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let bogus_path = data_dir.path().join("not_a_database.db");
+        tokio::fs::write(&bogus_path, b"definitely not a sqlite file")
+            .await
+            .unwrap();
+
+        let result = host
+            .admin_stage_restore(
+                &bogus_path.to_string_lossy(),
+                &data_dir.path().to_string_lossy(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-SQLite file must be rejected, not silently staged"
+        );
+
+        let staged = data_dir.path().join("pending_restore.staged.db");
+        assert!(
+            !staged.exists(),
+            "a rejected upload must not be staged for restore"
+        );
+    }
+
+    /// Every migration in crates/bbs-core/migrations is written to be safely
+    /// re-runnable (CREATE TABLE IF NOT EXISTS, INSERT OR IGNORE, DROP TABLE
+    /// IF EXISTS + CREATE TABLE), so running the migrator alone against a
+    /// brand-new, empty-but-valid SQLite file succeeds and quietly builds a
+    /// full empty schema out of it. Validation must catch this case
+    /// explicitly — a file migrate! is merely *willing to adopt* is not the
+    /// same as a file that is genuinely a prior backup of this application.
+    #[tokio::test]
+    async fn stage_restore_rejects_a_brand_new_empty_sqlite_file() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let empty_path = data_dir.path().join("empty.db");
+        {
+            use sqlx::sqlite::SqliteConnectOptions;
+            let opts = SqliteConnectOptions::new()
+                .filename(&empty_path)
+                .create_if_missing(true);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            // Merely opening and closing a connection does not force SQLite
+            // to write its header — that only happens on the first actual
+            // page write. VACUUM forces one, producing a genuinely
+            // initialized, zero-table database, mimicking what
+            // `sqlite3 empty.db "VACUUM;"` produces on the command line.
+            sqlx::query("VACUUM").execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        assert!(
+            tokio::fs::read(&empty_path).await.unwrap().len() >= 16,
+            "sanity check: SQLite must have written a real header for an \
+             empty database, or this test isn't exercising the header check"
+        );
+
+        let result = host
+            .admin_stage_restore(
+                &empty_path.to_string_lossy(),
+                &data_dir.path().to_string_lossy(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a brand-new empty SQLite file must be rejected — it has no \
+             migration history, so migrate! alone cannot distinguish it \
+             from a genuine backup that merely needs upgrading"
+        );
+
+        let staged = data_dir.path().join("pending_restore.staged.db");
+        assert!(
+            !staged.exists(),
+            "a rejected upload must not be staged for restore"
+        );
+    }
+
+    /// A candidate file that migrates cleanly (so the earlier checks all
+    /// pass) but has a structurally broken room linked-list must still be
+    /// rejected — otherwise this class of corruption is only discovered
+    /// AFTER the destructive swap in main.rs, which has no automatic
+    /// rollback to the pre-restore safety snapshot.
+    #[tokio::test]
+    async fn stage_restore_rejects_a_migratable_file_with_a_broken_room_walk_order() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backup_path = data_dir.path().join("source_backup.db");
+        host.db
+            .admin_backup(&backup_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        // Corrupt the backup directly: give a second room a NULL
+        // prev_neighbor, creating two "heads" in what must be a single
+        // linked list.
+        {
+            use sqlx::sqlite::SqliteConnectOptions;
+            let opts = SqliteConnectOptions::new()
+                .filename(&backup_path)
+                .create_if_missing(false);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE rooms SET prev_neighbor = NULL WHERE id = 2")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+
+        let result = host
+            .admin_stage_restore(
+                &backup_path.to_string_lossy(),
+                &data_dir.path().to_string_lossy(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a schema-valid but structurally broken room list must be rejected"
+        );
+
+        let staged = data_dir.path().join("pending_restore.staged.db");
+        assert!(
+            !staged.exists(),
+            "a rejected upload must not be staged for restore"
+        );
+    }
+
+    /// Confirming a staged restore must promote it to `pending_restore.db`
+    /// — the only name main.rs's startup check watches for — and must not
+    /// create that name before confirmation happens (issue #195: an
+    /// earlier version staged directly under that name, so ANY unrelated
+    /// restart between upload and confirmation silently applied an
+    /// unconfirmed restore).
+    #[tokio::test]
+    async fn admin_apply_staged_restore_promotes_a_staged_file_to_the_confirmed_name() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backup_path = data_dir.path().join("source_backup.db");
+        host.db
+            .admin_backup(&backup_path.to_string_lossy())
+            .await
+            .unwrap();
+        host.admin_stage_restore(
+            &backup_path.to_string_lossy(),
+            &data_dir.path().to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        assert!(data_dir.path().join("pending_restore.staged.db").exists());
+        assert!(!data_dir.path().join("pending_restore.db").exists());
+
+        host.admin_apply_staged_restore(&data_dir.path().to_string_lossy())
+            .await
+            .expect("a validly staged restore must confirm");
+
+        assert!(
+            data_dir.path().join("pending_restore.db").exists(),
+            "confirming must promote the staged file to the confirmed name"
+        );
+        assert!(
+            !data_dir.path().join("pending_restore.staged.db").exists(),
+            "the inert staged name must not remain after confirmation"
+        );
+    }
+
+    /// Confirming with nothing staged must error and touch nothing —
+    /// otherwise a sysop hitting "apply" a second time, or by mistake,
+    /// could trigger a pointless restart with no restore to apply.
+    #[tokio::test]
+    async fn admin_apply_staged_restore_errors_when_nothing_is_staged() {
+        let (host, _live_db_file) = make_host().await;
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .admin_apply_staged_restore(&data_dir.path().to_string_lossy())
+            .await;
+        assert!(result.is_err(), "nothing staged must be an error");
+        assert!(!data_dir.path().join("pending_restore.db").exists());
+    }
+
+    /// A staged file left truncated by an interrupted upload must be
+    /// rejected at confirm time, not blindly promoted to the name that
+    /// triggers a destructive swap on next boot.
+    #[tokio::test]
+    async fn admin_apply_staged_restore_rejects_a_corrupt_staged_file() {
+        let (host, _live_db_file) = make_host().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            data_dir.path().join("pending_restore.staged.db"),
+            b"not a real sqlite file",
+        )
+        .await
+        .unwrap();
+
+        let result = host
+            .admin_apply_staged_restore(&data_dir.path().to_string_lossy())
+            .await;
+        assert!(result.is_err(), "a corrupt staged file must be rejected");
+        assert!(
+            !data_dir.path().join("pending_restore.db").exists(),
+            "a rejected confirmation must not create the confirmed name"
+        );
+        assert!(
+            !data_dir.path().join("pending_restore.staged.db").exists(),
+            "the corrupt staged file should be discarded, not left around \
+             to fail confirmation again on every future attempt"
+        );
+    }
+
+    /// `admin_stats`'s `discovered_contacts`/`protected_contacts` fields
+    /// must reflect the same `AdvertBus` the web UI's "Discovered Contacts"
+    /// and "Contacts" pages read from, not some separate count that could
+    /// silently drift from what those pages actually show.
+    #[tokio::test]
+    async fn admin_stats_reflects_advert_bus_counts() {
+        let (host, _live_db_file) = make_host().await;
+
+        let before = host.admin_stats().await.unwrap();
+        assert_eq!(before.discovered_contacts, 0);
+        assert_eq!(before.protected_contacts, 0);
+
+        let bus = host.advert_bus();
+        let protected_key = [1u8; 32];
+        let unprotected_key = [2u8; 32];
+        bus.upsert_contact(
+            protected_key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        bus.upsert(unprotected_key, "Unprotected".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+
+        let after = host.admin_stats().await.unwrap();
+        assert_eq!(
+            after.discovered_contacts, 2,
+            "counts every record, protected or not"
+        );
+        assert_eq!(after.protected_contacts, 1, "counts only the protected one");
     }
 }

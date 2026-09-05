@@ -176,7 +176,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
     <header class="page-header">
       <div>
         <h1>messages</h1>
-        <p class="muted">Browse and moderate room messages — mail DMs are private</p>
+        <p class="muted">Browse and moderate room messages. Mail DMs are private</p>
       </div>
       <div class="search-bar">
         <input

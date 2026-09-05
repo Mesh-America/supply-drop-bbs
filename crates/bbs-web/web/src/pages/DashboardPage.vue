@@ -39,7 +39,7 @@ onMounted(async () => {
   <div class="page">
     <header class="page-header">
       <h1>dashboard</h1>
-      <p class="muted">supply drop bbs — admin panel</p>
+      <p class="muted">supply drop bbs admin panel</p>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>
@@ -79,8 +79,12 @@ onMounted(async () => {
       <h2>quick actions</h2>
       <div class="link-grid">
         <router-link class="quick-link" to="/adverts">
-          <span class="ql-title">adverts</span>
+          <span class="ql-title">discovered contacts</span>
           <span class="ql-hint muted">nodes heard over the mesh</span>
+        </router-link>
+        <router-link class="quick-link" to="/contacts">
+          <span class="ql-title">contacts</span>
+          <span class="ql-hint muted">protected contacts</span>
         </router-link>
         <router-link class="quick-link" to="/sessions">
           <span class="ql-title">sessions</span>

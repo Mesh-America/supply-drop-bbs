@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { api } from '../api/client'
+import { api, request } from '../api/client'
 
 interface BackupRecord {
   filename: string
@@ -21,6 +21,12 @@ const triggering = ref(false)
 const deleting = ref<string | null>(null)
 const error = ref<string | null>(null)
 const actionOk = ref<string | null>(null)
+
+const restoreFile = ref<File | null>(null)
+const uploading = ref(false)
+const applying = ref(false)
+const restoreStaged = ref(false)
+const fileInput = ref<HTMLInputElement | null>(null)
 
 const backupDirConfigured = computed(() => settings.value?.backup_dir != null)
 
@@ -84,6 +90,60 @@ async function deleteBackup(filename: string) {
   }
 }
 
+function pickRestoreFile(e: Event) {
+  const input = e.target as HTMLInputElement
+  restoreFile.value = input.files?.[0] ?? null
+  error.value = null
+  actionOk.value = null
+}
+
+// Uploads and validates the file WITHOUT restarting anything — the server
+// checks it's a real, migration-compatible database before staging it, and
+// nothing about the live system changes until applyRestore is confirmed
+// separately.
+async function uploadRestoreFile() {
+  if (!restoreFile.value) return
+  uploading.value = true
+  error.value = null
+  actionOk.value = null
+  try {
+    const form = new FormData()
+    form.append('file', restoreFile.value)
+    await request('/api/v1/backups/restore', { method: 'POST', body: form })
+    restoreStaged.value = true
+    actionOk.value = `${restoreFile.value.name} validated and staged. Review, then apply below to restore it.`
+    restoreFile.value = null
+    if (fileInput.value) fileInput.value.value = ''
+  } catch (e: any) {
+    error.value = e?.message ?? 'upload failed: the file was not staged'
+  } finally {
+    uploading.value = false
+  }
+}
+
+// The destructive step: exits the process so it restarts with the staged
+// file swapped in. A pre-restore safety snapshot of the CURRENT database is
+// taken automatically before anything is overwritten.
+async function applyRestore() {
+  if (!confirm(
+    'This will REPLACE the current database with the staged backup and ' +
+    'restart the service now. A safety snapshot of the current database ' +
+    'is taken first. Continue?'
+  )) return
+  applying.value = true
+  error.value = null
+  actionOk.value = null
+  try {
+    await api.post('/api/v1/backups/restore/apply')
+    actionOk.value = 'Restore applying. The service is restarting, and this page will stop responding for a few seconds.'
+    restoreStaged.value = false
+  } catch (e: any) {
+    error.value = e?.message ?? 'restore failed to apply'
+  } finally {
+    applying.value = false
+  }
+}
+
 onMounted(load)
 </script>
 
@@ -112,6 +172,37 @@ onMounted(load)
     <div v-if="backupDirConfigured" class="dir-info muted small">
       directory: <code>{{ settings!.backup_dir }}</code>
     </div>
+
+    <section class="restore-panel">
+      <h2>restore from backup</h2>
+      <p class="muted small">
+        Upload a <code>.db</code> or <code>.zip</code> backup, from this system or another, to
+        replace the current database. The file is validated before anything changes; nothing
+        is applied until you confirm below.
+      </p>
+      <div class="restore-controls">
+        <input
+          ref="fileInput"
+          type="file"
+          accept=".db,.zip"
+          :disabled="uploading"
+          @change="pickRestoreFile"
+        />
+        <button @click="uploadRestoreFile" :disabled="!restoreFile || uploading">
+          {{ uploading ? 'validating…' : 'upload & validate' }}
+        </button>
+      </div>
+      <div v-if="restoreStaged" class="restore-staged">
+        <p>
+          A validated backup is staged and ready. Applying it <strong>replaces the current
+          database</strong> and restarts the service. A safety snapshot of the current
+          database is taken automatically first.
+        </p>
+        <button class="danger" @click="applyRestore" :disabled="applying">
+          {{ applying ? 'applying…' : 'apply restore (restarts service)' }}
+        </button>
+      </div>
+    </section>
 
     <p v-if="error" class="error">{{ error }}</p>
     <p v-if="actionOk" class="ok">{{ actionOk }}</p>
@@ -173,6 +264,25 @@ p { margin: 0; }
 .ok { color: #2a8a2a; }
 
 .dir-info { margin-top: -0.25rem; }
+
+.restore-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 0.9rem 1.1rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.restore-panel h2 { margin: 0; font-size: 1em; }
+.restore-controls { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
+.restore-staged {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+.restore-staged p { line-height: 1.5; }
 .config-notice {
   padding: 0.9rem 1.1rem;
   border: 1px solid var(--warning);

@@ -274,7 +274,7 @@ onUnmounted(() => {
     <header class="page-header">
       <div>
         <h1>metrics</h1>
-        <p class="muted">System resource snapshot — refreshes every 30 s</p>
+        <p class="muted">System resource snapshot, refreshes every 30 s</p>
       </div>
       <button @click="load" :disabled="loading">refresh</button>
     </header>
@@ -283,7 +283,7 @@ onUnmounted(() => {
     <p v-if="loading && !snap" class="muted">Loading…</p>
 
     <div v-if="stats.rssAlertActive" class="rss-alert-banner">
-      <strong>Memory growth detected</strong> — process RSS has increased
+      <strong>Memory growth detected.</strong> Process RSS has increased
       monotonically for at least 5 minutes
       <span v-if="stats.rssGrowthBytes > 0"> (+{{ fmt(stats.rssGrowthBytes) }})</span>.
       This may indicate a memory leak. Monitor closely or consider restarting.
@@ -362,7 +362,7 @@ onUnmounted(() => {
     <section v-if="delivery" class="section">
       <h2 class="section-title">Inbound message health (cumulative since start)</h2>
       <p class="muted">
-        Where inbound DMs are lost before the BBS acts on them — read alongside the confirm rate above
+        Where inbound DMs are lost before the BBS acts on them. Read alongside the confirm rate above
         to tell an outbound return-path problem from an inbound one.
       </p>
       <div class="metrics-grid">
@@ -375,7 +375,7 @@ onUnmounted(() => {
           <div class="card-label">Dedup drops</div>
           <div class="big-num">{{ ratePct(dedupDropRate) }}</div>
           <div class="bar-track"><div class="bar-fill" :style="{ width: rateWidth(dedupDropRate) + '%' }" :class="failBarClass(dedupDropRate)"></div></div>
-          <div class="card-sub muted">{{ delivery.dedup_dropped_timestamp }} timestamp / {{ delivery.dedup_dropped_text }} text — retransmissions dropped</div>
+          <div class="card-sub muted">{{ delivery.dedup_dropped_timestamp }} timestamp / {{ delivery.dedup_dropped_text }} text (retransmissions dropped)</div>
         </div>
       </div>
     </section>
@@ -394,14 +394,14 @@ onUnmounted(() => {
       </svg>
       <div class="trend-axis muted">
         <span>{{ trendStart }}</span>
-        <span>confirm rate % — gaps are minutes with no reply traffic</span>
+        <span>confirm rate %, gaps are minutes with no reply traffic</span>
         <span>{{ trendEnd }}</span>
       </div>
     </section>
 
     <!-- Per-node link health -->
     <section v-if="delivery && delivery.per_node.length > 0" class="section">
-      <h2 class="section-title">Per-node link health — worst first ({{ delivery.nodes_tracked }} node{{ delivery.nodes_tracked === 1 ? '' : 's' }} tracked)</h2>
+      <h2 class="section-title">Per-node link health, worst first ({{ delivery.nodes_tracked }} node{{ delivery.nodes_tracked === 1 ? '' : 's' }} tracked)</h2>
       <div class="table-wrap">
         <table class="data-table">
           <thead>

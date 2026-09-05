@@ -119,6 +119,12 @@ pub struct AdminStats {
     pub total_rooms: i64,
     /// Count of currently live BBS sessions.
     pub active_sessions: usize,
+    /// Total mesh advert-bus records ever seen, protected or not — "Discovered
+    /// Contacts" in the web UI. `0` when no mesh transport is running.
+    pub discovered_contacts: usize,
+    /// Currently-protected advert-bus records — "Contacts" in the web UI.
+    /// `0` when no mesh transport is running.
+    pub protected_contacts: usize,
 }
 
 /// One entry in the top-senders report.

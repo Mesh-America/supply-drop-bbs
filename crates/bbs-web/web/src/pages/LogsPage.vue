@@ -106,7 +106,7 @@ onUnmounted(stop)
       </div>
       <div v-else class="empty-state">
         <p class="muted" v-if="!running">Press <strong>start</strong> to begin streaming log events.</p>
-        <p class="muted" v-else>No log events yet — application events will appear here as they occur.</p>
+        <p class="muted" v-else>No log events yet. Application events will appear here as they occur.</p>
       </div>
     </div>
   </div>
