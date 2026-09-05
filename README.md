@@ -32,11 +32,11 @@ to:
   device running the MeshCore companion firmware (no Python, no bridge
   process), or over TCP to
   [`pymc_core`](https://github.com/meshcore-dev/pymc_core)'s
-  CompanionFrameServer for Raspberry Pi HAT deployments. A third
-  transport lets an operator run any executable (Telnet, Slack, Discord,
-  APRS, SMS, ...) as a BBS transport over a simple JSON IPC protocol. The
-  BBS-core itself is protocol-agnostic; see
-  [ADR-0011](docs/adr/0011-transport-protocol-agnostic-core.md).
+  CompanionFrameServer, which also covers Raspberry Pi HAT radios as a
+  special case. A third transport lets an operator run any executable
+  (Telnet, Slack, Discord, APRS, SMS, ...) as a BBS transport over a
+  simple JSON IPC protocol. The BBS-core itself is protocol-agnostic;
+  see [ADR-0011](docs/adr/0011-transport-protocol-agnostic-core.md).
 - **CLI clients**, either an interactive session over a Unix-domain
   socket for local administration and scripting, or one-shot
   subcommands (`backup`/`restore`, user and room management, node key
