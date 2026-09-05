@@ -161,6 +161,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "rustversion",
@@ -274,6 +275,7 @@ dependencies = [
  "tokio",
  "toml_edit",
  "tracing",
+ "zip",
 ]
 
 [[package]]
