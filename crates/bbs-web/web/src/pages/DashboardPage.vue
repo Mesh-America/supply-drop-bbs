@@ -39,7 +39,7 @@ onMounted(async () => {
   <div class="page">
     <header class="page-header">
       <h1>dashboard</h1>
-      <p class="muted">supply drop bbs — admin panel</p>
+      <p class="muted">supply drop bbs admin panel</p>
     </header>
 
     <p v-if="error" class="error">{{ error }}</p>

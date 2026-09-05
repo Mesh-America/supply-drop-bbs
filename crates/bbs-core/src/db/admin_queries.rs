@@ -20,11 +20,14 @@ use tracing;
 // dead_code analysis does not follow, so these pub(crate) helpers appear unused.
 #[allow(dead_code)]
 impl Database {
-    /// Aggregate BBS statistics.  `active_sessions` is passed in because the
-    /// session count lives in `BbsHost`, not the DB.
+    /// Aggregate BBS statistics.  `active_sessions`, `discovered_contacts`,
+    /// and `protected_contacts` are passed in because they live in
+    /// `BbsHost`'s session tracker and advert bus, not the DB.
     pub(crate) async fn admin_stats(
         &self,
         active_sessions: usize,
+        discovered_contacts: usize,
+        protected_contacts: usize,
     ) -> Result<AdminStats, StoreError> {
         let active: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM users WHERE status = 0 AND permission_level > 0",
@@ -57,6 +60,8 @@ impl Database {
             total_messages,
             total_rooms,
             active_sessions,
+            discovered_contacts,
+            protected_contacts,
         })
     }
 

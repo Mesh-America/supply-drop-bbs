@@ -1375,8 +1375,10 @@ impl Host for BbsHost {
 
     async fn admin_stats(&self) -> Result<AdminStats, HostError> {
         let active_sessions = self.sessions.read().await.len();
+        let discovered_contacts = self.advert_bus.count();
+        let protected_contacts = self.advert_bus.count_protected();
         self.db
-            .admin_stats(active_sessions)
+            .admin_stats(active_sessions, discovered_contacts, protected_contacts)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
@@ -9419,5 +9421,48 @@ mod tests {
             "the corrupt staged file should be discarded, not left around \
              to fail confirmation again on every future attempt"
         );
+    }
+
+    /// `admin_stats`'s `discovered_contacts`/`protected_contacts` fields
+    /// must reflect the same `AdvertBus` the web UI's "Discovered Contacts"
+    /// and "Contacts" pages read from, not some separate count that could
+    /// silently drift from what those pages actually show.
+    #[tokio::test]
+    async fn admin_stats_reflects_advert_bus_counts() {
+        let (host, _live_db_file) = make_host().await;
+
+        let before = host.admin_stats().await.unwrap();
+        assert_eq!(before.discovered_contacts, 0);
+        assert_eq!(before.protected_contacts, 0);
+
+        let bus = host.advert_bus();
+        let protected_key = [1u8; 32];
+        let unprotected_key = [2u8; 32];
+        bus.upsert_contact(
+            protected_key,
+            "Protected".into(),
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Vec::new(),
+            -1,
+            "meshcore",
+        );
+        bus.upsert(unprotected_key, "Unprotected".into(), 1, 0, 0, "meshcore");
+        assert!(matches!(
+            bus.mark_favourite_if_eligible(protected_key, |_| true, 350, &[]),
+            bbs_plugin_api::FavouriteOutcome::Protected(_)
+        ));
+
+        let after = host.admin_stats().await.unwrap();
+        assert_eq!(
+            after.discovered_contacts, 2,
+            "counts every record, protected or not"
+        );
+        assert_eq!(after.protected_contacts, 1, "counts only the protected one");
     }
 }

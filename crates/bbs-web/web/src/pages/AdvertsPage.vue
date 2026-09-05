@@ -138,7 +138,7 @@ const columns = [
 <template>
   <div class="page">
     <header class="page-header">
-      <h1>discovered contacts</h1>
+      <h1>discovered contacts <span class="count-badge">{{ rows.length }}</span></h1>
       <p class="muted small">
         Every node heard over the mesh, protected or not. Polls every 5 s.
         You must have received a node's advert before you can communicate with it.
@@ -164,8 +164,8 @@ const columns = [
         </label>
         <span class="muted small">
           {{ flood
-            ? 'rebroadcast hop-by-hop — more reach, more airtime'
-            : 'neighbours only — single hop' }}
+            ? 'rebroadcast hop-by-hop: more reach, more airtime'
+            : 'neighbours only: single hop' }}
         </span>
         <button
           class="btn-danger"
@@ -250,6 +250,12 @@ const columns = [
 .page-header { display: flex; flex-direction: column; gap: 0.2rem; }
 h1 { margin: 0; }
 .small { font-size: 0.85em; }
+.count-badge {
+  display: inline-block; font-size: 0.55em; font-weight: 600;
+  background: var(--row-alt); color: var(--muted); border-radius: 999px;
+  padding: 0.15em 0.65em; vertical-align: middle; letter-spacing: 0.02em;
+  border: 1px solid var(--border);
+}
 
 .send-block {
   border: 1px solid var(--border);

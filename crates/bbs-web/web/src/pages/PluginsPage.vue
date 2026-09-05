@@ -97,7 +97,7 @@ async function restartServer() {
   restarting.value = true
   try {
     await api.post('/api/v1/restart', {})
-    toast.ok('Restart initiated — page will reload in a few seconds…')
+    toast.ok('Restart initiated. Page will reload in a few seconds…')
     setTimeout(() => window.location.reload(), 5000)
   } catch (e: any) {
     toast.error(e?.message ?? 'restart failed')
@@ -219,7 +219,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
 
     <!-- Restart banner -->
     <div v-if="pendingRestart" class="restart-banner">
-      <span>Transport config changed — a restart is required for changes to take effect.</span>
+      <span>Transport config changed. A restart is required for changes to take effect.</span>
       <button v-if="auth.isSysop" :disabled="restarting" @click="restartServer" class="restart-btn">
         {{ restarting ? 'restarting…' : 'restart now' }}
       </button>
@@ -313,7 +313,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
             </td>
             <td>
               <span :class="stateClass(p)">{{ p.state }}</span>
-              <span v-if="p.state === 'crashed'" class="muted small"> — {{ p.reason }}</span>
+              <span v-if="p.state === 'crashed'" class="muted small">: {{ p.reason }}</span>
             </td>
             <td class="muted small">{{ p.restart_count }}</td>
             <td v-if="auth.isSysop" class="actions">
@@ -345,7 +345,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
       <div v-if="logPlugin" class="drawer-backdrop" @click.self="logPlugin = null">
         <aside class="drawer">
           <div class="drawer-header">
-            <h2>{{ logPlugin.name }} — stderr</h2>
+            <h2>{{ logPlugin.name }}: stderr</h2>
             <button class="secondary small-btn" @click="logPlugin = null">✕</button>
           </div>
           <p v-if="loadingLogs" class="muted">loading…</p>
