@@ -6,18 +6,15 @@
 
 ## Context
 
-v1 ships with a single mesh transport: MeshCore, via
-`pymc_core`'s CompanionFrameServer. The architecture is built
-around a `TransportEngine` plugin contract that allows other
-transports to be added later - and one of those is almost
-certainly going to be Meshtastic, which has a substantially
-larger user base than MeshCore today.
+v1 shipped with a single mesh transport, MeshCore. The
+architecture is built around a `TransportEngine` plugin contract
+that allows other transports to be added later, and Meshtastic -
+which has a substantially larger user base than MeshCore - was
+added as a second, fully-supported transport shortly after
+(`bbs-meshtastic`). Both ship today.
 
 Other plausible future transports:
 
-- **Meshtastic** - protobuf over USB / BLE / TCP, no bridge
-  process needed (the device's firmware speaks the protocol
-  directly to the host)
 - **Reticulum / RNS** - a different mesh-network design altogether
 - **Custom packet radio** - AX.25 over an analog HT
 - **Telnet / TCP raw** - for network-attached operators
@@ -151,7 +148,7 @@ The mapping table lives in the MeshCore plugin's migration set.
 ### Compliant: a Meshtastic transport plugin doing the same thing
 
 ```rust
-// In bbs-meshtastic (hypothetical future plugin)
+// In bbs-meshtastic (the Meshtastic transport plugin)
 //
 //   CREATE TABLE meshtastic_identities (
 //     username TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
