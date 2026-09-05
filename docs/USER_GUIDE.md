@@ -425,6 +425,25 @@ R
 Shows the five most recent messages, newest at the top. Good for catching up
 quickly.
 
+### While reading a message
+
+Once `F`, `N`, or `R` shows you a message, single-key shortcuts control what
+happens next — no need to retype the full command:
+
+| Key | Action |
+|-----|--------|
+| `F` | Next message (forward) |
+| `R` | Previous message (back) |
+| `E` | Reply to this message |
+| `D` | Delete this message |
+| `H` | Show this help |
+| `X` | Exit reading |
+
+`D` (or `D <id>` to delete a different message you read earlier in the same
+session) deletes immediately and doesn't disturb your place — deleting the
+message currently on screen ends reading mode since there's nothing left to
+show; deleting any other id leaves you exactly where you were.
+
 ### Scan message headers
 
 ```
