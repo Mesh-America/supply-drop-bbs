@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { api, ApiError } from '../api/client'
 
 interface ConfigData {
@@ -399,9 +399,14 @@ function applyPreset(name: string) {
   radioTxPowerDbm.value      = String(p.tx_power_dbm)
 }
 
-watch(radioPreset, (name) => {
-  if (name) applyPreset(name)
-})
+// Fired only by the operator picking a preset from the dropdown — NOT a
+// watch() on radioPreset. loadRadioConfig() also sets radioPreset.value (to
+// reflect a stored preset name), and a watch() would fire from that too,
+// clobbering individually-overridden fields loaded moments earlier with the
+// preset's raw defaults every time the page loads.
+function onRadioPresetChange() {
+  if (radioPreset.value) applyPreset(radioPreset.value)
+}
 
 async function loadRadioConfig() {
   radioLoading.value = true
@@ -1207,8 +1212,12 @@ chmod g+w {{ configFile }}</pre>
 
         <div class="field">
           <label>Region preset</label>
-          <select v-model="radioPreset" :disabled="radioLoading" style="max-width: 320px">
+          <select v-model="radioPreset" @change="onRadioPresetChange" :disabled="radioLoading" style="max-width: 320px">
             <option value="">(select a preset to fill values below)</option>
+            <option
+              v-if="radioPreset && !radioPresets.some(p => p.name === radioPreset)"
+              :value="radioPreset"
+            >{{ radioPreset }}</option>
             <option v-for="p in radioPresets" :key="p.name" :value="p.name">{{ p.name }}</option>
           </select>
           <p class="hint">Selecting a preset fills in the parameters below. You can then adjust individual values.</p>
