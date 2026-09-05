@@ -4563,6 +4563,18 @@ mod tests {
         assert_eq!(set.path_bytes, Some(Some(2)));
     }
 
+    // The frontend looks up a preset by name (Vec::find) and uses name as a
+    // Vue :key. A duplicate name would make the second entry unreachable and
+    // collide as a key, both silently.
+    #[test]
+    fn radio_presets_have_unique_names() {
+        let mut names: Vec<&str> = RADIO_PRESETS.iter().map(|p| p.name).collect();
+        names.sort_unstable();
+        let mut deduped = names.clone();
+        deduped.dedup();
+        assert_eq!(names, deduped, "RADIO_PRESETS has a duplicate name");
+    }
+
     // T039b: api_adverts's `protected` field reflects AdvertRecord.flags bit 0.
     #[tokio::test]
     async fn api_adverts_reports_protected_field() {
