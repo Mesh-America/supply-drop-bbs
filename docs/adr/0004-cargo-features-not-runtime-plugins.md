@@ -105,11 +105,10 @@ won't be revisited.
 
 CI ships these binary variants per architecture:
 
-| Variant                      | Features                                |
-|------------------------------|-----------------------------------------|
-| `supply-drop-bbs`            | `transport-cli, transport-mesh` (default) |
-| `supply-drop-bbs-web`        | default + `admin-web`                   |
-| `supply-drop-bbs-headless`   | `transport-cli` only (development)      |
+| Variant                      | Features                                                                                       |
+|------------------------------|--------------------------------------------------------------------------------------------------|
+| `supply-drop-bbs`            | `transport-cli, transport-mesh, transport-meshtastic, admin-web, transport-process` (default)  |
+| `supply-drop-bbs-headless`   | `transport-cli, transport-mesh` only - no Meshtastic, no admin-web, no process-transport        |
 
 Architectures: `aarch64-unknown-linux-gnu` (Pi 4/5),
 `armv7-unknown-linux-gnueabihf` (older Pi),

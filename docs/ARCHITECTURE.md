@@ -473,17 +473,18 @@ Cargo features in the binary's `Cargo.toml`:
 
 ```toml
 [features]
-default = ["transport-cli", "transport-mesh"]
-transport-cli  = ["dep:bbs-cli"]
-transport-mesh = ["dep:bbs-mesh"]
-admin-web      = ["dep:bbs-web"]   # opt-in
+default               = ["transport-cli", "transport-mesh", "transport-meshtastic", "admin-web", "transport-process"]
+transport-cli         = ["dep:bbs-cli"]
+transport-mesh        = ["dep:bbs-mesh", "dep:meshcore-companion"]
+transport-meshtastic  = ["dep:bbs-meshtastic"]
+admin-web             = ["dep:bbs-web"]
+transport-process     = ["dep:bbs-process-transport"]
 ```
 
-CI builds three artefacts per architecture:
+CI builds two artefacts per architecture:
 
-- `supply-drop-bbs`           - default features (cli + mesh)
-- `supply-drop-bbs-web`       - default + admin-web
-- `supply-drop-bbs-headless`  - cli only (no mesh, for dev)
+- `supply-drop-bbs`           - default features (both mesh transports, the process-transport plugin, and admin-web all included)
+- `supply-drop-bbs-headless`  - `transport-cli, transport-mesh` only - no Meshtastic, no admin-web, no process-transport; smaller binary for resource-constrained nodes
 
 A future ADR may revisit this if we want runtime-loaded WASM
 plugins. Not v1.
