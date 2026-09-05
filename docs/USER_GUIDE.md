@@ -321,6 +321,16 @@ Rooms:
 - `[here]` marks your current room
 - `(3 new)` shows the unread count
 
+If the list doesn't fit in a single mesh reply, it's paginated with a
+trailer:
+
+```
+(more — press K again for the next page)
+```
+
+Press `K` again to see the next page; it keeps paging until every room
+you have access to has been shown once.
+
 ### Change room
 
 ```
