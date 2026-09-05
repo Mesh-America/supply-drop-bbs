@@ -1460,6 +1460,25 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    async fn admin_stage_restore(
+        &self,
+        uploaded_path: &str,
+        data_dir: &str,
+    ) -> Result<(), HostError> {
+        crate::db::Database::stage_restore(
+            std::path::Path::new(uploaded_path),
+            std::path::Path::new(data_dir),
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_apply_staged_restore(&self, data_dir: &str) -> Result<(), HostError> {
+        crate::db::Database::admin_apply_staged_restore(std::path::Path::new(data_dir))
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
     async fn admin_write_audit(
         &self,
         actor: &str,
@@ -9078,6 +9097,327 @@ mod tests {
         assert!(
             matches!(&resp, Response::Text(t) if t == "Mail sent to bob."),
             "multi-step mail send should confirm 'Mail sent to bob.', got: {resp:?}"
+        );
+    }
+
+    // ── Issue #195: restore-upload staging (validate without touching live DB) ─
+
+    /// A genuine backup of this BBS's own schema (produced the same way
+    /// `admin_trigger_backup` does, via VACUUM INTO) must validate and land
+    /// at `<data_dir>/pending_restore.staged.db` — the inert staged name,
+    /// not the name that actually triggers a swap on next boot — without
+    /// touching the live database at all.
+    #[tokio::test]
+    async fn stage_restore_accepts_a_genuine_backup_and_leaves_live_db_untouched() {
+        let (host, live_db_file) = make_host().await;
+
+        // Confirm the live DB has real content before staging anything, so
+        // "untouched" below is a meaningful assertion, not a vacuous one.
+        RoomStore::create(
+            &host.db,
+            "Untouched Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        let live_before = tokio::fs::read(live_db_file.path()).await.unwrap();
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backup_path = data_dir.path().join("source_backup.db");
+        host.db
+            .admin_backup(&backup_path.to_string_lossy())
+            .await
+            .expect("admin_backup should produce a valid backup file");
+
+        host.admin_stage_restore(
+            &backup_path.to_string_lossy(),
+            &data_dir.path().to_string_lossy(),
+        )
+        .await
+        .expect("a genuine backup of this schema must validate and stage");
+
+        let staged = data_dir.path().join("pending_restore.staged.db");
+        assert!(
+            staged.exists(),
+            "a valid upload must be staged at pending_restore.staged.db"
+        );
+        assert!(
+            !data_dir.path().join("pending_restore.db").exists(),
+            "staging alone must never create the confirmed name that \
+             actually triggers a swap on next boot — only \
+             admin_apply_staged_restore may do that"
+        );
+
+        let live_after = tokio::fs::read(live_db_file.path()).await.unwrap();
+        assert_eq!(
+            live_before, live_after,
+            "staging a restore must never modify the live database file"
+        );
+    }
+
+    /// `admin_backup`'s own zip-bundling caller never offers a raw `.db`
+    /// for download, only a `.zip` — so restore must accept that same zip
+    /// end to end, not just in the unit-level zip-extraction tests.
+    #[tokio::test]
+    async fn stage_restore_accepts_a_zip_wrapped_genuine_backup() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backup_path = data_dir.path().join("source_backup.db");
+        host.db
+            .admin_backup(&backup_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        let zip_path = data_dir.path().join("source_backup.zip");
+        let db_bytes = tokio::fs::read(&backup_path).await.unwrap();
+        {
+            use std::io::Write as _;
+            let file = std::fs::File::create(&zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opts = zip::write::SimpleFileOptions::default();
+            zip.start_file("source_backup.db", opts).unwrap();
+            zip.write_all(&db_bytes).unwrap();
+            zip.finish().unwrap();
+        }
+
+        host.admin_stage_restore(
+            &zip_path.to_string_lossy(),
+            &data_dir.path().to_string_lossy(),
+        )
+        .await
+        .expect("a zip-wrapped genuine backup must validate and stage");
+
+        assert!(
+            data_dir.path().join("pending_restore.staged.db").exists(),
+            "the extracted .db must be staged, not the zip itself"
+        );
+    }
+
+    /// A file that isn't a SQLite database at all must be rejected before
+    /// anything is staged or the live database is touched.
+    #[tokio::test]
+    async fn stage_restore_rejects_a_non_sqlite_file() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let bogus_path = data_dir.path().join("not_a_database.db");
+        tokio::fs::write(&bogus_path, b"definitely not a sqlite file")
+            .await
+            .unwrap();
+
+        let result = host
+            .admin_stage_restore(
+                &bogus_path.to_string_lossy(),
+                &data_dir.path().to_string_lossy(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a non-SQLite file must be rejected, not silently staged"
+        );
+
+        let staged = data_dir.path().join("pending_restore.staged.db");
+        assert!(
+            !staged.exists(),
+            "a rejected upload must not be staged for restore"
+        );
+    }
+
+    /// Every migration in crates/bbs-core/migrations is written to be safely
+    /// re-runnable (CREATE TABLE IF NOT EXISTS, INSERT OR IGNORE, DROP TABLE
+    /// IF EXISTS + CREATE TABLE), so running the migrator alone against a
+    /// brand-new, empty-but-valid SQLite file succeeds and quietly builds a
+    /// full empty schema out of it. Validation must catch this case
+    /// explicitly — a file migrate! is merely *willing to adopt* is not the
+    /// same as a file that is genuinely a prior backup of this application.
+    #[tokio::test]
+    async fn stage_restore_rejects_a_brand_new_empty_sqlite_file() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let empty_path = data_dir.path().join("empty.db");
+        {
+            use sqlx::sqlite::SqliteConnectOptions;
+            let opts = SqliteConnectOptions::new()
+                .filename(&empty_path)
+                .create_if_missing(true);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            // Merely opening and closing a connection does not force SQLite
+            // to write its header — that only happens on the first actual
+            // page write. VACUUM forces one, producing a genuinely
+            // initialized, zero-table database, mimicking what
+            // `sqlite3 empty.db "VACUUM;"` produces on the command line.
+            sqlx::query("VACUUM").execute(&pool).await.unwrap();
+            pool.close().await;
+        }
+        assert!(
+            tokio::fs::read(&empty_path).await.unwrap().len() >= 16,
+            "sanity check: SQLite must have written a real header for an \
+             empty database, or this test isn't exercising the header check"
+        );
+
+        let result = host
+            .admin_stage_restore(
+                &empty_path.to_string_lossy(),
+                &data_dir.path().to_string_lossy(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a brand-new empty SQLite file must be rejected — it has no \
+             migration history, so migrate! alone cannot distinguish it \
+             from a genuine backup that merely needs upgrading"
+        );
+
+        let staged = data_dir.path().join("pending_restore.staged.db");
+        assert!(
+            !staged.exists(),
+            "a rejected upload must not be staged for restore"
+        );
+    }
+
+    /// A candidate file that migrates cleanly (so the earlier checks all
+    /// pass) but has a structurally broken room linked-list must still be
+    /// rejected — otherwise this class of corruption is only discovered
+    /// AFTER the destructive swap in main.rs, which has no automatic
+    /// rollback to the pre-restore safety snapshot.
+    #[tokio::test]
+    async fn stage_restore_rejects_a_migratable_file_with_a_broken_room_walk_order() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backup_path = data_dir.path().join("source_backup.db");
+        host.db
+            .admin_backup(&backup_path.to_string_lossy())
+            .await
+            .unwrap();
+
+        // Corrupt the backup directly: give a second room a NULL
+        // prev_neighbor, creating two "heads" in what must be a single
+        // linked list.
+        {
+            use sqlx::sqlite::SqliteConnectOptions;
+            let opts = SqliteConnectOptions::new()
+                .filename(&backup_path)
+                .create_if_missing(false);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE rooms SET prev_neighbor = NULL WHERE id = 2")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+
+        let result = host
+            .admin_stage_restore(
+                &backup_path.to_string_lossy(),
+                &data_dir.path().to_string_lossy(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a schema-valid but structurally broken room list must be rejected"
+        );
+
+        let staged = data_dir.path().join("pending_restore.staged.db");
+        assert!(
+            !staged.exists(),
+            "a rejected upload must not be staged for restore"
+        );
+    }
+
+    /// Confirming a staged restore must promote it to `pending_restore.db`
+    /// — the only name main.rs's startup check watches for — and must not
+    /// create that name before confirmation happens (issue #195: an
+    /// earlier version staged directly under that name, so ANY unrelated
+    /// restart between upload and confirmation silently applied an
+    /// unconfirmed restore).
+    #[tokio::test]
+    async fn admin_apply_staged_restore_promotes_a_staged_file_to_the_confirmed_name() {
+        let (host, _live_db_file) = make_host().await;
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let backup_path = data_dir.path().join("source_backup.db");
+        host.db
+            .admin_backup(&backup_path.to_string_lossy())
+            .await
+            .unwrap();
+        host.admin_stage_restore(
+            &backup_path.to_string_lossy(),
+            &data_dir.path().to_string_lossy(),
+        )
+        .await
+        .unwrap();
+        assert!(data_dir.path().join("pending_restore.staged.db").exists());
+        assert!(!data_dir.path().join("pending_restore.db").exists());
+
+        host.admin_apply_staged_restore(&data_dir.path().to_string_lossy())
+            .await
+            .expect("a validly staged restore must confirm");
+
+        assert!(
+            data_dir.path().join("pending_restore.db").exists(),
+            "confirming must promote the staged file to the confirmed name"
+        );
+        assert!(
+            !data_dir.path().join("pending_restore.staged.db").exists(),
+            "the inert staged name must not remain after confirmation"
+        );
+    }
+
+    /// Confirming with nothing staged must error and touch nothing —
+    /// otherwise a sysop hitting "apply" a second time, or by mistake,
+    /// could trigger a pointless restart with no restore to apply.
+    #[tokio::test]
+    async fn admin_apply_staged_restore_errors_when_nothing_is_staged() {
+        let (host, _live_db_file) = make_host().await;
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let result = host
+            .admin_apply_staged_restore(&data_dir.path().to_string_lossy())
+            .await;
+        assert!(result.is_err(), "nothing staged must be an error");
+        assert!(!data_dir.path().join("pending_restore.db").exists());
+    }
+
+    /// A staged file left truncated by an interrupted upload must be
+    /// rejected at confirm time, not blindly promoted to the name that
+    /// triggers a destructive swap on next boot.
+    #[tokio::test]
+    async fn admin_apply_staged_restore_rejects_a_corrupt_staged_file() {
+        let (host, _live_db_file) = make_host().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        tokio::fs::write(
+            data_dir.path().join("pending_restore.staged.db"),
+            b"not a real sqlite file",
+        )
+        .await
+        .unwrap();
+
+        let result = host
+            .admin_apply_staged_restore(&data_dir.path().to_string_lossy())
+            .await;
+        assert!(result.is_err(), "a corrupt staged file must be rejected");
+        assert!(
+            !data_dir.path().join("pending_restore.db").exists(),
+            "a rejected confirmation must not create the confirmed name"
+        );
+        assert!(
+            !data_dir.path().join("pending_restore.staged.db").exists(),
+            "the corrupt staged file should be discarded, not left around \
+             to fail confirmation again on every future attempt"
         );
     }
 }

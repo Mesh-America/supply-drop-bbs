@@ -47,6 +47,8 @@
 //! │  │  GET  /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups/:filename    (auth)       │    │
 //! │  │  DELETE /api/v1/backups/:filename  (auth)       │    │
+//! │  │  POST /api/v1/backups/restore      (auth)       │    │
+//! │  │  POST /api/v1/backups/restore/apply(auth)       │    │
 //! │  │  GET  /api/v1/plugins              (auth)       │    │
 //! │  │  POST /api/v1/plugins              (auth)       │    │
 //! │  │  DELETE /api/v1/plugins/:name      (auth)       │    │
@@ -83,7 +85,7 @@ use error_tracker::{ErrorEntry, ErrorStore};
 use rss_monitor::RssAlert;
 
 use async_trait::async_trait;
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, Sse};
@@ -241,6 +243,17 @@ struct AppState {
     /// by the host binary after plugin init via [`WebPlugin::set_backup_dir`].
     /// When `None` the backup endpoints return 503.
     backup_dir: std::sync::Mutex<Option<String>>,
+    /// The BBS's data directory, sourced from `[bbs] data_dir` and injected
+    /// by the host binary after plugin init via [`WebPlugin::set_data_dir`].
+    /// Used to stage an uploaded restore file where `main.rs`'s startup
+    /// check will find it (issue #195).
+    data_dir: std::sync::Mutex<Option<String>>,
+    /// Serializes the whole validate-and-stage / confirm sequence for a
+    /// restore so two concurrent uploads (or an upload racing a confirm)
+    /// can't clobber the shared `pending_restore*.db` paths — an async
+    /// mutex, not `std::sync::Mutex`, since the guard must be held across
+    /// `.await` points (file I/O, running migrations against the upload).
+    restore_lock: tokio::sync::Mutex<()>,
     sessions: Mutex<HashMap<String, WebSession>>,
     started_at: Instant,
     log_tx: broadcast::Sender<String>,
@@ -270,6 +283,8 @@ impl AppState {
             host,
             config,
             backup_dir: std::sync::Mutex::new(None),
+            data_dir: std::sync::Mutex::new(None),
+            restore_lock: tokio::sync::Mutex::new(()),
             sessions: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             log_tx,
@@ -289,6 +304,11 @@ impl AppState {
     /// Return the configured backup directory, if any.
     fn backup_dir(&self) -> Option<String> {
         self.backup_dir.lock().expect("backup_dir poisoned").clone()
+    }
+
+    /// Return the BBS's data directory, if injected.
+    fn data_dir(&self) -> Option<String> {
+        self.data_dir.lock().expect("data_dir poisoned").clone()
     }
 
     fn create_session(&self, username: String, permission_level: u8) -> String {
@@ -559,10 +579,20 @@ impl WebPlugin {
     /// Set the directory where backup files are stored.
     ///
     /// Always sourced from `[backup] directory` in the operator config —
-    /// there is no separate `[plugins.web] backup_dir` setting.  Must be
-    /// called before `start()`.
+    /// there is no separate `[plugins.web] backup_dir` setting. Safe to call
+    /// at any time, including after `start()`: request handlers read this
+    /// value live from its `Mutex` rather than caching it at startup.
     pub fn set_backup_dir(&self, dir: Option<String>) {
         *self.state.backup_dir.lock().expect("backup_dir poisoned") = dir;
+    }
+
+    /// Set the BBS's data directory, used to stage restore uploads where
+    /// `main.rs`'s startup check will find them. Sourced from `[bbs]
+    /// data_dir`. Safe to call at any time, including after `start()`: request
+    /// handlers read this value live from its `Mutex` rather than caching it
+    /// at startup.
+    pub fn set_data_dir(&self, dir: Option<String>) {
+        *self.state.data_dir.lock().expect("data_dir poisoned") = dir;
     }
 }
 
@@ -673,6 +703,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/backups/:filename",
             get(api_download_backup).delete(api_delete_backup),
         )
+        .route(
+            "/backups/restore",
+            post(api_upload_restore).layer(DefaultBodyLimit::max(RESTORE_UPLOAD_MAX_BYTES)),
+        )
+        .route("/backups/restore/apply", post(api_apply_restore))
         .route("/plugins", get(api_list_plugins).post(api_add_plugin))
         .route(
             "/plugins/:name",
@@ -3814,6 +3849,203 @@ async fn api_delete_backup(
         }
         Err(e) => server_error(&e.to_string()),
     }
+}
+
+/// axum's own default multipart/request body limit is 2 MiB — far too small
+/// for a real database backup. This route raises it just for itself (not
+/// the whole API) to a generous ceiling; the endpoint is sysop-gated, so the
+/// only downside of a large cap is disk/memory use by an already-trusted
+/// operator, not an unauthenticated DoS surface.
+const RESTORE_UPLOAD_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// `POST /api/v1/backups/restore` — accepts a multipart file upload,
+/// validates it as a restorable database WITHOUT touching the live one, and
+/// stages it for restore on next startup. Does NOT restart the process —
+/// call `api_apply_restore` (`POST /api/v1/backups/restore/apply`)
+/// separately once the sysop has confirmed (issue #195: upload and the
+/// destructive restart are deliberately two separate steps).
+///
+/// Accepts either a raw `.db` file or the `.zip` bundle `api_trigger_backup`
+/// produces (single `.db` entry, optional `config.toml`) — `api_trigger_backup`
+/// never offers a raw `.db` for download, only the zip, so a zip-only
+/// validator would reject every backup this same page ever produces.
+/// Zip detection and extraction live in `Database::stage_restore` (bbs-core)
+/// rather than here, so the CLI `restore` subcommand shares the same logic
+/// without depending on bbs-web.
+async fn api_upload_restore(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    mut multipart: Multipart,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let data_dir = match state.data_dir() {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("data_dir not configured")),
+            )
+                .into_response()
+        }
+    };
+    // Held for the rest of this handler so a second concurrent upload (or a
+    // confirm) can't interleave with this one's validate-then-rename onto
+    // the shared pending_restore.staged.db path.
+    let _restore_guard = state.restore_lock.lock().await;
+
+    let field = match multipart.next_field().await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("no file in upload")),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error(&format!("reading upload: {e}"))),
+            )
+                .into_response()
+        }
+    };
+    let bytes = match field.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error(&format!("reading upload: {e}"))),
+            )
+                .into_response()
+        }
+    };
+
+    // Write into data_dir itself (not the system temp dir) so the rename
+    // stage_restore performs on success lands on the same filesystem and
+    // is a fast, atomic move rather than a copy. stage_restore itself
+    // detects and extracts a zip upload, so the raw bytes are written
+    // as-is here regardless of format.
+    let tmp_path =
+        std::path::Path::new(&data_dir).join(format!("restore_upload_{}.tmp", Uuid::new_v4()));
+    if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+        return server_error(&format!("saving upload: {e}"));
+    }
+
+    let result = state
+        .host
+        .admin_stage_restore(&tmp_path.to_string_lossy(), &data_dir)
+        .await;
+    // On failure stage_restore never moves the file — clean it up here so
+    // a rejected upload doesn't leave junk in data_dir.
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+    }
+
+    match result {
+        Ok(()) => {
+            let _ = state
+                .host
+                .admin_write_audit(
+                    &format!("web:{}", caller.username),
+                    "restore_staged",
+                    None,
+                    None,
+                )
+                .await;
+            Json(serde_json::json!({
+                "message": "upload validated and staged — call restore to apply it"
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json_error(&e.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/backups/restore/apply` — confirms a previously-staged
+/// restore (see `api_upload_restore`) by promoting it from its inert staged
+/// name to the name `main.rs`'s startup check actually looks for
+/// (`admin_apply_staged_restore`), then exits the process so systemd's
+/// `Restart=always` brings up a fresh instance that performs the swap.
+/// Reuses `api_restart`'s exact systemd-presence gate and delayed-exit
+/// pattern, since the safe way to apply a restore and the safe way to
+/// restart the service are the same mechanism (issue #195).
+///
+/// Confirming and staging are deliberately two different filesystem states:
+/// an earlier version of this feature staged directly under the name
+/// `main.rs` watches for, which meant ANY unrelated restart between upload
+/// and confirmation — a crash, an operator restarting the service for an
+/// unrelated reason, systemd firing `Restart=always` after any exit —
+/// silently applied a restore nobody had confirmed yet.
+async fn api_apply_restore(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let data_dir = match state.data_dir() {
+        Some(d) => d,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("data_dir not configured")),
+            )
+                .into_response()
+        }
+    };
+    // Same lock api_upload_restore holds, so a confirm can't run while an
+    // upload is still mid-validate/rename against the same staged path.
+    let _restore_guard = state.restore_lock.lock().await;
+
+    if std::env::var("INVOCATION_ID").is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "not running under systemd — restart manually to apply the \
+                 staged restore: sudo systemctl restart supply-drop-bbs",
+            )),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = state.host.admin_apply_staged_restore(&data_dir).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(&format!(
+                "no restore is staged, or it could not be confirmed: {e}"
+            ))),
+        )
+            .into_response();
+    }
+
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", caller.username),
+            "restore_applied",
+            None,
+            None,
+        )
+        .await;
+
+    tracing::warn!("web admin: database restore confirmed — exiting to apply it on restart");
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        std::process::exit(1);
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({ "message": "restore applying — service is restarting" })),
+    )
+        .into_response()
 }
 
 // ── Domain event formatting ───────────────────────────────────────────────────
