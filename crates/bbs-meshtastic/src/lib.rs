@@ -694,6 +694,9 @@ async fn flush_deferred_writes(
     host: &Arc<dyn Host>,
     state: &Arc<Mutex<SessionState>>,
 ) {
+    // Writes whose `try_send` failed (channel momentarily full) and that get
+    // requeued for a future flush attempt rather than silently dropped.
+    let mut retry: Vec<DeferredWrite> = Vec::new();
     for w in deferred.drain(..) {
         let rid = random_packet_id();
         match w {
@@ -763,25 +766,44 @@ async fn flush_deferred_writes(
                 }
             }
             DeferredWrite::SetFixedPosition { lat, lon } => {
-                if cmd_tx
-                    .try_send(admin_set_fixed_position(
-                        node,
-                        rid,
-                        lat,
-                        lon,
-                        passkey.to_vec(),
-                    ))
-                    .is_ok()
-                {
-                    info!(lat, lon, "meshtastic: set fixed position on device");
+                // Requeue on a full channel rather than silently dropping: this
+                // write encodes the sysop's current share/location preference,
+                // and there is no other resync path for it short of a full
+                // device reconnect (which re-derives it from
+                // `host.node_location()` at the next ConfigCompleteId anyway).
+                match cmd_tx.try_send(admin_set_fixed_position(
+                    node,
+                    rid,
+                    lat,
+                    lon,
+                    passkey.to_vec(),
+                )) {
+                    Ok(()) => info!(lat, lon, "meshtastic: set fixed position on device"),
+                    Err(e) => {
+                        warn!(
+                            lat,
+                            lon,
+                            error = %e,
+                            "meshtastic: fixed-position write dropped; will retry"
+                        );
+                        retry.push(DeferredWrite::SetFixedPosition { lat, lon });
+                    }
                 }
             }
             DeferredWrite::RemoveFixedPosition => {
-                if cmd_tx
-                    .try_send(admin_remove_fixed_position(node, rid, passkey.to_vec()))
-                    .is_ok()
-                {
-                    info!("meshtastic: cleared fixed position on device");
+                // Same requeue-on-failure discipline as `SetFixedPosition` above
+                // — a dropped clear would otherwise leave a stale position
+                // broadcasting from the device indefinitely with no indication
+                // anything failed.
+                match cmd_tx.try_send(admin_remove_fixed_position(node, rid, passkey.to_vec())) {
+                    Ok(()) => info!("meshtastic: cleared fixed position on device"),
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "meshtastic: fixed-position removal dropped; will retry"
+                        );
+                        retry.push(DeferredWrite::RemoveFixedPosition);
+                    }
                 }
             }
             DeferredWrite::SetFavoriteNode {
@@ -860,6 +882,7 @@ async fn flush_deferred_writes(
             }
         }
     }
+    deferred.extend(retry);
 }
 
 /// Fail/discard all deferred writes on a radio disconnect — called from
@@ -1050,13 +1073,21 @@ async fn event_loop(
                             // Always sync the device clock to system time on connect.
                             deferred_writes.push(DeferredWrite::Time);
                             // Manage fixed position from the host's configured GPS:
-                            // set it when a location is configured, clear it otherwise.
+                            // set it when a location is configured AND sharing is
+                            // enabled (`[location].share_in_advert` — the same
+                            // preference the MeshCore transport reads to decide
+                            // whether to advertise position), clear it otherwise.
+                            // Meshtastic has no separate device-side "share" bit like
+                            // MeshCore's advert_loc_policy — a fixed position is
+                            // broadcast via the node's own Position app port as soon
+                            // as it's set, so gating the write itself is this
+                            // transport's equivalent of the "Share Position in
+                            // Advert" checkbox.
                             match host.node_location() {
-                                Some((lat, lon)) => deferred_writes
-                                    .push(DeferredWrite::SetFixedPosition { lat, lon }),
-                                None => {
-                                    deferred_writes.push(DeferredWrite::RemoveFixedPosition)
+                                Some((lat, lon)) if host.share_location_in_advert() => {
+                                    deferred_writes.push(DeferredWrite::SetFixedPosition { lat, lon })
                                 }
+                                _ => deferred_writes.push(DeferredWrite::RemoveFixedPosition),
                             }
                             // Push configured radio params, node name, and the
                             // node-info broadcast interval (all skip-if-unchanged).
@@ -3696,6 +3727,111 @@ serial_port = "/dev/ttyAMA0"
         assert!(
             ctx.state.lock().unwrap().is_pending_protect(sender),
             "a failed flush must re-arm pending-protect for a future retry"
+        );
+    }
+
+    // Hostile-audit regression: a channel-saturated SetFixedPosition write
+    // must not be silently dropped — it is requeued so a later flush (the
+    // very next FromRadio message, once the passkey is still held) retries
+    // it, rather than leaving the sysop's location preference unapplied
+    // until the next full device reconnect with zero indication of failure.
+    #[tokio::test]
+    async fn channel_saturated_set_fixed_position_is_requeued_not_dropped() {
+        let mut ctx = TestCtx::new();
+        ctx.deferred_writes.push(DeferredWrite::SetFixedPosition {
+            lat: 12.5,
+            lon: -45.25,
+        });
+
+        // Close the receiver so flush_deferred_writes's try_send fails.
+        ctx.cmd_rx.close();
+        ctx.flush(1, b"passkey").await;
+
+        assert!(
+            matches!(
+                ctx.deferred_writes.as_slice(),
+                [DeferredWrite::SetFixedPosition { lat, lon }]
+                    if (*lat - 12.5).abs() < f64::EPSILON && (*lon - (-45.25)).abs() < f64::EPSILON
+            ),
+            "a dropped SetFixedPosition write must be requeued for retry, not discarded"
+        );
+    }
+
+    // Same requeue-on-failure discipline as the SetFixedPosition test above,
+    // for the clear-position direction (exercised more often now that
+    // `[location].share_in_advert` can toggle sharing off).
+    #[tokio::test]
+    async fn channel_saturated_remove_fixed_position_is_requeued_not_dropped() {
+        let mut ctx = TestCtx::new();
+        ctx.deferred_writes.push(DeferredWrite::RemoveFixedPosition);
+
+        ctx.cmd_rx.close();
+        ctx.flush(1, b"passkey").await;
+
+        assert!(
+            matches!(
+                ctx.deferred_writes.as_slice(),
+                [DeferredWrite::RemoveFixedPosition]
+            ),
+            "a dropped RemoveFixedPosition write must be requeued for retry, not discarded"
+        );
+    }
+
+    // Proves the requeue is a genuine retry, not a permanent wedge: once the
+    // channel actually has room again, a later flush sends the previously
+    // dropped write and clears it from `deferred_writes`. Uses a genuinely
+    // full (not closed) channel, since a closed `Sender` never recovers and
+    // would not distinguish "requeued" from "stuck forever".
+    #[tokio::test]
+    async fn requeued_fixed_position_write_sends_once_channel_drains() {
+        let mut ctx = TestCtx::new();
+        ctx.deferred_writes.push(DeferredWrite::SetFixedPosition {
+            lat: 12.5,
+            lon: -45.25,
+        });
+
+        // Saturate the channel (capacity 16) with filler traffic so the
+        // first flush's try_send fails on a full, not closed, channel.
+        for _ in 0..16 {
+            ctx.cmd_tx
+                .try_send(proto::ToRadio {
+                    payload_variant: None,
+                })
+                .expect("channel has room for filler traffic");
+        }
+        ctx.flush(1, b"passkey").await;
+        assert_eq!(
+            ctx.deferred_writes.len(),
+            1,
+            "first flush must fail and requeue while the channel is full"
+        );
+
+        // Free exactly one slot and flush again.
+        ctx.cmd_rx
+            .try_recv()
+            .expect("a filler message must be present to drain");
+        ctx.flush(1, b"passkey").await;
+
+        assert!(
+            ctx.deferred_writes.is_empty(),
+            "a later flush must actually send the requeued write once the channel has room"
+        );
+        // `decode_admin` can't distinguish *which* admin command this is:
+        // `SetFixedPosition`'s wire tag (41) isn't in `AdminMessage`'s own
+        // oneof `tags` list (see that field's doc comment), so prost skips
+        // it as an unrecognized field and `payload_variant` decodes back as
+        // `None` — a real, pre-existing decode gap, not something this test
+        // can work around. What it CAN prove: exactly one of the drained
+        // messages is admin-portnum-shaped at all (every filler message is a
+        // bare `ToRadio { payload_variant: None }`, which `decode_admin`
+        // rejects outright) — and since the only write ever queued in this
+        // test is the requeued `SetFixedPosition`, that one packet must be
+        // its retry actually reaching the wire.
+        let admin = ctx.drain_admin();
+        assert_eq!(
+            admin.len(),
+            1,
+            "the requeued SetFixedPosition must have actually reached the wire on retry"
         );
     }
 

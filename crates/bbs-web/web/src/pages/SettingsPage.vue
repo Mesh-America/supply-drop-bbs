@@ -12,6 +12,7 @@ interface ConfigData {
   bbs_timezone: string | null
   location_latitude: number | null
   location_longitude: number | null
+  location_share_in_advert: boolean | null
   backup_enabled: boolean | null
   backup_interval_hours: number | null
   backup_keep_daily: number | null
@@ -41,6 +42,7 @@ const form = ref({
   location_enabled: false,
   location_latitude: '',
   location_longitude: '',
+  location_share_in_advert: true,
   backup_enabled: true,
   backup_interval_hours: 6,
   backup_keep_daily: 7,
@@ -118,6 +120,7 @@ function populateForm(c: ConfigData) {
   form.value.location_enabled   = c.location_latitude != null && c.location_longitude != null
   form.value.location_latitude  = c.location_latitude  != null ? String(c.location_latitude)  : ''
   form.value.location_longitude = c.location_longitude != null ? String(c.location_longitude) : ''
+  form.value.location_share_in_advert = c.location_share_in_advert ?? true
 
   form.value.backup_enabled        = c.backup_enabled        ?? true
   form.value.backup_interval_hours = c.backup_interval_hours ?? 6
@@ -248,6 +251,7 @@ async function save() {
       patch.location_latitude  = null
       patch.location_longitude = null
     }
+    patch.location_share_in_advert = form.value.location_share_in_advert
 
     const res = await api.patch<{ message: string }>('/api/v1/config', patch)
     saveOk.value = res.message
@@ -1062,8 +1066,7 @@ chmod g+w {{ configFile }}</pre>
       <section v-show="settingsTab === 'general'" class="card">
         <h2>GPS location</h2>
         <p class="hint">
-          When set, the mesh transport sends your coordinates to the radio on connect so your
-          node appears on the map in LoRa adverts.
+          When set, the mesh transport sends your coordinates to the radio on connect.
           <strong>Takes effect on the next mesh transport reconnect. No restart needed.</strong>
         </p>
         <div class="field checkbox-field">
@@ -1085,6 +1088,18 @@ chmod g+w {{ configFile }}</pre>
               placeholder="e.g. -122.4194" />
             <p v-if="validationErrors.location_longitude" class="field-error">{{ validationErrors.location_longitude }}</p>
           </div>
+        </div>
+        <div class="field checkbox-field">
+          <label>
+            <input type="checkbox" v-model="form.location_share_in_advert" />
+            Share Position in Advert
+          </label>
+          <p class="hint">
+            Broadcast these coordinates to the mesh so your node appears on MeshCore maps.
+            Uncheck to keep the BBS aware of its own location without publishing it —
+            matches the same checkbox in the official MeshCore app. Has no effect while
+            "Set GPS coordinates" above is off.
+          </p>
         </div>
       </section>
 

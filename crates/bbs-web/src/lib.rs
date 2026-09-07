@@ -2041,6 +2041,7 @@ struct ConfigResponse {
     bbs_timezone: Option<String>,
     location_latitude: Option<f64>,
     location_longitude: Option<f64>,
+    location_share_in_advert: Option<bool>,
     backup_enabled: Option<bool>,
     backup_interval_hours: Option<u32>,
     backup_keep_daily: Option<u32>,
@@ -2068,6 +2069,7 @@ struct ConfigPatch {
     location_latitude: Option<Option<f64>>,
     #[serde(default, deserialize_with = "deserialize_some")]
     location_longitude: Option<Option<f64>>,
+    location_share_in_advert: Option<bool>,
     backup_enabled: Option<bool>,
     backup_interval_hours: Option<u32>,
     backup_keep_daily: Option<u32>,
@@ -2495,6 +2497,7 @@ async fn api_get_config(
         bbs_timezone: toml_str_field(&val, "bbs", "timezone"),
         location_latitude: toml_f64_field(&val, "location", "latitude"),
         location_longitude: toml_f64_field(&val, "location", "longitude"),
+        location_share_in_advert: toml_bool_field(&val, "location", "share_in_advert"),
         backup_enabled: toml_bool_field(&val, "backup", "enabled"),
         backup_interval_hours: toml_u32_field(&val, "backup", "interval_hours"),
         backup_keep_daily: toml_u32_field(&val, "backup", "keep_daily"),
@@ -2605,6 +2608,10 @@ async fn api_patch_config(
             Some(f) => doc["location"]["longitude"] = toml_edit::value(f),
         }
     }
+    let share_in_advert_touched = patch.location_share_in_advert.is_some();
+    if let Some(v) = patch.location_share_in_advert {
+        doc["location"]["share_in_advert"] = toml_edit::value(v);
+    }
     if let Some(v) = patch.backup_enabled {
         doc["backup"]["enabled"] = toml_edit::value(v);
     }
@@ -2679,6 +2686,14 @@ async fn api_patch_config(
             _ => None,
         };
         state.host.set_node_location(new_location);
+    }
+    if share_in_advert_touched {
+        let share_in_advert = doc
+            .get("location")
+            .and_then(|s| s.get("share_in_advert"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        state.host.set_share_location_in_advert(share_in_advert);
     }
 
     // Audit log — best-effort.

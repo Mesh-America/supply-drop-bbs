@@ -220,6 +220,18 @@ pub trait Host: Send + Sync {
     /// returned by the next call to `node_location()`.
     fn set_node_location(&self, location: Option<(f64, f64)>);
 
+    /// Whether the configured location (if any) should be broadcast in
+    /// mesh self-adverts — mirrors the MeshCore app's "Share Position
+    /// in Advert" checkbox. Defaults to `true`. Independent of
+    /// `node_location()`: an operator may want the BBS to know its own
+    /// coordinates without publishing them mesh-wide.
+    fn share_location_in_advert(&self) -> bool { true }
+
+    /// Update the in-memory advert-sharing preference without a
+    /// restart. Same admin-only caller convention as
+    /// `set_node_location`.
+    fn set_share_location_in_advert(&self, share: bool) {}
+
     // ── Audit ───────────────────────────────────────────────────
 
     /// Append-only audit log. Plugins should call this for any
@@ -307,6 +319,31 @@ Calling on each reconnect (rather than caching at `init`) is
 intentional: a sysop can update the coordinates via the web UI while
 the service is running, and the change takes effect the next time
 the transport reconnects.
+
+`SetAdvertLatlon` only stores raw coordinates on the device — it does
+**not** by itself make the node appear on public MeshCore maps. Whether
+those coordinates are actually included in outgoing self-adverts is a
+separate device-side policy bit (`advert_loc_policy`, set via
+`CMD_SET_OTHER_PARAMS`), gated by `host.share_location_in_advert()`. Read
+both together:
+
+```rust
+if let Some((lat, lon)) = host.node_location() {
+    // ... push SetAdvertLatlon as above ...
+}
+let desired_policy = if host.node_location().is_some() && host.share_location_in_advert() {
+    ADVERT_LOC_SHARE
+} else {
+    ADVERT_LOC_NONE
+};
+// ... push CMD_SET_OTHER_PARAMS with advert_loc_policy = desired_policy,
+// preserving the device's other CMD_SET_OTHER_PARAMS fields ...
+```
+
+A transport without an equivalent device-side policy bit (e.g.
+Meshtastic, which broadcasts any configured fixed position
+automatically) should instead gate the position write itself on
+`share_location_in_advert()`.
 
 ### What transport plugins must NOT do
 

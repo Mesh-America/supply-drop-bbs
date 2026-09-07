@@ -192,11 +192,16 @@ fn default_require_verify() -> bool {
 
 /// GPS coordinates for this BBS node.
 ///
-/// When set, the mesh transport sends `SetAdvertLatlon` to the radio on
-/// connect so the node's location is broadcast in LoRa adverts.
-/// Both fields must be present for the location to be applied; a partial
-/// entry (only lat or only lon) is silently ignored.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// When set, the mesh transport pushes the coordinates to the radio on
+/// connect (`SetAdvertLatlon`) and, when [`share_in_advert`](Self::share_in_advert)
+/// is also `true`, flips the device's advert-location policy bit so the
+/// coordinates actually ride along in outgoing self-adverts — the same
+/// thing the official MeshCore app's "Share Position in Advert" checkbox
+/// controls. The Meshtastic transport mirrors this with its own native
+/// fixed-position mechanism. Both fields must be present for the location
+/// to be applied; a partial entry (only lat or only lon) is silently
+/// ignored.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocationConfig {
     /// Latitude in decimal degrees (e.g. `37.7749`).
@@ -206,6 +211,25 @@ pub struct LocationConfig {
     /// Longitude in decimal degrees (e.g. `-122.4194`).
     #[serde(default)]
     pub longitude: Option<f64>,
+
+    /// Broadcast the coordinates in mesh self-adverts. Defaults to `true`.
+    ///
+    /// Set to `false` to have the BBS know its own coordinates (e.g. for
+    /// display) without publishing them mesh-wide — mirrors the MeshCore
+    /// app's "Share Position in Advert" checkbox. Has no effect unless
+    /// `latitude`/`longitude` are also set.
+    #[serde(default = "default_share_in_advert")]
+    pub share_in_advert: bool,
+}
+
+impl Default for LocationConfig {
+    fn default() -> Self {
+        Self {
+            latitude: None,
+            longitude: None,
+            share_in_advert: default_share_in_advert(),
+        }
+    }
 }
 
 impl LocationConfig {
@@ -216,6 +240,10 @@ impl LocationConfig {
             _ => None,
         }
     }
+}
+
+fn default_share_in_advert() -> bool {
+    true
 }
 
 // ── [database] ────────────────────────────────────────────────────────────────

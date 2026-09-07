@@ -528,6 +528,28 @@ pub trait Host: Send + Sync {
     /// The mesh transport reads this on the next reconnect.
     fn set_node_location(&self, _location: Option<(f64, f64)>) {}
 
+    /// Whether the configured GPS location (if any) should be broadcast in
+    /// mesh self-adverts — mirrors the official MeshCore app's "Share
+    /// Position in Advert" checkbox. Independent of [`node_location`](Self::node_location)
+    /// itself: an operator may want the BBS to know its own coordinates
+    /// without publishing them mesh-wide.
+    ///
+    /// The mesh transport reads this alongside `node_location()` on
+    /// `Connected` and sets the device's `advert_loc_policy` byte
+    /// accordingly (`ADVERT_LOC_SHARE` vs `ADVERT_LOC_NONE`). The
+    /// Meshtastic transport reads it to decide whether to push a fixed
+    /// position to the device at all. Defaults to `true` so existing
+    /// `[location]` configs keep behaving as documented.
+    fn share_location_in_advert(&self) -> bool {
+        true
+    }
+
+    /// Update the in-memory advert-sharing preference without a restart.
+    /// Called by the web admin after saving a `[location]` config change.
+    /// Transports read this on the next reconnect (or the next periodic
+    /// advert / fixed-position sync).
+    fn set_share_location_in_advert(&self, _share: bool) {}
+
     /// Return the node name to advertise on the mesh (the BBS name), already
     /// truncated to a MeshCore-safe length.
     ///

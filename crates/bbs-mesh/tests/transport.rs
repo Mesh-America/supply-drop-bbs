@@ -40,6 +40,14 @@ fn radio_frame(payload: &[u8]) -> Vec<u8> {
 }
 
 fn self_info_frame(name: &str) -> Vec<u8> {
+    self_info_frame_with_policy(name, ADVERT_LOC_NONE)
+}
+
+/// Like [`self_info_frame`] but with an explicit `advert_loc_policy` byte —
+/// lets a test simulate a device that already has (or doesn't have) the
+/// "Share Position in Advert" bit set, to exercise
+/// `sync_advert_location_policy`'s sync-only-on-mismatch behaviour.
+fn self_info_frame_with_policy(name: &str, advert_loc_policy: u8) -> Vec<u8> {
     let mut body = Vec::new();
     body.push(ADV_TYPE_CHAT);
     body.push(20u8);
@@ -47,10 +55,10 @@ fn self_info_frame(name: &str) -> Vec<u8> {
     body.extend_from_slice(&[0xAAu8; 32]);
     body.extend_from_slice(&0i32.to_le_bytes());
     body.extend_from_slice(&0i32.to_le_bytes());
-    body.push(0u8);
-    body.push(ADVERT_LOC_NONE);
-    body.push(0u8);
-    body.push(0u8);
+    body.push(0u8); // multi_acks
+    body.push(advert_loc_policy);
+    body.push(0u8); // telemetry_modes
+    body.push(0u8); // manual_add_contacts
     body.extend_from_slice(&915_000u32.to_le_bytes());
     body.extend_from_slice(&125_000u32.to_le_bytes());
     body.push(10u8);
@@ -479,6 +487,118 @@ async fn radio_params_not_resent_when_they_already_match() {
     assert_eq!(
         first[0], CMD_SET_PATH_HASH_MODE,
         "matching radio config must not be re-sent"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// A configured `[location]` with sharing enabled (the default) must flip the
+/// device's `advert_loc_policy` byte to `ADVERT_LOC_SHARE` on connect — the
+/// on-device equivalent of the MeshCore app's "Share Position in Advert"
+/// checkbox — when the device reports it's currently off. Without this the
+/// BBS pushes raw coordinates (`SetAdvertLatlon`) but never actually turns on
+/// broadcasting, so the node never appears on public MeshCore maps even
+/// though GPS is configured (the exact bug this guards against).
+///
+/// `CMD_SET_OTHER_PARAMS` sets four fields at once, so this also checks the
+/// other three (manual_add/telemetry_modes/multi_acks) are carried over
+/// unchanged from the device's own `SelfInfo`, not clobbered with zeros.
+#[tokio::test]
+async fn advert_location_shared_when_configured_and_device_not_yet_sharing() {
+    let host = Arc::new(MockHost::new());
+    host.set_location(Some((37.7749, -122.4194)), true);
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    // Device currently has sharing off; SelfInfo reports manual_add=0,
+    // telemetry_modes=0, multi_acks=0 (see self_info_frame_with_policy).
+    bridge
+        .send(&self_info_frame_with_policy("Node", ADVERT_LOC_NONE))
+        .await;
+
+    let set_latlon = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_ADVERT_LATLON),
+    )
+    .await
+    .expect("expected CMD_SET_ADVERT_LATLON on connect");
+    assert_eq!(set_latlon[0], CMD_SET_ADVERT_LATLON);
+
+    let set_other = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_OTHER_PARAMS),
+    )
+    .await
+    .expect("expected CMD_SET_OTHER_PARAMS to sync advert_loc_policy");
+    assert_eq!(set_other[1], 0, "manual_add_contacts must be preserved");
+    assert_eq!(set_other[2], 0, "telemetry_modes must be preserved");
+    assert_eq!(
+        set_other[3], ADVERT_LOC_SHARE,
+        "advert_loc_policy must flip to SHARE"
+    );
+    assert_eq!(set_other[4], 0, "multi_acks must be preserved");
+
+    transport.stop().await.unwrap();
+}
+
+/// The mirror case: `share_in_advert = false` must push `ADVERT_LOC_NONE`
+/// when the device currently has sharing on — e.g. an operator turning the
+/// checkbox off after previously enabling it. Coordinates are still
+/// configured (and still pushed via `SetAdvertLatlon`); only the broadcast
+/// policy is turned off.
+#[tokio::test]
+async fn advert_location_unshared_when_disabled_and_device_currently_sharing() {
+    let host = Arc::new(MockHost::new());
+    host.set_location(Some((37.7749, -122.4194)), false);
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge
+        .send(&self_info_frame_with_policy("Node", ADVERT_LOC_SHARE))
+        .await;
+
+    let set_other = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_OTHER_PARAMS),
+    )
+    .await
+    .expect("expected CMD_SET_OTHER_PARAMS to sync advert_loc_policy");
+    assert_eq!(
+        set_other[3], ADVERT_LOC_NONE,
+        "advert_loc_policy must flip back to NONE when sharing is disabled"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// No location configured (the default `MockHost`) must never emit
+/// `CMD_SET_OTHER_PARAMS` — the desired policy (`ADVERT_LOC_NONE`) already
+/// matches what a freshly-flashed/default device reports, so there is
+/// nothing to sync. Guards the "no-op when already matching" branch of
+/// `sync_advert_location_policy` explicitly, on top of the many other tests
+/// that already rely on no extra frames appearing here (e.g.
+/// `complete_handshake`'s strict ordering assertions).
+#[tokio::test]
+async fn no_advert_location_sync_when_nothing_configured() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge.complete_handshake("Node").await;
+
+    // Give any (incorrect) SetOtherParams frame a chance to arrive, then
+    // confirm the connection is otherwise healthy — a stray frame here would
+    // desync the next assertion in whatever test runs against this bridge,
+    // but since the test ends here we instead prove liveness with a benign
+    // round-trip: request an advert send and confirm no SetOtherParams shows
+    // up ahead of it.
+    host.advert_bus().request_send(true);
+    let cmd = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+        .await
+        .expect("expected some command after requesting an advert send");
+    assert_ne!(
+        cmd[0], CMD_SET_OTHER_PARAMS,
+        "no location configured — advert_loc_policy already matches, nothing to sync"
     );
 
     transport.stop().await.unwrap();
