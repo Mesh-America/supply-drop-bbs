@@ -1050,13 +1050,21 @@ async fn event_loop(
                             // Always sync the device clock to system time on connect.
                             deferred_writes.push(DeferredWrite::Time);
                             // Manage fixed position from the host's configured GPS:
-                            // set it when a location is configured, clear it otherwise.
+                            // set it when a location is configured AND sharing is
+                            // enabled (`[location].share_in_advert` — the same
+                            // preference the MeshCore transport reads to decide
+                            // whether to advertise position), clear it otherwise.
+                            // Meshtastic has no separate device-side "share" bit like
+                            // MeshCore's advert_loc_policy — a fixed position is
+                            // broadcast via the node's own Position app port as soon
+                            // as it's set, so gating the write itself is this
+                            // transport's equivalent of the "Share Position in
+                            // Advert" checkbox.
                             match host.node_location() {
-                                Some((lat, lon)) => deferred_writes
-                                    .push(DeferredWrite::SetFixedPosition { lat, lon }),
-                                None => {
-                                    deferred_writes.push(DeferredWrite::RemoveFixedPosition)
+                                Some((lat, lon)) if host.share_location_in_advert() => {
+                                    deferred_writes.push(DeferredWrite::SetFixedPosition { lat, lon })
                                 }
+                                _ => deferred_writes.push(DeferredWrite::RemoveFixedPosition),
                             }
                             // Push configured radio params, node name, and the
                             // node-info broadcast interval (all skip-if-unchanged).

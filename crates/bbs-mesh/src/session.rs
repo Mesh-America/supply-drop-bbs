@@ -161,6 +161,25 @@ pub struct SessionState {
     /// never reset on reconnect, so the cooldown persists across reconnects
     /// too.
     contacts_catchup_requested_at: Option<Instant>,
+    /// The device's `CMD_SET_OTHER_PARAMS` fields as last reported by
+    /// `SelfInfo` (refreshed after this transport pushes its own change).
+    /// `None` until the device has reported `SelfInfo` at least once —
+    /// firmware old enough to skip `SelfInfo` on `AppStart` may not support
+    /// `CMD_SET_OTHER_PARAMS` at all, so nothing derived from this is ever
+    /// sent in that case. Used to sync `advert_loc_policy` (the "Share
+    /// Position in Advert" bit) without clobbering the other three fields
+    /// this transport doesn't manage.
+    pub device_other_params: Option<DeviceOtherParams>,
+}
+
+/// Snapshot of the device's `CMD_SET_OTHER_PARAMS` fields — see
+/// [`SessionState::device_other_params`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceOtherParams {
+    pub manual_add_contacts: u8,
+    pub telemetry_modes: u8,
+    pub advert_loc_policy: u8,
+    pub multi_acks: u8,
 }
 
 impl SessionState {
