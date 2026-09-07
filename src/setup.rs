@@ -78,6 +78,7 @@ struct Existing {
     // GPS
     latitude: Option<f64>,
     longitude: Option<f64>,
+    share_in_advert: bool,
     // Process plugins — preserved verbatim through reconfigure
     process_plugins_toml: Option<String>,
 }
@@ -239,6 +240,10 @@ fn load_existing(out_path: &Path) -> Existing {
     let longitude = location
         .and_then(|l| l.get("longitude"))
         .and_then(|v| v.as_float());
+    let share_in_advert = location
+        .and_then(|l| l.get("share_in_advert"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     // pymc-companion (HAT)
     let yaml_path = companion_yaml_path(out_path);
@@ -327,6 +332,7 @@ fn load_existing(out_path: &Path) -> Existing {
         mesh_radio,
         latitude,
         longitude,
+        share_in_advert,
         process_plugins_toml,
     }
 }
@@ -1102,6 +1108,16 @@ pub fn run_wizard(config_out: Option<&Path>) {
         (None, None)
     };
 
+    let gps_share = if set_gps {
+        Confirm::with_theme(&theme)
+            .with_prompt("Share Position in Advert? (broadcast these coordinates to the mesh)")
+            .default(ex.share_in_advert)
+            .interact()
+            .unwrap_or_else(|_| cancelled())
+    } else {
+        true
+    };
+
     // ── MeshCore Pi HAT: region + model ──────────────────────────────────────
     //
     // When pymc-companion.yaml already exists (reconfigure run) ask before
@@ -1181,6 +1197,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         web_backup_dir: web_backup_dir.as_deref(),
         latitude: gps_lat,
         longitude: gps_lon,
+        share_in_advert: gps_share,
         process_plugins_toml: ex.process_plugins_toml.as_deref(),
         mesh_radio: mesh_radio.as_ref(),
     });
@@ -1849,6 +1866,7 @@ struct TomlParams<'a> {
     // GPS
     latitude: Option<f64>,
     longitude: Option<f64>,
+    share_in_advert: bool,
     // Process plugins — preserved verbatim from the previous config
     process_plugins_toml: Option<&'a str>,
     // USB serial radio config (None = omit section)
@@ -1882,6 +1900,11 @@ fn build_toml(p: &TomlParams<'_>) -> String {
         writeln!(s, "\n[location]").unwrap();
         writeln!(s, "latitude  = {lat}").unwrap();
         writeln!(s, "longitude = {lon}").unwrap();
+        // share_in_advert defaults to true in code — only write it when the
+        // operator opted out, to keep a default config file minimal.
+        if !p.share_in_advert {
+            writeln!(s, "share_in_advert = false").unwrap();
+        }
     }
 
     // [plugins.mesh]

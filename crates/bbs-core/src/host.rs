@@ -271,6 +271,10 @@ pub struct BbsHost {
     /// Optional GPS coordinates from `[location]` config section.
     /// Wrapped in a RwLock so the web admin can update it without a restart.
     location: std::sync::RwLock<Option<(f64, f64)>>,
+    /// Whether `location` (if set) should be broadcast in mesh self-adverts —
+    /// `[location].share_in_advert`. Wrapped in an `AtomicBool` so the web
+    /// admin can flip it without a restart, mirroring `location` itself.
+    share_location_in_advert: std::sync::atomic::AtomicBool,
     /// MeshCore advert node name (the BBS name), pre-truncated to an
     /// advert-safe length. Set at startup from `bbs.name`; read by the mesh
     /// transport on connect to push `SetAdvertName` to the radio so the node
@@ -305,8 +309,11 @@ impl BbsHost {
     }
 
     /// Create a [`BbsHost`] with an optional GPS location.
+    ///
+    /// Advert sharing defaults to `true` (matching `[location].share_in_advert`'s
+    /// default) — use [`with_config`](Self::with_config) to override it.
     pub fn with_location(db: Database, location: Option<(f64, f64)>) -> Self {
-        Self::with_config(db, location, AccessPolicy::default(), None)
+        Self::with_config(db, location, true, AccessPolicy::default(), None)
     }
 
     /// Create a [`BbsHost`] with a full configuration.
@@ -316,6 +323,7 @@ impl BbsHost {
     pub fn with_config(
         db: Database,
         location: Option<(f64, f64)>,
+        share_location_in_advert: bool,
         policy: AccessPolicy,
         config_path: Option<PathBuf>,
     ) -> Self {
@@ -328,6 +336,7 @@ impl BbsHost {
             advert_bus: Arc::new(AdvertBus::new()),
             login_failures: tokio::sync::Mutex::new(HashMap::new()),
             location: std::sync::RwLock::new(location),
+            share_location_in_advert: std::sync::atomic::AtomicBool::new(share_location_in_advert),
             node_name: std::sync::RwLock::new(None),
             access_policy: RwLock::new(policy),
             guest_room_id: std::sync::RwLock::new(None),
@@ -636,6 +645,15 @@ impl Host for BbsHost {
 
     fn set_node_location(&self, location: Option<(f64, f64)>) {
         *self.location.write().unwrap() = location;
+    }
+
+    fn share_location_in_advert(&self) -> bool {
+        self.share_location_in_advert.load(Ordering::Relaxed)
+    }
+
+    fn set_share_location_in_advert(&self, share: bool) {
+        self.share_location_in_advert
+            .store(share, Ordering::Relaxed);
     }
 
     fn mesh_node_name(&self) -> Option<String> {
@@ -7568,7 +7586,7 @@ mod tests {
         let db = Database::open(&f.path().to_string_lossy())
             .await
             .expect("db open");
-        let host = BbsHost::with_config(db, None, policy, None);
+        let host = BbsHost::with_config(db, None, true, policy, None);
         host.ensure_guest_room().await.expect("ensure_guest_room");
         (Arc::new(host), f)
     }

@@ -206,6 +206,61 @@ sudo supply-drop-bbs config guest-room off \
 
 ---
 
+### `config location`
+
+```
+supply-drop-bbs config location <latitude> <longitude> [OPTIONS]
+supply-drop-bbs config location off [OPTIONS]
+```
+
+Set or clear this node's GPS coordinates. Writes `latitude`/`longitude` to the `[location]` section of the config file. Radio transports push these coordinates to the device on connect. **Takes effect on the next BBS restart.**
+
+Setting coordinates alone does not make the node appear on public mesh maps — see `config share-position` below.
+
+| Argument | Meaning |
+|----------|---------|
+| `<latitude> <longitude>` | WGS-84 decimal degrees, e.g. `37.7749 -122.4194` |
+| `off` | Clear both coordinates |
+
+```sh
+sudo supply-drop-bbs config location 37.7749 -122.4194 \
+  --config /etc/supply-drop-bbs/config.toml
+
+sudo supply-drop-bbs config location off \
+  --config /etc/supply-drop-bbs/config.toml
+```
+
+> **Tip:** The web admin's **Settings** page can apply the same change live, without a restart.
+
+---
+
+### `config share-position`
+
+```
+supply-drop-bbs config share-position <on|off> [OPTIONS]
+```
+
+Enable or disable broadcasting the configured GPS coordinates in mesh self-adverts — mirrors the official MeshCore app's **"Share Position in Advert"** checkbox. Writes `share_in_advert` to the `[location]` section. Has no effect until coordinates are also set via `config location`. **Takes effect on the next BBS restart.**
+
+| Argument | Meaning |
+|----------|---------|
+| `on` | Broadcast coordinates in mesh self-adverts — this is what makes the node appear on MeshCore maps (default) |
+| `off` | Keep the BBS aware of its own coordinates without publishing them |
+
+```sh
+# Stop broadcasting position (coordinates stay configured)
+sudo supply-drop-bbs config share-position off \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Resume broadcasting
+sudo supply-drop-bbs config share-position on \
+  --config /etc/supply-drop-bbs/config.toml
+```
+
+> **Tip:** The web admin's **Settings** page can apply the same change live, without a restart.
+
+---
+
 ### `migrate`
 
 ```

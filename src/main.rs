@@ -365,6 +365,36 @@ enum ConfigAction {
         /// Room name, or `off` to disable.
         value: String,
     },
+
+    /// Set or clear this node's GPS coordinates.
+    ///
+    /// Writes `latitude`/`longitude` to the `[location]` section of the
+    /// config file. Radio transports push these coordinates on connect.
+    /// Whether they're actually broadcast in mesh self-adverts is a
+    /// separate setting — see `config share-position`.
+    /// Changes take effect on the next BBS restart. (The web admin's
+    /// Settings page can apply the same change live, without a restart.)
+    Location {
+        /// Latitude in decimal degrees (-90..90), or `off` to clear both
+        /// coordinates.
+        latitude: String,
+        /// Longitude in decimal degrees (-180..180). Required unless
+        /// `latitude` is `off`.
+        longitude: Option<String>,
+    },
+
+    /// Enable or disable broadcasting GPS coordinates in mesh self-adverts.
+    ///
+    /// Mirrors the official MeshCore app's "Share Position in Advert"
+    /// checkbox. Writes `share_in_advert` to the `[location]` section.
+    /// Has no effect until coordinates are also set via `config location`.
+    /// Changes take effect on the next BBS restart. (The web admin's
+    /// Settings page can apply the same change live, without a restart.)
+    SharePosition {
+        /// `on` to broadcast coordinates (default), `off` to keep the BBS
+        /// aware of its own location without publishing it.
+        enabled: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -915,6 +945,7 @@ async fn cmd_run(cli: &Cli) {
     let bbs = BbsHost::with_config(
         db,
         cfg.location.as_coords(),
+        cfg.location.share_in_advert,
         access_policy,
         host_config_path,
     );
@@ -1448,6 +1479,50 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                 );
             }
         }
+        ConfigAction::Location {
+            latitude,
+            longitude,
+        } => {
+            if latitude.eq_ignore_ascii_case("off") {
+                config_remove_location_key(config_path, "latitude");
+                config_remove_location_key(config_path, "longitude");
+                println!("GPS coordinates cleared. Restart the BBS for the change to take effect.");
+            } else {
+                let Some(longitude) = longitude else {
+                    eprintln!("error: longitude is required unless latitude is 'off'");
+                    std::process::exit(1);
+                };
+                let lat: f64 = match latitude.parse() {
+                    Ok(v) if (-90.0..=90.0).contains(&v) => v,
+                    _ => {
+                        eprintln!("error: latitude must be a number between -90 and 90");
+                        std::process::exit(1);
+                    }
+                };
+                let lon: f64 = match longitude.parse() {
+                    Ok(v) if (-180.0..=180.0).contains(&v) => v,
+                    _ => {
+                        eprintln!("error: longitude must be a number between -180 and 180");
+                        std::process::exit(1);
+                    }
+                };
+                config_edit_location_float(config_path, "latitude", lat);
+                config_edit_location_float(config_path, "longitude", lon);
+                println!("location = {lat}, {lon}. Restart the BBS for the change to take effect.");
+            }
+        }
+        ConfigAction::SharePosition { enabled } => {
+            let value = match enabled.to_ascii_lowercase().as_str() {
+                "on" | "true" | "1" => true,
+                "off" | "false" | "0" => false,
+                other => {
+                    eprintln!("error: expected on|off, got '{other}'");
+                    std::process::exit(1);
+                }
+            };
+            config_edit_location_bool(config_path, "share_in_advert", value);
+            println!("share_in_advert = {value}. Restart the BBS for the change to take effect.");
+        }
     }
 }
 
@@ -1554,6 +1629,41 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
     let (path, mut doc) = open_config_for_edit(config_path);
     if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
         bbs.remove(key);
+    }
+    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
+        eprintln!("error writing {}: {e}", path.display());
+        std::process::exit(1);
+    }
+}
+
+fn config_edit_location_float(config_path: Option<&std::path::Path>, key: &str, value: f64) {
+    let (path, mut doc) = open_config_for_edit(config_path);
+    if doc.get("location").is_none() {
+        doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["location"][key] = toml_edit::value(value);
+    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
+        eprintln!("error writing {}: {e}", path.display());
+        std::process::exit(1);
+    }
+}
+
+fn config_edit_location_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
+    let (path, mut doc) = open_config_for_edit(config_path);
+    if doc.get("location").is_none() {
+        doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["location"][key] = toml_edit::value(value);
+    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
+        eprintln!("error writing {}: {e}", path.display());
+        std::process::exit(1);
+    }
+}
+
+fn config_remove_location_key(config_path: Option<&std::path::Path>, key: &str) {
+    let (path, mut doc) = open_config_for_edit(config_path);
+    if let Some(location) = doc.get_mut("location").and_then(|t| t.as_table_mut()) {
+        location.remove(key);
     }
     if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
         eprintln!("error writing {}: {e}", path.display());

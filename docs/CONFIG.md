@@ -162,26 +162,39 @@ supply-drop-bbs config guest-room off
 ## `[location]` - GPS coordinates
 
 When set, the mesh transport sends your node's coordinates to the radio
-immediately after each connection is established, so it appears on the
-MeshCore map in LoRa adverts. **Takes effect on the next mesh transport
-reconnect — no server restart needed.**
+immediately after each connection is established. **Takes effect on the
+next mesh transport reconnect — no server restart needed.**
 
-| Key         | Type  | Default | Required | Description                          |
-|-------------|-------|---------|----------|--------------------------------------|
-| `latitude`  | float | (unset) | no       | WGS-84 latitude, degrees (-90…90)    |
-| `longitude` | float | (unset) | no       | WGS-84 longitude, degrees (-180…180) |
+| Key               | Type    | Default | Required | Description                                    |
+|-------------------|---------|---------|----------|-------------------------------------------------|
+| `latitude`        | float   | (unset) | no       | WGS-84 latitude, degrees (-90…90)              |
+| `longitude`       | float   | (unset) | no       | WGS-84 longitude, degrees (-180…180)           |
+| `share_in_advert` | boolean | `true`  | no       | Broadcast the coordinates in mesh self-adverts |
 
-Both keys must be set together; setting only one has no effect.
-Remove both (or omit the section) to stop broadcasting GPS coordinates.
+Both `latitude`/`longitude` must be set together; setting only one has no
+effect. Remove both (or omit the section) to stop pushing GPS coordinates
+to the radio entirely.
 
-The setup wizard prompts for these during initial configuration and
-writes them here. They can also be edited live from the web admin's
-**Settings** page without restarting the server.
+`share_in_advert` mirrors the official MeshCore app's **"Share Position in
+Advert"** checkbox: with `latitude`/`longitude` set but `share_in_advert =
+false`, the BBS still knows its own coordinates (e.g. for the web UI) but
+does not publish them — the node won't appear on public MeshCore maps.
+Set it to `true` (the default) to actually broadcast the position, which is
+what makes the node show up on the map. On MeshCore this flips the
+device's `advert_loc_policy` byte (`CMD_SET_OTHER_PARAMS`); on Meshtastic
+it gates whether a fixed position is pushed to the device at all, since
+Meshtastic broadcasts any configured fixed position automatically via its
+own Position app port.
+
+The setup wizard prompts for `latitude`/`longitude` during initial
+configuration and writes them here. All three keys can also be edited live
+from the web admin's **Settings** page without restarting the server.
 
 ```toml
 [location]
-latitude  = 37.7749
-longitude = -122.4194
+latitude        = 37.7749
+longitude       = -122.4194
+share_in_advert = true
 ```
 
 ## `[database]` - persistence
@@ -555,8 +568,9 @@ radio only reboots when something actually changed.
 On connect the BBS also:
 
 - **syncs the device clock** to system time,
-- **sets a fixed GPS position** from the `[location]` config (or clears it when no
-  location is configured), and
+- **sets a fixed GPS position** from the `[location]` config when coordinates are
+  set and `share_in_advert` is `true` (clears it otherwise — see
+  [`[location]`](#location---gps-coordinates)), and
 - sets the device's `node_info_broadcast_secs` to **3600 s (1 h, the firmware
   minimum)** so the node re-announces itself to the mesh hourly. This is the
   firmware-native way neighbouring nodes discover the BBS; you can also force an

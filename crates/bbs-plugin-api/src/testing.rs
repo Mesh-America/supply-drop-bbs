@@ -95,6 +95,14 @@ struct MockHostState {
     /// routes through in production, unlike this mock's own short-circuiting
     /// override of that method (which never touches this channel at all).
     mesh_key_tx: Option<tokio::sync::mpsc::Sender<MeshKeyRequest>>,
+    /// GPS coordinates returned by `node_location()`. Set via
+    /// [`MockHost::set_location`]. `None` by default, matching the trait's
+    /// own default.
+    location: Option<(f64, f64)>,
+    /// Value returned by `share_location_in_advert()`. Set via
+    /// [`MockHost::set_location`] or [`MockHost::set_share_location_in_advert`].
+    /// `true` by default, matching the trait's own default.
+    share_location_in_advert: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,6 +146,8 @@ impl MockHost {
                 removed_meshcore_contacts: Vec::new(),
                 removed_meshtastic_favorites: Vec::new(),
                 mesh_key_tx: None,
+                location: None,
+                share_location_in_advert: true,
             }),
             events: tx,
             advert_bus: Arc::new(AdvertBus::new()),
@@ -189,6 +199,26 @@ impl MockHost {
     /// backpressure without dropping or reordering. Defaults to zero (no delay).
     pub fn set_process_delay(&self, delay: Duration) {
         self.state.lock().expect("mock poisoned").process_delay = delay;
+    }
+
+    /// Configure the coordinates `node_location()` returns and whether
+    /// `share_location_in_advert()` reports them as shareable — the two
+    /// settings a transport reads together to decide what (if anything) to
+    /// push to the radio/device on connect.
+    pub fn set_location(&self, location: Option<(f64, f64)>, share_in_advert: bool) {
+        let mut state = self.state.lock().expect("mock poisoned");
+        state.location = location;
+        state.share_location_in_advert = share_in_advert;
+    }
+
+    /// Flip the advert-sharing preference without changing the configured
+    /// coordinates. The `Host` trait impl below delegates to this so the
+    /// two can't drift.
+    pub fn set_share_location_in_advert(&self, share: bool) {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .share_location_in_advert = share;
     }
 
     /// Inspect the commands that have been dispatched, in order.
@@ -332,6 +362,28 @@ impl Host for MockHost {
 
     fn advert_bus(&self) -> Arc<AdvertBus> {
         Arc::clone(&self.advert_bus)
+    }
+
+    fn node_location(&self) -> Option<(f64, f64)> {
+        self.state.lock().expect("mock poisoned").location
+    }
+
+    fn set_node_location(&self, location: Option<(f64, f64)>) {
+        self.state.lock().expect("mock poisoned").location = location;
+    }
+
+    fn share_location_in_advert(&self) -> bool {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .share_location_in_advert
+    }
+
+    fn set_share_location_in_advert(&self, share: bool) {
+        // Inherent methods take priority over trait methods in Rust's method
+        // resolution, so this calls MockHost::set_share_location_in_advert
+        // (above), not itself — no recursion.
+        self.set_share_location_in_advert(share);
     }
 
     /// Stores the sender, unlike the trait's default no-op body — so a test

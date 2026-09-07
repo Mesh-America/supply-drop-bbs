@@ -40,7 +40,10 @@ use bbs_plugin_api::{
 };
 use meshcore_companion::{
     client::{ClientConfig, ClientEvent, CompanionClient, SerialConfig},
-    constants::{ADV_TYPE_CHAT, MAX_FRAME_SIZE, MAX_PATH_SIZE, TXT_TYPE_PLAIN},
+    constants::{
+        ADVERT_LOC_NONE, ADVERT_LOC_SHARE, ADV_TYPE_CHAT, MAX_FRAME_SIZE, MAX_PATH_SIZE,
+        TXT_TYPE_PLAIN,
+    },
     frame::OutboundFrame,
     types::{Contact, SelfInfo},
 };
@@ -63,7 +66,7 @@ use crate::{
     metrics::DeliveryStats,
     presets::resolve_radio,
     send_tracker::{RetryConfig, SendTracker, SentOutcome},
-    session::SessionState,
+    session::{DeviceOtherParams, SessionState},
 };
 
 /// Floor for how long to wait for a reply's end-to-end ACK before retransmitting.
@@ -248,6 +251,58 @@ fn next_outbound_timestamp() -> u32 {
     }
 }
 
+/// Push the device's advert-location-sharing policy bit if it doesn't already
+/// match the configured `[location]` sharing preference.
+///
+/// `SetAdvertLatlon` (sent separately) only stores raw coordinates on the
+/// device — it is `advert_loc_policy` (`ADVERT_LOC_SHARE` vs `ADVERT_LOC_NONE`,
+/// pushed via `CMD_SET_OTHER_PARAMS`) that actually makes the firmware include
+/// lat/lon in outgoing self-adverts. This is the on-device equivalent of the
+/// official MeshCore app's "Share Position in Advert" checkbox.
+///
+/// `CMD_SET_OTHER_PARAMS` sets four fields at once, so this preserves the
+/// other three (`manual_add`, `telemetry_modes`, `multi_acks`) from the
+/// last-known device state rather than clobbering them. No-ops until the
+/// device has reported `SelfInfo` at least once — older firmware that skips
+/// `SelfInfo` on `AppStart` may not support this command at all — and no-ops
+/// again if the desired policy already matches, to avoid a needless write on
+/// every periodic advert tick.
+async fn sync_advert_location_policy(
+    cmd_tx: &mpsc::Sender<OutboundFrame>,
+    host: &Arc<dyn Host>,
+    state: &Arc<Mutex<SessionState>>,
+) {
+    let desired = if host.node_location().is_some() && host.share_location_in_advert() {
+        ADVERT_LOC_SHARE
+    } else {
+        ADVERT_LOC_NONE
+    };
+    let updated: Option<DeviceOtherParams> = {
+        let mut guard = state.lock().expect("state mutex poisoned");
+        match guard.device_other_params.as_mut() {
+            Some(params) if params.advert_loc_policy != desired => {
+                params.advert_loc_policy = desired;
+                Some(*params)
+            }
+            _ => None,
+        }
+    };
+    if let Some(params) = updated {
+        info!(
+            advert_loc_policy = desired,
+            "mesh: syncing advert location-sharing policy"
+        );
+        let _ = cmd_tx
+            .send(OutboundFrame::SetOtherParams {
+                manual_add: params.manual_add_contacts,
+                telemetry_modes: params.telemetry_modes,
+                advert_loc_policy: params.advert_loc_policy,
+                multi_acks: params.multi_acks,
+            })
+            .await;
+    }
+}
+
 /// Push the configured node name + location to the radio and broadcast a
 /// self-advert. Used by the on-connect advert, the periodic advert tick, and the
 /// web-UI "send advert" trigger. Refreshing the name/location first means the
@@ -257,6 +312,7 @@ fn next_outbound_timestamp() -> u32 {
 async fn broadcast_self_advert(
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     host: &Arc<dyn Host>,
+    state: &Arc<Mutex<SessionState>>,
     flood: bool,
 ) {
     if let Some((lat, lon)) = host.node_location() {
@@ -266,6 +322,7 @@ async fn broadcast_self_advert(
             .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
             .await;
     }
+    sync_advert_location_policy(cmd_tx, host, state).await;
     if let Some(node_name) = host.mesh_node_name() {
         if !node_name.is_empty() {
             let _ = cmd_tx
@@ -487,6 +544,7 @@ impl Plugin for MeshTransport {
         let mut advert_send_rx = host.advert_bus().subscribe_send();
         let advert_cmd_tx = self.cmd_tx.clone();
         let advert_host = Arc::clone(&host);
+        let advert_state = Arc::clone(&state);
         let mut advert_shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             loop {
@@ -494,7 +552,7 @@ impl Plugin for MeshTransport {
                     result = advert_send_rx.recv() => {
                         match result {
                             Ok(flood) => {
-                                broadcast_self_advert(&advert_cmd_tx, &advert_host, flood).await;
+                                broadcast_self_advert(&advert_cmd_tx, &advert_host, &advert_state, flood).await;
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("mesh: advert send requests lagged by {n}");
@@ -953,8 +1011,21 @@ async fn event_loop(
                             );
                             // Record our own pubkey so the NewAdvert handler can
                             // detect self-advert echoes and preserve configured GPS.
-                            state.lock().expect("state mutex poisoned").self_pubkey =
-                                Some(info.pubkey);
+                            // Also snapshot the device's CMD_SET_OTHER_PARAMS fields
+                            // (manual_add/telemetry/advert_loc_policy/multi_acks) so
+                            // sync_advert_location_policy can flip advert_loc_policy
+                            // later without clobbering the other three.
+                            {
+                                let mut guard =
+                                    state.lock().expect("state mutex poisoned");
+                                guard.self_pubkey = Some(info.pubkey);
+                                guard.device_other_params = Some(DeviceOtherParams {
+                                    manual_add_contacts: info.manual_add_contacts,
+                                    telemetry_modes: info.telemetry_modes,
+                                    advert_loc_policy: info.advert_loc_policy,
+                                    multi_acks: info.multi_acks,
+                                });
+                            }
                             // Publish pubkey to Host so the web UI can display it.
                             let pubkey_hex: String = info.pubkey.iter().map(|b| format!("{b:02x}")).collect();
                             host.set_node_pubkey(pubkey_hex);
@@ -997,6 +1068,11 @@ async fn event_loop(
                                     TRANSPORT_NAME,
                                 );
                             }
+                            // Flip the device's advert-location-sharing policy bit if
+                            // it doesn't already match `[location].share_in_advert`
+                            // (works whether or not a location is configured — an
+                            // unconfigured location resolves to ADVERT_LOC_NONE).
+                            sync_advert_location_policy(&cmd_tx, &host, &state).await;
                             // Set the routing path-hash width (2- or 3-byte paths).
                             // Pushed here in the SelfInfo branch — a device modern
                             // enough to answer AppStart supports this newer command;
@@ -1163,7 +1239,7 @@ async fn event_loop(
                 }
             }
             _ = advert_tick.tick() => {
-                broadcast_self_advert(&cmd_tx, &host, true).await;
+                broadcast_self_advert(&cmd_tx, &host, &state, true).await;
                 last_advert_at = Some(Instant::now());
             }
             Some(req) = key_rx.recv() => {
