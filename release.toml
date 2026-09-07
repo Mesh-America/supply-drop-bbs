@@ -11,6 +11,22 @@
 #   3. Commits with "chore(release): v{{version}}".
 #   4. Creates an annotated git tag "v{{version}}".
 #   5. Pushes the commit + tag — GitHub Actions release.yml then fires.
+#
+# Compatibility notes (verified against cargo-release 1.1.5, the latest on
+# crates.io as of this writing — https://crates.io/crates/cargo-release):
+#   - `post-release-commit-message` is NOT parseable by any released version;
+#     it only exists in cargo-release's unreleased docs (github.com/crate-ci/
+#     cargo-release, `master` branch docs are ahead of the last crates.io
+#     release). Setting this key — even to "" — makes cargo-release abort
+#     with "Failed to parse `release.toml`" before doing anything. We don't
+#     want a post-release dev-version bump anyway, so it's simply omitted.
+#   - `pre-release-hook` is ONE command's argv (`[program, arg, arg, ...]`),
+#     NOT a list of separate shell command lines — cargo-release does not
+#     shell-parse each string. A flat list of two full command strings (as
+#     this file used to have) gets read as a single argv whose "program" is
+#     the entire first string including its spaces, which then fails to
+#     launch ("No such file or directory"). Route through `sh -c` instead so
+#     the two steps run as one real shell command.
 
 # ── Version tag & commit ────────────────────────────────────────────
 tag         = true
@@ -22,13 +38,11 @@ push-remote = "origin"
 
 # ── Commit message ──────────────────────────────────────────────────
 pre-release-commit-message  = "chore(release): v{{version}}"
-# No post-release dev bump — we don't use alpha/dev suffixes.
-post-release-commit-message = ""
 
 # ── CHANGELOG via git-cliff ─────────────────────────────────────────
 pre-release-hook = [
-  "git cliff --tag v{{version}} --output CHANGELOG.md",
-  "git add CHANGELOG.md",
+  "sh", "-c",
+  "git cliff --tag v{{version}} --output CHANGELOG.md && git add CHANGELOG.md",
 ]
 
 # ── Don't publish to crates.io ──────────────────────────────────────
