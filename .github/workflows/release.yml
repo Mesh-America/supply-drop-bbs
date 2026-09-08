@@ -16,7 +16,21 @@ jobs:
   # ─── Build release binaries for all deployment targets ─────────────
   build:
     name: Build · ${{ matrix.target }}
-    runs-on: ubuntu-latest
+    # Pinned, NOT ubuntu-latest: the runner's glibc becomes the minimum glibc
+    # every release binary requires. ubuntu-latest floats and previously
+    # drifted from 22.04 (glibc 2.35) to 24.04 (glibc 2.39) with no code
+    # change on our side, silently breaking `install.sh`'s binary download on
+    # Raspberry Pi OS Bookworm (glibc 2.36) — see supply-drop-bbs-7je / #238.
+    # ubuntu-22.04 (glibc 2.35) stays compatible with Bookworm and newer.
+    # Do not change this back to ubuntu-latest.
+    #
+    # NOT a permanent fix: GitHub is deprecating ubuntu-22.04 runner images
+    # starting 2026-09-17 (brownouts), fully removed 2027-04-17
+    # (actions/runner-images#14254). Before then, this needs a durable
+    # solution decoupled from GitHub's runner-image lifecycle entirely —
+    # e.g. building inside an old-glibc Docker container (manylinux-style),
+    # or switching release targets to musl (static, no glibc dependency).
+    runs-on: ubuntu-22.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
