@@ -304,17 +304,22 @@ async fn sync_advert_location_policy(
 }
 
 /// Push the configured node name + location to the radio and broadcast a
-/// self-advert. Used by the on-connect advert, the periodic advert tick, and the
-/// web-UI "send advert" trigger. Refreshing the name/location first means the
-/// advert always carries the configured identity, even on a device that returned
-/// no SelfInfo on AppStart (issue #101). Adverts are typically flooded so they
-/// propagate mesh-wide and let repeaters (re)learn a route back to the BBS.
+/// self-advert. Used by the periodic advert tick and the web-UI "send advert"
+/// trigger — NOT the on-connect advert, which has its own hand-written
+/// sequence inline in the `SelfInfo` branch below (different ordering, plus
+/// the advert-bus registration and `SetPathHashMode` this function doesn't
+/// send; keep both in sync when changing name/location handling in either).
+/// Refreshing the name/location first means the advert always carries the
+/// configured identity, even on a device that returned no SelfInfo on
+/// AppStart (issue #101). Adverts are typically flooded so they propagate
+/// mesh-wide and let repeaters (re)learn a route back to the BBS.
 async fn broadcast_self_advert(
     cmd_tx: &mpsc::Sender<OutboundFrame>,
     host: &Arc<dyn Host>,
     state: &Arc<Mutex<SessionState>>,
     flood: bool,
 ) {
+    let sharing_location = host.node_location().is_some() && host.share_location_in_advert();
     if let Some((lat, lon)) = host.node_location() {
         let lat_1e6 = (lat * 1_000_000.0) as i32;
         let lon_1e6 = (lon * 1_000_000.0) as i32;
@@ -324,9 +329,17 @@ async fn broadcast_self_advert(
     }
     sync_advert_location_policy(cmd_tx, host, state).await;
     if let Some(node_name) = host.mesh_node_name() {
-        if !node_name.is_empty() {
+        // The cached name was truncated to the no-location budget when it was
+        // stored (share_in_advert can flip live, without a restart); re-check
+        // it here against the *current* sharing state — sharing a location
+        // tightens the safe byte budget from 31 to 23 (bbs_core::mesh_name),
+        // and an over-length name silently fails to advertise once it's on.
+        let name = bbs_core::mesh_name::truncate_mesh_node_name(&node_name, sharing_location);
+        if !name.is_empty() {
             let _ = cmd_tx
-                .send(OutboundFrame::SetAdvertName { name: node_name })
+                .send(OutboundFrame::SetAdvertName {
+                    name: name.to_owned(),
+                })
                 .await;
         }
     }
@@ -1038,10 +1051,29 @@ async fn event_loop(
 
                             // Push the configured node name to the radio so the BBS
                             // advertises with a human name instead of its key-derived
-                            // fallback (issue #101).  The host has already truncated it
-                            // to a MeshCore-safe length; the frame encoder also caps at
-                            // 31 bytes as a final guard.
+                            // fallback (issue #101). Re-truncated below to the
+                            // *current* sharing state — the cached copy was only
+                            // truncated to the no-location budget when it was
+                            // stored. The frame encoder (meshcore-companion's
+                            // OutboundFrame::SetAdvertName) also caps raw bytes at
+                            // 31 as a fallback, but that cap is NOT UTF-8-boundary
+                            // aware (a plain byte slice) — it's not a substitute for
+                            // truncate_mesh_node_name here, only a backstop against
+                            // a future caller that skips this step.
                             if let Some(node_name) = host.mesh_node_name() {
+                                // Sharing a location tightens the safe name
+                                // budget from 31 to 23 bytes (see
+                                // bbs_core::mesh_name) — re-check against the
+                                // *current* sharing state, since the cached
+                                // name was only truncated to the no-location
+                                // budget when it was stored.
+                                let sharing_location = host.node_location().is_some()
+                                    && host.share_location_in_advert();
+                                let node_name = bbs_core::mesh_name::truncate_mesh_node_name(
+                                    &node_name,
+                                    sharing_location,
+                                )
+                                .to_owned();
                                 if !node_name.is_empty() {
                                     info!(node_name = %node_name, "mesh: setting advert name");
                                     let _ = cmd_tx

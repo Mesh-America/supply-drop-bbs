@@ -103,6 +103,10 @@ struct MockHostState {
     /// [`MockHost::set_location`] or [`MockHost::set_share_location_in_advert`].
     /// `true` by default, matching the trait's own default.
     share_location_in_advert: bool,
+    /// Value returned by `mesh_node_name()`. Set via
+    /// [`MockHost::set_node_name`]. `None` by default, matching the trait's
+    /// own default.
+    node_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -148,6 +152,7 @@ impl MockHost {
                 mesh_key_tx: None,
                 location: None,
                 share_location_in_advert: true,
+                node_name: None,
             }),
             events: tx,
             advert_bus: Arc::new(AdvertBus::new()),
@@ -219,6 +224,19 @@ impl MockHost {
             .lock()
             .expect("mock poisoned")
             .share_location_in_advert = share;
+    }
+
+    /// Configure the value `mesh_node_name()` returns — the name the mesh
+    /// transport pushes to the radio via `SetAdvertName` on connect.
+    ///
+    /// Unlike the real `Host` trait's documented contract ("already
+    /// truncated to a MeshCore-safe length"), this echoes `name` back
+    /// verbatim, untruncated — deliberately, so a test can inject an
+    /// over-length name to exercise the transport's own defensive
+    /// re-truncation at the actual advert-send call sites, rather than
+    /// having the mock silently pre-truncate and mask a regression there.
+    pub fn set_node_name(&self, name: Option<String>) {
+        self.state.lock().expect("mock poisoned").node_name = name;
     }
 
     /// Inspect the commands that have been dispatched, in order.
@@ -384,6 +402,10 @@ impl Host for MockHost {
         // resolution, so this calls MockHost::set_share_location_in_advert
         // (above), not itself — no recursion.
         self.set_share_location_in_advert(share);
+    }
+
+    fn mesh_node_name(&self) -> Option<String> {
+        self.state.lock().expect("mock poisoned").node_name.clone()
     }
 
     /// Stores the sender, unlike the trait's default no-op body — so a test

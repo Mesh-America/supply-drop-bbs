@@ -488,12 +488,14 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // bbs.name is also the MeshCore advert node name, which the firmware caps
     // at 31 bytes (see bbs_core::mesh_name). Reject over-length / invalid names
     // here so an operator can't configure a node that silently fails to
-    // advertise on the mesh.
+    // advertise on the mesh. GPS location-sharing isn't decided yet at this
+    // point in the wizard, so this checks the looser no-location limit; the
+    // tighter 23-byte limit is re-checked below once `gps_share` is known.
     let bbs_name: String = Input::with_theme(&theme)
         .with_prompt("BBS name")
         .default(ex.bbs_name.clone())
         .validate_with(|input: &String| -> Result<(), String> {
-            bbs_core::mesh_name::validate_mesh_node_name(input).map_err(|e| e.to_string())
+            bbs_core::mesh_name::validate_mesh_node_name(input, false).map_err(|e| e.to_string())
         })
         .interact_text()
         .unwrap_or_else(|_| cancelled());
@@ -1116,6 +1118,33 @@ pub fn run_wizard(config_out: Option<&Path>) {
             .unwrap_or_else(|_| cancelled())
     } else {
         true
+    };
+
+    // Sharing location tightens the advert name budget from 31 to 23 bytes
+    // (see bbs_core::mesh_name) — re-check the name now that we know whether
+    // this node will actually broadcast its GPS position.
+    let sharing_location = set_gps && gps_share;
+    let bbs_name = if sharing_location
+        && bbs_core::mesh_name::validate_mesh_node_name(&bbs_name, true).is_err()
+    {
+        println!();
+        println!(
+            "\"{bbs_name}\" is {} bytes — sharing GPS location in adverts limits the \
+             node name to {} bytes (a MeshCore protocol limit; over-length names \
+             silently fail to advertise once location is included).",
+            bbs_name.len(),
+            bbs_core::mesh_name::MAX_MESH_NODE_NAME_BYTES_WITH_LOCATION
+        );
+        Input::with_theme(&theme)
+            .with_prompt("BBS name")
+            .default(bbs_core::mesh_name::truncate_mesh_node_name(&bbs_name, true).to_string())
+            .validate_with(|input: &String| -> Result<(), String> {
+                bbs_core::mesh_name::validate_mesh_node_name(input, true).map_err(|e| e.to_string())
+            })
+            .interact_text()
+            .unwrap_or_else(|_| cancelled())
+    } else {
+        bbs_name
     };
 
     // ── MeshCore Pi HAT: region + model ──────────────────────────────────────
@@ -1783,11 +1812,15 @@ fn build_companion_yaml(p: &HatParams) -> String {
     writeln!(s, "companion:").unwrap();
     // Truncate defensively: input is validated above, but a hand-edited
     // config.toml could carry an over-length bbs.name, and an over-length
-    // advert name is silently un-deliverable on the mesh.
+    // advert name is silently un-deliverable on the mesh. This generator
+    // doesn't know whether GPS location-sharing is on, so it truncates to
+    // the tighter with-location budget — safe either way, since the BBS's
+    // own SetAdvertName push at connect (bbs-mesh::transport) overrides this
+    // fallback default with the actually-validated name regardless.
     writeln!(
         s,
         "  node_name: {:?}",
-        bbs_core::mesh_name::truncate_mesh_node_name(&p.bbs_name)
+        bbs_core::mesh_name::truncate_mesh_node_name(&p.bbs_name, true)
     )
     .unwrap();
     writeln!(s, "  identity_path: {:?}", p.identity_path).unwrap();

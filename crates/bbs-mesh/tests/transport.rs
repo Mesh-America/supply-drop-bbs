@@ -573,6 +573,101 @@ async fn advert_location_unshared_when_disabled_and_device_currently_sharing() {
     transport.stop().await.unwrap();
 }
 
+/// `OutboundFrame::SetAdvertName`'s payload is `CMD_SET_ADVERT_NAME` + name
+/// bytes + a trailing NUL terminator (matching firmware's C-string
+/// convention) — strip that terminator to get the actual name bytes sent.
+fn advert_name_payload(set_name_cmd: &[u8]) -> &str {
+    let raw = &set_name_cmd[1..];
+    let raw = raw.strip_suffix(&[0]).unwrap_or(raw);
+    std::str::from_utf8(raw).expect("advert name must be valid UTF-8")
+}
+
+/// A configured node name that fits the no-location 31-byte budget but
+/// exceeds the tighter 23-byte with-location budget must be truncated before
+/// `SetAdvertName` is sent, once GPS location-sharing is active — otherwise
+/// every receiver silently drops the advert as forged (MeshCore clamps
+/// app_data to 32 bytes before verifying the signature; see
+/// bbs_core::mesh_name and supply-drop-bbs#225, the bug this guards against).
+#[tokio::test]
+async fn advert_name_truncated_to_with_location_budget_when_sharing() {
+    let host = Arc::new(MockHost::new());
+    host.set_location(Some((37.7749, -122.4194)), true);
+    // Built so the 23-byte with-location cutoff lands INSIDE a trailing
+    // 4-byte codepoint — 🇺🇸 (8 bytes) + 14 ASCII bytes (boundary at 22) + 🌎
+    // (4 bytes: 22,23,24,25 — byte 23 is mid-sequence, not a boundary) — 26
+    // bytes total, over the 23-byte with-location budget. A fixture where
+    // the cutoff already sits on a boundary (e.g. plain "🇺🇸 Mesh America
+    // BBS") would pass this same assertion even with a naive, non-UTF-8-safe
+    // `&s[..23]` slice, so it wouldn't actually prove boundary-safe
+    // truncation happened on the real send path — this one does.
+    let long_name = format!("🇺🇸{}🌎", "A".repeat(14));
+    assert_eq!(long_name.len(), 26);
+    assert!(
+        !long_name.is_char_boundary(23),
+        "fixture must land the 23-byte cutoff mid-codepoint"
+    );
+    host.set_node_name(Some(long_name.clone()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge
+        .send(&self_info_frame_with_policy("Node", ADVERT_LOC_SHARE))
+        .await;
+
+    let set_name = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_ADVERT_NAME),
+    )
+    .await
+    .expect("expected CMD_SET_ADVERT_NAME on connect");
+    let sent_name = advert_name_payload(&set_name);
+    assert_eq!(
+        sent_name, "🇺🇸AAAAAAAAAAAAAA",
+        "must back off to the last full codepoint (22 bytes), dropping the \
+         trailing 🌎 whole rather than emitting a truncated/invalid byte \
+         sequence for it"
+    );
+    assert!(
+        long_name.starts_with(sent_name),
+        "truncation must be a prefix of the configured name, not garbage"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// The same over-length name must pass through *unmodified* when location
+/// sharing is off — the tighter 23-byte budget only applies once an advert
+/// actually carries lat/lon.
+#[tokio::test]
+async fn advert_name_not_truncated_below_31_bytes_when_not_sharing() {
+    let host = Arc::new(MockHost::new());
+    // No location configured at all: sharing has nothing to share regardless
+    // of the share_in_advert flag's own value.
+    let long_name = "🇺🇸 Mesh America BBS"; // 25 bytes — over 23, under 31.
+    assert_eq!(long_name.len(), 25);
+    host.set_node_name(Some(long_name.to_string()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    let set_name = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_ADVERT_NAME),
+    )
+    .await
+    .expect("expected CMD_SET_ADVERT_NAME on connect");
+    let sent_name = advert_name_payload(&set_name);
+    assert_eq!(
+        sent_name, long_name,
+        "a 25-byte name must pass through unmodified with no location shared"
+    );
+
+    transport.stop().await.unwrap();
+}
+
 /// No location configured (the default `MockHost`) must never emit
 /// `CMD_SET_OTHER_PARAMS` — the desired policy (`ADVERT_LOC_NONE`) already
 /// matches what a freshly-flashed/default device reports, so there is
