@@ -66,6 +66,14 @@ const isDirty = computed(() => savedForm.value !== '' && JSON.stringify(form.val
 const isFormValid = computed<boolean>(() => {
   const f = form.value
   if (!f.bbs_name.trim()) return false
+  // Mirrors validate()'s byte-length check (see its comment for why) — kept
+  // in sync manually since this is a separate reactive computed, not a call
+  // into validate() itself (which has the side effect of populating
+  // validationErrors on every evaluation, which would show errors before
+  // the user has attempted to save).
+  const nameBytes = new TextEncoder().encode(f.bbs_name).length
+  const nameLimit = (f.location_enabled && f.location_share_in_advert) ? 23 : 31
+  if (nameBytes > nameLimit) return false
   if (!f.bbs_starting_room.trim()) return false
   if (!f.bbs_timezone.trim()) return false
   if (timezones.value.length && !timezones.value.includes(f.bbs_timezone)) return false
@@ -168,17 +176,27 @@ async function loadRooms() {
 function validate(): boolean {
   const errs: Record<string, string> = {}
 
+  // bbs.name doubles as the MeshCore advert node name, which the firmware
+  // caps at 31 bytes — 23 if the advert also shares a GPS location, since
+  // lat/lon costs 8 bytes of the same MAX_ADVERT_DATA_SIZE=32 budget (see
+  // bbs_core::mesh_name on the Rust side). An over-length name silently
+  // fails to advertise: every receiver clamps app_data before verifying the
+  // signature, so it looks forged and just gets dropped, with no error
+  // anywhere in the sending path.
+  const sharingLocation = form.value.location_enabled && form.value.location_share_in_advert
+  const nameLimit = sharingLocation ? 23 : 31
   if (!form.value.bbs_name.trim()) {
     errs.bbs_name = 'Name is required.'
   } else {
-    // bbs.name doubles as the MeshCore advert node name, capped at 31 bytes by
-    // the firmware (an over-length name silently fails to advertise). Count
-    // UTF-8 bytes, not characters — a flag emoji is 8 bytes.
+    // Count UTF-8 bytes, not characters — a flag emoji is 8 bytes.
     const bytes = new TextEncoder().encode(form.value.bbs_name).length
-    if (bytes > 31)
-      errs.bbs_name = `Name is ${bytes} bytes; maximum is 31 (MeshCore advert limit; emoji count as several bytes each).`
-    else if ([...form.value.bbs_name].some((ch) => { const c = ch.codePointAt(0) ?? 0; return c < 0x20 || (c >= 0x7f && c <= 0x9f) }))
+    if (bytes > nameLimit) {
+      errs.bbs_name = sharingLocation
+        ? `Name is ${bytes} bytes; maximum is 23 while sharing GPS location in adverts (31 otherwise — lat/lon costs 8 bytes of the same MeshCore advert-data limit).`
+        : `Name is ${bytes} bytes; maximum is 31 (MeshCore advert limit; emoji count as several bytes each).`
+    } else if ([...form.value.bbs_name].some((ch) => { const c = ch.codePointAt(0) ?? 0; return c < 0x20 || (c >= 0x7f && c <= 0x9f) })) {
       errs.bbs_name = 'Name must not contain control characters.'
+    }
   }
 
   if (!form.value.bbs_starting_room.trim())
@@ -1019,7 +1037,9 @@ chmod g+w {{ configFile }}</pre>
           <label>Name</label>
           <input v-model="form.bbs_name" type="text" />
           <p v-if="validationErrors.bbs_name" class="field-error">{{ validationErrors.bbs_name }}</p>
-          <p v-else class="hint">Display name shown to users on connect.</p>
+          <p v-else class="hint">Display name shown to users on connect. Also the MeshCore advert
+            name — max 31 bytes (23 if sharing GPS location below); emoji count as several bytes
+            each.</p>
         </div>
 
         <div class="field" :class="{ 'has-error': validationErrors.bbs_starting_room }">
@@ -1098,7 +1118,8 @@ chmod g+w {{ configFile }}</pre>
             Broadcast these coordinates to the mesh so your node appears on MeshCore maps.
             Uncheck to keep the BBS aware of its own location without publishing it —
             matches the same checkbox in the official MeshCore app. Has no effect while
-            "Set GPS coordinates" above is off.
+            "Set GPS coordinates" above is off. Tightens the BBS name's advert byte limit
+            from 31 to 23 (see the Name field above).
           </p>
         </div>
       </section>
