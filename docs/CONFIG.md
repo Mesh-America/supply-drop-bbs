@@ -107,7 +107,7 @@ which plugin sections are valid.
 
 | Key              | Type   | Default                  | Required | Description                                      |
 |------------------|--------|--------------------------|----------|--------------------------------------------------|
-| `name`           | string | `"Supply Drop BBS"`      | no       | Display name shown to users on connect           |
+| `name`           | string | `"Supply Drop BBS"`      | no       | Display name shown to users on connect; also the MeshCore advert node name — max 31 UTF-8 bytes (23 if sharing GPS location, see [`[location]`](#location---gps-coordinates)) |
 | `data_dir`       | path   | `/var/lib/supply-drop-bbs` (root) or `~/.local/share/supply-drop-bbs` (user) | no | Where the BBS stores its data |
 | `starting_room`  | string | `"Lobby"`                | no       | Room a newly logged-in user lands in             |
 | `welcome_msg`    | string | `"Welcome to {name}."`   | no       | Banner shown on connect; supports `{name}` substitution |
@@ -162,8 +162,12 @@ supply-drop-bbs config guest-room off
 ## `[location]` - GPS coordinates
 
 When set, the mesh transport sends your node's coordinates to the radio
-immediately after each connection is established. **Takes effect on the
-next mesh transport reconnect — no server restart needed.**
+immediately after each connection is established. **Editing this section
+through the web admin's Settings page takes effect on the next mesh
+transport reconnect — no server restart needed** (see below). Editing
+`config.toml` directly — by hand, or via `config location`/`config
+share-position` on the CLI — requires restarting the BBS for the running
+process to pick up the change; the CLI itself prints this after every write.
 
 | Key               | Type    | Default | Required | Description                                    |
 |-------------------|---------|---------|----------|-------------------------------------------------|
@@ -185,6 +189,18 @@ device's `advert_loc_policy` byte (`CMD_SET_OTHER_PARAMS`); on Meshtastic
 it gates whether a fixed position is pushed to the device at all, since
 Meshtastic broadcasts any configured fixed position automatically via its
 own Position app port.
+
+**Interaction with `[bbs].name`:** MeshCore firmware caps an advert's data at
+32 bytes total (`flags` + `name`, plus `lat`/`lon` when shared). That leaves
+**31 bytes** for `[bbs].name` normally, or **23 bytes** once `share_in_advert`
+is `true` and a location is configured — count UTF-8 bytes, not characters,
+since an emoji can cost 4–8 bytes each. This isn't advisory: every receiver
+clamps advert data to 32 bytes *before* verifying its signature, so an
+over-length combination doesn't error — it just silently stops advertising,
+even though the BBS's own logs show a successful send. The setup wizard, CLI
+(`config location`, `config share-position`), and web admin Settings page all
+validate this combination and reject a change that would push the name over
+budget.
 
 The setup wizard prompts for `latitude`/`longitude` during initial
 configuration and writes them here. All three keys can also be edited live

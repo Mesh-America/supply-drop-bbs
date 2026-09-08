@@ -217,6 +217,8 @@ Set or clear this node's GPS coordinates. Writes `latitude`/`longitude` to the `
 
 Setting coordinates alone does not make the node appear on public mesh maps — see `config share-position` below.
 
+If `share_in_advert` is already `on`, setting coordinates here is what actually starts putting lat/lon in the advert — this command checks `[bbs].name` against the tighter 23-byte with-location limit ([`[location]`](CONFIG.md#location---gps-coordinates)) and refuses to write an over-length combination.
+
 | Argument | Meaning |
 |----------|---------|
 | `<latitude> <longitude>` | WGS-84 decimal degrees, e.g. `37.7749 -122.4194` |
@@ -241,6 +243,8 @@ supply-drop-bbs config share-position <on|off> [OPTIONS]
 ```
 
 Enable or disable broadcasting the configured GPS coordinates in mesh self-adverts — mirrors the official MeshCore app's **"Share Position in Advert"** checkbox. Writes `share_in_advert` to the `[location]` section. Has no effect until coordinates are also set via `config location`. **Takes effect on the next BBS restart.**
+
+Turning this `on` while a location is already configured checks `[bbs].name` against the tighter 23-byte with-location limit ([`[location]`](CONFIG.md#location---gps-coordinates)) and refuses to write the change if the current name is too long — shorten it first.
 
 | Argument | Meaning |
 |----------|---------|

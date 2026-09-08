@@ -2436,6 +2436,66 @@ fn doc_remove_key(doc: &mut toml_edit::DocumentMut, section: &str, key: &str) {
     }
 }
 
+/// The effective `[bbs].name` and GPS-location-sharing state a [`ConfigPatch`]
+/// would produce once applied to `doc`, for validating the combination
+/// against [`bbs_core::mesh_name`]'s byte budget *before* writing anything.
+///
+/// Each of `bbs_name`, `location_share_in_advert`, `location_latitude` and
+/// `location_longitude` falls back independently to whatever `doc` already
+/// has on disk when the patch doesn't touch it — so a patch that only
+/// flips `share_in_advert`, or only changes the name, still gets validated
+/// against the *resulting* combined state, not just the field it touches.
+///
+/// Uses `.get()` chains, not `doc["section"]["key"]` bracket indexing —
+/// `toml_edit::DocumentMut`'s `Index` impl *panics* on a missing key
+/// (`.expect("index not found")`), and an empty/partial config.toml missing
+/// `[bbs]` or `[location]` entirely is a first-class supported shape
+/// (`config::load()`'s own doc comment: "an empty config file ... is valid").
+/// A request as simple as an empty-body `PATCH {}` against such a file would
+/// panic the handler outright — and under the `release-min` build profile
+/// (`panic = "abort"`, used for shipped release-tag builds), that takes down
+/// the whole process for every connected user, not just the one request.
+fn effective_advert_name_sharing(
+    patch: &ConfigPatch,
+    doc: &toml_edit::DocumentMut,
+) -> (String, bool) {
+    let doc_location = doc.get("location");
+    let effective_name = patch
+        .bbs_name
+        .clone()
+        .or_else(|| {
+            doc.get("bbs")
+                .and_then(|t| t.get("name"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        // Matches config::default_bbs_name() — must be a real fallback name,
+        // not "", which validate_mesh_node_name rejects as Empty and would
+        // permanently block every future PATCH (even an unrelated one) on a
+        // config missing [bbs].name.
+        .unwrap_or_else(|| "Supply Drop BBS".to_owned());
+    let effective_sharing = patch.location_share_in_advert.unwrap_or_else(|| {
+        doc_location
+            .and_then(|t| t.get("share_in_advert"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    });
+    let effective_lat = match patch.location_latitude {
+        Some(v) => v,
+        None => doc_location
+            .and_then(|t| t.get("latitude"))
+            .and_then(|v| v.as_float()),
+    };
+    let effective_lon = match patch.location_longitude {
+        Some(v) => v,
+        None => doc_location
+            .and_then(|t| t.get("longitude"))
+            .and_then(|v| v.as_float()),
+    };
+    let sharing_location = effective_sharing && effective_lat.is_some() && effective_lon.is_some();
+    (effective_name, sharing_location)
+}
+
 /// Read a bool from `[plugins.<plugin>].<key>`.
 fn toml_plugin_bool(val: &toml::Value, plugin: &str, key: &str) -> Option<bool> {
     val.get("plugins")?.get(plugin)?.get(key)?.as_bool()
@@ -2572,12 +2632,16 @@ async fn api_patch_config(
     }
 
     // Validate bbs.name before mutating anything. It doubles as the MeshCore
-    // advert node name, which the firmware caps at 31 bytes — an over-length
-    // name silently fails to advertise on the mesh (see bbs_core::mesh_name).
-    if let Some(ref name) = patch.bbs_name {
-        if let Err(e) = bbs_core::mesh_name::validate_mesh_node_name(name) {
-            return (StatusCode::BAD_REQUEST, Json(json_error(&e.to_string()))).into_response();
-        }
+    // advert node name, which the firmware caps at 31 bytes — 23 if the
+    // advert also shares a GPS location (see bbs_core::mesh_name). Check the
+    // *effective* name and location-sharing state this patch would produce —
+    // whichever of the two this request doesn't touch falls back to what's
+    // already on disk — so changing either the name or the sharing toggle
+    // alone still catches a combination that would silently stop advertising.
+    let (effective_name, sharing_location) = effective_advert_name_sharing(&patch, &doc);
+    if let Err(e) = bbs_core::mesh_name::validate_mesh_node_name(&effective_name, sharing_location)
+    {
+        return (StatusCode::BAD_REQUEST, Json(json_error(&e.to_string()))).into_response();
     }
 
     // Apply patches — only touch keys explicitly present in the request.
@@ -4529,6 +4593,122 @@ mod tests {
                 .expect("numeric values must parse");
         assert_eq!(set.location_latitude, Some(Some(45.5)));
         assert_eq!(set.location_longitude, Some(Some(-122.6)));
+    }
+
+    // supply-drop-bbs#225: a name that fits without location can silently
+    // stop advertising the instant location-sharing turns on, with no error
+    // anywhere in the sending stack. These tests cover the four ways a PATCH
+    // request can produce that combination — changing the name alone,
+    // changing the sharing toggle alone, changing the coordinates alone, and
+    // touching nothing (so it's purely what's already on disk) — since each
+    // must be caught from whichever field the request actually touches, by
+    // falling back to what's already on disk for the rest.
+    mod effective_advert_name_sharing_tests {
+        use super::*;
+
+        fn empty_patch() -> ConfigPatch {
+            serde_json::from_str("{}").expect("an empty body must parse")
+        }
+
+        fn doc_with(toml: &str) -> toml_edit::DocumentMut {
+            toml.parse().expect("test fixture TOML must parse")
+        }
+
+        #[test]
+        fn falls_back_entirely_to_disk_when_patch_touches_nothing() {
+            let doc = doc_with(
+                "[bbs]\nname = \"Mesh America BBS\"\n\
+                 [location]\nlatitude = 1.0\nlongitude = 2.0\nshare_in_advert = true\n",
+            );
+            let (name, sharing) = effective_advert_name_sharing(&empty_patch(), &doc);
+            assert_eq!(name, "Mesh America BBS");
+            assert!(sharing);
+        }
+
+        // An empty (or [bbs]/[location]-less) config.toml is a first-class
+        // supported shape — config::load()'s own doc comment says so — not a
+        // corrupted-file edge case. doc["bbs"]["name"] bracket indexing
+        // panics on a missing key; a `.get()` chain doesn't. This must not
+        // regress back to the panicking form, since a request as ordinary as
+        // `PATCH {}` or a single-field patch would reach this exact path.
+        #[test]
+        fn missing_bbs_and_location_sections_does_not_panic() {
+            let doc = doc_with("logging_level = \"INFO\"\n");
+            let (name, sharing) = effective_advert_name_sharing(&empty_patch(), &doc);
+            // Matches config::default_bbs_name() — never "", which
+            // validate_mesh_node_name rejects as Empty.
+            assert_eq!(name, "Supply Drop BBS");
+            assert!(!sharing);
+        }
+
+        #[test]
+        fn unrelated_field_patch_against_missing_sections_does_not_panic() {
+            // The exact shape of a real caller: a patch that only touches an
+            // unrelated field (logging_level), against a config that has
+            // never had [bbs]/[location] written to it.
+            let doc = doc_with("logging_level = \"INFO\"\n");
+            let patch: ConfigPatch = serde_json::from_str(r#"{"logging_level":"DEBUG"}"#).unwrap();
+            let (name, sharing) = effective_advert_name_sharing(&patch, &doc);
+            assert_eq!(name, "Supply Drop BBS");
+            assert!(!sharing);
+            // And the fallback name must itself be a name validate_mesh_node_name
+            // accepts, or every such patch would be permanently rejected.
+            assert!(bbs_core::mesh_name::validate_mesh_node_name(&name, sharing).is_ok());
+        }
+
+        #[test]
+        fn patched_name_alone_is_checked_against_disk_sharing_state() {
+            // The request only changes the name; share_in_advert=true and a
+            // location are already on disk, so the *new* name must be
+            // checked against the tighter 23-byte with-location budget, even
+            // though this request never touches location at all.
+            let doc = doc_with(
+                "[bbs]\nname = \"short\"\n\
+                 [location]\nlatitude = 1.0\nlongitude = 2.0\nshare_in_advert = true\n",
+            );
+            let patch: ConfigPatch =
+                serde_json::from_str(r#"{"bbs_name":"🇺🇸 Mesh America BBS"}"#).unwrap();
+            let (name, sharing) = effective_advert_name_sharing(&patch, &doc);
+            assert_eq!(name, "🇺🇸 Mesh America BBS");
+            assert!(sharing);
+            assert!(bbs_core::mesh_name::validate_mesh_node_name(&name, sharing).is_err());
+        }
+
+        #[test]
+        fn patched_sharing_toggle_alone_is_checked_against_disk_name() {
+            // The request only flips share_in_advert on; the name and
+            // coordinates are already on disk. This is the exact scenario
+            // `supply-drop-bbs config share-position on` and the web UI
+            // checkbox both need to catch.
+            let doc = doc_with(
+                "[bbs]\nname = \"🇺🇸 Mesh America BBS\"\n\
+                 [location]\nlatitude = 1.0\nlongitude = 2.0\nshare_in_advert = false\n",
+            );
+            let patch: ConfigPatch =
+                serde_json::from_str(r#"{"location_share_in_advert":true}"#).unwrap();
+            let (name, sharing) = effective_advert_name_sharing(&patch, &doc);
+            assert_eq!(name, "🇺🇸 Mesh America BBS");
+            assert!(sharing);
+            assert!(bbs_core::mesh_name::validate_mesh_node_name(&name, sharing).is_err());
+        }
+
+        #[test]
+        fn clearing_location_relaxes_the_budget_even_if_sharing_stays_on() {
+            // share_in_advert=true on disk, but this request clears the
+            // coordinates — an advert can't carry lat/lon it doesn't have,
+            // so the name must fall back to the looser no-location budget.
+            let doc = doc_with(
+                "[bbs]\nname = \"🇺🇸 Mesh America BBS\"\n\
+                 [location]\nlatitude = 1.0\nlongitude = 2.0\nshare_in_advert = true\n",
+            );
+            let patch: ConfigPatch =
+                serde_json::from_str(r#"{"location_latitude":null,"location_longitude":null}"#)
+                    .unwrap();
+            let (name, sharing) = effective_advert_name_sharing(&patch, &doc);
+            assert_eq!(name, "🇺🇸 Mesh America BBS");
+            assert!(!sharing);
+            assert!(bbs_core::mesh_name::validate_mesh_node_name(&name, sharing).is_ok());
+        }
     }
 
     // Same bug, same fix, applied to all seven fields of PATCH

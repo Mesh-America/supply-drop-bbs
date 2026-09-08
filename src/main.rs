@@ -377,9 +377,15 @@ enum ConfigAction {
     Location {
         /// Latitude in decimal degrees (-90..90), or `off` to clear both
         /// coordinates.
+        // Without this, clap parses a negative value (e.g. -122.4194) as an
+        // unrecognized flag, not a positional argument — breaking every
+        // longitude in the Americas and every Southern Hemisphere latitude,
+        // including this command's own documented example.
+        #[arg(allow_hyphen_values = true)]
         latitude: String,
         /// Longitude in decimal degrees (-180..180). Required unless
         /// `latitude` is `off`.
+        #[arg(allow_hyphen_values = true)]
         longitude: Option<String>,
     },
 
@@ -953,9 +959,16 @@ async fn cmd_run(cli: &Cli) {
     // bbs.name is the MeshCore advert node name. Store an advert-safe
     // (truncated) copy so the mesh transport can push it to the radio via
     // SetAdvertName on connect — without this the node advertises with its
-    // key-derived fallback name (issue #101).
+    // key-derived fallback name (issue #101). Truncate to the looser
+    // no-location budget here: `[location].share_in_advert` can be flipped
+    // live via the web UI without a restart, and this cached copy is not
+    // re-read from config afterward, so truncating to the tighter
+    // with-location budget now could permanently lose bytes of the
+    // configured name if sharing is later turned off. bbs-mesh::transport
+    // re-truncates to the correct, current-state-aware budget at the actual
+    // point each advert is sent (see bbs_core::mesh_name).
     bbs.set_node_name(Some(
-        bbs_core::mesh_name::truncate_mesh_node_name(&cfg.bbs.name).to_owned(),
+        bbs_core::mesh_name::truncate_mesh_node_name(&cfg.bbs.name, false).to_owned(),
     ));
 
     if let Err(e) = bbs.ensure_guest_room().await {
@@ -1484,8 +1497,14 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
             longitude,
         } => {
             if latitude.eq_ignore_ascii_case("off") {
-                config_remove_location_key(config_path, "latitude");
-                config_remove_location_key(config_path, "longitude");
+                if longitude.is_some() {
+                    eprintln!(
+                        "error: unexpected extra argument after 'off' — did you mean \
+                         'config location <lat> <lon>'?"
+                    );
+                    std::process::exit(1);
+                }
+                config_remove_location_keys(config_path, &["latitude", "longitude"]);
                 println!("GPS coordinates cleared. Restart the BBS for the change to take effect.");
             } else {
                 let Some(longitude) = longitude else {
@@ -1506,8 +1525,25 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                         std::process::exit(1);
                     }
                 };
-                config_edit_location_float(config_path, "latitude", lat);
-                config_edit_location_float(config_path, "longitude", lon);
+                // Sharing a location tightens the advert name budget from 31
+                // to 23 bytes (see bbs_core::mesh_name) — if sharing is
+                // already on, setting coordinates now is what actually
+                // starts putting lat/lon in the advert, so check the
+                // *current* name against that budget before writing.
+                if cfg.location.share_in_advert {
+                    if let Err(e) =
+                        bbs_core::mesh_name::validate_mesh_node_name(&cfg.bbs.name, true)
+                    {
+                        eprintln!(
+                            "error: {e}\nShorten [bbs].name first, or run \
+                             'supply-drop-bbs config share-position off' before setting a \
+                             location this long — an over-length name silently fails to \
+                             advertise once GPS sharing is on."
+                        );
+                        std::process::exit(1);
+                    }
+                }
+                config_edit_location_floats(config_path, &[("latitude", lat), ("longitude", lon)]);
                 println!("location = {lat}, {lon}. Restart the BBS for the change to take effect.");
             }
         }
@@ -1520,6 +1556,20 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                     std::process::exit(1);
                 }
             };
+            // Turning sharing on tightens the advert name budget from 31 to
+            // 23 bytes (see bbs_core::mesh_name) — check the current name
+            // against that budget before writing, but only if a location is
+            // actually configured (an unconfigured location never puts
+            // lat/lon in the advert regardless of this flag).
+            if value && cfg.location.as_coords().is_some() {
+                if let Err(e) = bbs_core::mesh_name::validate_mesh_node_name(&cfg.bbs.name, true) {
+                    eprintln!(
+                        "error: {e}\nShorten [bbs].name first — an over-length name silently \
+                         fails to advertise once GPS location-sharing is on."
+                    );
+                    std::process::exit(1);
+                }
+            }
             config_edit_location_bool(config_path, "share_in_advert", value);
             println!("share_in_advert = {value}. Restart the BBS for the change to take effect.");
         }
@@ -1636,12 +1686,19 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
     }
 }
 
-fn config_edit_location_float(config_path: Option<&std::path::Path>, key: &str, value: f64) {
+/// Set multiple `[location]` float keys in a single read-modify-write, so a
+/// crash or kill between writes can't leave one key set without the other —
+/// e.g. latitude persisted with no longitude, which `config location <lat>
+/// <lon>` would otherwise risk by writing each key through a separate
+/// `open_config_for_edit`/`atomic_write_file` round trip.
+fn config_edit_location_floats(config_path: Option<&std::path::Path>, pairs: &[(&str, f64)]) {
     let (path, mut doc) = open_config_for_edit(config_path);
     if doc.get("location").is_none() {
         doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
     }
-    doc["location"][key] = toml_edit::value(value);
+    for (key, value) in pairs {
+        doc["location"][*key] = toml_edit::value(*value);
+    }
     if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
         eprintln!("error writing {}: {e}", path.display());
         std::process::exit(1);
@@ -1660,10 +1717,14 @@ fn config_edit_location_bool(config_path: Option<&std::path::Path>, key: &str, v
     }
 }
 
-fn config_remove_location_key(config_path: Option<&std::path::Path>, key: &str) {
+/// Remove multiple `[location]` keys in a single read-modify-write — same
+/// atomicity rationale as [`config_edit_location_floats`].
+fn config_remove_location_keys(config_path: Option<&std::path::Path>, keys: &[&str]) {
     let (path, mut doc) = open_config_for_edit(config_path);
     if let Some(location) = doc.get_mut("location").and_then(|t| t.as_table_mut()) {
-        location.remove(key);
+        for key in keys {
+            location.remove(key);
+        }
     }
     if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
         eprintln!("error writing {}: {e}", path.display());
