@@ -358,7 +358,7 @@ async fn broadcast_self_advert(
 
 /// The MeshCore transport plugin.
 ///
-/// Connects Supply Drop BBS to a `pymc_core` radio bridge over the companion-
+/// Connects Supply Drop BBS to an `openhop_core` radio bridge over the companion-
 /// frame TCP protocol.  Implements both [`Plugin`] (lifecycle) and
 /// [`TransportEngine`] (inbound command processing + outbound notifications).
 ///

@@ -4,7 +4,7 @@ Supply Drop BBS can serve MeshCore and Meshtastic users from a single instance. 
 
 Each transport connects to its own radio. Both MeshCore and Meshtastic support the same two connection types:
 
-- **Pi HAT** — a radio HAT connected to the Raspberry Pi's SPI/GPIO pins, managed by `pymc_core`
+- **Pi HAT** — a radio HAT connected to the Raspberry Pi's SPI/GPIO pins, managed by `openhop_core`
 - **USB device** — a radio such as a Heltec V3, T-Beam, or RAK4631 connected over USB serial
 
 Mix and match freely. Common setups include MeshCore HAT + Meshtastic USB, two USB devices, or two HATs if your Pi has the GPIO pins available.
@@ -29,12 +29,12 @@ The rest of this guide covers manual configuration for operators who prefer to e
 
 ```
 MeshCore radio (HAT or USB)
-    ├── HAT: pymc_core daemon → [plugins.mesh]  ──┐
-    └── USB: direct serial   → [plugins.mesh]  ──┤
-                                                  ├── Supply Drop BBS (shared DB + rooms)
-Meshtastic radio (HAT or USB)                     │
-    ├── HAT: pymc_core daemon → [plugins.meshtastic]  ──┤
-    └── USB: direct serial   → [plugins.meshtastic] ───┘
+    ├── HAT: openhop_core daemon → [plugins.mesh]       ──┐
+    └── USB: direct serial       → [plugins.mesh]       ──┤
+                                                          ├── Supply Drop BBS (shared DB + rooms)
+Meshtastic radio (HAT or USB)                             │
+    ├── HAT: openhop_core daemon → [plugins.meshtastic] ──┤
+    └── USB: direct serial       → [plugins.meshtastic] ──┘
 ```
 
 The two transports run as independent tasks inside the same BBS process. They share nothing except the host — rooms, users, and messages are the same regardless of which radio a user comes in on.
@@ -71,7 +71,7 @@ usb 1-1.2: cp210x converter now attached to ttyUSB0
 
 If you have two USB radios, plug them in one at a time and note which port each claims. The first USB serial device is usually `/dev/ttyUSB0`, the second `/dev/ttyUSB1` — but this depends on plug order and the chips involved, so always confirm with `dmesg`.
 
-HAT connections do not use a serial port number; the connection goes through `pymc_core` on `127.0.0.1:5000`.
+HAT connections do not use a serial port number; the connection goes through `openhop_core` on `127.0.0.1:5000`.
 
 ---
 
@@ -87,7 +87,7 @@ Edit your `config.toml` (typically `/etc/supply-drop-bbs/config.toml`) and add b
 [plugins.mesh]
 enabled         = true
 connection_type = "hat"
-addr            = "127.0.0.1:5000"  # pymc_core; default, change only if remote
+addr            = "127.0.0.1:5000"  # openhop_core; default, change only if remote
 
 [plugins.mesh.hat]
 preset = "zebrahat"  # see preset table below
@@ -179,10 +179,10 @@ INFO bbs_mesh::transport     connected
 INFO bbs_meshtastic           connected
 ```
 
-If the MeshCore HAT transport logs a connection error, check that `pymc_core` is running:
+If the MeshCore HAT transport logs a connection error, check that `openhop_core` is running:
 
 ```sh
-systemctl status pymc-core
+systemctl status pymc-companion
 ```
 
 If either transport logs a serial error, confirm the port name with `dmesg | grep tty` and update `serial_port` in the config. If the error is `Permission denied (os error 13)`, the service user lacks access to the port's group — see [OPERATIONS.md → Serial port: Permission denied](OPERATIONS.md#serial-port-permission-denied).

@@ -336,7 +336,7 @@ arrive.
 ### Serial mode (`connection_type = "serial"`)
 
 Used for USB-native MeshCore devices (Heltec V3, T-Beam, etc.) that
-run companion-frame firmware. No `pymc_core` required.
+run companion-frame firmware. No `openhop_core` required.
 
 | Key           | Type    | Default          | Required | Description                              |
 |---------------|---------|------------------|----------|------------------------------------------|
@@ -345,10 +345,10 @@ run companion-frame firmware. No `pymc_core` required.
 
 ### TCP / HAT mode (`connection_type = "tcp"` or `"hat"`)
 
-Used when `pymc_core` is running separately (Pi HAT setups or any
+Used when `openhop_core` is running separately (Pi HAT setups or any
 external `CompanionFrameServer`). `"hat"` and `"tcp"` are identical at
 the transport level; the distinction tells the setup wizard to install
-`pymc_core` as a systemd dependency.
+`openhop_core` as a systemd dependency.
 
 | Key                          | Type    | Default            | Required | Description                                             |
 |------------------------------|---------|--------------------|----------|---------------------------------------------------------|

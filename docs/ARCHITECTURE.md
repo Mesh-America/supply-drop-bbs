@@ -109,7 +109,7 @@ serial port via `meshcore-companion`. No bridge process. No Python.
 
 ```
                   ┌──────────────────────────────┐
-                  │    pymc_core                  │
+                  │    openhop_core               │
                   │    CompanionFrameServer       │
                   │    (Python - radio bridge)    │
                   │                               │
@@ -147,9 +147,11 @@ The two processes are independent. Stopping one doesn't break the
 other; the BBS reports mesh unavailability cleanly and continues
 serving CLI and web clients.
 
-`pymc_core` is **not part of this project's source tree**. We install
-and configure it as part of the setup wizard for HAT deployments.
-See [ADR-0007](adr/0007-bridge-stays-pymc-core.md) and
+`openhop_core` (formerly published as `pymc_core` — the upstream
+project was rebranded from pyMC Core to openHop) is **not part of
+this project's source tree**. We install and configure it as part of
+the setup wizard for HAT deployments. See
+[ADR-0007](adr/0007-bridge-stays-pymc-core.md) and
 [ADR-0013](adr/0013-native-serial-transport-for-usb-devices.md).
 
 ### 2.2 Crate layout
@@ -179,7 +181,7 @@ supply-drop-bbs/
 │   │                         compiled Vue frontend via rust-embed.
 │   └── meshcore-companion/ ← Pure-Rust client for the
 │                             companion-frame TCP protocol that
-│                             pymc_core's CompanionFrameServer
+│                             openhop_core's CompanionFrameServer
 │                             speaks. Standalone crate; could be
 │                             published to crates.io eventually.
 ├── docs/                   ← what you're reading
@@ -587,7 +589,7 @@ authenticate the same way the bundled Vue UI does.
 
 The companion-frame protocol between the BBS and the radio bridge
 is documented in [`PROTOCOL.md`](PROTOCOL.md). It is not OpenAPI;
-it's a binary framing format inherited from `pymc_core` /
+it's a binary framing format inherited from `openhop_core` /
 MeshCore upstream.
 
 The application layer on top of mesh - the BBS commands users send
@@ -849,7 +851,7 @@ when it becomes real.
 
 - **WASM plugins.** Runtime-loadable, sandboxed, language-agnostic.
   Real long-term answer for "anyone can write a plugin." Not v1.
-- **Native Rust radio bridge.** Replace `pymc_core`'s
+- **Native Rust radio bridge.** Replace `openhop_core`'s
   CompanionFrameServer with a Rust binary that talks to the SX1262
   directly. Eliminates the Python supply chain entirely.
 - **MFA on sysop login.** TOTP or hardware key.
@@ -875,7 +877,7 @@ Decisions with their own dedicated record:
 | 0004 | Cargo features for plugin selection             | Accepted |
 | 0005 | DB strategy: disk WAL with SD-card tuning       | Accepted |
 | 0006 | No migration from mesh-citadel                  | Accepted |
-| 0007 | Pin pymc_core CompanionFrameServer for v1       | Accepted |
+| 0007 | Pin pymc_core (now openhop_core) CompanionFrameServer for v1 | Accepted |
 | 0008 | TOML config with env var + CLI overrides        | Accepted |
 | 0009 | Tracing-based logging that respects config      | Accepted |
 | 0010 | OpenAPI generated from Rust via utoipa          | Accepted |

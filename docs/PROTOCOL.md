@@ -3,7 +3,7 @@
 Two protocols are documented here:
 
 1. **Companion-frame** - the binary TCP protocol between Supply
-   Drop BBS and the radio bridge process (`pymc_core`'s
+   Drop BBS and the radio bridge process (`openhop_core`'s
    `CompanionFrameServer`)
 2. **BBS-over-mesh** - the application-layer command vocabulary
    that mesh users exchange with the BBS
@@ -13,7 +13,7 @@ OpenAPI: see [`openapi.json`](openapi.json) (generated from Rust;
 committed for diffability).
 
 > **Status:** stub. The companion-frame section captures what we
-> know from reading `meshcore_py` and `pymc_core` source; details
+> know from reading `meshcore_py` and `openhop_core` source; details
 > get pinned down precisely when we implement the
 > `meshcore-companion` crate. Sections marked **TBD** require
 > implementation experience to confirm.
@@ -22,7 +22,7 @@ committed for diffability).
 
 ### Purpose
 
-`pymc_core`'s `CompanionFrameServer` exposes a TCP server that
+`openhop_core`'s `CompanionFrameServer` exposes a TCP server that
 speaks the MeshCore "companion" wire protocol - the same protocol
 a USB or serial-attached MeshCore companion device speaks. This
 abstracts the radio: the BBS doesn't care if the bridge is on a
@@ -41,7 +41,7 @@ SX1262.
 ### Framing
 
 **TBD** - exact framing inherited from MeshCore companion protocol.
-Working hypothesis from `pymc_core` source:
+Working hypothesis from `openhop_core` source:
 
 - Each frame is length-prefixed
 - A single-byte frame type identifier
@@ -104,7 +104,7 @@ The companion-frame protocol surface produces:
 
 ### Versioning
 
-`pymc_core` versions it ships, and so does the companion protocol
+`openhop_core` versions it ships, and so does the companion protocol
 itself. Our `meshcore-companion` crate pins a version range it
 supports and refuses to talk to a bridge outside that range. The
 range is documented in the crate's README and in the BBS's
@@ -122,7 +122,7 @@ range is documented in the crate's README and in the BBS's
 - **Integration tests** against a `MockBridgeServer` - a Rust test
   harness that imitates the bridge well enough for the BBS to
   exercise its mesh transport without actual radio hardware.
-- **End-to-end tests** against a real `pymc_core` instance - gated
+- **End-to-end tests** against a real `openhop_core` instance - gated
   behind a `--features integration-tests-with-bridge` cargo flag,
   not run in default CI.
 
@@ -417,7 +417,7 @@ operation since plugins are in-process).
 - `crates/bbs-mesh/` - the BBS-side mesh transport plugin (TBD)
 - `crates/bbs-core/src/command.rs` - internal command/response
   types (TBD)
-- [`pymc_core`](https://github.com/meshcore-dev/pymc_core) -
-  upstream radio bridge
+- [`openhop_core`](https://github.com/openhop-dev/openhop_core) -
+  upstream radio bridge (formerly `pymc_core`)
 - [`meshcore_py`](https://github.com/meshcore-dev/meshcore_py) -
   Python reference client of the companion-frame protocol

@@ -605,19 +605,19 @@ if [[ "$_mesh_enabled" == true && "$_mesh_conn_type" == "hat" ]]; then
     apt-get install -y -qq $_syspkgs
     success "HAT system packages installed"
 
-    # ── Python venv + pymc_core ───────────────────────────────────────────────
+    # ── Python venv + openhop_core ────────────────────────────────────────────
     mkdir -p "$PYMC_DIR"
     if [[ ! -d "$PYMC_DIR/venv" ]]; then
         info "Creating Python venv at $PYMC_DIR/venv..."
         python3 -m venv "$PYMC_DIR/venv"
     fi
-    info "Installing pymc_core (this may take a minute)..."
+    info "Installing openhop-core (this may take a minute)..."
     "$PYMC_DIR/venv/bin/pip" install -q --upgrade pip
-    "$PYMC_DIR/venv/bin/pip" install -q pymc_core pyyaml spidev
+    "$PYMC_DIR/venv/bin/pip" install -q openhop-core pyyaml spidev
     if [[ "$_gpiod" == false ]]; then
         "$PYMC_DIR/venv/bin/pip" install -q lgpio python-periphery
     fi
-    success "pymc_core installed"
+    success "openhop-core installed"
 
     # ── Install companion script ───────────────────────────────────────────────
     install -m 755 \

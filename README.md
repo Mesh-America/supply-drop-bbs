@@ -31,7 +31,7 @@ to:
   shipping today. MeshCore connects either directly over USB serial to a
   device running the MeshCore companion firmware (no Python, no bridge
   process), or over TCP to
-  [`pymc_core`](https://github.com/meshcore-dev/pymc_core)'s
+  [`openhop_core`](https://github.com/openhop-dev/openhop_core)'s
   CompanionFrameServer, which also covers Raspberry Pi HAT radios as a
   special case. A third transport lets an operator run any executable
   (Telnet, Slack, Discord, APRS, SMS, ...) as a BBS transport over a

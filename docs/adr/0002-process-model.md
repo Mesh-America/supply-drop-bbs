@@ -4,6 +4,11 @@
 - **Date:** 2026-05-08
 - **Deciders:** Mesh-America
 
+> **2026-09 update:** the radio-bridge's `pymc_core` dependency (referenced
+> below) was rebranded upstream to `openhop_core`; see
+> [ADR-0007](0007-bridge-stays-pymc-core.md)'s own update note. The
+> process-separation decision here is unaffected.
+
 ## Context
 
 The BBS needs to talk to a LoRa radio (SX1262 over SPI on a Pi).

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-pymc-companion — minimal pymc_core companion frame server for supply-drop-bbs.
+pymc-companion — minimal openhop_core companion frame server for supply-drop-bbs.
 
-Drives a LoRa HAT directly via SPI using pymc_core and exposes the MeshCore
+Drives a LoRa HAT directly via SPI using openhop_core and exposes the MeshCore
 companion frame protocol on a TCP port so supply-drop-bbs can connect to it.
 
-This is the same approach as mesh-citadel's HatRuntime — pymc_core runs
+This is the same approach as mesh-citadel's HatRuntime — openhop_core runs
 in-process as a library, not as a separate daemon.
 
 Usage:
@@ -62,13 +62,13 @@ def load_or_create_identity(LocalIdentity, identity_path: str | None):
 
 async def run(config: dict) -> None:
     try:
-        from pymc_core import LocalIdentity
-        from pymc_core.companion import CompanionFrameServer, CompanionRadio
-        from pymc_core.hardware.sx1262_wrapper import SX1262Radio
+        from openhop_core import LocalIdentity
+        from openhop_core.companion import CompanionFrameServer, CompanionRadio
+        from openhop_core.hardware.sx1262_wrapper import SX1262Radio
     except ImportError as e:
         log.error(
-            f"pymc_core is not installed: {e}\n"
-            "Install with: pip install pymc_core"
+            f"openhop_core is not installed: {e}\n"
+            "Install with: pip install openhop-core"
         )
         sys.exit(1)
 
@@ -106,9 +106,15 @@ async def run(config: dict) -> None:
     }
     if "dio3_tcxo_voltage" in radio_cfg:
         radio_kwargs["dio3_tcxo_voltage"] = float(radio_cfg["dio3_tcxo_voltage"])
-    for _opt_int in ("gpio_chip", "cs_id", "en_pin", "tx_led", "rx_led"):
+    for _opt_int in ("gpio_chip", "cs_id", "en_pin"):
         if _opt_int in radio_cfg:
             radio_kwargs[_opt_int] = int(radio_cfg[_opt_int])
+    # YAML key names (tx_led/rx_led) predate and differ from SX1262Radio's
+    # real constructor parameter names (txled_pin/rxled_pin) — kept as-is on
+    # the config side for stability, translated here.
+    for _yaml_key, _kwarg_name in (("tx_led", "txled_pin"), ("rx_led", "rxled_pin")):
+        if _yaml_key in radio_cfg:
+            radio_kwargs[_kwarg_name] = int(radio_cfg[_yaml_key])
     if radio_cfg.get("use_gpiod_backend"):
         radio_kwargs["use_gpiod_backend"] = True
 
@@ -192,7 +198,7 @@ async def run(config: dict) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="pymc_core companion frame server for supply-drop-bbs"
+        description="openhop_core companion frame server for supply-drop-bbs"
     )
     parser.add_argument("--config", required=True, help="Path to YAML config file")
     parser.add_argument("--log-level", default="INFO", help="Log level (default: INFO)")
