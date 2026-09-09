@@ -233,7 +233,17 @@ if [[ -d "$SRC_DIR/.git" ]]; then
     # existing SRC_DIR left on the wrong branch by an older install — e.g.
     # one cloned before this pin existed, when a bare `git clone` picked up
     # whatever the repo's default branch was at the time.
-    git -C "$SRC_DIR" fetch --depth 1 origin "$SRC_BRANCH:refs/remotes/origin/$SRC_BRANCH"
+    #
+    # --force is required, not optional: on a real SRC_DIR with accumulated
+    # history (as opposed to a fresh clone), updating the local
+    # refs/remotes/origin/$SRC_BRANCH ref can be a non-fast-forward relative
+    # to what's already stored there — confirmed on a live host, where the
+    # unforced fetch below failed outright ("[rejected] ... non-fast-forward",
+    # exit 1). Under `set -e` that aborts the whole update instead of
+    # silently leaving a stale checkout, which is at least safe — but it
+    # defeats this block's entire purpose (self-healing an existing SRC_DIR
+    # onto the correct branch), so force it instead of letting it fail.
+    git -C "$SRC_DIR" fetch --depth 1 --force origin "$SRC_BRANCH:refs/remotes/origin/$SRC_BRANCH"
     git -C "$SRC_DIR" checkout -B "$SRC_BRANCH" "origin/$SRC_BRANCH"
     success "Source updated"
 else
