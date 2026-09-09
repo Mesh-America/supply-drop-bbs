@@ -3,7 +3,7 @@
 //! Supports two transports:
 //!
 //! - **TCP** ([`CompanionClient::connect`]) — connects to a
-//!   `CompanionFrameServer`, typically `pymc_core`'s TCP bridge.  Used in
+//!   `CompanionFrameServer`, typically `openhop_core`'s TCP bridge.  Used in
 //!   HAT and standalone TCP deployments.
 //!
 //! - **Serial** ([`CompanionClient::connect_serial`]) — opens a local USB

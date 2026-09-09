@@ -2,7 +2,9 @@
 //!
 //! Each test section corresponds to a decoded frame type or an encoding
 //! command. Wire bytes are constructed by hand from the documented layouts
-//! (confirmed against `pymc_core/frame_server.py`).
+//! (confirmed as of 2026-09-08 against openhop_core 1.1.3's
+//! `openhop_core/companion/frame_server/server.py`; formerly
+//! `pymc_core/frame_server.py` in the pre-rename layout).
 
 use meshcore_companion::{
     constants::*,

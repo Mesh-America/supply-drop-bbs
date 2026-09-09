@@ -2,12 +2,12 @@
 //!
 //! Deserialized from the `[plugins.mesh]` section of the operator's
 //! TOML config file.  All fields have sensible defaults so an
-//! operator running `pymc_core` on the same machine with default
+//! operator running `openhop_core` on the same machine with default
 //! settings needs zero configuration.
 //!
 //! # Connection types
 //!
-//! | `connection_type` | Transport        | pymc_core needed? |
+//! | `connection_type` | Transport        | openhop_core needed? |
 //! |-------------------|------------------|-------------------|
 //! | `tcp`             | TCP socket       | yes (default)     |
 //! | `hat`             | TCP socket       | yes (Pi HAT)      |
@@ -16,7 +16,7 @@
 //! Both `tcp` and `hat` connect to a `CompanionFrameServer` over TCP.
 //! `hat` is operationally identical to `tcp` at the BBS level; the
 //! distinction is that the setup wizard offers Pi HAT GPIO / SPI setup
-//! only for `hat`.  `serial` bypasses `pymc_core` entirely and speaks
+//! only for `hat`.  `serial` bypasses `openhop_core` entirely and speaks
 //! the companion-frame protocol directly to the USB device.
 
 use std::{net::SocketAddr, time::Duration};
@@ -28,20 +28,20 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ConnectionType {
-    /// Connect via TCP to a `pymc_core` `CompanionFrameServer`.
+    /// Connect via TCP to an `openhop_core` `CompanionFrameServer`.
     /// The default — works for standalone Pi + USB radio setups managed
-    /// by `pymc_core`, or for any networked bridge.
+    /// by `openhop_core`, or for any networked bridge.
     #[default]
     Tcp,
 
-    /// Connect via TCP to a `pymc_core` `CompanionFrameServer` that
+    /// Connect via TCP to an `openhop_core` `CompanionFrameServer` that
     /// manages a Pi HAT radio (GPIO / SPI).  Operationally identical to
     /// `tcp` at the BBS level; the setup wizard uses this to offer HAT-
     /// specific configuration (pin presets, UART setup, service install).
     Hat,
 
     /// Connect directly to a USB companion device (e.g. Heltec V3,
-    /// T-Beam) via a local serial port.  `pymc_core` is not required;
+    /// T-Beam) via a local serial port.  `openhop_core` is not required;
     /// the BBS speaks the companion-frame protocol directly.  See
     /// ADR-0013 for the rationale.
     Serial,
@@ -101,13 +101,13 @@ pub struct RadioConfig {
 ///
 /// # Minimal TOML examples
 ///
-/// TCP (pymc_core on the same host, default port):
+/// TCP (openhop_core on the same host, default port):
 /// ```toml
 /// [plugins.mesh]
 /// # Nothing required — defaults connect to 127.0.0.1:5000
 /// ```
 ///
-/// USB serial (no pymc_core):
+/// USB serial (no openhop_core):
 /// ```toml
 /// [plugins.mesh]
 /// connection_type = "serial"
@@ -129,7 +129,7 @@ pub struct MeshConfig {
     /// Address of the `CompanionFrameServer` TCP listener.
     ///
     /// Used when `connection_type` is `tcp` or `hat`.
-    /// Defaults to `127.0.0.1:5000`, which is the `pymc_core` default
+    /// Defaults to `127.0.0.1:5000`, which is the `openhop_core` default
     /// when both processes run on the same host.
     #[serde(default = "default_addr")]
     pub addr: SocketAddr,

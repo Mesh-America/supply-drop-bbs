@@ -2,7 +2,7 @@
 //!
 //! Uses [`MockHost`] from `bbs-plugin-api` and an in-process TCP loopback
 //! (ephemeral port on 127.0.0.1) to exercise the full
-//! `init → start → frame → response` path without a real `pymc_core` process.
+//! `init → start → frame → response` path without a real `openhop_core` process.
 //!
 //! # Bridge protocol reminder
 //!

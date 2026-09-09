@@ -49,7 +49,7 @@ In scope:
 
 Out of scope (report to the upstream project):
 
-- Vulnerabilities in `pymc_core`, `meshcore_py`, or the MeshCore
+- Vulnerabilities in `openhop_core`, `meshcore_py`, or the MeshCore
   firmware itself. Report those at the relevant upstream repos.
 - Vulnerabilities in third-party plugins or UIs that consume our
   plugin API. Report to that plugin's maintainers.

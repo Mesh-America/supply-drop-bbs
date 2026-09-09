@@ -588,7 +588,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         let conn_items = &[
             "USB / serial  (Heltec V3, T-Beam, RAK4631 — plug in via USB)",
             "Pi HAT        (ZebraHat, Waveshare, PiMesh, FemtoFox — SPI on GPIO)",
-            "TCP           (connect to a running pymc_core, default port 5000)",
+            "TCP           (connect to a running openhop_core, default port 5000)",
         ];
         let conn_default = if ex.mesh_connection_type == "hat" {
             1
@@ -613,7 +613,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
             1 => ("hat", None, None, None),
             _ => {
                 let addr: String = Input::with_theme(&theme)
-                    .with_prompt("pymc_core address")
+                    .with_prompt("openhop_core address")
                     .default(
                         ex.mesh_addr
                             .clone()
@@ -665,7 +665,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
     // ── MeshCore radio parameters (serial mode only) ──────────────────────────
     //
     // For HAT mode, radio parameters go into pymc-companion.yaml (handled
-    // later by configure_hat). For TCP mode, pymc_core owns the radio config.
+    // later by configure_hat). For TCP mode, openhop_core owns the radio config.
     // Only USB serial devices are configured here.
 
     let mesh_radio: Option<RadioChoice> = if use_mesh && mesh_conn_type == "serial" {
@@ -2184,8 +2184,8 @@ fn print_next_steps(
     config_chown_ok: bool,
 ) {
     if use_mesh && mesh_conn_type == "tcp" {
-        println!("MeshCore TCP mode: Supply Drop BBS will connect to pymc_core at");
-        println!("the configured address. Make sure pymc_core is running before");
+        println!("MeshCore TCP mode: Supply Drop BBS will connect to openhop_core at");
+        println!("the configured address. Make sure openhop_core is running before");
         println!("starting the BBS.");
         println!();
     }
