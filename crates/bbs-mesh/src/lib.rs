@@ -1,7 +1,7 @@
 //! # bbs-mesh
 //!
 //! The MeshCore transport plugin for Supply Drop BBS.  Connects to
-//! `pymc_core`'s `CompanionFrameServer` over TCP and translates between
+//! `openhop_core`'s `CompanionFrameServer` over TCP and translates between
 //! MeshCore direct messages and the BBS `Command` / `Response` types
 //! defined in `bbs_plugin_api`.
 //!
@@ -9,7 +9,7 @@
 //!
 //! ```text
 //! ┌──────────────────────────────────────────────────────────────┐
-//! │  pymc_core CompanionFrameServer  (radio bridge, TCP :5000)   │
+//! │  openhop_core CompanionFrameServer  (radio bridge, TCP :5000)│
 //! └──────────────────────┬───────────────────────────────────────┘
 //!                        │ companion-frame TCP protocol
 //! ┌──────────────────────▼───────────────────────────────────────┐

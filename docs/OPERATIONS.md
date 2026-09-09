@@ -42,7 +42,7 @@ If you're a contributor or plugin author, see
 | Disk      | 2 GB free for DB + logs + backups; SD card OK |
 | Radio     | SX1262 Pi HAT **or** USB MeshCore companion device |
 | OS        | Linux - Raspberry Pi OS / Debian tested. Other Unixes likely work. |
-| Python    | 3.10+ - **Pi HAT mode only** (for `pymc_core`) |
+| Python    | 3.10+ - **Pi HAT mode only** (for `openhop_core`) |
 
 The BBS itself is a single static Rust binary with no runtime dependencies.
 Python is only required when using a Pi HAT
@@ -76,15 +76,15 @@ No bridge process, no Python. One service to manage.
 ### Pi HAT (two-process)
 
 ```
-   ┌──────────────────────┐         ┌────────────────────────┐
-   │  pymc-companion      │         │  supply-drop-bbs       │
-   │  (Python - pymc_core │◄─TCP──► │  (Rust BBS host)       │
-   │  CompanionRadio +    │         │                        │
-   │  CompanionFrameServer│         │  also exposes:         │
-   │                      │         │  - web UI (opt-in)     │
-   │  manages GPIO/SPI    │         └────────────────────────┘
-   │  for the LoRa HAT    │
-   └──────────────────────┘
+   ┌─────────────────────────┐      ┌────────────────────────┐
+   │  pymc-companion         │      │  supply-drop-bbs       │
+   │  (Python - openhop_core)│◄TCP► │  (Rust BBS host)       │
+   │  CompanionRadio +       │      │                        │
+   │  CompanionFrameServer   │      │  also exposes:         │
+   │                         │      │  - web UI (opt-in)     │
+   │  manages GPIO/SPI       │      └────────────────────────┘
+   │  for the LoRa HAT       │
+   └─────────────────────────┘
             │
             ▼
       SX1262 LoRa HAT
@@ -203,7 +203,7 @@ Append `-headless` to the binary name for a smaller build without the admin web 
 ### Option 3 — Guided setup script
 
 The `install.sh` script handles the full stack including Pi HAT configuration
-(`pymc_core`, SPI, `pymc-companion.service`). Download and read it before running:
+(`openhop_core`, SPI, `pymc-companion.service`). Download and read it before running:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/Mesh-America/supply-drop-bbs/main/install.sh \
@@ -222,7 +222,7 @@ sudo bash install.sh
 6. Creates the `supply-drop` system user and the config/data directories
 7. Installs the `supply-drop-bbs.service` systemd unit
 8. Runs the **setup wizard**
-9. **Pi HAT only:** installs `pymc_core` in a Python venv, writes `pymc-companion.yaml`, and enables `pymc-companion.service`
+9. **Pi HAT only:** installs `openhop_core` in a Python venv, writes `pymc-companion.yaml`, and enables `pymc-companion.service`
 10. Enables and starts both services
 
 ### What the setup wizard asks
@@ -246,7 +246,7 @@ After the BBS wizard, the installer asks:
 The installer then:
 
 - Enables SPI via `raspi-config` if not already active
-- Creates `/opt/pymc-companion/venv` with `pymc_core`, `spidev`, and `lgpio`
+- Creates `/opt/pymc-companion/venv` with `openhop_core`, `spidev`, and `lgpio`
 - Writes `/etc/supply-drop-bbs/pymc-companion.yaml` with your HAT's pin config
 - Installs and enables `pymc-companion.service`
 

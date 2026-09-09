@@ -4,6 +4,14 @@
 - **Date:** 2026-05-08
 - **Deciders:** Mesh-America
 
+> **2026-09 update:** upstream `pymc_core` was rebranded to `openhop_core`
+> (PyPI package `openhop-core`); the old `pymc_core` PyPI package is no
+> longer maintained. The decision and rationale below are unaffected — we
+> still use the same upstream project's `CompanionFrameServer`, just under
+> its current name. See `supply-drop-bbs-4yv` / [#232](https://github.com/Mesh-America/supply-drop-bbs/issues/232)
+> for the migration. The rest of this document is left as originally
+> written, under the name in use at the time.
+
 ## Context
 
 The radio-bridge process (see [ADR-0002](0002-process-model.md))

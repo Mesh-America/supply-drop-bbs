@@ -30,6 +30,16 @@ fi
 
 REPO="https://github.com/Mesh-America/supply-drop-bbs.git"
 GITHUB_API="https://api.github.com/repos/Mesh-America/supply-drop-bbs"
+# Pinned, NOT the repo's default branch: this script itself is only ever
+# fetched from `main` (see the curl one-liner in the header comment and in
+# docs/OPERATIONS.md) — `main` tracks released code, while GitHub's default
+# branch is `next` (integration branch, ahead of any release). Cloning
+# whatever the default branch happens to be would let this SRC_DIR checkout
+# silently drift ahead of the running script's own logic — e.g. a newer
+# contrib/pymc-companion/pymc-companion.py (installed further below from
+# SRC_DIR) importing a dependency this stale script never installs. Pinning
+# both to the same ref keeps the script and everything it copies in sync.
+SRC_BRANCH="main"
 SRC_DIR="/opt/supply-drop-bbs"
 BIN_PATH="/usr/local/bin/supply-drop-bbs"
 SERVICE_USER="supply-drop"
@@ -219,11 +229,16 @@ success "Base dependencies installed"
 
 if [[ -d "$SRC_DIR/.git" ]]; then
     info "Updating Supply Drop BBS source..."
-    git -C "$SRC_DIR" pull --ff-only
+    # fetch + checkout -B (not `pull --ff-only`) so this self-heals an
+    # existing SRC_DIR left on the wrong branch by an older install — e.g.
+    # one cloned before this pin existed, when a bare `git clone` picked up
+    # whatever the repo's default branch was at the time.
+    git -C "$SRC_DIR" fetch --depth 1 origin "$SRC_BRANCH:refs/remotes/origin/$SRC_BRANCH"
+    git -C "$SRC_DIR" checkout -B "$SRC_BRANCH" "origin/$SRC_BRANCH"
     success "Source updated"
 else
     info "Cloning Supply Drop BBS..."
-    git clone --depth 1 "$REPO" "$SRC_DIR"
+    git clone --depth 1 --branch "$SRC_BRANCH" "$REPO" "$SRC_DIR"
     success "Source cloned to $SRC_DIR"
 fi
 
@@ -605,19 +620,19 @@ if [[ "$_mesh_enabled" == true && "$_mesh_conn_type" == "hat" ]]; then
     apt-get install -y -qq $_syspkgs
     success "HAT system packages installed"
 
-    # ── Python venv + pymc_core ───────────────────────────────────────────────
+    # ── Python venv + openhop_core ────────────────────────────────────────────
     mkdir -p "$PYMC_DIR"
     if [[ ! -d "$PYMC_DIR/venv" ]]; then
         info "Creating Python venv at $PYMC_DIR/venv..."
         python3 -m venv "$PYMC_DIR/venv"
     fi
-    info "Installing pymc_core (this may take a minute)..."
+    info "Installing openhop-core (this may take a minute)..."
     "$PYMC_DIR/venv/bin/pip" install -q --upgrade pip
-    "$PYMC_DIR/venv/bin/pip" install -q pymc_core pyyaml spidev
+    "$PYMC_DIR/venv/bin/pip" install -q openhop-core pyyaml spidev
     if [[ "$_gpiod" == false ]]; then
         "$PYMC_DIR/venv/bin/pip" install -q lgpio python-periphery
     fi
-    success "pymc_core installed"
+    success "openhop-core installed"
 
     # ── Install companion script ───────────────────────────────────────────────
     install -m 755 \

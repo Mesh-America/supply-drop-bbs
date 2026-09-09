@@ -803,7 +803,7 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
             // (field `frequency_khz`).  The `OutboundFrame` field is named
             // `frequency_hz` for human clarity; we divide by 1000 here.
             //
-            // This matches the pymc_core CompanionFrameServer comment:
+            // This matches the openhop_core CompanionFrameServer comment:
             //   "Frequency in kHz (match firmware self-info; client sends same encoding)"
             // and the validation range (100_000–2_500_000 kHz = 100 MHz–2.5 GHz).
             let freq_khz = frequency_hz / 1000;

@@ -4,6 +4,13 @@
 - **Date:** 2026-05-08
 - **Deciders:** Mesh-America
 
+> **2026-09 update:** `pymc_core` (referenced throughout below) was
+> rebranded upstream to `openhop_core`; see
+> [ADR-0007](0007-bridge-stays-pymc-core.md)'s own update note. The
+> decision and every "pymc_core required/not required" statement below
+> are unaffected — they apply equally to `openhop_core` under its
+> current name.
+
 ## Context
 
 [ADR-0007](0007-bridge-stays-pymc-core.md) established that the radio

@@ -1,7 +1,7 @@
 //! Tests for the companion TCP client.
 //!
 //! All tests use an in-process TCP loopback (ephemeral port on 127.0.0.1) so
-//! no real `pymc_core` process or external network is needed.  The test
+//! no real `openhop_core` process or external network is needed.  The test
 //! controls the "server" side manually via [`TcpBridge`].
 //!
 //! AppStart is always 11 wire bytes:

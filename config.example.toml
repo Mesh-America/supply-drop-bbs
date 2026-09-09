@@ -172,10 +172,10 @@
 
 [plugins.mesh]
 # How to reach the radio.
-#   "tcp"    — connect to a pymc_core CompanionFrameServer over TCP (default)
+#   "tcp"    — connect to an openhop_core CompanionFrameServer over TCP (default)
 #   "hat"    — same as tcp; the setup wizard offers Pi HAT GPIO/SPI hints
 #   "serial" — connect directly to a USB companion device (Heltec V3,
-#              T-Beam, RAK4631, etc.) — no pymc_core required (ADR-0013)
+#              T-Beam, RAK4631, etc.) — no openhop_core required (ADR-0013)
 # connection_type = "tcp"
 
 # ── Serial mode (connection_type = "serial") ──────────────────────
@@ -184,7 +184,7 @@
 # baud_rate = 115200
 
 # ── TCP / HAT mode (connection_type = "tcp" or "hat") ─────────────
-# Address of the pymc_core CompanionFrameServer.
+# Address of the openhop_core CompanionFrameServer.
 # addr = "127.0.0.1:5000"
 
 # Reconnection backoff after the bridge disconnects.

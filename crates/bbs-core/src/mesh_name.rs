@@ -15,7 +15,7 @@
 //! so a compliant sender never produces an oversized packet in the first
 //! place — the name is silently *shortened*, not rejected. supply-drop-bbs
 //! is itself always the sender here, though, and not every companion bridge
-//! it talks to replicates that self-truncation: the `pymc_core`/
+//! it talks to replicates that self-truncation: the `openhop_core`/
 //! `pymc-companion` bridge used for Pi HAT setups does not, so it happily
 //! signs an over-budget `app_data` in full — and *every* receiver then
 //! clamps those signed bytes before verifying, so the signature no longer

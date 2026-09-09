@@ -1,7 +1,7 @@
 //! # meshcore-companion
 //!
 //! A pure-Rust client for the MeshCore companion-frame TCP
-//! protocol, as spoken by `pymc_core`'s `CompanionFrameServer`
+//! protocol, as spoken by `openhop_core`'s `CompanionFrameServer`
 //! (and by USB / serial MeshCore companion devices, with a
 //! transport adapter).
 //!

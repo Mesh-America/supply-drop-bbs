@@ -95,7 +95,7 @@ export default defineConfig({
             link: '/adr/0006-no-migration-from-mesh-citadel',
           },
           {
-            text: 'ADR-0007: pymc_core Bridge',
+            text: 'ADR-0007: pymc_core (now openhop_core) Bridge',
             link: '/adr/0007-bridge-stays-pymc-core',
           },
           {
