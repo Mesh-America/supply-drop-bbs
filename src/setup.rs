@@ -1752,6 +1752,7 @@ const HAT_PRESETS: &[HatPreset] = &[
 struct HatParams {
     bbs_name: String,
     identity_path: String,
+    contacts_db_path: String,
     region: usize,
     preset: usize,
 }
@@ -1787,6 +1788,10 @@ fn configure_hat(
         bbs_name: bbs_name.to_owned(),
         identity_path: data_dir
             .join("companion.key")
+            .to_string_lossy()
+            .into_owned(),
+        contacts_db_path: data_dir
+            .join("pymc-companion-contacts.db")
             .to_string_lossy()
             .into_owned(),
         region: region_choice,
@@ -1832,6 +1837,7 @@ fn build_companion_yaml(p: &HatParams) -> String {
     )
     .unwrap();
     writeln!(s, "  autoadd_config: 0x0F").unwrap();
+    writeln!(s, "  contacts_db_path: {:?}", p.contacts_db_path).unwrap();
     writeln!(s).unwrap();
     writeln!(s, "radio:").unwrap();
     writeln!(s, "  frequency: {}", r.frequency_hz).unwrap();
