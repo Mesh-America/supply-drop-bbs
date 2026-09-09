@@ -86,9 +86,22 @@ jobs:
         run: cargo build --profile release-min --target ${{ matrix.target }}
 
       - name: Stage full binary
+        env:
+          # Routed through env, not interpolated directly into the script
+          # below (`TAG="${{ github.ref_name }}"`) — a tag name is operator-
+          # controlled (anyone with tag-push access sets it) and GitHub
+          # substitutes ${{ }} expressions into the YAML *before* bash ever
+          # sees it, so a tag containing e.g. $(...) or backticks would be
+          # executed as shell, not treated as a literal string. This is
+          # GitHub's own documented script-injection anti-pattern — see
+          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable.
+          # Confirmed exploitable here via a hostile-audit repro before this
+          # fix (a tag like v1.0.0$(...) matches this workflow's own
+          # `v[0-9]*` trigger). $TAG below is a real environment variable,
+          # which bash never re-interprets as script source.
+          TAG: ${{ github.ref_name }}
         run: |
           TARGET="${{ matrix.target }}"
-          TAG="${{ github.ref_name }}"
           mkdir -p dist
           cp "target/${TARGET}/release-min/supply-drop-bbs" \
              "dist/supply-drop-bbs-${TAG}-${TARGET}"
@@ -98,9 +111,12 @@ jobs:
       # it can use the raw binary. The .deb installs to the standard paths and
       # wires up the systemd unit without requiring a cloned repo or root curl.
       - name: Package as .deb
+        # TAG via env, not interpolated directly — see "Stage full binary"'s
+        # env block above for why (script-injection via a hostile tag name).
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           TARGET="${{ matrix.target }}"
-          TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
 
           case "$TARGET" in
@@ -166,9 +182,12 @@ jobs:
             --no-default-features --features transport-cli,transport-mesh
 
       - name: Stage headless binary
+        # TAG via env, not interpolated directly — see "Stage full binary"'s
+        # env block above for why (script-injection via a hostile tag name).
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           TARGET="${{ matrix.target }}"
-          TAG="${{ github.ref_name }}"
           cp "target/${TARGET}/release-min/supply-drop-bbs" \
              "dist/supply-drop-bbs-${TAG}-${TARGET}-headless"
 
