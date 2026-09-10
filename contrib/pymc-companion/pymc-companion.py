@@ -19,11 +19,138 @@ import asyncio
 import logging
 import os
 import signal
+import sqlite3
 import sys
 
 import yaml
 
 log = logging.getLogger("pymc-companion")
+
+# ── Contact persistence ───────────────────────────────────────────────────────
+#
+# openhop_core's ContactStore is purely in-memory (see its own docstring) —
+# nothing in openhop_core or this script persisted it to disk until now, so
+# every restart of this process (an upgrade, a crash, a reboot — not just a
+# restart of the BBS itself) silently wiped every contact, including which
+# ones were favourited/protected. supply-drop-bbs's own "protected contact"
+# state is rehydrated FROM whatever this bridge reports on each reconnect, so
+# losing the bridge's copy meant losing the BBS's copy too, with no way to
+# recover. See supply-drop-bbs-7ot / GitHub #244.
+#
+# load_contacts_db/save_contacts_db below are plain synchronous sqlite3 --
+# NOT matching openhop_repeater's own approach to persisting this same
+# ContactStore (a hostile-audit finding: openhop_repeater actually wraps its
+# equivalent calls in asyncio.to_thread(), explicitly to avoid blocking its
+# event loop). Call sites that run concurrently with radio I/O / companion
+# protocol handling (the periodic autosave, the shutdown save) route through
+# asyncio.to_thread() for the same reason; only the one-time startup load,
+# which runs before anything else is happening on the loop, calls it
+# directly.
+
+_CONTACTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS contacts (
+    public_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
+    adv_type INTEGER NOT NULL DEFAULT 0,
+    flags INTEGER NOT NULL DEFAULT 0,
+    out_path_len INTEGER NOT NULL DEFAULT -1,
+    out_path TEXT NOT NULL DEFAULT '',
+    last_advert_timestamp INTEGER NOT NULL DEFAULT 0,
+    lastmod INTEGER NOT NULL DEFAULT 0,
+    gps_lat REAL NOT NULL DEFAULT 0.0,
+    gps_lon REAL NOT NULL DEFAULT 0.0,
+    sync_since INTEGER NOT NULL DEFAULT 0,
+    last_advert_packet TEXT NOT NULL DEFAULT ''
+)
+"""
+
+# Same field names as openhop_core's ContactStore.to_dicts()/load_from_dicts()
+# use — the schema is a direct mirror so load/save need no field translation.
+_CONTACT_FIELDS = (
+    "public_key",
+    "name",
+    "adv_type",
+    "flags",
+    "out_path_len",
+    "out_path",
+    "last_advert_timestamp",
+    "lastmod",
+    "gps_lat",
+    "gps_lon",
+    "sync_since",
+    "last_advert_packet",
+)
+
+
+def load_contacts_db(path: str) -> list[dict]:
+    """Load persisted contacts from `path`.
+
+    Returns an empty list if the file doesn't exist yet (first run — not an
+    error). Raises on any other failure (corrupt file, permission error, or
+    a file too small/damaged to be a real SQLite database): callers must not
+    treat that the same as "no contacts survived" — silently continuing with
+    an empty store risks the next autosave overwriting a recoverable file
+    with nothing, permanently losing what was in it.
+
+    A hostile-audit repro found that a plain `SELECT` alone does NOT catch
+    this: SQLite treats a 0-byte file as a freshly-initialisable empty
+    database (no error, `CREATE TABLE IF NOT EXISTS` succeeds, the SELECT
+    returns `[]`) and a file truncated to ~75-90% of its real size can also
+    return a row set with no exception. Two explicit checks close this: a
+    minimum-size floor (a real SQLite file is at least one page, 4096 bytes,
+    once anything has ever been written to it) and `PRAGMA integrity_check`,
+    which walks SQLite's own on-disk structures rather than trusting that a
+    query merely returning success means the data is intact.
+    """
+    if not os.path.exists(path):
+        return []
+    if os.path.getsize(path) < 4096:
+        raise ValueError(
+            f"{path} exists but is smaller than one SQLite page (4096 bytes) "
+            "-- too small to be a valid database that ever held data; "
+            "treating as corrupt rather than risking a truncated read."
+        )
+    conn = sqlite3.connect(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if integrity != "ok":
+            raise ValueError(f"integrity_check failed for {path}: {integrity}")
+        conn.execute(_CONTACTS_SCHEMA)
+        rows = conn.execute(
+            f"SELECT {', '.join(_CONTACT_FIELDS)} FROM contacts"
+        ).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def save_contacts_db(path: str, records: list[dict]) -> None:
+    """Atomically overwrite `path` with the current full contact list."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    for stale in (tmp, tmp + "-journal"):
+        try:
+            os.remove(stale)
+        except FileNotFoundError:
+            pass
+    conn = sqlite3.connect(tmp)
+    try:
+        conn.execute(_CONTACTS_SCHEMA)
+        # OR REPLACE: to_dicts() is keyed by public_key internally so it
+        # can't itself produce duplicates today, but a plain INSERT would
+        # otherwise let one future duplicate discard the entire batch (a
+        # hostile-audit repro confirmed executemany's failure is all-or-
+        # nothing, not per-row) -- cheap insurance against that either way.
+        conn.executemany(
+            f"INSERT OR REPLACE INTO contacts ({', '.join(_CONTACT_FIELDS)}) "
+            f"VALUES ({', '.join('?' for _ in _CONTACT_FIELDS)})",
+            [tuple(rec[f] for f in _CONTACT_FIELDS) for rec in records],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    os.replace(tmp, path)
 
 
 def load_config(path: str) -> dict:
@@ -152,6 +279,29 @@ async def run(config: dict) -> None:
     _type_names = {1: "Chat", 2: "Repeater", 3: "Room", 4: "Sensor"}
     log.info(f"Advertising as adv_type={adv_type_val} ({_type_names.get(adv_type_val, 'unknown')})")
 
+    # ── Restore persisted contacts ────────────────────────────────────────────
+
+    contacts_db_path = companion_cfg.get(
+        "contacts_db_path", "/var/lib/supply-drop-bbs/pymc-companion-contacts.db"
+    )
+    try:
+        persisted_contacts = load_contacts_db(contacts_db_path)
+    except Exception as e:
+        log.error(
+            f"Could not load persisted contacts from {contacts_db_path}: {e}\n"
+            "Refusing to start with an empty contact store — a corrupt or "
+            "unreadable file is not the same as having no contacts, and "
+            "continuing would risk the next autosave overwriting recoverable "
+            "data with nothing. Fix or remove the file, then restart."
+        )
+        sys.exit(1)
+    if persisted_contacts:
+        companion.contacts.load_from_dicts(persisted_contacts)
+        log.info(
+            f"Restored {len(persisted_contacts)} persisted contact(s) "
+            f"from {contacts_db_path}"
+        )
+
     # Auto-add contacts so the BBS sees incoming users without manual approval.
     # 0x01 = overwrite oldest, 0x02 = chat, 0x04 = repeater, 0x08 = room
     autoadd = int(companion_cfg.get("autoadd_config", 0x0F))
@@ -181,6 +331,33 @@ async def run(config: dict) -> None:
     await server.start()
     log.info(f"Companion frame server listening on {host}:{port}")
 
+    # ── Periodic contact autosave ──────────────────────────────────────────────
+    #
+    # Safety net for an unclean shutdown (crash, `kill -9`, power loss — a real
+    # risk on Pi HAT hardware) that the graceful shutdown-time save below can't
+    # cover. 60s balances write frequency against how much could be lost in a
+    # crash between saves; not configurable since neither extreme (near-zero
+    # loss window vs. near-zero write overhead) matters enough here to expose.
+
+    _CONTACTS_AUTOSAVE_INTERVAL_SECS = 60
+
+    async def _autosave_contacts_loop() -> None:
+        while True:
+            await asyncio.sleep(_CONTACTS_AUTOSAVE_INTERVAL_SECS)
+            try:
+                # to_dicts() itself stays on the event loop -- it's a fast,
+                # synchronous read of in-memory state with no I/O, and doing
+                # it here (rather than inside the worker thread) means the
+                # snapshot it takes can never race a concurrent mutation from
+                # elsewhere on this same single-threaded loop. Only the slow
+                # part (writing the snapshot to disk) moves to a thread.
+                records = companion.contacts.to_dicts()
+                await asyncio.to_thread(save_contacts_db, contacts_db_path, records)
+            except Exception as e:
+                log.error(f"Failed to autosave contacts to {contacts_db_path}: {e}")
+
+    autosave_task = asyncio.create_task(_autosave_contacts_loop())
+
     # ── Run until signal ───────────────────────────────────────────────────────
 
     loop = asyncio.get_running_loop()
@@ -190,6 +367,17 @@ async def run(config: dict) -> None:
 
     await stop
     log.info("Shutdown signal received")
+
+    autosave_task.cancel()
+    try:
+        records = companion.contacts.to_dicts()
+        await asyncio.to_thread(save_contacts_db, contacts_db_path, records)
+        log.info(
+            f"Saved {companion.contacts.get_count()} contact(s) "
+            f"to {contacts_db_path}"
+        )
+    except Exception as e:
+        log.error(f"Failed to save contacts on shutdown: {e}")
 
     await server.stop()
     await companion.stop()

@@ -22,6 +22,14 @@ companion:
   # 0x0F adds all types and evicts the oldest when the contact list is full.
   autoadd_config: 0x0F
 
+  # Where the contact list (including which contacts are favourited/
+  # protected) is persisted across restarts of this bridge. Without this,
+  # restarting pymc-companion for any reason — an upgrade, a crash, a
+  # reboot — silently loses every contact, and supply-drop-bbs loses its
+  # own "protected contact" state along with it (it's rehydrated from
+  # whatever this bridge reports on reconnect).
+  contacts_db_path: "/var/lib/supply-drop-bbs/pymc-companion-contacts.db"
+
 radio:
   # ── Frequency ─────────────────────────────────────────────────────────────
   # Must match the mesh network you're joining.
