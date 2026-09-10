@@ -13,9 +13,13 @@ git-fetch-with-cli = true
 # ─── Cross-compilation linkers ─────────────────────────────────────
 #
 # Used when building release binaries for ARM targets from an x86
-# host (CI, dev box). The named linkers must be installed on the
-# build machine: `gcc-aarch64-linux-gnu` and `gcc-arm-linux-gnueabihf`
-# on Debian/Ubuntu.
+# host. CI (.github/workflows/release.yml) no longer installs these
+# via apt — it builds through the `cross` tool, whose per-target
+# Docker images already provide a linker at this same name (verified
+# against cross-rs's own Dockerfiles), so these settings are redundant
+# there but harmless. They still matter for a manual/local cross-build
+# outside of `cross`: on Debian/Ubuntu, install `gcc-aarch64-linux-gnu`
+# and `gcc-arm-linux-gnueabihf` first.
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
