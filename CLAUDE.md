@@ -18,9 +18,16 @@ so plain `cargo` automatically uses the correct toolchain:
 ```
 cargo fmt --all --check
 cargo test --workspace
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo doc --workspace --no-deps --all-features
 ```
+
+`--all-targets` is required, not optional — it's what makes clippy compile
+`#[cfg(test)]` code, so lints that only fire on test items (e.g.
+`items_after_test_module`) are invisible without it. CI runs both clippy
+invocations above; a pre-commit check without `--all-targets` can pass
+locally and still fail CI.
 
 Be certain to update documentation, where relevant.
 
