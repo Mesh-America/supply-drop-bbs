@@ -2158,100 +2158,6 @@ fn build_toml(p: &TomlParams<'_>) -> String {
     s
 }
 
-#[cfg(test)]
-mod build_toml_tests {
-    use super::*;
-
-    // bbs-mesh applies [plugins.mesh.radio] on every companion-frame connect
-    // regardless of transport (crates/bbs-mesh/src/transport.rs's
-    // sync_radio_params_if_configured, called unconditionally from the
-    // Connected event handler) — so the wizard must be able to write that
-    // section for every connection type, not just serial (supply-drop-bbs-xmv
-    // / #224). These guard the two conditions that regressed relative to that
-    // runtime behavior.
-
-    fn base_params<'a>(
-        mesh_connection_type: &'a str,
-        mesh_radio: Option<&'a RadioChoice>,
-    ) -> TomlParams<'a> {
-        TomlParams {
-            bbs_name: "Test BBS",
-            data_dir: Path::new("/var/lib/supply-drop-bbs"),
-            use_mesh: true,
-            mesh_connection_type,
-            mesh_serial_port: None,
-            mesh_baud_rate: None,
-            mesh_addr: None,
-            mesh_path_bytes: 3,
-            use_meshtastic: false,
-            meshtastic_connection_type: "serial",
-            meshtastic_serial_port: None,
-            meshtastic_baud_rate: None,
-            meshtastic_addr: None,
-            meshtastic_radio_region: None,
-            meshtastic_radio_preset: None,
-            meshtastic_short_name: None,
-            meshtastic_long_name: None,
-            web_enabled: false,
-            web_bind: None,
-            web_backup_dir: None,
-            latitude: None,
-            longitude: None,
-            share_in_advert: true,
-            process_plugins_toml: None,
-            mesh_radio,
-        }
-    }
-
-    #[test]
-    fn radio_section_written_for_hat_when_configured() {
-        let radio = RadioChoice::Preset(0);
-        let toml = build_toml(&base_params("hat", Some(&radio)));
-        assert!(
-            toml.contains("[plugins.mesh.radio]"),
-            "hat connection with a configured radio must write [plugins.mesh.radio]:\n{toml}"
-        );
-    }
-
-    #[test]
-    fn radio_section_written_for_tcp_when_configured() {
-        let radio = RadioChoice::Custom {
-            frequency_hz: 910_525_000,
-            bandwidth_hz: 62_500,
-            spreading_factor: 7,
-            coding_rate: 5,
-            tx_power_dbm: 22,
-        };
-        let toml = build_toml(&base_params("tcp", Some(&radio)));
-        assert!(
-            toml.contains("[plugins.mesh.radio]"),
-            "tcp connection with a configured radio must write [plugins.mesh.radio]:\n{toml}"
-        );
-        assert!(toml.contains("frequency_hz     = 910525000"));
-    }
-
-    #[test]
-    fn radio_section_omitted_when_not_configured_regardless_of_connection_type() {
-        for conn_type in ["serial", "hat", "tcp"] {
-            let toml = build_toml(&base_params(conn_type, None));
-            assert!(
-                !toml.contains("[plugins.mesh.radio]"),
-                "{conn_type} connection with no radio choice must NOT write [plugins.mesh.radio]:\n{toml}"
-            );
-        }
-    }
-
-    #[test]
-    fn radio_section_still_written_for_serial_when_configured() {
-        let radio = RadioChoice::Preset(0);
-        let toml = build_toml(&base_params("serial", Some(&radio)));
-        assert!(
-            toml.contains("[plugins.mesh.radio]"),
-            "serial (the pre-existing, already-working case) must be unaffected by this fix:\n{toml}"
-        );
-    }
-}
-
 fn toml_str(s: &str) -> String {
     let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
@@ -2500,4 +2406,98 @@ fn prompt_select<S: ToString>(
 fn cancelled() -> ! {
     println!("\nSetup cancelled.");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod build_toml_tests {
+    use super::*;
+
+    // bbs-mesh applies [plugins.mesh.radio] on every companion-frame connect
+    // regardless of transport (crates/bbs-mesh/src/transport.rs's
+    // sync_radio_params_if_configured, called unconditionally from the
+    // Connected event handler) — so the wizard must be able to write that
+    // section for every connection type, not just serial (supply-drop-bbs-xmv
+    // / #224). These guard the two conditions that regressed relative to that
+    // runtime behavior.
+
+    fn base_params<'a>(
+        mesh_connection_type: &'a str,
+        mesh_radio: Option<&'a RadioChoice>,
+    ) -> TomlParams<'a> {
+        TomlParams {
+            bbs_name: "Test BBS",
+            data_dir: Path::new("/var/lib/supply-drop-bbs"),
+            use_mesh: true,
+            mesh_connection_type,
+            mesh_serial_port: None,
+            mesh_baud_rate: None,
+            mesh_addr: None,
+            mesh_path_bytes: 3,
+            use_meshtastic: false,
+            meshtastic_connection_type: "serial",
+            meshtastic_serial_port: None,
+            meshtastic_baud_rate: None,
+            meshtastic_addr: None,
+            meshtastic_radio_region: None,
+            meshtastic_radio_preset: None,
+            meshtastic_short_name: None,
+            meshtastic_long_name: None,
+            web_enabled: false,
+            web_bind: None,
+            web_backup_dir: None,
+            latitude: None,
+            longitude: None,
+            share_in_advert: true,
+            process_plugins_toml: None,
+            mesh_radio,
+        }
+    }
+
+    #[test]
+    fn radio_section_written_for_hat_when_configured() {
+        let radio = RadioChoice::Preset(0);
+        let toml = build_toml(&base_params("hat", Some(&radio)));
+        assert!(
+            toml.contains("[plugins.mesh.radio]"),
+            "hat connection with a configured radio must write [plugins.mesh.radio]:\n{toml}"
+        );
+    }
+
+    #[test]
+    fn radio_section_written_for_tcp_when_configured() {
+        let radio = RadioChoice::Custom {
+            frequency_hz: 910_525_000,
+            bandwidth_hz: 62_500,
+            spreading_factor: 7,
+            coding_rate: 5,
+            tx_power_dbm: 22,
+        };
+        let toml = build_toml(&base_params("tcp", Some(&radio)));
+        assert!(
+            toml.contains("[plugins.mesh.radio]"),
+            "tcp connection with a configured radio must write [plugins.mesh.radio]:\n{toml}"
+        );
+        assert!(toml.contains("frequency_hz     = 910525000"));
+    }
+
+    #[test]
+    fn radio_section_omitted_when_not_configured_regardless_of_connection_type() {
+        for conn_type in ["serial", "hat", "tcp"] {
+            let toml = build_toml(&base_params(conn_type, None));
+            assert!(
+                !toml.contains("[plugins.mesh.radio]"),
+                "{conn_type} connection with no radio choice must NOT write [plugins.mesh.radio]:\n{toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn radio_section_still_written_for_serial_when_configured() {
+        let radio = RadioChoice::Preset(0);
+        let toml = build_toml(&base_params("serial", Some(&radio)));
+        assert!(
+            toml.contains("[plugins.mesh.radio]"),
+            "serial (the pre-existing, already-working case) must be unaffected by this fix:\n{toml}"
+        );
+    }
 }
