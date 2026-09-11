@@ -17,6 +17,28 @@ fn main() {
         println!("cargo:rerun-if-changed={path}");
     }
 
+    // The release workflow cross-compiles inside cross-rs's Docker images
+    // (Ubuntu 16.04-based, no Node.js/npm) — it builds the frontend once on
+    // the runner itself beforehand and sets this to skip re-running npm
+    // inside the container, where it would fail outright. Unset in every
+    // other context (local dev, CI's native build), so this doesn't change
+    // ordinary behavior.
+    if std::env::var_os("BBS_WEB_SKIP_NPM_BUILD").is_some() {
+        let index_html = web_dir.join("dist").join("index.html");
+        if !index_html.exists() {
+            panic!(
+                "BBS_WEB_SKIP_NPM_BUILD is set but {} is missing — build the frontend \
+                 first (npm ci && npm run build in {}) before compiling with this set",
+                index_html.display(),
+                web_dir.display()
+            );
+        }
+        println!(
+            "cargo:warning=BBS_WEB_SKIP_NPM_BUILD set — using pre-built web/dist/, not running npm"
+        );
+        return;
+    }
+
     let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
 
     let install = Command::new(npm)
