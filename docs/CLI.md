@@ -573,6 +573,33 @@ The new password must be at least 6 characters. The same operation is available 
 
 ---
 
+### `user ban` / `user unban`
+
+```
+supply-drop-bbs user ban <USERNAME> [OPTIONS]
+supply-drop-bbs user unban <USERNAME> [OPTIONS]
+```
+
+Disable (`ban`) or re-enable (`unban`) a user account. A disabled account can't log in and any live session is ended immediately — but the account and its authored messages are preserved. This is a softer action than deletion: deleting additionally reserves the username so no-one else can register it, and isn't currently exposed as a CLI command.
+
+| Argument | Description |
+|----------|-------------|
+| `<USERNAME>` | BBS username to disable/re-enable (case-sensitive) |
+
+```sh
+supply-drop-bbs user ban alice
+# disabled: alice (login rejected, session ended)
+
+supply-drop-bbs user unban alice
+# re-enabled: alice
+```
+
+**Exit codes:** `0` on success; `1` if the user is not found or the database cannot be opened.
+
+Equivalent to the in-BBS `BAN <username>` (Aide+) / `UNBAN <username>` (Sysop) commands, and to the **ban**/**unban** buttons on the web admin's Users page.
+
+---
+
 ### `contacts list` / `contacts discovered` / `contacts delete`
 
 ```
