@@ -62,6 +62,10 @@ pub struct AdminUserInfo {
     pub created_at: String,
     /// RFC 3339 last login timestamp, or `None` if never logged in.
     pub last_login_at: Option<String>,
+    /// RFC 3339 timestamp a time-limited suspension ("timeout") lifts, or
+    /// `None` for an active account or a permanent ban. Only meaningful
+    /// when `status == "banned"` (supply-drop-bbs-ax3 / #280).
+    pub suspended_until: Option<String>,
 }
 
 /// A BBS room with message count, as seen by the admin.

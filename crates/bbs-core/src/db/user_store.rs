@@ -104,11 +104,28 @@ pub trait UserStore: Send + Sync {
     /// deactivation. Returns [`StoreError::IntegrityViolation`] if the
     /// user has authored messages (soft-delete instead).
     async fn hard_delete(&self, id: UserId) -> Result<(), StoreError>;
+
+    /// Put a user into a time-limited suspension ("timeout"): sets
+    /// `status = Banned` and `suspended_until = until` in one statement
+    /// (supply-drop-bbs-ax3 / #280). Distinct from [`update`](Self::update)
+    /// with `status = Some(Banned)`, which is a *permanent* ban and leaves
+    /// `suspended_until` untouched (callers going through `update` for a
+    /// permanent ban should pair it with [`clear_suspension`]
+    /// (Self::clear_suspension) to avoid leaving a stale expiry from an
+    /// earlier suspension).
+    async fn suspend(&self, id: UserId, until: Timestamp) -> Result<(), StoreError>;
+
+    /// Clear `suspended_until` back to `NULL`, without touching `status`.
+    /// Called whenever a status change should invalidate any suspension
+    /// expiry that might still be set — reactivating (unban), a fresh
+    /// permanent ban, or deletion.
+    async fn clear_suspension(&self, id: UserId) -> Result<(), StoreError>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────
 
 /// Map a raw query-row tuple to a `User`, validating enum discriminants.
+#[allow(clippy::too_many_arguments)]
 fn map_user_row(
     id: i64,
     username: String,
@@ -117,6 +134,7 @@ fn map_user_row(
     permission_level: i64,
     created_at: String,
     last_login_at: Option<String>,
+    suspended_until: Option<String>,
 ) -> Result<User, StoreError> {
     let status = status_from_i64(status)?;
     let permission_level = permission_from_i64(permission_level)?;
@@ -129,6 +147,11 @@ fn map_user_row(
         .map(Timestamp::parse_rfc3339)
         .transpose()
         .map_err(|e| StoreError::Decode(format!("invalid last_login_at: {e}")))?;
+    let suspended_until = suspended_until
+        .as_deref()
+        .map(Timestamp::parse_rfc3339)
+        .transpose()
+        .map_err(|e| StoreError::Decode(format!("invalid suspended_until: {e}")))?;
     Ok(User {
         id: UserId::new(id),
         username,
@@ -137,6 +160,7 @@ fn map_user_row(
         permission_level,
         created_at,
         last_login_at,
+        suspended_until,
     })
 }
 
@@ -149,7 +173,7 @@ impl UserStore for Database {
         let row = sqlx::query!(
             r#"SELECT id AS "id!", username AS "username!", display_name,
                       status AS "status!", permission_level AS "permission_level!",
-                      created_at AS "created_at!", last_login_at
+                      created_at AS "created_at!", last_login_at, suspended_until
                FROM users WHERE id = ?"#,
             uid
         )
@@ -164,6 +188,7 @@ impl UserStore for Database {
                 r.permission_level,
                 r.created_at,
                 r.last_login_at,
+                r.suspended_until,
             )
         })
         .transpose()
@@ -174,7 +199,7 @@ impl UserStore for Database {
         let row = sqlx::query!(
             r#"SELECT id AS "id!", username AS "username!", display_name,
                       status AS "status!", permission_level AS "permission_level!",
-                      created_at AS "created_at!", last_login_at
+                      created_at AS "created_at!", last_login_at, suspended_until
                FROM users WHERE username = ?"#,
             name
         )
@@ -189,6 +214,7 @@ impl UserStore for Database {
                 r.permission_level,
                 r.created_at,
                 r.last_login_at,
+                r.suspended_until,
             )
         })
         .transpose()
@@ -222,8 +248,8 @@ impl UserStore for Database {
         let deleted = UserStatus::Deleted as i64;
         let lim = limit as i64;
         let off = offset as i64;
-        let cols =
-            "id, username, display_name, status, permission_level, created_at, last_login_at";
+        let cols = "id, username, display_name, status, permission_level, created_at, \
+                     last_login_at, suspended_until";
         let rows = if let Some(s) = filter_status {
             sqlx::query(&format!(
                 "SELECT {cols} FROM users WHERE status != ? AND status = ? \
@@ -256,6 +282,7 @@ impl UserStore for Database {
                     r.try_get("permission_level")?,
                     r.try_get("created_at")?,
                     r.try_get("last_login_at")?,
+                    r.try_get("suspended_until")?,
                 )
             })
             .collect()
@@ -341,6 +368,37 @@ impl UserStore for Database {
         Ok(())
     }
 
+    async fn suspend(&self, id: UserId, until: Timestamp) -> Result<(), StoreError> {
+        let uid = id.as_i64();
+        let banned = UserStatus::Banned as i64;
+        let until_str = until.to_rfc3339();
+        let rows = sqlx::query!(
+            "UPDATE users SET status = ?, suspended_until = ? WHERE id = ?",
+            banned,
+            until_str,
+            uid
+        )
+        .execute(&self.write_pool)
+        .await?
+        .rows_affected();
+        if rows == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn clear_suspension(&self, id: UserId) -> Result<(), StoreError> {
+        let uid = id.as_i64();
+        let rows = sqlx::query!("UPDATE users SET suspended_until = NULL WHERE id = ?", uid)
+            .execute(&self.write_pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     async fn hard_delete(&self, id: UserId) -> Result<(), StoreError> {
         let uid = id.as_i64();
 
@@ -387,7 +445,7 @@ impl Database {
         let rows = sqlx::query!(
             r#"SELECT id AS "id!", username AS "username!", display_name,
                       status AS "status!", permission_level AS "permission_level!",
-                      created_at AS "created_at!", last_login_at
+                      created_at AS "created_at!", last_login_at, suspended_until
                FROM users ORDER BY created_at LIMIT ? OFFSET ?"#,
             lim,
             off
@@ -404,6 +462,7 @@ impl Database {
                     r.permission_level,
                     r.created_at,
                     r.last_login_at,
+                    r.suspended_until,
                 )
             })
             .collect()
@@ -419,7 +478,7 @@ impl Database {
         let rows = sqlx::query!(
             r#"SELECT id AS "id!", username AS "username!", display_name,
                       status AS "status!", permission_level AS "permission_level!",
-                      created_at AS "created_at!", last_login_at
+                      created_at AS "created_at!", last_login_at, suspended_until
                FROM users WHERE status = ? ORDER BY created_at LIMIT ? OFFSET ?"#,
             discriminant,
             lim,
@@ -437,6 +496,7 @@ impl Database {
                     r.permission_level,
                     r.created_at,
                     r.last_login_at,
+                    r.suspended_until,
                 )
             })
             .collect()

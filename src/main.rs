@@ -295,6 +295,20 @@ enum UserAction {
         /// BBS username to re-enable.
         username: String,
     },
+    /// Suspend a user account for a fixed number of days, distinct from a
+    /// permanent `ban`: login is rejected and any live session is ended
+    /// immediately, same as `ban`, but the account reactivates
+    /// automatically once the timeout elapses rather than staying disabled
+    /// until an explicit `unban`.
+    ///
+    /// Equivalent to the in-session `TIMEOUT <username> <days>` sysop/aide
+    /// command and the web admin's Users page.
+    Timeout {
+        /// BBS username to suspend.
+        username: String,
+        /// Suspension length in days (1-5).
+        days: u8,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2292,6 +2306,20 @@ async fn cmd_user(cli: &Cli, action: &UserAction) {
             }
         }
 
+        UserAction::Timeout { username, days } => {
+            match host.admin_suspend_user(username, *days).await {
+                Ok(()) => println!("suspended: {username} for {days} day(s)"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         UserAction::Create { username, sysop } => {
             let password = dialoguer::Password::new()
                 .with_prompt("Password")
@@ -2355,7 +2383,8 @@ async fn cmd_user(cli: &Cli, action: &UserAction) {
                 | UserAction::Verify { .. }
                 | UserAction::SetPassword { .. }
                 | UserAction::Ban { .. }
-                | UserAction::Unban { .. } => {
+                | UserAction::Unban { .. }
+                | UserAction::Timeout { .. } => {
                     unreachable!()
                 }
             };
@@ -3604,6 +3633,23 @@ mod contacts_tests {
             Some(Commands::User { action }) => match action {
                 UserAction::Unban { username } => assert_eq!(username, "alice"),
                 _ => panic!("expected UserAction::Unban"),
+            },
+            _ => panic!("expected Commands::User"),
+        }
+    }
+
+    // supply-drop-bbs-ax3 / #280: `user timeout` — one of the three
+    // required surfaces (BBS sysop/aide command, web UI, CLI).
+    #[test]
+    fn user_timeout_captures_the_username_and_days_arguments() {
+        let cli = parse(&["supply-drop-bbs", "user", "timeout", "alice", "3"]);
+        match cli.command {
+            Some(Commands::User { action }) => match action {
+                UserAction::Timeout { username, days } => {
+                    assert_eq!(username, "alice");
+                    assert_eq!(days, 3);
+                }
+                _ => panic!("expected UserAction::Timeout"),
             },
             _ => panic!("expected Commands::User"),
         }

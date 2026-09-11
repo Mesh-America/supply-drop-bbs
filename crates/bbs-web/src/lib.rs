@@ -1473,6 +1473,11 @@ struct UpdateUserBody {
     status: Option<u8>,
     permission_level: Option<u8>,
     password: Option<String>,
+    /// Suspend for this many days (1-5) instead of a permanent ban
+    /// (supply-drop-bbs-ax3 / #280). Mutually exclusive with `status` in
+    /// the same request — send them as separate PATCHes if both are
+    /// somehow needed.
+    suspend_days: Option<u8>,
 }
 
 async fn api_update_user(
@@ -1481,11 +1486,24 @@ async fn api_update_user(
     Path(username): Path<String>,
     Json(body): Json<UpdateUserBody>,
 ) -> Response {
-    if body.status.is_none() && body.permission_level.is_none() && body.password.is_none() {
+    if body.status.is_none()
+        && body.permission_level.is_none()
+        && body.password.is_none()
+        && body.suspend_days.is_none()
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error(
-                "at least one of status, permission_level, or password is required",
+                "at least one of status, permission_level, password, or suspend_days is required",
+            )),
+        )
+            .into_response();
+    }
+    if body.status.is_some() && body.suspend_days.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "status and suspend_days are mutually exclusive in one request",
             )),
         )
             .into_response();
@@ -1515,15 +1533,16 @@ async fn api_update_user(
         }
     }
 
-    // A sysop must not lock themselves out by changing their own status or
-    // permission level. (Resetting one's own password is still allowed.)
-    if (body.status.is_some() || body.permission_level.is_some())
+    // A sysop must not lock themselves out by changing their own status,
+    // permission level, or suspending themselves. (Resetting one's own
+    // password is still allowed.)
+    if (body.status.is_some() || body.permission_level.is_some() || body.suspend_days.is_some())
         && caller.username.eq_ignore_ascii_case(&username)
     {
         return (
             StatusCode::FORBIDDEN,
             Json(json_error(
-                "you can't change your own status or permission level",
+                "you can't change your own status, permission level, or suspend yourself",
             )),
         )
             .into_response();
@@ -1591,6 +1610,36 @@ async fn api_update_user(
             }
             Err(HostError::NotFound(_)) => {
                 return (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response();
+            }
+            Err(e) => return server_error(&e.to_string()),
+        }
+    }
+
+    if let Some(days) = body.suspend_days {
+        match state.host.admin_suspend_user(&username, days).await {
+            Ok(()) => {
+                // Same rationale as the ban/unban path above: a cached web
+                // token for the now-suspended user must not keep working.
+                state.invalidate_sessions_for(&username);
+                let detail = format!("{{\"days\":{days}}}");
+                if let Err(e) = state
+                    .host
+                    .admin_write_audit(
+                        &actor_str,
+                        "timeout",
+                        Some(username.as_str()),
+                        Some(&detail),
+                    )
+                    .await
+                {
+                    warn!("audit write failed: {e}");
+                }
+            }
+            Err(HostError::NotFound(_)) => {
+                return (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response();
+            }
+            Err(HostError::PreconditionFailed(msg)) => {
+                return (StatusCode::BAD_REQUEST, Json(json_error(&msg))).into_response();
             }
             Err(e) => return server_error(&e.to_string()),
         }

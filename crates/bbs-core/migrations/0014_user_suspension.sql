@@ -1,0 +1,12 @@
+-- Time-limited user suspensions ("timeout"), distinct from a permanent ban.
+--
+-- Reuses status = 1 (Banned) rather than adding a new UserStatus
+-- discriminant -- widening the existing `status` CHECK constraint would
+-- require SQLite's full create-copy-drop-rename table-rebuild dance (no
+-- ALTER TABLE ... DROP CONSTRAINT), which is a much riskier migration than
+-- this ADD COLUMN. A suspension is: status = Banned AND suspended_until IS
+-- NOT NULL. A permanent ban is: status = Banned AND suspended_until IS
+-- NULL. See supply-drop-bbs-ax3 / #280.
+--
+-- Append-only: never edit this file once applied (sqlx records its checksum).
+ALTER TABLE users ADD COLUMN suspended_until TEXT;
