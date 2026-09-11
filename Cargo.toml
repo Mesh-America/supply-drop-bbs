@@ -107,6 +107,13 @@ sqlx        = { version = "0.8", features = ["sqlite", "runtime-tokio", "time", 
 argon2      = { version = "0.5", features = ["std"] }
 tempfile    = "3"
 tracing     = "0.1"
+# Safe flock(2) wrapper for bbs-core's config_lock module — keeps the
+# `unsafe_code = "forbid"` lint intact (raw libc FFI would need an ADR
+# per that lint's own comment; this avoids needing one).
+fd-lock     = "4"
+# O_NOFOLLOW constant for config_lock's symlink-safe lock-file open, via
+# the safe `OpenOptionsExt::custom_flags` — no `unsafe` needed to use it.
+libc        = "0.2"
 uuid        = { version = "1", features = ["v4", "serde"] }
 axum        = { version = "0.7", features = ["macros", "json", "multipart"] }
 axum-extra  = { version = "0.9", features = ["cookie"] }

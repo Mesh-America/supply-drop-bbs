@@ -1095,33 +1095,25 @@ async fn api_update_native_plugin(
         }
     };
 
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json_error(&format!("could not read config file: {e}"))),
-            )
-                .into_response()
-        }
-    };
-    let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json_error(&format!("could not parse config file: {e}"))),
-            )
-                .into_response()
-        }
-    };
+    let path_for_lock = std::path::PathBuf::from(&path);
+    let name_for_edit = name.clone();
+    let write_result = bbs_core::config_lock::with_config_lock(&path_for_lock, move || {
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("could not read config file: {e}"))
+        })?;
+        let mut doc = raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| std::io::Error::other(format!("could not parse config file: {e}")))?;
+        doc["plugins"][name_for_edit.as_str()]["enabled"] = toml_edit::value(enabled);
+        atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes())
+            .map_err(|e| std::io::Error::other(format!("could not write config file: {e}")))
+    })
+    .await;
 
-    doc["plugins"][name.as_str()]["enabled"] = toml_edit::value(enabled);
-
-    if let Err(e) = atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes()) {
+    if let Err(e) = write_result {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json_error(&format!("could not write config file: {e}"))),
+            Json(json_error(&format!("{e}"))),
         )
             .into_response();
     }
@@ -2572,6 +2564,17 @@ async fn api_get_config(
     Json(resp).into_response()
 }
 
+/// What `api_patch_config`'s locked critical section resolves for the
+/// post-write side effects (log-level reload, in-memory `Host` location
+/// state) that run after the lock is released — extracted from `doc`
+/// while still inside the lock, rather than handing the parsed
+/// `toml_edit::DocumentMut` itself back out. See the call site.
+struct PatchConfigOutcome {
+    resolved_logging_level: Option<String>,
+    new_location: Option<Option<(f64, f64)>>,
+    new_share_in_advert: Option<bool>,
+}
+
 async fn api_patch_config(
     State(state): State<Arc<AppState>>,
     Extension(user): Extension<CurrentUser>,
@@ -2594,169 +2597,198 @@ async fn api_patch_config(
         }
     };
 
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json_error(&format!("could not read config file: {e}"))),
-            )
-                .into_response()
-        }
-    };
-    let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json_error(&format!("could not parse config file: {e}"))),
-            )
-                .into_response()
-        }
-    };
+    // Everything from read through write is one locked critical section —
+    // including validation. Validating against a `doc` read outside the
+    // lock (the original bug this closes, supply-drop-bbs / #227) lets a
+    // concurrent writer invalidate what was just checked before this
+    // request's own write lands, e.g. defeating the mesh-name byte-budget
+    // cross-check below by racing a location/name change in between.
+    let path_for_lock = std::path::PathBuf::from(&path);
+    let write_result: std::io::Result<PatchConfigOutcome> =
+        bbs_core::config_lock::with_config_lock(&path_for_lock, move || {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| std::io::Error::other(format!("could not read config file: {e}")))?;
+            let mut doc = raw
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|e| std::io::Error::other(format!("could not parse config file: {e}")))?;
 
-    // Validate logging level before mutating anything.
-    if let Some(ref level) = patch.logging_level {
-        match level.to_ascii_uppercase().as_str() {
-            "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR" => {}
-            _ => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json_error(
-                        "logging_level must be one of TRACE, DEBUG, INFO, WARN, ERROR",
-                    )),
-                )
-                    .into_response();
+            // Validate logging level before mutating anything.
+            if let Some(ref level) = patch.logging_level {
+                match level.to_ascii_uppercase().as_str() {
+                    "TRACE" | "DEBUG" | "INFO" | "WARN" | "ERROR" => {}
+                    _ => {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "logging_level must be one of TRACE, DEBUG, INFO, WARN, ERROR",
+                        ));
+                    }
+                }
             }
-        }
-    }
 
-    // Validate bbs.name before mutating anything. It doubles as the MeshCore
-    // advert node name, which the firmware caps at 31 bytes — 23 if the
-    // advert also shares a GPS location (see bbs_core::mesh_name). Check the
-    // *effective* name and location-sharing state this patch would produce —
-    // whichever of the two this request doesn't touch falls back to what's
-    // already on disk — so changing either the name or the sharing toggle
-    // alone still catches a combination that would silently stop advertising.
-    let (effective_name, sharing_location) = effective_advert_name_sharing(&patch, &doc);
-    if let Err(e) = bbs_core::mesh_name::validate_mesh_node_name(&effective_name, sharing_location)
-    {
-        return (StatusCode::BAD_REQUEST, Json(json_error(&e.to_string()))).into_response();
-    }
+            // Validate bbs.name before mutating anything. It doubles as the
+            // MeshCore advert node name, which the firmware caps at 31 bytes
+            // — 23 if the advert also shares a GPS location (see
+            // bbs_core::mesh_name). Check the *effective* name and
+            // location-sharing state this patch would produce — whichever of
+            // the two this request doesn't touch falls back to what's
+            // already on disk — so changing either the name or the sharing
+            // toggle alone still catches a combination that would silently
+            // stop advertising.
+            let (effective_name, sharing_location) = effective_advert_name_sharing(&patch, &doc);
+            if let Err(e) =
+                bbs_core::mesh_name::validate_mesh_node_name(&effective_name, sharing_location)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    e.to_string(),
+                ));
+            }
 
-    // Apply patches — only touch keys explicitly present in the request.
-    if let Some(v) = patch.bbs_name {
-        doc["bbs"]["name"] = toml_edit::value(v);
-    }
-    if let Some(v) = patch.bbs_starting_room {
-        doc["bbs"]["starting_room"] = toml_edit::value(v);
-    }
-    if let Some(v) = patch.bbs_welcome_msg {
-        doc["bbs"]["welcome_msg"] = toml_edit::value(v);
-    }
-    if let Some(v) = patch.bbs_timezone {
-        doc["bbs"]["timezone"] = toml_edit::value(v);
-    }
-    // Latitude/longitude: absent → leave unchanged, `null` → remove the key,
-    // a number → set it.
-    let location_touched = patch.location_latitude.is_some() || patch.location_longitude.is_some();
-    if let Some(v) = patch.location_latitude {
-        match v {
-            None => doc_remove_key(&mut doc, "location", "latitude"),
-            Some(f) => doc["location"]["latitude"] = toml_edit::value(f),
-        }
-    }
-    if let Some(v) = patch.location_longitude {
-        match v {
-            None => doc_remove_key(&mut doc, "location", "longitude"),
-            Some(f) => doc["location"]["longitude"] = toml_edit::value(f),
-        }
-    }
-    let share_in_advert_touched = patch.location_share_in_advert.is_some();
-    if let Some(v) = patch.location_share_in_advert {
-        doc["location"]["share_in_advert"] = toml_edit::value(v);
-    }
-    if let Some(v) = patch.backup_enabled {
-        doc["backup"]["enabled"] = toml_edit::value(v);
-    }
-    if let Some(v) = patch.backup_interval_hours {
-        doc["backup"]["interval_hours"] = toml_edit::value(v as i64);
-    }
-    if let Some(v) = patch.backup_keep_daily {
-        doc["backup"]["keep_daily"] = toml_edit::value(v as i64);
-    }
-    if let Some(v) = patch.backup_keep_weekly {
-        doc["backup"]["keep_weekly"] = toml_edit::value(v as i64);
-    }
-    if let Some(v) = patch.security_session_web_secs {
-        doc["security"]["session_lifetime_web_secs"] = toml_edit::value(v as i64);
-    }
-    if let Some(v) = patch.security_session_mesh_secs {
-        doc["security"]["session_lifetime_mesh_secs"] = toml_edit::value(v as i64);
-    }
-    if let Some(v) = patch.security_login_rate_per_min {
-        doc["security"]["login_rate_per_min"] = toml_edit::value(v as i64);
-    }
-    if let Some(v) = patch.security_command_rate_per_min {
-        doc["security"]["command_rate_per_min"] = toml_edit::value(v as i64);
-    }
-    let logging_level_changed = patch.logging_level.is_some();
-    if let Some(v) = patch.logging_level {
-        doc["logging"]["level"] = toml_edit::value(v.to_ascii_uppercase());
-    }
+            // Apply patches — only touch keys explicitly present in the request.
+            if let Some(v) = patch.bbs_name {
+                doc["bbs"]["name"] = toml_edit::value(v);
+            }
+            if let Some(v) = patch.bbs_starting_room {
+                doc["bbs"]["starting_room"] = toml_edit::value(v);
+            }
+            if let Some(v) = patch.bbs_welcome_msg {
+                doc["bbs"]["welcome_msg"] = toml_edit::value(v);
+            }
+            if let Some(v) = patch.bbs_timezone {
+                doc["bbs"]["timezone"] = toml_edit::value(v);
+            }
+            // Latitude/longitude: absent → leave unchanged, `null` → remove
+            // the key, a number → set it.
+            let location_touched =
+                patch.location_latitude.is_some() || patch.location_longitude.is_some();
+            if let Some(v) = patch.location_latitude {
+                match v {
+                    None => doc_remove_key(&mut doc, "location", "latitude"),
+                    Some(f) => doc["location"]["latitude"] = toml_edit::value(f),
+                }
+            }
+            if let Some(v) = patch.location_longitude {
+                match v {
+                    None => doc_remove_key(&mut doc, "location", "longitude"),
+                    Some(f) => doc["location"]["longitude"] = toml_edit::value(f),
+                }
+            }
+            let share_in_advert_touched = patch.location_share_in_advert.is_some();
+            if let Some(v) = patch.location_share_in_advert {
+                doc["location"]["share_in_advert"] = toml_edit::value(v);
+            }
+            if let Some(v) = patch.backup_enabled {
+                doc["backup"]["enabled"] = toml_edit::value(v);
+            }
+            if let Some(v) = patch.backup_interval_hours {
+                doc["backup"]["interval_hours"] = toml_edit::value(v as i64);
+            }
+            if let Some(v) = patch.backup_keep_daily {
+                doc["backup"]["keep_daily"] = toml_edit::value(v as i64);
+            }
+            if let Some(v) = patch.backup_keep_weekly {
+                doc["backup"]["keep_weekly"] = toml_edit::value(v as i64);
+            }
+            if let Some(v) = patch.security_session_web_secs {
+                doc["security"]["session_lifetime_web_secs"] = toml_edit::value(v as i64);
+            }
+            if let Some(v) = patch.security_session_mesh_secs {
+                doc["security"]["session_lifetime_mesh_secs"] = toml_edit::value(v as i64);
+            }
+            if let Some(v) = patch.security_login_rate_per_min {
+                doc["security"]["login_rate_per_min"] = toml_edit::value(v as i64);
+            }
+            if let Some(v) = patch.security_command_rate_per_min {
+                doc["security"]["command_rate_per_min"] = toml_edit::value(v as i64);
+            }
+            let logging_level_changed = patch.logging_level.is_some();
+            if let Some(v) = patch.logging_level {
+                doc["logging"]["level"] = toml_edit::value(v.to_ascii_uppercase());
+            }
 
-    if let Err(e) = atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes()) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json_error(&format!("could not write config file: {e}"))),
-        )
-            .into_response();
-    }
+            atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes())
+                .map_err(|e| std::io::Error::other(format!("could not write config file: {e}")))?;
+
+            // Resolve whatever the post-write side effects (below, outside
+            // the lock) need from the now-written `doc`, into the small,
+            // cheap-to-move `PatchConfigOutcome` rather than handing the
+            // whole parsed `doc` back out — `toml_edit::DocumentMut` does
+            // satisfy `with_config_lock`'s `Send + 'static` bound (verified
+            // against toml_edit 0.22.27), so this isn't required for that;
+            // it's simpler to reason about a handful of named fields at the
+            // call site than a full `DocumentMut`.
+            let resolved_logging_level = logging_level_changed
+                .then(|| {
+                    doc.get("logging")
+                        .and_then(|s| s.get("level"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_owned)
+                })
+                .flatten();
+            let new_location = location_touched.then(|| {
+                match (
+                    doc.get("location")
+                        .and_then(|s| s.get("latitude"))
+                        .and_then(|v| v.as_float()),
+                    doc.get("location")
+                        .and_then(|s| s.get("longitude"))
+                        .and_then(|v| v.as_float()),
+                ) {
+                    (Some(lat), Some(lon)) => Some((lat, lon)),
+                    _ => None,
+                }
+            });
+            let new_share_in_advert = share_in_advert_touched.then(|| {
+                doc.get("location")
+                    .and_then(|s| s.get("share_in_advert"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)
+            });
+
+            Ok(PatchConfigOutcome {
+                resolved_logging_level,
+                new_location,
+                new_share_in_advert,
+            })
+        })
+        .await;
+
+    let outcome = match write_result {
+        Ok(outcome) => outcome,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            return (StatusCode::BAD_REQUEST, Json(json_error(&e.to_string()))).into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("{e}"))),
+            )
+                .into_response();
+        }
+    };
 
     // Apply log level change immediately without a restart.
-    if logging_level_changed {
-        if let Some(level) = doc
-            .get("logging")
-            .and_then(|s| s.get("level"))
-            .and_then(|v| v.as_str())
+    if let Some(level) = outcome.resolved_logging_level {
+        if let Some(reload) = state
+            .log_reload
+            .lock()
+            .expect("log_reload poisoned")
+            .as_ref()
         {
-            if let Some(reload) = state
-                .log_reload
-                .lock()
-                .expect("log_reload poisoned")
-                .as_ref()
-            {
-                if let Err(e) = reload(level) {
-                    warn!("log level reload failed: {e}");
-                } else {
-                    info!(level, "log level changed at runtime");
-                }
+            if let Err(e) = reload(&level) {
+                warn!("log level reload failed: {e}");
+            } else {
+                info!(level, "log level changed at runtime");
             }
         }
     }
 
     // Update in-memory GPS location so the mesh transport picks it up on next
     // reconnect without a restart.
-    if location_touched {
-        let new_location = match (
-            doc.get("location")
-                .and_then(|s| s.get("latitude"))
-                .and_then(|v| v.as_float()),
-            doc.get("location")
-                .and_then(|s| s.get("longitude"))
-                .and_then(|v| v.as_float()),
-        ) {
-            (Some(lat), Some(lon)) => Some((lat, lon)),
-            _ => None,
-        };
+    if let Some(new_location) = outcome.new_location {
         state.host.set_node_location(new_location);
     }
-    if share_in_advert_touched {
-        let share_in_advert = doc
-            .get("location")
-            .and_then(|s| s.get("share_in_advert"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
+    if let Some(share_in_advert) = outcome.new_share_in_advert {
         state.host.set_share_location_in_advert(share_in_advert);
     }
 
@@ -2948,92 +2980,102 @@ async fn api_patch_radio_config(
         }
     };
 
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json_error(&format!("could not read config file: {e}"))),
-            )
-                .into_response()
-        }
-    };
-    let mut doc = match raw.parse::<toml_edit::DocumentMut>() {
-        Ok(d) => d,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json_error(&format!("could not parse config file: {e}"))),
-            )
-                .into_response()
-        }
-    };
+    // Read through write is one locked critical section — see
+    // api_patch_config's comment (same rationale, supply-drop-bbs / #227).
+    let path_for_lock = std::path::PathBuf::from(&path);
+    let path_for_closure = path.clone();
+    let write_result = bbs_core::config_lock::with_config_lock(&path_for_lock, move || {
+        let raw = std::fs::read_to_string(&path_for_closure)
+            .map_err(|e| std::io::Error::other(format!("could not read config file: {e}")))?;
+        let mut doc = raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| std::io::Error::other(format!("could not parse config file: {e}")))?;
 
-    // Apply patches — absent → leave unchanged, `null` → clear the key, a
-    // value → set it.
-    if let Some(v) = patch.preset {
-        match v {
-            None => doc_remove_radio_field(&mut doc, "preset"),
-            Some(s) => doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s)),
-        }
-    }
-    if let Some(v) = patch.frequency_hz {
-        match v {
-            None => doc_remove_radio_field(&mut doc, "frequency_hz"),
-            Some(n) => {
-                doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64))
+        // Apply patches — absent → leave unchanged, `null` → clear the key, a
+        // value → set it.
+        if let Some(v) = patch.preset {
+            match v {
+                None => doc_remove_radio_field(&mut doc, "preset"),
+                Some(s) => doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s)),
             }
         }
-    }
-    if let Some(v) = patch.bandwidth_hz {
-        match v {
-            None => doc_remove_radio_field(&mut doc, "bandwidth_hz"),
-            Some(n) => {
-                doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64))
+        if let Some(v) = patch.frequency_hz {
+            match v {
+                None => doc_remove_radio_field(&mut doc, "frequency_hz"),
+                Some(n) => {
+                    doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64))
+                }
             }
         }
-    }
-    if let Some(v) = patch.spreading_factor {
-        match v {
-            None => doc_remove_radio_field(&mut doc, "spreading_factor"),
-            Some(n) => doc_set_radio_field(
-                &mut doc,
-                "spreading_factor",
-                toml_edit::Value::from(n as i64),
-            ),
-        }
-    }
-    if let Some(v) = patch.coding_rate {
-        match v {
-            None => doc_remove_radio_field(&mut doc, "coding_rate"),
-            Some(n) => {
-                doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64))
+        if let Some(v) = patch.bandwidth_hz {
+            match v {
+                None => doc_remove_radio_field(&mut doc, "bandwidth_hz"),
+                Some(n) => {
+                    doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64))
+                }
             }
         }
-    }
-    if let Some(v) = patch.tx_power_dbm {
-        match v {
-            None => doc_remove_radio_field(&mut doc, "tx_power_dbm"),
-            Some(n) => doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n)),
-        }
-    }
-    if let Some(v) = patch.path_bytes {
-        match v {
-            None => doc_remove_mesh_field(&mut doc, "path_bytes"),
-            Some(n) if n == 2 || n == 3 => {
-                doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n))
+        if let Some(v) = patch.spreading_factor {
+            match v {
+                None => doc_remove_radio_field(&mut doc, "spreading_factor"),
+                Some(n) => doc_set_radio_field(
+                    &mut doc,
+                    "spreading_factor",
+                    toml_edit::Value::from(n as i64),
+                ),
             }
-            Some(_) => {} // out-of-range value: silently ignored, same as before
         }
-    }
+        if let Some(v) = patch.coding_rate {
+            match v {
+                None => doc_remove_radio_field(&mut doc, "coding_rate"),
+                Some(n) => {
+                    doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64))
+                }
+            }
+        }
+        if let Some(v) = patch.tx_power_dbm {
+            match v {
+                None => doc_remove_radio_field(&mut doc, "tx_power_dbm"),
+                Some(n) => doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n)),
+            }
+        }
+        if let Some(v) = patch.path_bytes {
+            match v {
+                None => doc_remove_mesh_field(&mut doc, "path_bytes"),
+                Some(n) if n == 2 || n == 3 => {
+                    doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n))
+                }
+                Some(_) => {} // out-of-range value: silently ignored, same as before
+            }
+        }
 
-    if let Err(e) = atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes()) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json_error(&format!("could not write config file: {e}"))),
+        let serialized = doc.to_string();
+        atomic_write_file(
+            std::path::Path::new(&path_for_closure),
+            serialized.as_bytes(),
         )
-            .into_response();
-    }
+        .map_err(|e| std::io::Error::other(format!("could not write config file: {e}")))?;
+
+        // Parse what was just written, still inside the lock, so the
+        // response reflects exactly this request's write — a separate
+        // unlocked re-read after the lock releases could observe a
+        // different writer's change instead (supply-drop-bbs / #227).
+        serialized
+            .parse::<toml::Value>()
+            .map_err(|e| std::io::Error::other(format!("could not parse just-written config: {e}")))
+    })
+    .await;
+
+    let val = match write_result {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json_error(&format!("{e}"))),
+            )
+                .into_response()
+        }
+    };
 
     // Audit log — best-effort.
     let _ = state
@@ -3046,11 +3088,6 @@ async fn api_patch_radio_config(
         )
         .await;
 
-    // Return updated config.
-    let val = match read_config_toml(&path) {
-        Ok(v) => v,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json_error(&e))).into_response(),
-    };
     Json(RadioConfigResponse {
         preset: toml_radio_str(&val, "preset"),
         frequency_hz: toml_radio_u64(&val, "frequency_hz"),
@@ -3155,7 +3192,7 @@ fn meshtastic_preset_name(n: i32) -> &'static str {
 /// in the operator config file.  Returns `Ok(true)` when written,
 /// `Ok(false)` when no config path is configured.
 #[allow(clippy::too_many_arguments)]
-fn save_meshtastic_radio_to_config(
+async fn save_meshtastic_radio_to_config(
     config_path: &Option<String>,
     region_int: i32,
     preset_int: i32,
@@ -3168,70 +3205,80 @@ fn save_meshtastic_radio_to_config(
         Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
         _ => return Ok(false),
     };
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc = raw
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("config parse error: {e}"))?;
+    // Read through write is one locked critical section — see
+    // api_patch_config's comment (same rationale, supply-drop-bbs / #227).
+    // Uses the async `with_config_lock`, not `with_config_lock_sync`,
+    // because this is called from an async axum handler — the sync
+    // variant would block that handler's tokio worker thread on lock
+    // contention and the read/write themselves.
+    let path_for_closure = path.clone();
+    bbs_core::config_lock::with_config_lock(&path, move || {
+        let raw = std::fs::read_to_string(&path_for_closure)?;
+        let mut doc = raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(std::io::Error::other)?;
 
-    // Ensure [plugins.meshtastic.radio] table path exists.
-    if doc.get("plugins").is_none() {
-        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let plugins = doc["plugins"].as_table_mut().unwrap();
-    if plugins.get("meshtastic").is_none() {
-        plugins.insert(
-            "meshtastic",
-            toml_edit::Item::Table(toml_edit::Table::new()),
-        );
-    }
-    let mt = plugins
-        .get_mut("meshtastic")
-        .unwrap()
-        .as_table_mut()
-        .unwrap();
-    if mt.get("radio").is_none() {
-        mt.insert("radio", toml_edit::Item::Table(toml_edit::Table::new()));
-    }
-    let radio = mt.get_mut("radio").unwrap().as_table_mut().unwrap();
+        // Ensure [plugins.meshtastic.radio] table path exists.
+        if doc.get("plugins").is_none() {
+            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let plugins = doc["plugins"].as_table_mut().unwrap();
+        if plugins.get("meshtastic").is_none() {
+            plugins.insert(
+                "meshtastic",
+                toml_edit::Item::Table(toml_edit::Table::new()),
+            );
+        }
+        let mt = plugins
+            .get_mut("meshtastic")
+            .unwrap()
+            .as_table_mut()
+            .unwrap();
+        if mt.get("radio").is_none() {
+            mt.insert("radio", toml_edit::Item::Table(toml_edit::Table::new()));
+        }
+        let radio = mt.get_mut("radio").unwrap().as_table_mut().unwrap();
 
-    if region_int != 0 {
+        if region_int != 0 {
+            radio.insert(
+                "region",
+                toml_edit::Item::Value(toml_edit::Value::from(meshtastic_region_name(region_int))),
+            );
+        }
         radio.insert(
-            "region",
-            toml_edit::Item::Value(toml_edit::Value::from(meshtastic_region_name(region_int))),
+            "modem_preset",
+            toml_edit::Item::Value(toml_edit::Value::from(meshtastic_preset_name(preset_int))),
         );
-    }
-    radio.insert(
-        "modem_preset",
-        toml_edit::Item::Value(toml_edit::Value::from(meshtastic_preset_name(preset_int))),
-    );
-    radio.insert(
-        "hops",
-        toml_edit::Item::Value(toml_edit::Value::from(hops as i64)),
-    );
-    radio.insert(
-        "rx_boosted_gain",
-        toml_edit::Item::Value(toml_edit::Value::from(rx_boosted_gain)),
-    );
-    radio.insert(
-        "ignore_mqtt",
-        toml_edit::Item::Value(toml_edit::Value::from(ignore_mqtt)),
-    );
-    radio.insert(
-        "tx_enabled",
-        toml_edit::Item::Value(toml_edit::Value::from(tx_enabled)),
-    );
+        radio.insert(
+            "hops",
+            toml_edit::Item::Value(toml_edit::Value::from(hops as i64)),
+        );
+        radio.insert(
+            "rx_boosted_gain",
+            toml_edit::Item::Value(toml_edit::Value::from(rx_boosted_gain)),
+        );
+        radio.insert(
+            "ignore_mqtt",
+            toml_edit::Item::Value(toml_edit::Value::from(ignore_mqtt)),
+        );
+        radio.insert(
+            "tx_enabled",
+            toml_edit::Item::Value(toml_edit::Value::from(tx_enabled)),
+        );
 
-    atomic_write_file(&path, doc.to_string().as_bytes())
-        .map_err(|e| format!("write error: {e}"))?;
+        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+    })
+    .await
+    .map_err(|e| format!("{e}"))?;
     Ok(true)
 }
 
 /// Write short_name and/or long_name into `[plugins.meshtastic]`
 /// in the operator config file.
-fn save_meshtastic_owner_to_config(
+async fn save_meshtastic_owner_to_config(
     config_path: &Option<String>,
-    short_name: Option<&str>,
-    long_name: Option<&str>,
+    short_name: Option<String>,
+    long_name: Option<String>,
 ) -> Result<bool, String> {
     let path = match config_path {
         Some(p) if !p.is_empty() => std::path::PathBuf::from(p),
@@ -3240,42 +3287,50 @@ fn save_meshtastic_owner_to_config(
     if short_name.is_none() && long_name.is_none() {
         return Ok(true);
     }
-    let raw = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc = raw
-        .parse::<toml_edit::DocumentMut>()
-        .map_err(|e| format!("config parse error: {e}"))?;
+    // Read through write is one locked critical section — see
+    // api_patch_config's comment (same rationale, supply-drop-bbs / #227).
+    // Uses the async `with_config_lock`, not `with_config_lock_sync`, for
+    // the same reason as `save_meshtastic_radio_to_config` above.
+    let path_for_closure = path.clone();
+    bbs_core::config_lock::with_config_lock(&path, move || {
+        let raw = std::fs::read_to_string(&path_for_closure)?;
+        let mut doc = raw
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(std::io::Error::other)?;
 
-    if doc.get("plugins").is_none() {
-        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let plugins = doc["plugins"].as_table_mut().unwrap();
-    if plugins.get("meshtastic").is_none() {
-        plugins.insert(
-            "meshtastic",
-            toml_edit::Item::Table(toml_edit::Table::new()),
-        );
-    }
-    let mt = plugins
-        .get_mut("meshtastic")
-        .unwrap()
-        .as_table_mut()
-        .unwrap();
+        if doc.get("plugins").is_none() {
+            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let plugins = doc["plugins"].as_table_mut().unwrap();
+        if plugins.get("meshtastic").is_none() {
+            plugins.insert(
+                "meshtastic",
+                toml_edit::Item::Table(toml_edit::Table::new()),
+            );
+        }
+        let mt = plugins
+            .get_mut("meshtastic")
+            .unwrap()
+            .as_table_mut()
+            .unwrap();
 
-    if let Some(sn) = short_name {
-        mt.insert(
-            "short_name",
-            toml_edit::Item::Value(toml_edit::Value::from(sn)),
-        );
-    }
-    if let Some(ln) = long_name {
-        mt.insert(
-            "long_name",
-            toml_edit::Item::Value(toml_edit::Value::from(ln)),
-        );
-    }
+        if let Some(sn) = short_name {
+            mt.insert(
+                "short_name",
+                toml_edit::Item::Value(toml_edit::Value::from(sn)),
+            );
+        }
+        if let Some(ln) = long_name {
+            mt.insert(
+                "long_name",
+                toml_edit::Item::Value(toml_edit::Value::from(ln)),
+            );
+        }
 
-    atomic_write_file(&path, doc.to_string().as_bytes())
-        .map_err(|e| format!("write error: {e}"))?;
+        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+    })
+    .await
+    .map_err(|e| format!("{e}"))?;
     Ok(true)
 }
 
@@ -3378,7 +3433,8 @@ async fn api_patch_meshtastic_radio_config(
         config.sx126x_rx_boosted_gain,
         config.ignore_mqtt,
         config.tx_enabled,
-    );
+    )
+    .await;
     if let Err(ref e) = saved {
         tracing::warn!("meshtastic radio: could not save to config.toml: {e}");
     }
@@ -3484,9 +3540,10 @@ async fn api_patch_meshtastic_owner(
     let config_path = &state.config.config_path;
     let saved = save_meshtastic_owner_to_config(
         config_path,
-        body.short_name.as_deref(),
-        body.long_name.as_deref(),
-    );
+        body.short_name.clone(),
+        body.long_name.clone(),
+    )
+    .await;
     if let Err(ref e) = saved {
         tracing::warn!("meshtastic owner: could not save to config.toml: {e}");
     }

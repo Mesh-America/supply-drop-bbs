@@ -3775,7 +3775,7 @@ impl BbsHost {
     /// Failures are logged as warnings but not propagated — the in-memory
     /// state is already updated and the sysop can restart to re-read the file.
     async fn persist_access_policy(&self) {
-        let Some(ref path) = self.config_path else {
+        let Some(path) = self.config_path.clone() else {
             warn!("no config_path set — access policy change will not survive restart");
             return;
         };
@@ -3785,49 +3785,42 @@ impl BbsHost {
             (policy.require_verify, policy.guest_room_name.clone())
         };
 
-        let content = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    "persist_access_policy: could not read {}: {e}",
-                    path.display()
-                );
-                return;
+        // Read through write is one locked critical section — see
+        // crate::config_lock's module doc comment (supply-drop-bbs / #227).
+        // Every config-mutating call site must go through this lock; this
+        // one previously didn't, silently reopening the race the lock
+        // exists to close.
+        let path_for_closure = path.clone();
+        let result = crate::config_lock::with_config_lock(&path, move || {
+            let content = std::fs::read_to_string(&path_for_closure)?;
+            let mut doc = content
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(std::io::Error::other)?;
+
+            if doc.get("bbs").is_none() {
+                doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
             }
-        };
 
-        let mut doc = match content.parse::<toml_edit::DocumentMut>() {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(
-                    "persist_access_policy: could not parse {}: {e}",
-                    path.display()
-                );
-                return;
-            }
-        };
+            doc["bbs"]["require_verify"] = toml_edit::value(require_verify);
 
-        // Ensure [bbs] table exists.
-        if doc.get("bbs").is_none() {
-            doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-
-        doc["bbs"]["require_verify"] = toml_edit::value(require_verify);
-
-        match guest_room_name {
-            Some(name) => {
-                doc["bbs"]["guest_room"] = toml_edit::value(name);
-            }
-            None => {
-                if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
-                    bbs.remove("guest_room");
+            match guest_room_name {
+                Some(name) => {
+                    doc["bbs"]["guest_room"] = toml_edit::value(name);
+                }
+                None => {
+                    if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
+                        bbs.remove("guest_room");
+                    }
                 }
             }
-        }
 
-        if let Err(e) = std::fs::write(path, doc.to_string()) {
+            crate::config_lock::atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+        })
+        .await;
+
+        if let Err(e) = result {
             warn!(
-                "persist_access_policy: could not write {}: {e}",
+                "persist_access_policy: could not read/parse/write {}: {e}",
                 path.display()
             );
         } else {
