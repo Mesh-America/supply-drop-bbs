@@ -246,7 +246,20 @@ async def run(config: dict) -> None:
         radio_kwargs["use_gpiod_backend"] = True
 
     radio = SX1262Radio(**radio_kwargs)
-    if radio.begin() is False:
+    # begin() signals failure two different ways depending on where it
+    # fails: a plain `False` return for some paths, but an exception (e.g.
+    # RuntimeError from IRQ-pin setup) for others — both are the same
+    # class of problem from an operator's perspective (wiring/SPI
+    # misconfiguration), so both get the same actionable hint instead of
+    # only the `False` case getting it and the other showing a bare
+    # traceback. log.exception still includes the traceback, just with
+    # the hint prepended.
+    try:
+        began = radio.begin()
+    except Exception:
+        log.exception("SX1262Radio.begin() raised an exception — check wiring and SPI settings")
+        sys.exit(1)
+    if began is False:
         log.error("SX1262Radio.begin() returned False — check wiring and SPI settings")
         sys.exit(1)
     log.info("Radio initialised")
@@ -303,7 +316,9 @@ async def run(config: dict) -> None:
         )
 
     # Auto-add contacts so the BBS sees incoming users without manual approval.
-    # 0x01 = overwrite oldest, 0x02 = chat, 0x04 = repeater, 0x08 = room
+    # 0x01 = overwrite oldest, 0x02 = chat, 0x04 = repeater, 0x08 = room,
+    # 0x10 = sensor. Default 0x0F does NOT include sensor — use 0x1F to
+    # also auto-add sensor contacts.
     autoadd = int(companion_cfg.get("autoadd_config", 0x0F))
     try:
         companion.set_autoadd_config(autoadd)
