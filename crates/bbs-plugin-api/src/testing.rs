@@ -63,6 +63,19 @@ pub struct MockHost {
     state: Mutex<MockHostState>,
     events: broadcast::Sender<DomainEvent>,
     advert_bus: Arc<AdvertBus>,
+    /// Call counters for the location-related `Host` accessors, exposed via
+    /// [`MockHost::node_location_call_count`] /
+    /// [`MockHost::share_location_in_advert_call_count`] /
+    /// [`MockHost::advert_location_state_call_count`]. Lets a test prove a
+    /// code path calls the single atomic `advert_location_state()` snapshot
+    /// instead of the two separate, independently-lockable accessors — the
+    /// distinction that closed supply-drop-bbs / #226 (a `BbsHost`-specific
+    /// race; `MockHost` itself stores both fields in one already-atomic
+    /// `Mutex<MockHostState>`, so these counters test *call-site discipline*,
+    /// not this mock's own storage).
+    node_location_calls: AtomicU64,
+    share_location_in_advert_calls: AtomicU64,
+    advert_location_state_calls: AtomicU64,
 }
 
 struct MockHostState {
@@ -156,7 +169,28 @@ impl MockHost {
             }),
             events: tx,
             advert_bus: Arc::new(AdvertBus::new()),
+            node_location_calls: AtomicU64::new(0),
+            share_location_in_advert_calls: AtomicU64::new(0),
+            advert_location_state_calls: AtomicU64::new(0),
         }
+    }
+
+    /// Number of times `node_location()` has been called on this mock.
+    #[must_use]
+    pub fn node_location_call_count(&self) -> u64 {
+        self.node_location_calls.load(Ordering::Relaxed)
+    }
+
+    /// Number of times `share_location_in_advert()` has been called on this mock.
+    #[must_use]
+    pub fn share_location_in_advert_call_count(&self) -> u64 {
+        self.share_location_in_advert_calls.load(Ordering::Relaxed)
+    }
+
+    /// Number of times `advert_location_state()` has been called on this mock.
+    #[must_use]
+    pub fn advert_location_state_call_count(&self) -> u64 {
+        self.advert_location_state_calls.load(Ordering::Relaxed)
     }
 
     /// Pre-create a session with a bound user at a specific
@@ -383,6 +417,7 @@ impl Host for MockHost {
     }
 
     fn node_location(&self) -> Option<(f64, f64)> {
+        self.node_location_calls.fetch_add(1, Ordering::Relaxed);
         self.state.lock().expect("mock poisoned").location
     }
 
@@ -391,6 +426,8 @@ impl Host for MockHost {
     }
 
     fn share_location_in_advert(&self) -> bool {
+        self.share_location_in_advert_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.state
             .lock()
             .expect("mock poisoned")
@@ -402,6 +439,14 @@ impl Host for MockHost {
         // resolution, so this calls MockHost::set_share_location_in_advert
         // (above), not itself — no recursion.
         self.set_share_location_in_advert(share);
+    }
+
+    fn advert_location_state(&self) -> Option<(f64, f64, bool)> {
+        self.advert_location_state_calls
+            .fetch_add(1, Ordering::Relaxed);
+        let guard = self.state.lock().expect("mock poisoned");
+        let (lat, lon) = guard.location?;
+        Some((lat, lon, guard.share_location_in_advert))
     }
 
     fn mesh_node_name(&self) -> Option<String> {

@@ -232,6 +232,16 @@ pub trait Host: Send + Sync {
     /// `set_node_location`.
     fn set_share_location_in_advert(&self, share: bool) {}
 
+    /// Atomic snapshot of `node_location()` and
+    /// `share_location_in_advert()` taken together — **the API to use
+    /// whenever your transport needs both**, not the two accessors
+    /// above called separately. See "How transport plugins consume
+    /// this" below for why.
+    fn advert_location_state(&self) -> Option<(f64, f64, bool)> {
+        let (lat, lon) = self.node_location()?;
+        Some((lat, lon, self.share_location_in_advert()))
+    }
+
     // ── Audit ───────────────────────────────────────────────────
 
     /// Append-only audit log. Plugins should call this for any
@@ -295,24 +305,67 @@ saves new coordinates — no restart required.
 
 ### How transport plugins consume this
 
-Call `host.node_location()` each time your transport successfully
-connects to its underlying layer (radio bridge, network socket, etc.).
-It returns `Option<(f64, f64)>` in `(latitude, longitude)` order:
+If your transport only ever needs the coordinates alone (nothing else
+in the same operation depends on the sharing preference), calling
+`host.node_location()` by itself is fine — it returns `Option<(f64,
+f64)>` in `(latitude, longitude)` order, `None` meaning no location is
+configured.
 
-- `None` → no location configured; leave the hardware default as-is.
-- `Some((lat, lon))` → send the appropriate position frame to your
-  hardware or network layer.
+**But if your transport makes more than one decision from this state
+in a single connect/advert-send operation — e.g. both "should I send
+a position frame" and "how much byte budget does the node name get"
+— call `host.advert_location_state()` ONCE and reuse that one
+snapshot for every decision in that operation.** Do not call
+`node_location()` and `share_location_in_advert()` as two separate,
+independent accessor calls to get the same information: a concurrent
+admin config change can land between them and pair a stale flag with
+a fresh coordinate (or vice versa), and if that combination feeds two
+different decisions (e.g. name-truncation budget vs. whether to
+include GPS), those decisions can disagree with each other on what
+the "current" state actually was — corrupting whatever you send.
+This is exactly what happened in the mesh transport before it was
+fixed (supply-drop-bbs / #226): sending an over-length name alongside
+GPS data overflowed MeshCore's 32-byte advert limit, and every
+receiver silently dropped the advert.
 
-The call is synchronous and cheap (reads a `RwLock`). The mesh
-transport does this in its `ClientEvent::Connected` handler:
+`advert_location_state()` returns `Option<(f64, f64, bool)>` — `None`
+when no location is configured, `Some((lat, lon, share_in_advert))`
+otherwise. `lat`/`lon` are meaningful even when `share_in_advert` is
+`false`: the convention is that the BBS still tells its own hardware/
+network layer its coordinates either way, `share_in_advert` only gates
+whether those coordinates are also *published* mesh-wide (via a
+device-side policy bit, or by only writing a broadcast-visible fixed
+position at all — see below for transports without an equivalent
+policy bit).
+
+The call is synchronous and cheap (reads one `RwLock`). The mesh
+transport takes its snapshot once per `ClientEvent::Connected` /
+advert-send and reuses it for every subsequent decision:
 
 ```rust
-// On every successful radio-bridge connect:
-if let Some((lat, lon)) = host.node_location() {
+// Once per connect/advert-send — reused for every decision below,
+// never re-queried mid-operation.
+let location_state = host.advert_location_state();
+let sharing_location = location_state.is_some_and(|(_, _, share)| share);
+
+if let Some((lat, lon, _)) = location_state {
     let lat_1e6 = (lat * 1_000_000.0) as i32;
     let lon_1e6 = (lon * 1_000_000.0) as i32;
     cmd_tx.send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 }).await?;
 }
+
+// `SetAdvertLatlon` only stores raw coordinates on the device — it does
+// NOT by itself make the node appear on public MeshCore maps. Whether
+// those coordinates are actually included in outgoing self-adverts is a
+// separate device-side policy bit (`advert_loc_policy`, set via
+// `CMD_SET_OTHER_PARAMS`), driven by the SAME `sharing_location` value:
+let desired_policy = if sharing_location { ADVERT_LOC_SHARE } else { ADVERT_LOC_NONE };
+// ... push CMD_SET_OTHER_PARAMS with advert_loc_policy = desired_policy,
+// preserving the device's other CMD_SET_OTHER_PARAMS fields ...
+
+// And the same `sharing_location` value again for any name-truncation
+// budget or other decision that depends on whether GPS is being shared —
+// never re-derive it from node_location()/share_location_in_advert().
 ```
 
 Calling on each reconnect (rather than caching at `init`) is
@@ -320,38 +373,29 @@ intentional: a sysop can update the coordinates via the web UI while
 the service is running, and the change takes effect the next time
 the transport reconnects.
 
-`SetAdvertLatlon` only stores raw coordinates on the device — it does
-**not** by itself make the node appear on public MeshCore maps. Whether
-those coordinates are actually included in outgoing self-adverts is a
-separate device-side policy bit (`advert_loc_policy`, set via
-`CMD_SET_OTHER_PARAMS`), gated by `host.share_location_in_advert()`. Read
-both together:
-
-```rust
-if let Some((lat, lon)) = host.node_location() {
-    // ... push SetAdvertLatlon as above ...
-}
-let desired_policy = if host.node_location().is_some() && host.share_location_in_advert() {
-    ADVERT_LOC_SHARE
-} else {
-    ADVERT_LOC_NONE
-};
-// ... push CMD_SET_OTHER_PARAMS with advert_loc_policy = desired_policy,
-// preserving the device's other CMD_SET_OTHER_PARAMS fields ...
-```
-
 A transport without an equivalent device-side policy bit (e.g.
 Meshtastic, which broadcasts any configured fixed position
-automatically) should instead gate the position write itself on
-`share_location_in_advert()`.
+automatically) should instead gate the position write itself on the
+snapshot's `share_in_advert` value:
+
+```rust
+match host.advert_location_state() {
+    Some((lat, lon, true)) => { /* write a fixed position */ }
+    _ => { /* no location configured, or sharing is off — clear it */ }
+}
+```
 
 ### What transport plugins must NOT do
 
 - Do **not** call `set_node_location`. That method is reserved for
   the admin layer. Transports are consumers of the location, not
   producers.
-- Do **not** cache `node_location()` at `init` time. Always read it
-  fresh on each connect so live updates from the web UI are picked up.
+- Do **not** cache `node_location()` / `advert_location_state()` at
+  `init` time. Always read fresh on each connect so live updates from
+  the web UI are picked up.
+- Do **not** call `node_location()` and `share_location_in_advert()`
+  independently when a single operation needs both — use
+  `advert_location_state()` instead (see above).
 
 ## Configuration
 
