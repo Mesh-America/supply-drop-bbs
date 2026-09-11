@@ -1581,20 +1581,27 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
 // Used by `config require-verify` and `config guest-room` to update
 // config.toml in place via toml_edit.
 
-/// Open the config file and return its parsed document + resolved path.
-fn open_config_for_edit(
-    config_path: Option<&std::path::Path>,
-) -> (std::path::PathBuf, toml_edit::DocumentMut) {
+/// Resolve the config file path for a `config <subcommand>` edit, exiting
+/// with an error message if none is found.
+///
+/// Deliberately separate from reading/parsing (see
+/// [`read_and_parse_config`]): callers need the resolved path BEFORE
+/// acquiring `bbs_core::config_lock`'s lock (the lock's own sidecar file
+/// path is derived from it), and the read itself must happen INSIDE the
+/// lock, not before it — see that module's doc comment for why.
+fn resolve_config_path_for_edit(config_path: Option<&std::path::Path>) -> std::path::PathBuf {
     #[cfg(feature = "transport-process")]
-    let path = match config::resolve_config_path(config_path) {
-        Some(p) => p,
-        None => {
-            eprintln!("error: no config file found");
-            std::process::exit(1);
+    {
+        match config::resolve_config_path(config_path) {
+            Some(p) => p,
+            None => {
+                eprintln!("error: no config file found");
+                std::process::exit(1);
+            }
         }
-    };
+    }
     #[cfg(not(feature = "transport-process"))]
-    let path = {
+    {
         let explicit = config_path.map(|p| p.to_path_buf());
         let found = explicit.or_else(|| {
             [
@@ -1612,23 +1619,50 @@ fn open_config_for_edit(
                 std::process::exit(1);
             }
         }
-    };
+    }
+}
 
-    let content = match std::fs::read_to_string(&path) {
+/// Read and parse the config file at `path`. Must only be called while
+/// holding `bbs_core::config_lock`'s lock on `path` (see that module's doc
+/// comment) — a read outside the lock can observe a snapshot a concurrent
+/// writer is about to invalidate.
+fn read_and_parse_config(path: &std::path::Path) -> toml_edit::DocumentMut {
+    let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error reading {}: {e}", path.display());
             std::process::exit(1);
         }
     };
-    let doc = match content.parse::<toml_edit::DocumentMut>() {
+    match content.parse::<toml_edit::DocumentMut>() {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error parsing {}: {e}", path.display());
             std::process::exit(1);
         }
-    };
-    (path, doc)
+    }
+}
+
+/// Run `edit` (read the current config, mutate the returned document,
+/// return it to be written back) while holding the cross-process
+/// config-file lock, then atomically write the result — the whole
+/// read-modify-write cycle as one locked critical section. Exits the
+/// process on any I/O error, matching this CLI's existing error-handling
+/// convention for config edits.
+fn with_locked_config_edit(
+    config_path: Option<&std::path::Path>,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut),
+) {
+    let path = resolve_config_path_for_edit(config_path);
+    let result = bbs_core::config_lock::with_config_lock_sync(&path, || {
+        let mut doc = read_and_parse_config(&path);
+        edit(&mut doc);
+        atomic_write_file(&path, doc.to_string().as_bytes())
+    });
+    if let Err(e) = result {
+        eprintln!("error writing {}: {e}", path.display());
+        std::process::exit(1);
+    }
 }
 
 /// Write `contents` to `path` atomically: write to a `.tmp` sibling, fsync,
@@ -1652,84 +1686,66 @@ fn atomic_write_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result
 }
 
 fn config_edit_bbs_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
-    let (path, mut doc) = open_config_for_edit(config_path);
-    if doc.get("bbs").is_none() {
-        doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    doc["bbs"][key] = toml_edit::value(value);
-    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
-        eprintln!("error writing {}: {e}", path.display());
-        std::process::exit(1);
-    }
+    with_locked_config_edit(config_path, |doc| {
+        if doc.get("bbs").is_none() {
+            doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["bbs"][key] = toml_edit::value(value);
+    });
 }
 
 fn config_edit_bbs_string(config_path: Option<&std::path::Path>, key: &str, value: &str) {
-    let (path, mut doc) = open_config_for_edit(config_path);
-    if doc.get("bbs").is_none() {
-        doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    doc["bbs"][key] = toml_edit::value(value);
-    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
-        eprintln!("error writing {}: {e}", path.display());
-        std::process::exit(1);
-    }
+    with_locked_config_edit(config_path, |doc| {
+        if doc.get("bbs").is_none() {
+            doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["bbs"][key] = toml_edit::value(value);
+    });
 }
 
 fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
-    let (path, mut doc) = open_config_for_edit(config_path);
-    if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
-        bbs.remove(key);
-    }
-    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
-        eprintln!("error writing {}: {e}", path.display());
-        std::process::exit(1);
-    }
+    with_locked_config_edit(config_path, |doc| {
+        if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
+            bbs.remove(key);
+        }
+    });
 }
 
 /// Set multiple `[location]` float keys in a single read-modify-write, so a
 /// crash or kill between writes can't leave one key set without the other —
 /// e.g. latitude persisted with no longitude, which `config location <lat>
 /// <lon>` would otherwise risk by writing each key through a separate
-/// `open_config_for_edit`/`atomic_write_file` round trip.
+/// locked round trip.
 fn config_edit_location_floats(config_path: Option<&std::path::Path>, pairs: &[(&str, f64)]) {
-    let (path, mut doc) = open_config_for_edit(config_path);
-    if doc.get("location").is_none() {
-        doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    for (key, value) in pairs {
-        doc["location"][*key] = toml_edit::value(*value);
-    }
-    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
-        eprintln!("error writing {}: {e}", path.display());
-        std::process::exit(1);
-    }
+    with_locked_config_edit(config_path, |doc| {
+        if doc.get("location").is_none() {
+            doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        for (key, value) in pairs {
+            doc["location"][*key] = toml_edit::value(*value);
+        }
+    });
 }
 
 fn config_edit_location_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
-    let (path, mut doc) = open_config_for_edit(config_path);
-    if doc.get("location").is_none() {
-        doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    doc["location"][key] = toml_edit::value(value);
-    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
-        eprintln!("error writing {}: {e}", path.display());
-        std::process::exit(1);
-    }
+    with_locked_config_edit(config_path, |doc| {
+        if doc.get("location").is_none() {
+            doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["location"][key] = toml_edit::value(value);
+    });
 }
 
 /// Remove multiple `[location]` keys in a single read-modify-write — same
 /// atomicity rationale as [`config_edit_location_floats`].
 fn config_remove_location_keys(config_path: Option<&std::path::Path>, keys: &[&str]) {
-    let (path, mut doc) = open_config_for_edit(config_path);
-    if let Some(location) = doc.get_mut("location").and_then(|t| t.as_table_mut()) {
-        for key in keys {
-            location.remove(key);
+    with_locked_config_edit(config_path, |doc| {
+        if let Some(location) = doc.get_mut("location").and_then(|t| t.as_table_mut()) {
+            for key in keys {
+                location.remove(key);
+            }
         }
-    }
-    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
-        eprintln!("error writing {}: {e}", path.display());
-        std::process::exit(1);
-    }
+    });
 }
 
 /// Manage process transport plugins.
@@ -1842,9 +1858,7 @@ fn cmd_plugin(config_path: Option<&std::path::Path>, action: PluginAction) {
             }
             if in_toml {
                 toml_plugins.retain(|p| p.name != name);
-                let raw = std::fs::read_to_string(&path).unwrap_or_default();
-                let mut doc: toml_edit::DocumentMut = raw.parse().unwrap_or_default();
-                write_plugins(&mut doc, &toml_plugins, &path);
+                write_plugins(&toml_plugins, &path);
             }
             println!("Removed plugin '{name}'.");
         }
@@ -1963,9 +1977,7 @@ fn update_plugin_enabled(
     }
     if let Some(p) = toml_plugins.iter_mut().find(|p| p.name == name) {
         p.enabled = enabled;
-        let raw = std::fs::read_to_string(config_path).unwrap_or_default();
-        let mut doc: toml_edit::DocumentMut = raw.parse().unwrap_or_default();
-        write_plugins(&mut doc, toml_plugins, config_path);
+        write_plugins(toml_plugins, config_path);
         println!("{verb} '{name}'.");
         return;
     }
@@ -1973,12 +1985,13 @@ fn update_plugin_enabled(
     std::process::exit(1);
 }
 
+/// Replace `[[plugins.process]]` in `config.toml` at `path` with `plugins`.
+/// Reads the current file fresh from inside the config-file lock (rather
+/// than taking an already-parsed `doc`) so a concurrent writer's changes to
+/// other sections aren't silently reverted — see
+/// `bbs_core::config_lock`'s module doc comment (supply-drop-bbs / #227).
 #[cfg(feature = "transport-process")]
-fn write_plugins(
-    doc: &mut toml_edit::DocumentMut,
-    plugins: &[bbs_plugin_api::ProcessPluginConfig],
-    path: &std::path::Path,
-) {
+fn write_plugins(plugins: &[bbs_plugin_api::ProcessPluginConfig], path: &std::path::Path) {
     let mut aot = toml_edit::ArrayOfTables::new();
     for p in plugins {
         let mut tbl = toml_edit::Table::new();
@@ -1999,8 +2012,13 @@ fn write_plugins(
         );
         aot.push(tbl);
     }
-    doc["plugins"]["process"] = toml_edit::Item::ArrayOfTables(aot);
-    if let Err(e) = atomic_write_file(path, doc.to_string().as_bytes()) {
+
+    let result = bbs_core::config_lock::with_config_lock_sync(path, || {
+        let mut doc = read_and_parse_config(path);
+        doc["plugins"]["process"] = toml_edit::Item::ArrayOfTables(aot);
+        atomic_write_file(path, doc.to_string().as_bytes())
+    });
+    if let Err(e) = result {
         eprintln!("error writing config: {e}");
         std::process::exit(1);
     }
@@ -2463,25 +2481,39 @@ fn save_radio_config(config_path: Option<&std::path::Path>, r: &ResolvedRadio) {
         }
     };
 
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = content.parse().unwrap_or_default();
+    // Read through write is one locked critical section — see
+    // bbs_core::config_lock's module doc comment (supply-drop-bbs / #227).
+    let (frequency_hz, bandwidth_hz, spreading_factor, coding_rate, tx_power_dbm) = (
+        r.frequency_hz,
+        r.bandwidth_hz,
+        r.spreading_factor,
+        r.coding_rate,
+        r.tx_power_dbm,
+    );
+    let path_for_closure = path.clone();
+    let result = bbs_core::config_lock::with_config_lock_sync(&path, move || {
+        let content = std::fs::read_to_string(&path_for_closure)?;
+        let mut doc: toml_edit::DocumentMut = content.parse().map_err(std::io::Error::other)?;
 
-    // Ensure [plugins] and [plugins.mesh] exist.
-    if doc.get("plugins").is_none() {
-        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    if doc["plugins"].get("mesh").is_none() {
-        doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    // Write [plugins.mesh.radio] fields.
-    doc["plugins"]["mesh"]["radio"]["frequency_hz"] = toml_edit::value(r.frequency_hz as i64);
-    doc["plugins"]["mesh"]["radio"]["bandwidth_hz"] = toml_edit::value(r.bandwidth_hz as i64);
-    doc["plugins"]["mesh"]["radio"]["spreading_factor"] =
-        toml_edit::value(r.spreading_factor as i64);
-    doc["plugins"]["mesh"]["radio"]["coding_rate"] = toml_edit::value(r.coding_rate as i64);
-    doc["plugins"]["mesh"]["radio"]["tx_power_dbm"] = toml_edit::value(r.tx_power_dbm as i64);
+        // Ensure [plugins] and [plugins.mesh] exist.
+        if doc.get("plugins").is_none() {
+            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        if doc["plugins"].get("mesh").is_none() {
+            doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        // Write [plugins.mesh.radio] fields.
+        doc["plugins"]["mesh"]["radio"]["frequency_hz"] = toml_edit::value(frequency_hz as i64);
+        doc["plugins"]["mesh"]["radio"]["bandwidth_hz"] = toml_edit::value(bandwidth_hz as i64);
+        doc["plugins"]["mesh"]["radio"]["spreading_factor"] =
+            toml_edit::value(spreading_factor as i64);
+        doc["plugins"]["mesh"]["radio"]["coding_rate"] = toml_edit::value(coding_rate as i64);
+        doc["plugins"]["mesh"]["radio"]["tx_power_dbm"] = toml_edit::value(tx_power_dbm as i64);
 
-    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
+        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+    });
+
+    if let Err(e) = result {
         eprintln!("warning: --save: could not write {}: {e}", path.display());
     } else {
         eprintln!("Saved radio config to {}.", path.display());
@@ -2514,17 +2546,24 @@ fn save_path_bytes(config_path: Option<&std::path::Path>, bytes: u8) {
         }
     };
 
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-    let mut doc: toml_edit::DocumentMut = content.parse().unwrap_or_default();
-    if doc.get("plugins").is_none() {
-        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    if doc["plugins"].get("mesh").is_none() {
-        doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    doc["plugins"]["mesh"]["path_bytes"] = toml_edit::value(bytes as i64);
+    // Read through write is one locked critical section — see
+    // bbs_core::config_lock's module doc comment (supply-drop-bbs / #227).
+    let path_for_closure = path.clone();
+    let result = bbs_core::config_lock::with_config_lock_sync(&path, move || {
+        let content = std::fs::read_to_string(&path_for_closure)?;
+        let mut doc: toml_edit::DocumentMut = content.parse().map_err(std::io::Error::other)?;
+        if doc.get("plugins").is_none() {
+            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        if doc["plugins"].get("mesh").is_none() {
+            doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        doc["plugins"]["mesh"]["path_bytes"] = toml_edit::value(bytes as i64);
 
-    if let Err(e) = atomic_write_file(&path, doc.to_string().as_bytes()) {
+        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+    });
+
+    if let Err(e) = result {
         eprintln!("warning: --save: could not write {}: {e}", path.display());
     } else {
         eprintln!("Saved path_bytes = {bytes} to {}.", path.display());
