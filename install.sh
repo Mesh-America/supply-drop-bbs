@@ -701,7 +701,12 @@ if [[ "$_mesh_enabled" == true && "$_mesh_conn_type" == "hat" ]]; then
     exec 9>"$PYMC_DIR/.pymc-companion-update.lock"
     flock 9
     "$PYMC_DIR/venv/bin/pip" install -q --upgrade pip
-    "$PYMC_DIR/venv/bin/pip" install -q openhop-core pyyaml spidev
+    # Pinned exact version, not a floating "openhop-core" install — see
+    # OPENHOP_CORE_VERSION's own comment in packaging/postinst for why
+    # (supply-drop-bbs-6zu / #268). Keep this pin in sync with postinst's;
+    # a mismatch just means a wizard-run venv and an apt-upgraded venv can
+    # diverge, not a crash, but there's no reason to let that happen.
+    "$PYMC_DIR/venv/bin/pip" install -q "openhop-core==1.1.3" pyyaml spidev
     if [[ "$_gpiod" == false ]]; then
         "$PYMC_DIR/venv/bin/pip" install -q lgpio python-periphery
     fi
