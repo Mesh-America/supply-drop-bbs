@@ -2197,6 +2197,31 @@ async fn attempt_protect_and_update_pending(
     }
 }
 
+/// Resolve the connect-time greeting's `{name}` placeholder from whichever
+/// source is available, sanitizing the result either way (supply-drop-bbs /
+/// #292).
+///
+/// `auto_username` is a BBS account name (already constrained by the BBS's
+/// own username policy) — sanitizing it too is defense in depth, not a
+/// response to a known gap there. `advert_name`, used only when there's no
+/// auto-login, is a remote mesh node's own self-reported display name taken
+/// as-is from an advert frame this BBS received over the mesh: a malicious
+/// or careless participant could advertise Unicode display-spoofing
+/// codepoints (U+202E RTL override, zero-width joiners, etc.), which would
+/// otherwise reach this BBS's own greeting shown to a *different*, unrelated
+/// connecting user. `advert_bus` itself can't sanitize on ingestion
+/// (`bbs-plugin-api` has no dependency on `bbs-core`, where the sanitizer
+/// lives — the same constraint #228's fix hit), so this is sanitized at the
+/// display site instead, the same approach `bbs-web`'s `to_advert_response`
+/// uses for the equivalent inbound-name gap there.
+fn resolve_greeting_name(auto_username: Option<&str>, advert_name: Option<String>) -> String {
+    auto_username
+        .map(str::to_owned)
+        .or(advert_name)
+        .map(|n| bbs_core::mesh_name::strip_display_spoofing_codepoints(&n))
+        .unwrap_or_default()
+}
+
 /// Parse a direct message text, route it through the host, and send the reply.
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_message(
@@ -2355,13 +2380,14 @@ async fn dispatch_message(
             None
         };
 
-        // Resolve {name} — prefer auto-login username, then advertised display
-        // name, then empty so the placeholder is always removed.
-        let name = auto_username
-            .as_ref()
-            .map(|u| u.as_str().to_owned())
-            .or_else(|| host.advert_bus().name_by_prefix(&sender_prefix))
-            .unwrap_or_default();
+        // Resolve {name} — prefer auto-login username, then advertised
+        // display name, then empty so the placeholder is always removed.
+        // See resolve_greeting_name's doc comment for why the result is
+        // sanitized regardless of which source it came from (#292).
+        let name = resolve_greeting_name(
+            auto_username.as_ref().map(|u| u.as_str()),
+            host.advert_bus().name_by_prefix(&sender_prefix),
+        );
 
         let welcome = welcome_message.replace("{name}", &name);
 
@@ -2754,4 +2780,48 @@ async fn get_or_create_session(
     }
 
     Some((sid, is_new))
+}
+
+#[cfg(test)]
+mod resolve_greeting_name_tests {
+    use super::resolve_greeting_name;
+
+    #[test]
+    fn prefers_auto_username_over_advert_name() {
+        let name = resolve_greeting_name(Some("alice"), Some("Bob's Node".to_owned()));
+        assert_eq!(name, "alice");
+    }
+
+    #[test]
+    fn falls_back_to_advert_name_when_no_auto_login() {
+        let name = resolve_greeting_name(None, Some("Bob's Node".to_owned()));
+        assert_eq!(name, "Bob's Node");
+    }
+
+    #[test]
+    fn empty_when_neither_source_is_available() {
+        let name = resolve_greeting_name(None, None);
+        assert_eq!(name, "");
+    }
+
+    /// The regression #292 exists to prevent: a remote node's own advert
+    /// frame carries Unicode display-spoofing codepoints, and that must not
+    /// reach the greeting text shown to a different, unrelated connecting
+    /// user.
+    #[test]
+    fn strips_display_spoofing_codepoints_from_advert_name() {
+        let name = resolve_greeting_name(None, Some("\u{202E}Admin BBS".to_owned()));
+        assert_eq!(name, "Admin BBS");
+        assert!(!name.contains('\u{202E}'));
+    }
+
+    /// Defense in depth, not a response to a known gap: an auto-login
+    /// username is already constrained by the BBS's own username policy,
+    /// but sanitizing it too costs nothing and removes one more place a
+    /// future policy change could reopen this class of bug.
+    #[test]
+    fn strips_display_spoofing_codepoints_from_auto_username_too() {
+        let name = resolve_greeting_name(Some("\u{202E}alice"), None);
+        assert_eq!(name, "alice");
+    }
 }
