@@ -7,6 +7,13 @@
       "runtimeArgs": ["vitepress", "preview", "--port", "5174"],
       "port": 5174,
       "cwd": "docs-site"
+    },
+    {
+      "name": "bbs-web-dev",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite"],
+      "port": 5173,
+      "cwd": "crates/bbs-web/web"
     }
   ]
 }
