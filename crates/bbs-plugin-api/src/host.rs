@@ -534,12 +534,16 @@ pub trait Host: Send + Sync {
     /// itself: an operator may want the BBS to know its own coordinates
     /// without publishing them mesh-wide.
     ///
-    /// The mesh transport reads this alongside `node_location()` on
-    /// `Connected` and sets the device's `advert_loc_policy` byte
-    /// accordingly (`ADVERT_LOC_SHARE` vs `ADVERT_LOC_NONE`). The
-    /// Meshtastic transport reads it to decide whether to push a fixed
-    /// position to the device at all. Defaults to `true` so existing
-    /// `[location]` configs keep behaving as documented.
+    /// The mesh transport factors this into the device's
+    /// `advert_loc_policy` byte (`ADVERT_LOC_SHARE` vs `ADVERT_LOC_NONE`)
+    /// on `Connected`. The Meshtastic transport reads it to decide whether
+    /// to push a fixed position to the device at all. Defaults to `true`
+    /// so existing `[location]` configs keep behaving as documented.
+    ///
+    /// Callers that also need [`node_location`](Self::node_location) in the
+    /// same operation should use [`advert_location_state`](Self::advert_location_state)
+    /// instead of calling this and `node_location()` separately — see that
+    /// method's doc comment for why.
     fn share_location_in_advert(&self) -> bool {
         true
     }
@@ -549,6 +553,51 @@ pub trait Host: Send + Sync {
     /// Transports read this on the next reconnect (or the next periodic
     /// advert / fixed-position sync).
     fn set_share_location_in_advert(&self, _share: bool) {}
+
+    /// Atomic snapshot of [`node_location`](Self::node_location) and
+    /// [`share_location_in_advert`](Self::share_location_in_advert) taken
+    /// together.
+    ///
+    /// A caller that makes more than one advert-affecting decision from
+    /// this state during a single advert-send operation (e.g. whether to
+    /// include GPS in `SetAdvertLatlon` *and* how much byte budget the node
+    /// name gets) MUST call this once and reuse the result — calling the
+    /// two separate accessors independently reopens a real race: a
+    /// concurrent admin config change (the web admin's `PATCH /api/config`)
+    /// landing between them can pair a stale sharing flag with a fresh
+    /// location (or vice versa), truncating the name for the old
+    /// "not sharing" state while still sending the new, longer location
+    /// payload. `flags(1) + latlon(8) + name(up to 28)` then exceeds
+    /// MeshCore's 32-byte advert limit, and every receiver clamps to 32
+    /// bytes before checking the signature, so the advert is silently
+    /// dropped mesh-wide. See supply-drop-bbs / #226.
+    ///
+    /// Returns `None` when no location is configured. `Some((lat, lon,
+    /// share_in_advert))` otherwise — `lat`/`lon` are meaningful even when
+    /// `share_in_advert` is `false`: the radio is still told its own
+    /// coordinates either way (so it "knows" its location without
+    /// publishing it), `share_in_advert` only governs whether those
+    /// coordinates are included in outgoing adverts.
+    ///
+    /// This guarantees the *reader* sees both fields as of one instant —
+    /// it does not make the writer side (`set_node_location` /
+    /// `set_share_location_in_advert`) atomic with respect to each other.
+    /// A snapshot can still land between two writes from a single request
+    /// that changes both, but every value it can return is one the
+    /// underlying state genuinely held at some instant — never a
+    /// combination from two arbitrarily-separated points in time the way
+    /// calling the two accessors independently allowed.
+    ///
+    /// The default implementation just calls the two accessors above in
+    /// sequence and is **not** atomic — it exists so `Host` implementors
+    /// that don't share this crate's concurrency concerns (tests, mocks)
+    /// don't have to implement a third method for two fields they may not
+    /// even store behind separate locks. `bbs-core`'s `BbsHost` overrides
+    /// this with a version backed by a single lock.
+    fn advert_location_state(&self) -> Option<(f64, f64, bool)> {
+        let (lat, lon) = self.node_location()?;
+        Some((lat, lon, self.share_location_in_advert()))
+    }
 
     /// Return the node name to advertise on the mesh (the BBS name), already
     /// truncated to a MeshCore-safe length.

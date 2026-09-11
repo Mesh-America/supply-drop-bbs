@@ -1083,8 +1083,18 @@ async fn event_loop(
                             // as it's set, so gating the write itself is this
                             // transport's equivalent of the "Share Position in
                             // Advert" checkbox.
-                            match host.node_location() {
-                                Some((lat, lon)) if host.share_location_in_advert() => {
+                            //
+                            // Uses advert_location_state() (one snapshot), not
+                            // node_location()/share_location_in_advert() read
+                            // independently: even with no .await between them, a
+                            // concurrent web-admin config write can land between two
+                            // separate lock acquisitions on another thread under
+                            // tokio's multi-threaded runtime — the same class of race
+                            // as supply-drop-bbs / #226 (found in bbs-mesh; this
+                            // call site has the narrower but structurally identical
+                            // gap).
+                            match host.advert_location_state() {
+                                Some((lat, lon, true)) => {
                                     deferred_writes.push(DeferredWrite::SetFixedPosition { lat, lon })
                                 }
                                 _ => deferred_writes.push(DeferredWrite::RemoveFixedPosition),

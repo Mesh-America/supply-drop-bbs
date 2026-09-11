@@ -258,6 +258,49 @@ impl Default for AccessPolicy {
 
 // ── BbsHost ───────────────────────────────────────────────────────────────────
 
+/// [`BbsHost::location_state`]'s payload: GPS location and whether it should
+/// be broadcast in mesh self-adverts, combined behind one lock so
+/// [`Host::advert_location_state`] can hand callers a genuinely atomic
+/// snapshot of both instead of two independent reads that a concurrent
+/// writer could interleave between — see that method's doc comment (and
+/// supply-drop-bbs / #226) for the advert-corruption bug this closes.
+///
+/// This closes the *reader* side: a caller taking one
+/// `advert_location_state()` snapshot always sees both fields as of the
+/// same instant. The *writer* side (`set_node_location` /
+/// `set_share_location_in_advert`, called independently by the web admin's
+/// `PATCH /api/config` handler when a request changes both) is not
+/// atomic with respect to each other — a reader's snapshot can still land
+/// between those two writes. That's a real, narrower residual gap
+/// (tracked separately), not the #226 bug: every value such a snapshot
+/// can observe is a value the struct genuinely held at some instant, never
+/// a combination from two arbitrarily-separated points in time the way the
+/// original two-separate-trait-method-calls pattern allowed.
+///
+/// One consequence of combining these into one lock: a panic while holding
+/// it (none currently exists — no fallible code runs under this lock)
+/// would now poison access to both fields together, where it previously
+/// would have poisoned only `location` (the old `share_location_in_advert`
+/// was a plain `AtomicBool`, which cannot be poisoned at all).
+// No #[derive(Default)]: the trait-documented default for share_in_advert
+// is `true` (existing `[location]` configs keep behaving as documented),
+// but a derived Default would silently give `false` — a real trap for a
+// future construction site (e.g. `..Default::default()` in a test) even
+// though nothing uses it today (the only constructor, BbsHost::with_config,
+// always sets both fields explicitly). Add an explicit `impl Default` if a
+// real need for one shows up, so the `true` default is a deliberate choice
+// visible in a diff, not a side effect of `#[derive]`.
+#[derive(Clone, Copy)]
+struct LocationState {
+    /// Optional GPS coordinates from `[location]` config section.
+    location: Option<(f64, f64)>,
+    /// Whether `location` (if set) should be broadcast in mesh self-adverts
+    /// — `[location].share_in_advert`. Independent of `location` itself:
+    /// an operator may want the BBS to know its own coordinates without
+    /// publishing them mesh-wide.
+    share_in_advert: bool,
+}
+
 /// Concrete [`Host`] implementation backed by the bbs-core [`Database`].
 pub struct BbsHost {
     db: Database,
@@ -268,13 +311,10 @@ pub struct BbsHost {
     /// Per-username login failure counts (failures, last_attempt).
     /// Shared across all sessions so parallel sessions can't bypass rate limiting.
     login_failures: tokio::sync::Mutex<HashMap<String, (u32, Instant)>>,
-    /// Optional GPS coordinates from `[location]` config section.
-    /// Wrapped in a RwLock so the web admin can update it without a restart.
-    location: std::sync::RwLock<Option<(f64, f64)>>,
-    /// Whether `location` (if set) should be broadcast in mesh self-adverts —
-    /// `[location].share_in_advert`. Wrapped in an `AtomicBool` so the web
-    /// admin can flip it without a restart, mirroring `location` itself.
-    share_location_in_advert: std::sync::atomic::AtomicBool,
+    /// GPS location + advert-sharing preference, wrapped in one `RwLock` so
+    /// the web admin can update either without a restart AND a reader can
+    /// snapshot both together atomically. See [`LocationState`].
+    location_state: std::sync::RwLock<LocationState>,
     /// MeshCore advert node name (the BBS name), pre-truncated to an
     /// advert-safe length. Set at startup from `bbs.name`; read by the mesh
     /// transport on connect to push `SetAdvertName` to the radio so the node
@@ -335,8 +375,10 @@ impl BbsHost {
             next_id: AtomicU64::new(1),
             advert_bus: Arc::new(AdvertBus::new()),
             login_failures: tokio::sync::Mutex::new(HashMap::new()),
-            location: std::sync::RwLock::new(location),
-            share_location_in_advert: std::sync::atomic::AtomicBool::new(share_location_in_advert),
+            location_state: std::sync::RwLock::new(LocationState {
+                location,
+                share_in_advert: share_location_in_advert,
+            }),
             node_name: std::sync::RwLock::new(None),
             access_policy: RwLock::new(policy),
             guest_room_id: std::sync::RwLock::new(None),
@@ -640,20 +682,25 @@ impl Host for BbsHost {
     }
 
     fn node_location(&self) -> Option<(f64, f64)> {
-        *self.location.read().unwrap()
+        self.location_state.read().unwrap().location
     }
 
     fn set_node_location(&self, location: Option<(f64, f64)>) {
-        *self.location.write().unwrap() = location;
+        self.location_state.write().unwrap().location = location;
     }
 
     fn share_location_in_advert(&self) -> bool {
-        self.share_location_in_advert.load(Ordering::Relaxed)
+        self.location_state.read().unwrap().share_in_advert
     }
 
     fn set_share_location_in_advert(&self, share: bool) {
-        self.share_location_in_advert
-            .store(share, Ordering::Relaxed);
+        self.location_state.write().unwrap().share_in_advert = share;
+    }
+
+    fn advert_location_state(&self) -> Option<(f64, f64, bool)> {
+        let state = self.location_state.read().unwrap();
+        let (lat, lon) = state.location?;
+        Some((lat, lon, state.share_in_advert))
     }
 
     fn mesh_node_name(&self) -> Option<String> {

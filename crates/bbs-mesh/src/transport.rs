@@ -267,12 +267,18 @@ fn next_outbound_timestamp() -> u32 {
 /// `SelfInfo` on `AppStart` may not support this command at all — and no-ops
 /// again if the desired policy already matches, to avoid a needless write on
 /// every periodic advert tick.
+///
+/// `sharing_location` must come from the SAME [`Host::advert_location_state`]
+/// snapshot the caller used for its other advert-send decisions in this
+/// invocation (e.g. node-name truncation) — re-deriving it here from
+/// `host.node_location()`/`host.share_location_in_advert()` independently
+/// would reopen the exact race supply-drop-bbs / #226 closed.
 async fn sync_advert_location_policy(
     cmd_tx: &mpsc::Sender<OutboundFrame>,
-    host: &Arc<dyn Host>,
+    sharing_location: bool,
     state: &Arc<Mutex<SessionState>>,
 ) {
-    let desired = if host.node_location().is_some() && host.share_location_in_advert() {
+    let desired = if sharing_location {
         ADVERT_LOC_SHARE
     } else {
         ADVERT_LOC_NONE
@@ -319,15 +325,20 @@ async fn broadcast_self_advert(
     state: &Arc<Mutex<SessionState>>,
     flood: bool,
 ) {
-    let sharing_location = host.node_location().is_some() && host.share_location_in_advert();
-    if let Some((lat, lon)) = host.node_location() {
+    // One snapshot for this whole advert-send, reused for every decision
+    // below — see Host::advert_location_state's doc comment for why calling
+    // node_location()/share_location_in_advert() independently at each step
+    // (as this used to) is a real race, not just a style nit.
+    let location_state = host.advert_location_state();
+    let sharing_location = location_state.is_some_and(|(_, _, share)| share);
+    if let Some((lat, lon, _)) = location_state {
         let lat_1e6 = (lat * 1_000_000.0) as i32;
         let lon_1e6 = (lon * 1_000_000.0) as i32;
         let _ = cmd_tx
             .send(OutboundFrame::SetAdvertLatlon { lat_1e6, lon_1e6 })
             .await;
     }
-    sync_advert_location_policy(cmd_tx, host, state).await;
+    sync_advert_location_policy(cmd_tx, sharing_location, state).await;
     if let Some(node_name) = host.mesh_node_name() {
         // The cached name was truncated to the no-location budget when it was
         // stored (share_in_advert can flip live, without a restart); re-check
@@ -1049,6 +1060,15 @@ async fn event_loop(
                             // `sync_radio_params_if_configured`'s doc comment).
                             sync_radio_params_if_configured(&radio_config, &info, &cmd_tx).await;
 
+                            // One snapshot for this whole connect-time sync, reused
+                            // for both the name-truncation decision below and the
+                            // SetAdvertLatlon push — see Host::advert_location_state's
+                            // doc comment for the race two independent reads here
+                            // used to allow (supply-drop-bbs / #226).
+                            let location_state = host.advert_location_state();
+                            let sharing_location =
+                                location_state.is_some_and(|(_, _, share)| share);
+
                             // Push the configured node name to the radio so the BBS
                             // advertises with a human name instead of its key-derived
                             // fallback (issue #101). Re-truncated below to the
@@ -1067,8 +1087,6 @@ async fn event_loop(
                                 // *current* sharing state, since the cached
                                 // name was only truncated to the no-location
                                 // budget when it was stored.
-                                let sharing_location = host.node_location().is_some()
-                                    && host.share_location_in_advert();
                                 let node_name = bbs_core::mesh_name::truncate_mesh_node_name(
                                     &node_name,
                                     sharing_location,
@@ -1084,7 +1102,7 @@ async fn event_loop(
                             // Push GPS coordinates to the radio if configured, and
                             // refresh the advert bus entry so the web UI shows
                             // the config GPS.
-                            if let Some((lat, lon)) = host.node_location() {
+                            if let Some((lat, lon, _)) = location_state {
                                 let lat_1e6 = (lat * 1_000_000.0) as i32;
                                 let lon_1e6 = (lon * 1_000_000.0) as i32;
                                 info!(lat_1e6, lon_1e6, "mesh: setting radio location");
@@ -1104,7 +1122,7 @@ async fn event_loop(
                             // it doesn't already match `[location].share_in_advert`
                             // (works whether or not a location is configured — an
                             // unconfigured location resolves to ADVERT_LOC_NONE).
-                            sync_advert_location_policy(&cmd_tx, &host, &state).await;
+                            sync_advert_location_policy(&cmd_tx, sharing_location, &state).await;
                             // Set the routing path-hash width (2- or 3-byte paths).
                             // Pushed here in the SelfInfo branch — a device modern
                             // enough to answer AppStart supports this newer command;
