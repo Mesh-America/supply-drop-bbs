@@ -275,6 +275,26 @@ enum UserAction {
         /// BBS username whose password will be reset.
         username: String,
     },
+    /// Disable a user account: login is rejected and any live session is
+    /// ended immediately, but the account and its authored messages are
+    /// preserved (this is a softer action than deletion — deleting a user
+    /// additionally reserves the username so no-one else can register it,
+    /// and is not currently exposed as a CLI command).
+    ///
+    /// Equivalent to the in-session `BAN <username>` sysop/aide command and
+    /// the web admin's Users page.
+    Ban {
+        /// BBS username to disable.
+        username: String,
+    },
+    /// Re-enable a previously disabled (`ban`ned) user account.
+    ///
+    /// Equivalent to the in-session `UNBAN <username>` sysop command and the
+    /// web admin's Users page.
+    Unban {
+        /// BBS username to re-enable.
+        username: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2254,6 +2274,34 @@ async fn cmd_user(cli: &Cli, action: &UserAction) {
             }
         }
 
+        UserAction::Ban { username } => {
+            match host.admin_update_user(username, Some(1), None).await {
+                Ok(()) => println!("disabled: {username} (login rejected, session ended)"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        UserAction::Unban { username } => {
+            match host.admin_update_user(username, Some(0), None).await {
+                Ok(()) => println!("re-enabled: {username}"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         UserAction::Create { username, sysop } => {
             let password = dialoguer::Password::new()
                 .with_prompt("Password")
@@ -2315,7 +2363,9 @@ async fn cmd_user(cli: &Cli, action: &UserAction) {
                 UserAction::Create { .. }
                 | UserAction::List { .. }
                 | UserAction::Verify { .. }
-                | UserAction::SetPassword { .. } => {
+                | UserAction::SetPassword { .. }
+                | UserAction::Ban { .. }
+                | UserAction::Unban { .. } => {
                     unreachable!()
                 }
             };
@@ -3536,6 +3586,34 @@ mod contacts_tests {
                 _ => panic!("expected ContactsAction::Delete"),
             },
             _ => panic!("expected Commands::Contacts"),
+        }
+    }
+
+    // supply-drop-bbs#252: `user ban`/`user unban` — the only one of the
+    // three requested surfaces (BBS sysop/aide command, web UI, CLI) that
+    // was actually missing; the underlying UserStatus::Banned mechanism and
+    // its BBS-command/web-UI exposure already existed.
+    #[test]
+    fn user_ban_captures_the_username_argument() {
+        let cli = parse(&["supply-drop-bbs", "user", "ban", "alice"]);
+        match cli.command {
+            Some(Commands::User { action }) => match action {
+                UserAction::Ban { username } => assert_eq!(username, "alice"),
+                _ => panic!("expected UserAction::Ban"),
+            },
+            _ => panic!("expected Commands::User"),
+        }
+    }
+
+    #[test]
+    fn user_unban_captures_the_username_argument() {
+        let cli = parse(&["supply-drop-bbs", "user", "unban", "alice"]);
+        match cli.command {
+            Some(Commands::User { action }) => match action {
+                UserAction::Unban { username } => assert_eq!(username, "alice"),
+                _ => panic!("expected UserAction::Unban"),
+            },
+            _ => panic!("expected Commands::User"),
         }
     }
 
