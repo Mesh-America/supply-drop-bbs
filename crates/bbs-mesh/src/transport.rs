@@ -1167,10 +1167,23 @@ async fn event_loop(
                             // until the device pushes an advert, and there is no
                             // current-value baseline to diff radio params against,
                             // so config sync is skipped for this connection.
-                            info!(
-                                "mesh: radio bridge connected (no SelfInfo — \
-                                 CMD_APP_START unsupported by device) \
-                                 — draining stale queue"
+                            //
+                            // warn!, not info! (supply-drop-bbs / #225): several
+                            // configured settings silently no-op on every
+                            // reconnect while this holds -- radio params, advert
+                            // name, GPS location, and advert_loc_policy are all
+                            // pushed only in the SelfInfo branch above and never
+                            // here. A sysop skimming routine connect-time info
+                            // logs could easily miss a single unlabeled line
+                            // saying the same thing; this is meant to stand out.
+                            warn!(
+                                "mesh: radio bridge connected but device returned no \
+                                 SelfInfo (CMD_APP_START unsupported or failed) — \
+                                 config sync skipped for this connection: radio \
+                                 params, advert name, GPS location, and \
+                                 advert_loc_policy will NOT be pushed to the device \
+                                 until a connection returns SelfInfo. Draining stale \
+                                 queue and continuing."
                             );
                         }
 
