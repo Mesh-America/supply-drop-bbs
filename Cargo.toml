@@ -117,6 +117,15 @@ fd-lock     = "4"
 # O_NOFOLLOW constant for config_lock's symlink-safe lock-file open, via
 # the safe `OpenOptionsExt::custom_flags` — no `unsafe` needed to use it.
 libc        = "0.2"
+# Unicode General_Category + Bidi_Control classification for
+# mesh_name::truncate_mesh_node_name's display-spoofing sanitization
+# (supply-drop-bbs / #228). `icu_properties` already sits in Cargo.lock
+# transitively (via reqwest -> idna), but only reachable from the
+# supply-drop-bbs binary crate, not bbs-core — and it's a much heavier,
+# data-table-driven ICU4X dependency than this single char-classification
+# check warrants. unicode-properties is the small, focused unicode-rs-family
+# crate purpose-built for exactly this.
+unicode-properties = "0.1"
 uuid        = { version = "1", features = ["v4", "serde"] }
 axum        = { version = "0.7", features = ["macros", "json", "multipart"] }
 axum-extra  = { version = "0.9", features = ["cookie"] }

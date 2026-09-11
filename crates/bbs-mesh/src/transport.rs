@@ -346,12 +346,16 @@ async fn broadcast_self_advert(
         // tightens the safe byte budget from 31 to 23 (bbs_core::mesh_name),
         // and an over-length name silently fails to advertise once it's on.
         let name = bbs_core::mesh_name::truncate_mesh_node_name(&node_name, sharing_location);
-        if !name.is_empty() {
-            let _ = cmd_tx
-                .send(OutboundFrame::SetAdvertName {
-                    name: name.to_owned(),
-                })
-                .await;
+        if name.is_empty() {
+            // Reproduces the #225 failure class if left silent: a name that
+            // was entirely Unicode display-spoofing codepoints (validate_mesh_node_name
+            // doesn't reject Cf-category input, only Cc) strips down to
+            // nothing here, and the advert silently keeps whatever name the
+            // radio already had instead — visibly wrong on the mesh, with no
+            // error anywhere in this path unless it's logged.
+            warn!("mesh: configured node name is empty after sanitization -- not updating advert name");
+        } else {
+            let _ = cmd_tx.send(OutboundFrame::SetAdvertName { name }).await;
         }
     }
     if cmd_tx
@@ -1090,9 +1094,12 @@ async fn event_loop(
                                 let node_name = bbs_core::mesh_name::truncate_mesh_node_name(
                                     &node_name,
                                     sharing_location,
-                                )
-                                .to_owned();
-                                if !node_name.is_empty() {
+                                );
+                                if node_name.is_empty() {
+                                    // See the same guard in broadcast_self_advert above --
+                                    // reproduces the #225 failure class if left silent.
+                                    warn!("mesh: configured node name is empty after sanitization -- not updating advert name");
+                                } else {
                                     info!(node_name = %node_name, "mesh: setting advert name");
                                     let _ = cmd_tx
                                         .send(OutboundFrame::SetAdvertName { name: node_name })

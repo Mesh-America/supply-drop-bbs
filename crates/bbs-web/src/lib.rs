@@ -1154,7 +1154,17 @@ fn to_advert_response(r: bbs_plugin_api::AdvertRecord) -> AdvertResponse {
     AdvertResponse {
         ts: r.last_seen_secs,
         pubkey: r.pubkey_hex,
-        name: r.name,
+        // `r.name` is a remote mesh node's self-reported display name,
+        // stored verbatim by AdvertBus with no sanitization (bbs-plugin-api
+        // has no dependency on bbs-core, so it can't reach
+        // bbs_core::mesh_name itself) -- any node can broadcast Unicode
+        // display-spoofing codepoints (e.g. U+202E RIGHT-TO-LEFT OVERRIDE)
+        // in its advert, and this is the response every consumer of the
+        // Discovered Contacts / Contacts panels renders. Sanitize at this
+        // display boundary rather than at storage, so protection-eligibility
+        // matching and anything else keyed on the raw name is unaffected
+        // (supply-drop-bbs / #228).
+        name: bbs_core::mesh_name::strip_display_spoofing_codepoints(&r.name),
         adv_type: r.adv_type,
         type_name: adv_type_name(&r.transport, r.adv_type).to_owned(),
         lat: r.lat,
@@ -4870,6 +4880,33 @@ mod tests {
             .collect();
         assert_eq!(by_name.get("Protected"), Some(&true));
         assert_eq!(by_name.get("Unprotected"), Some(&false));
+    }
+
+    // supply-drop-bbs#228: a remote mesh node's self-reported advert name is
+    // stored verbatim by AdvertBus (bbs-plugin-api has no dependency on
+    // bbs-core, so it can't sanitize on ingestion) -- any node can broadcast
+    // Unicode display-spoofing codepoints, and GET /api/v1/adverts is what
+    // the web admin's Discovered Contacts panel renders directly.
+    #[tokio::test]
+    async fn api_adverts_strips_display_spoofing_codepoints_from_remote_names() {
+        let (state, mock) = test_state();
+        let bus = mock.advert_bus();
+        bus.upsert(
+            dummy_key(1),
+            "\u{202E}Admin BBS".into(),
+            1,
+            0,
+            0,
+            "meshcore",
+        );
+
+        let resp = api_adverts(State(state)).await.into_response();
+        let body = body_json(resp).await;
+        let entries = body.as_array().expect("array response");
+        assert_eq!(entries.len(), 1);
+        let name = entries[0]["name"].as_str().unwrap();
+        assert_eq!(name, "Admin BBS");
+        assert!(!name.contains('\u{202E}'));
     }
 
     // T039b: GET /api/v1/contacts returns only protected records.

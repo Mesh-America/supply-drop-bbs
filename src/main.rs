@@ -967,9 +967,10 @@ async fn cmd_run(cli: &Cli) {
     // configured name if sharing is later turned off. bbs-mesh::transport
     // re-truncates to the correct, current-state-aware budget at the actual
     // point each advert is sent (see bbs_core::mesh_name).
-    bbs.set_node_name(Some(
-        bbs_core::mesh_name::truncate_mesh_node_name(&cfg.bbs.name, false).to_owned(),
-    ));
+    bbs.set_node_name(Some(bbs_core::mesh_name::truncate_mesh_node_name(
+        &cfg.bbs.name,
+        false,
+    )));
 
     if let Err(e) = bbs.ensure_guest_room().await {
         error!("guest room setup failed: {e}");
@@ -1028,7 +1029,13 @@ async fn cmd_run(cli: &Cli) {
     let mesh_cfg = {
         let mut c = cfg.plugins.mesh.clone();
         // Substitute {name} placeholder before wiring into mesh transport.
-        c.welcome_message = cfg.bbs.welcome_msg.replace("{name}", &cfg.bbs.name);
+        // Sanitized (not just validated at config-set time — a hand-edited
+        // config.toml bypasses that) since this reaches every connecting
+        // user's very first screen; see bbs_core::mesh_name / #228.
+        c.welcome_message = cfg.bbs.welcome_msg.replace(
+            "{name}",
+            &bbs_core::mesh_name::strip_display_spoofing_codepoints(&cfg.bbs.name),
+        );
         c
     };
 
