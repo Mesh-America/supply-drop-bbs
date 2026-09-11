@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "SELECT id AS \"id!\", username AS \"username!\", display_name,\n                      status AS \"status!\", permission_level AS \"permission_level!\",\n                      created_at AS \"created_at!\", last_login_at\n               FROM users WHERE status = ? ORDER BY created_at LIMIT ? OFFSET ?",
+  "query": "SELECT id AS \"id!\", username AS \"username!\", display_name,\n                      status AS \"status!\", permission_level AS \"permission_level!\",\n                      created_at AS \"created_at!\", last_login_at, suspended_until\n               FROM users WHERE status = ? ORDER BY created_at LIMIT ? OFFSET ?",
   "describe": {
     "columns": [
       {
@@ -37,6 +37,11 @@
         "name": "last_login_at",
         "ordinal": 6,
         "type_info": "Text"
+      },
+      {
+        "name": "suspended_until",
+        "ordinal": 7,
+        "type_info": "Text"
       }
     ],
     "parameters": {
@@ -49,8 +54,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "23719a84e377af1044e5d68fa3a500a3fae377374fc8f65442b9733246af8156"
+  "hash": "3fa8ae839fa5da93ac20e9b8a86d46e3e96c69c85f7830d4d50b83009d8c686f"
 }

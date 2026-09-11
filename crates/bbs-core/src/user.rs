@@ -77,6 +77,12 @@ pub struct User {
     /// Last successful login. `None` if never logged in (a fresh
     /// registration before its first login).
     pub last_login_at: Option<Timestamp>,
+    /// When a time-limited suspension ("timeout") lifts. Only meaningful
+    /// when `status == Banned` — a permanent ban has this as `None`,
+    /// a timeout has it set to the end of the suspension window. See
+    /// `crates::host`'s login-path suspension check for how this is
+    /// consumed (supply-drop-bbs-ax3 / #280).
+    pub suspended_until: Option<Timestamp>,
 }
 
 impl User {
@@ -154,6 +160,7 @@ mod tests {
             permission_level: PermissionLevel::User,
             created_at: Timestamp::now(),
             last_login_at: None,
+            suspended_until: None,
         }
     }
 

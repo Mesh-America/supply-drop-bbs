@@ -861,13 +861,34 @@ Notes:
 - An Aide cannot ban another Aide or a Sysop
 - Banning is logged in the audit trail
 
+### Suspending a user for a fixed number of days (Aide+)
+
+```
+TIMEOUT <username> <days>
+```
+
+A time-limited alternative to `BAN`: `<days>` must be `1`-`5`. The user is
+immediately disconnected from all active sessions, same as a ban, but the
+account **reactivates automatically** once the timeout elapses — no
+`UNBAN` needed. A login attempt during the timeout is told how many days
+remain:
+
+```
+You have been suspended for 2 more day(s).
+```
+
+Use `UNBAN` to lift a timeout early. The same rules as `BAN` apply (an
+Aide cannot suspend another Aide or a Sysop), and it's logged in the
+audit trail.
+
 ### Unbanning a user (Sysop only)
 
 ```
 UNBAN <username>
 ```
 
-Restores the account to **Active** status. The user can log in again.
+Restores the account to **Active** status, whether it was permanently
+banned or in a timeout. The user can log in again.
 
 ### Setting a user's permission level (Sysop only)
 
@@ -1127,6 +1148,7 @@ account and you can re-register with the same username.
 | `PENDING` | List unvalidated accounts |
 | `V <user>` | Validate (approve) an account |
 | `BAN <user>` | Ban a user |
+| `TIMEOUT <user> <days>` | Suspend a user for 1-5 days |
 | `.ER` | Edit the current room |
 | `.EU <user>` | Edit a user's profile / permissions (not to Sysop) |
 
@@ -1134,7 +1156,7 @@ account and you can re-register with the same username.
 
 | Command | Action |
 |---|---|
-| `UNBAN <user>` | Lift a ban |
+| `UNBAN <user>` | Lift a ban or end a timeout early |
 | `.AIDE <user>` | Promote a validated user to Aide |
 | `.SYSOP <user>` | Promote a validated user to Sysop |
 | `.USER <user>` | Demote a user back to plain User |

@@ -189,6 +189,19 @@ fn auth_escape(reply: &str) -> Option<AuthEscape> {
     }
 }
 
+/// Outcome of [`BbsHost::resolve_suspension`] — see its doc comment.
+enum LoginSuspensionCheck {
+    /// A timeout that just auto-lifted. `User` reflects the now-reactivated
+    /// status.
+    Allowed(crate::user::User),
+    /// Still within an active timeout.
+    Suspended { days_remaining: i64 },
+    /// `status == Banned` with no `suspended_until` — a permanent ban, not
+    /// a timeout. Callers should reject with the same generic message a
+    /// permanent ban already got before this feature existed.
+    PermanentlyBanned,
+}
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug)]
 enum ComposeStage {
@@ -563,6 +576,9 @@ impl Host for BbsHost {
             }
             Command::BanUser { username } => self.handle_ban_user(session, username).await,
             Command::UnbanUser { username } => self.handle_unban_user(session, username).await,
+            Command::TimeoutUser { username, days } => {
+                self.handle_timeout_user(session, username, days).await
+            }
 
             // Profile / room management
             Command::EditProfile => self.handle_edit_profile(session).await,
@@ -1184,6 +1200,7 @@ impl Host for BbsHost {
                 permission_level: u.permission_level as u8,
                 created_at: u.created_at.to_rfc3339(),
                 last_login_at: u.last_login_at.map(|t| t.to_rfc3339()),
+                suspended_until: u.suspended_until.map(|t| t.to_rfc3339()),
             })
             .collect())
     }
@@ -1264,6 +1281,19 @@ impl Host for BbsHost {
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
 
+        // Any explicit status change through this generic path invalidates a
+        // stale suspension expiry: reactivating should end a timeout early
+        // (not leave it primed to silently reapply if something re-banned
+        // the account without going through admin_suspend_user), and a
+        // fresh permanent ban or deletion should not carry forward an old
+        // timeout's expiry either. Only admin_suspend_user itself ever sets
+        // suspended_until (supply-drop-bbs-ax3 / #280).
+        if new_status.is_some() {
+            UserStore::clear_suspension(&self.db, user.id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+        }
+
         // If banning or deleting, forcibly remove all live sessions and fire SessionEnded.
         if matches!(
             new_status,
@@ -1303,6 +1333,52 @@ impl Host for BbsHost {
                     r.level = level;
                 }
             }
+        }
+
+        Ok(())
+    }
+
+    async fn admin_suspend_user(&self, username: &str, days: u8) -> Result<(), HostError> {
+        if !(1..=5).contains(&days) {
+            return Err(HostError::PreconditionFailed(
+                "suspension length must be 1-5 days".into(),
+            ));
+        }
+
+        let uname = Username::new(username)
+            .map_err(|_| HostError::NotFound(format!("user {username:?}")))?;
+        let user = UserStore::get_by_username(&self.db, &uname)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+            .ok_or_else(|| HostError::NotFound(format!("user {username:?}")))?;
+
+        let until = Timestamp::from_utc(
+            Timestamp::now().as_offset_datetime() + time::Duration::days(days as i64),
+        );
+
+        UserStore::suspend(&self.db, user.id, until)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        // Same immediate-eviction treatment as a permanent ban — see
+        // admin_update_user's matching block above for the rationale.
+        let to_end: Vec<SessionId> = {
+            let mut sessions = self.sessions.write().await;
+            let ids: Vec<SessionId> = sessions
+                .iter()
+                .filter(|(_, r)| r.username.as_ref().map(|u| u.as_str()) == Some(username))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &ids {
+                sessions.remove(id);
+            }
+            ids
+        };
+        for id in to_end {
+            let _ = self.events_tx.send(DomainEvent::SessionEnded {
+                session: id,
+                reason: "user suspended".into(),
+            });
         }
 
         Ok(())
@@ -1967,6 +2043,64 @@ impl BbsHost {
         u64::min(2u64.saturating_pow(failures), 30)
     }
 
+    /// Resolve `user`'s suspension state at the point of a successful
+    /// password verification (supply-drop-bbs-ax3 / #280) — deliberately
+    /// checked only *after* the password is known correct, not merely from
+    /// a username lookup, so a suspension message is never disclosed to a
+    /// caller who hasn't proven they know the account's own credentials.
+    /// This mirrors the "don't reveal whether the account exists" posture
+    /// the generic "Login failed." already has for a wrong username; it
+    /// would be a weaker version of that same protection to hand out
+    /// suspension status for free at the username-entry stage.
+    ///
+    /// Callers must only call this with `user.status == Banned` — it
+    /// doesn't itself re-check that, only distinguishes a timeout from a
+    /// permanent ban within it. The interactive/one-shot login handlers
+    /// below are the two callers, and each documents exactly how they
+    /// combine this with the `status == Banned` gate.
+    ///
+    /// A timeout that has already elapsed is auto-reactivated (status back
+    /// to `Active`, `suspended_until` cleared) as a side effect of this
+    /// call, and `Allowed`'s `User` reflects that so the caller doesn't
+    /// finalize a login against a stale in-memory `Banned` status.
+    async fn resolve_suspension(
+        &self,
+        user: crate::user::User,
+    ) -> Result<LoginSuspensionCheck, HostError> {
+        let Some(until) = user.suspended_until else {
+            return Ok(LoginSuspensionCheck::PermanentlyBanned);
+        };
+        if Timestamp::now() >= until {
+            UserStore::update(
+                &self.db,
+                user.id,
+                None,
+                Some(UserStatus::Active),
+                None,
+                None,
+            )
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+            UserStore::clear_suspension(&self.db, user.id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let mut user = user;
+            user.status = UserStatus::Active;
+            user.suspended_until = None;
+            return Ok(LoginSuspensionCheck::Allowed(user));
+        }
+        // Ceiling-divide the remaining whole seconds into days, so a
+        // suspension ending in a few hours still reads as "1 more day" —
+        // "0 more days" would be a confusing thing to tell someone who is
+        // still, in fact, blocked.
+        let remaining_secs =
+            (until.as_offset_datetime() - Timestamp::now().as_offset_datetime()).whole_seconds();
+        // Manual ceiling division — `i64::div_ceil` isn't stable on this
+        // toolchain (1.96) yet. `remaining_secs` is always positive here.
+        let days_remaining = ((remaining_secs + 86_400 - 1) / 86_400).max(1);
+        Ok(LoginSuspensionCheck::Suspended { days_remaining })
+    }
+
     /// Create `username` with `password`, attach the new account to `session`,
     /// log them in, and fire the registration side-effects (first-user → Sysop,
     /// sysop notification DMs). Shared by the interactive Confirm step and the
@@ -2186,9 +2320,14 @@ impl BbsHost {
             .get_by_username(&username)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // Deleted, or Active-but-wrong-password below, both fall through to
+        // the same generic failure — don't reveal whether the account
+        // exists. A Banned account (permanent or suspended) is NOT rejected
+        // here: its password still needs to verify before a suspension
+        // message can be disclosed (supply-drop-bbs-ax3 / #280) — see
+        // resolve_suspension's doc comment for why.
         let user = match user {
-            Some(u) if u.status == UserStatus::Active => u,
-            // Don't reveal whether the account exists; same generic failure.
+            Some(u) if matches!(u.status, UserStatus::Active | UserStatus::Banned) => u,
             _ => return Ok(Response::Error("Login failed.".into())),
         };
 
@@ -2204,6 +2343,22 @@ impl BbsHost {
             warn!(%session, %username, backoff, "one-shot login failed: wrong password");
             return Ok(Response::Error("Login failed.".into()));
         }
+
+        let user = if user.status == UserStatus::Banned {
+            match self.resolve_suspension(user).await? {
+                LoginSuspensionCheck::Allowed(u) => u,
+                LoginSuspensionCheck::Suspended { days_remaining } => {
+                    return Ok(Response::Error(format!(
+                        "You have been suspended for {days_remaining} more day(s)."
+                    )));
+                }
+                LoginSuspensionCheck::PermanentlyBanned => {
+                    return Ok(Response::Error("Login failed.".into()));
+                }
+            }
+        } else {
+            user
+        };
 
         // Success: clear failures, stamp last_login.
         self.login_failures.lock().await.remove(username.as_str());
@@ -2272,8 +2427,14 @@ impl BbsHost {
             .get_by_username(&username)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // A Banned account (permanent or suspended) is deliberately NOT
+        // rejected here, at the username-entry stage — same rationale as
+        // the one-shot login path: a suspension message must not be
+        // disclosed before the password is known to be correct (see
+        // resolve_suspension's doc comment). It's gated for real in the
+        // Workflow::Login password-reply arm below.
         match user {
-            Some(u) if u.status == UserStatus::Active => {}
+            Some(u) if matches!(u.status, UserStatus::Active | UserStatus::Banned) => {}
             _ => return Ok(Response::Error("Login failed.".into())),
         }
 
@@ -2445,6 +2606,33 @@ impl BbsHost {
                     .map_err(|e| HostError::Storage(format!("verify password: {e}")))?;
 
                 if ok {
+                    // Password verified — now, and only now, it's safe to
+                    // disclose a suspension (supply-drop-bbs-ax3 / #280).
+                    // See resolve_suspension's doc comment.
+                    let user = if user.status == UserStatus::Banned {
+                        match self.resolve_suspension(user).await? {
+                            LoginSuspensionCheck::Allowed(u) => u,
+                            LoginSuspensionCheck::Suspended { days_remaining } => {
+                                let mut sessions = self.sessions.write().await;
+                                if let Some(r) = sessions.get_mut(&session) {
+                                    r.workflow = Workflow::None;
+                                }
+                                return Ok(Response::Error(format!(
+                                    "You have been suspended for {days_remaining} more day(s)."
+                                )));
+                            }
+                            LoginSuspensionCheck::PermanentlyBanned => {
+                                let mut sessions = self.sessions.write().await;
+                                if let Some(r) = sessions.get_mut(&session) {
+                                    r.workflow = Workflow::None;
+                                }
+                                return Ok(Response::Error("Login failed.".into()));
+                            }
+                        }
+                    } else {
+                        user
+                    };
+
                     // Clear failure count on success.
                     self.login_failures.lock().await.remove(username.as_str());
                     UserStore::update(&self.db, user.id, None, None, None, Some(Timestamp::now()))
@@ -4907,6 +5095,12 @@ impl BbsHost {
         )
         .await
         .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // A permanent ban must not carry forward a stale expiry from an
+        // earlier timeout (supply-drop-bbs-ax3 / #280) — see
+        // admin_update_user's matching comment for the full rationale.
+        UserStore::clear_suspension(&self.db, user.id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         // Force-end any active sessions for this user.
         let to_end: Vec<SessionId> = {
@@ -4939,6 +5133,70 @@ impl BbsHost {
         warn!(%actor, %username, "user banned");
         Ok(Response::Text(format!(
             "'{}' has been banned.",
+            username.as_str()
+        )))
+    }
+
+    async fn handle_timeout_user(
+        &self,
+        session: SessionId,
+        username: Username,
+        days: u8,
+    ) -> Result<Response, HostError> {
+        let (actor, _, level, _) = match self.session_auth_user(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        if level < PermissionLevel::Aide {
+            return Ok(Response::Error("Aide access required.".into()));
+        }
+
+        let user = UserStore::get_by_username(&self.db, &username)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let user = match user {
+            None => return Ok(Response::Error("User not found.".into())),
+            Some(u) => u,
+        };
+
+        if user.status == UserStatus::Banned {
+            let msg = if user.suspended_until.is_some() {
+                format!("'{}' is already suspended.", username.as_str())
+            } else {
+                format!(
+                    "'{}' is already permanently banned — UNBAN first to replace with a timeout.",
+                    username.as_str()
+                )
+            };
+            return Ok(Response::Error(msg));
+        }
+
+        if user.permission_level >= level {
+            return Ok(Response::Error(format!(
+                "Cannot suspend '{}' — equal or higher permission tier.",
+                username.as_str()
+            )));
+        }
+
+        self.admin_suspend_user(username.as_str(), days).await?;
+
+        if let Err(e) = self
+            .db
+            .audit_write(
+                actor.as_str(),
+                "timeout",
+                Some(username.as_str()),
+                Some(&format!("{{\"days\":{days}}}")),
+            )
+            .await
+        {
+            tracing::warn!("audit write failed: {e}");
+        }
+
+        warn!(%actor, %username, days, "user suspended");
+        Ok(Response::Text(format!(
+            "'{}' has been suspended for {days} day(s).",
             username.as_str()
         )))
     }
@@ -4986,6 +5244,12 @@ impl BbsHost {
         )
         .await
         .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // Ends a timeout early, if this was a suspension rather than a
+        // permanent ban (supply-drop-bbs-ax3 / #280) — harmless no-op
+        // otherwise.
+        UserStore::clear_suspension(&self.db, user.id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         if let Err(e) = self
             .db
@@ -5471,6 +5735,7 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::BlockUser { .. } => "BlockUser",
         Command::BanUser { .. } => "BanUser",
         Command::UnbanUser { .. } => "UnbanUser",
+        Command::TimeoutUser { .. } => "TimeoutUser",
         Command::EditProfile => "EditProfile",
         Command::ChangePassword => "ChangePassword",
         Command::EditRoom => "EditRoom",
@@ -5640,6 +5905,12 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".er" if is_aide => ".ER — edit current room\nEdit name, description, read-only flag, or min permission level.",
         ".eu" if is_aide => ".EU <user> — edit a user's profile or permissions\nAides cannot promote to Sysop.",
         "ban" if is_aide => "BAN <user> — ban a user account",
+        "timeout" if is_aide => {
+            "TIMEOUT <user> <days> — suspend a user account for 1-5 days\n\
+             Logs them out immediately and rejects login with the days \
+             remaining shown; reactivates automatically once the timeout \
+             elapses. UNBAN lifts it early."
+        }
         "u" | "users" if logged_in => {
             "U — list active user accounts\n\
              U banned — list banned accounts\n\
@@ -5777,6 +6048,7 @@ Aide:\n\
  PENDING  pending users\n\
  V <u>   validate user\n\
  BAN <u>  ban a user\n\
+ TIMEOUT <u> <d> suspend\n\
  .ER     edit current room\n\
 H U — Users";
 
@@ -7980,6 +8252,334 @@ mod tests {
             }
         };
         assert!(found, "SessionEnded for alice's session was not fired");
+    }
+
+    // ── supply-drop-bbs-ax3 / #280: user suspension ("timeout") ───────────────
+
+    #[tokio::test]
+    async fn admin_suspend_user_rejects_out_of_range_days() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "hunter99").await;
+
+        for bad in [0u8, 6, 255] {
+            let r = host.admin_suspend_user("alice", bad).await;
+            assert!(
+                matches!(&r, Err(HostError::PreconditionFailed(_))),
+                "days={bad} should be rejected, got {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_suspend_user_evicts_live_session() {
+        let (host, _db) = make_host().await;
+        let mut ev_rx = host.events_tx.subscribe();
+
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "hunter99").await;
+        while ev_rx.try_recv().is_ok() {}
+
+        host.admin_suspend_user("alice", 2).await.unwrap();
+
+        assert!(
+            host.sessions.read().await.get(&sid).is_none(),
+            "suspended alice's session must be removed"
+        );
+        let ended = ev_rx.try_recv().expect("SessionEnded event expected");
+        assert!(
+            matches!(ended, DomainEvent::SessionEnded { session, .. } if session == sid),
+            "expected SessionEnded for alice's session, got {ended:?}"
+        );
+
+        let stored = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, UserStatus::Banned);
+        assert!(stored.suspended_until.is_some());
+    }
+
+    /// The core UX #280 asks for: a login attempt during an active timeout
+    /// is told how many days remain, not a generic "Login failed."
+    #[tokio::test]
+    async fn login_while_suspended_reports_days_remaining() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "hunter99").await;
+        host.process_command(sid, Command::Logout).await.unwrap();
+
+        host.admin_suspend_user("alice", 3).await.unwrap();
+
+        let sid2 = host.create_session("test").await.unwrap();
+        host.process_command(
+            sid2,
+            Command::Login {
+                username: alice.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let r = host
+            .process_command(
+                sid2,
+                Command::WorkflowReply {
+                    reply: "hunter99".into(),
+                },
+            )
+            .await
+            .unwrap();
+        match r {
+            Response::Error(msg) => {
+                assert!(
+                    msg.contains("suspended") && msg.contains("3"),
+                    "expected a message naming the days remaining, got: {msg:?}"
+                );
+            }
+            other => panic!("expected Response::Error naming days remaining, got {other:?}"),
+        }
+        // Must not be logged in.
+        assert!(host
+            .permission_ctx(sid2)
+            .await
+            .unwrap()
+            .username()
+            .is_none());
+    }
+
+    /// The same check on the one-shot (LOGIN <user> <password> in one
+    /// message) path used by radio transports.
+    #[tokio::test]
+    async fn one_shot_login_while_suspended_reports_days_remaining() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "hunter99").await;
+        host.process_command(sid, Command::Logout).await.unwrap();
+
+        host.admin_suspend_user("alice", 1).await.unwrap();
+
+        let sid2 = host.create_session("test").await.unwrap();
+        let r = host
+            .process_command(
+                sid2,
+                Command::LoginOneShot {
+                    username: alice.clone(),
+                    password: "hunter99".into(),
+                },
+            )
+            .await
+            .unwrap();
+        match r {
+            Response::Error(msg) => assert!(
+                msg.contains("suspended"),
+                "expected a suspension message, got: {msg:?}"
+            ),
+            other => panic!("expected Response::Error, got {other:?}"),
+        }
+    }
+
+    /// A permanent ban (never suspended) must keep the pre-existing generic
+    /// "Login failed." — not the new suspension-specific message, and not
+    /// disclosed any differently than before this feature existed.
+    #[tokio::test]
+    async fn login_while_permanently_banned_still_gets_generic_message() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "hunter99").await;
+        host.process_command(sid, Command::Logout).await.unwrap();
+
+        host.admin_update_user("alice", Some(1), None)
+            .await
+            .unwrap();
+
+        let sid2 = host.create_session("test").await.unwrap();
+        host.process_command(
+            sid2,
+            Command::Login {
+                username: alice.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let r = host
+            .process_command(
+                sid2,
+                Command::WorkflowReply {
+                    reply: "hunter99".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(msg) if msg == "Login failed."),
+            "a permanent ban must give the generic message, got {r:?}"
+        );
+    }
+
+    /// A timeout that has already elapsed auto-reactivates the account on
+    /// the next login attempt, rather than requiring an explicit UNBAN.
+    #[tokio::test]
+    async fn expired_suspension_auto_reactivates_on_next_login() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "hunter99").await;
+        host.process_command(sid, Command::Logout).await.unwrap();
+
+        let alice_id = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        // Directly set an already-past suspended_until — admin_suspend_user
+        // itself only ever computes a future one.
+        let past =
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() - time::Duration::seconds(1));
+        UserStore::suspend(&host.db, alice_id, past).await.unwrap();
+
+        let sid2 = host.create_session("test").await.unwrap();
+        host.process_command(
+            sid2,
+            Command::Login {
+                username: alice.clone(),
+            },
+        )
+        .await
+        .unwrap();
+        let r = host
+            .process_command(
+                sid2,
+                Command::WorkflowReply {
+                    reply: "hunter99".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::LoggedIn { .. }),
+            "an elapsed timeout must not block login, got {r:?}"
+        );
+
+        let stored = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, UserStatus::Active);
+        assert!(stored.suspended_until.is_none());
+    }
+
+    /// UNBAN lifts an active timeout early, same as it lifts a permanent
+    /// ban.
+    #[tokio::test]
+    async fn unban_ends_an_active_suspension_early() {
+        let (host, _db) = make_host().await;
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop, "pass12345678").await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice, "hunter99").await;
+
+        host.admin_suspend_user("alice", 5).await.unwrap();
+
+        let resp = host
+            .process_command(
+                sysop_sid,
+                Command::UnbanUser {
+                    username: alice.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(resp, Response::Text(_)));
+
+        let stored = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, UserStatus::Active);
+        assert!(
+            stored.suspended_until.is_none(),
+            "unban must clear the suspension expiry, not just flip status"
+        );
+    }
+
+    /// The in-BBS TIMEOUT command, end to end: an Aide can invoke it, a
+    /// plain User cannot, and it refuses an out-of-range day count.
+    #[tokio::test]
+    async fn handle_timeout_user_permission_and_range_checks() {
+        let (host, _db) = make_host().await;
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop, "pass12345678").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob, "pass56789012").await;
+        // bob is a plain (validated) User — promote from Unvalidated first.
+        host.admin_update_user("bob", None, Some(10)).await.unwrap();
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice, "hunter99").await;
+        host.admin_update_user("alice", None, Some(10))
+            .await
+            .unwrap();
+
+        // A plain User is refused.
+        let r = host
+            .process_command(
+                bob_sid,
+                Command::TimeoutUser {
+                    username: alice.clone(),
+                    days: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(m) if m.contains("Aide")),
+            "a plain User must be refused, got {r:?}"
+        );
+
+        // A Sysop (Aide+) can suspend.
+        let r = host
+            .process_command(
+                sysop_sid,
+                Command::TimeoutUser {
+                    username: alice.clone(),
+                    days: 2,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Text(m) if m.contains("suspended")),
+            "expected a success message, got {r:?}"
+        );
+
+        // Already suspended — a second TIMEOUT is refused, not silently
+        // re-applied.
+        let r = host
+            .process_command(
+                sysop_sid,
+                Command::TimeoutUser {
+                    username: alice.clone(),
+                    days: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Error(m) if m.contains("already")),
+            "an already-suspended user should be refused, got {r:?}"
+        );
     }
 
     // ── Test helper: register + login in one call ─────────────────────────────

@@ -266,6 +266,17 @@ pub enum Command {
         username: Username,
     },
 
+    /// Suspend a user account for a fixed number of days (Aide+),
+    /// distinct from a permanent ban — logs the user out immediately and
+    /// rejects further login until the timeout elapses, at which point the
+    /// account reactivates automatically. (TIMEOUT)
+    TimeoutUser {
+        /// The username of the account to suspend.
+        username: Username,
+        /// Suspension length in days, always `1..=5`.
+        days: u8,
+    },
+
     /// Begin editing the caller's own display name. (PROFILE)
     EditProfile,
 
@@ -538,6 +549,19 @@ impl Command {
                     raw: text.to_owned(),
                 },
             },
+            "timeout" => {
+                let mut parts = rest.unwrap_or("").split_whitespace();
+                let username = parts.next().and_then(|s| Username::new(s).ok());
+                let days = parts.next().and_then(|s| s.parse::<u8>().ok());
+                match (username, days) {
+                    (Some(username), Some(days)) if (1..=5).contains(&days) => {
+                        Command::TimeoutUser { username, days }
+                    }
+                    _ => Command::Unknown {
+                        raw: text.to_owned(),
+                    },
+                }
+            }
             "u" | "users" => Command::ListUsers {
                 filter: rest.map(str::to_owned),
             },

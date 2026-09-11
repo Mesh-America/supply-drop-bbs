@@ -278,6 +278,23 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_update_user".into()))
     }
 
+    /// Put a user into a time-limited suspension ("timeout"): rejects login
+    /// with a message stating how many days remain, and terminates any
+    /// existing sessions immediately, the same as a permanent ban — but
+    /// automatically lifts once `days` have elapsed rather than staying in
+    /// effect until an explicit unban (supply-drop-bbs-ax3 / #280).
+    ///
+    /// `days` must be in `1..=5`; implementations should return
+    /// `HostError::PreconditionFailed` outside that range. Distinct from
+    /// [`admin_update_user`](Self::admin_update_user) with `status =
+    /// Some(1)` (a permanent ban with no expiry) — that call is unaffected
+    /// by this method and vice versa, aside from both ultimately setting
+    /// the same underlying `Banned` status.
+    async fn admin_suspend_user(&self, username: &str, days: u8) -> Result<(), HostError> {
+        let _ = (username, days);
+        Err(HostError::NotSupported("admin_suspend_user".into()))
+    }
+
     /// Reset a user's password without requiring the old password.
     ///
     /// Sysop-only operation.  Returns `HostError::NotFound` when the username is
