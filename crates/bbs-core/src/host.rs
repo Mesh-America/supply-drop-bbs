@@ -703,6 +703,20 @@ impl Host for BbsHost {
         Some((lat, lon, state.share_in_advert))
     }
 
+    fn set_advert_location_state(
+        &self,
+        location: Option<Option<(f64, f64)>>,
+        share_in_advert: Option<bool>,
+    ) {
+        let mut state = self.location_state.write().unwrap();
+        if let Some(location) = location {
+            state.location = location;
+        }
+        if let Some(share) = share_in_advert {
+            state.share_in_advert = share;
+        }
+    }
+
     fn mesh_node_name(&self) -> Option<String> {
         self.node_name.read().unwrap().clone()
     }
@@ -9522,5 +9536,73 @@ mod tests {
             "counts every record, protected or not"
         );
         assert_eq!(after.protected_contacts, 1, "counts only the protected one");
+    }
+
+    /// supply-drop-bbs#274: PATCH /api/config touching both `[location]`
+    /// fields in one request must apply them as a single atomic update, not
+    /// two independent writes — a concurrent `advert_location_state()`
+    /// reader must never observe a transient combination that isn't either
+    /// the pre- or post-request state. A single write's race window
+    /// (nanoseconds — the gap between releasing one `RwLock::write()` guard
+    /// and acquiring the next) is too narrow for even several concurrent
+    /// spinning readers to reliably hit in one trial; thousands of
+    /// alternating writes give many independent chances instead.
+    // Needs real OS-thread parallelism, not this crate's default
+    // single-threaded test runtime: the reader tasks below spin tightly
+    // with no `.await` inside the loop (deliberately, to maximize the
+    // chance of hitting a narrow race window), so a single-threaded runtime
+    // would let the first one scheduled starve every other task forever.
+    // worker_threads comfortably exceeds reader-count + 1 (the writer) so
+    // every reader gets genuine concurrent execution for the whole test,
+    // not just whichever few win a race for a worker thread up front.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn set_advert_location_state_is_atomic_with_concurrent_reads() {
+        let (host, _f) = make_host().await;
+        host.set_node_location(Some((1.0, 2.0)));
+        host.set_share_location_in_advert(true);
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let violation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let host = Arc::clone(&host);
+            let stop = Arc::clone(&stop);
+            let violation = Arc::clone(&violation);
+            readers.push(tokio::spawn(async move {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(state) = host.advert_location_state() {
+                        let valid = state == (1.0, 2.0, true) || state == (3.0, 4.0, false);
+                        if !valid {
+                            violation.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+
+        // Let the readers actually start spinning before the writes that
+        // matter for this test.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        for i in 0..20_000u32 {
+            if i % 2 == 0 {
+                host.set_advert_location_state(Some(Some((3.0, 4.0))), Some(false));
+            } else {
+                host.set_advert_location_state(Some(Some((1.0, 2.0))), Some(true));
+            }
+        }
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for r in readers {
+            r.await.unwrap();
+        }
+
+        assert!(
+            !violation.load(std::sync::atomic::Ordering::Relaxed),
+            "a concurrent reader observed a torn combination of location \
+             and share_in_advert — the write wasn't atomic"
+        );
     }
 }

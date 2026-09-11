@@ -599,6 +599,47 @@ pub trait Host: Send + Sync {
         Some((lat, lon, self.share_location_in_advert()))
     }
 
+    /// Update [`node_location`](Self::node_location) and/or
+    /// [`share_location_in_advert`](Self::share_location_in_advert)
+    /// together, in one write-lock acquisition where the implementor backs
+    /// both by the same lock (`bbs-core`'s `BbsHost` does).
+    ///
+    /// `location`/`share` each follow the PATCH-request convention: `None`
+    /// means "this field wasn't touched by the request, leave it alone";
+    /// `location: Some(None)` means "clear the location"; `location:
+    /// Some(Some((lat, lon)))` means "set it to this value".
+    ///
+    /// A caller that changes both fields from a single logical request
+    /// (e.g. `PATCH /api/config` touching both `[location]` fields at once)
+    /// MUST use this instead of calling [`set_node_location`](Self::set_node_location)
+    /// and [`set_share_location_in_advert`](Self::set_share_location_in_advert)
+    /// separately — two independent writes briefly expose a transient
+    /// combination a concurrent [`advert_location_state`](Self::advert_location_state)
+    /// reader can observe, even though it's neither the pre- nor
+    /// post-request intended state (see supply-drop-bbs / #274 — narrower
+    /// than #226's read-side race this mirrors, since the window is bounded
+    /// to the width of one request rather than arbitrarily wide, but the
+    /// same class of bug).
+    ///
+    /// The default implementation just calls the two setters above in
+    /// sequence and is **not** atomic, for the same reason
+    /// [`advert_location_state`](Self::advert_location_state)'s default
+    /// isn't — it exists so `Host` implementors that don't share this
+    /// crate's concurrency concerns don't need a third pair of methods for
+    /// two fields they may not even store behind separate locks.
+    fn set_advert_location_state(
+        &self,
+        location: Option<Option<(f64, f64)>>,
+        share_in_advert: Option<bool>,
+    ) {
+        if let Some(location) = location {
+            self.set_node_location(location);
+        }
+        if let Some(share) = share_in_advert {
+            self.set_share_location_in_advert(share);
+        }
+    }
+
     /// Return the node name to advertise on the mesh (the BBS name), already
     /// truncated to a MeshCore-safe length.
     ///

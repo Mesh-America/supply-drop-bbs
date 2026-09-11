@@ -2794,13 +2794,11 @@ async fn api_patch_config(
     }
 
     // Update in-memory GPS location so the mesh transport picks it up on next
-    // reconnect without a restart.
-    if let Some(new_location) = outcome.new_location {
-        state.host.set_node_location(new_location);
-    }
-    if let Some(share_in_advert) = outcome.new_share_in_advert {
-        state.host.set_share_location_in_advert(share_in_advert);
-    }
+    // reconnect without a restart. One call, not two independent writes —
+    // see Host::set_advert_location_state's doc comment (supply-drop-bbs / #274).
+    state
+        .host
+        .set_advert_location_state(outcome.new_location, outcome.new_share_in_advert);
 
     // Audit log — best-effort.
     let _ = state
