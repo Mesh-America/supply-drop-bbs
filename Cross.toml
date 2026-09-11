@@ -13,5 +13,11 @@
 # container's environment consistent with the plain `cargo build` case (and
 # with ci.yml), rather than relying on that DATABASE_URL absence continuing
 # to hold as the only thing preventing a live-DB connection attempt in CI.
+#
+# BBS_WEB_SKIP_NPM_BUILD tells crates/bbs-web/build.rs to use the web
+# frontend the release workflow already built on the runner, instead of
+# invoking npm — these Ubuntu 16.04-based images have no Node.js/npm, so
+# build.rs's unconditional `npm install`/`npm run build` fails outright
+# without this (supply-drop-bbs / #284).
 [build.env]
-passthrough = ["SQLX_OFFLINE"]
+passthrough = ["SQLX_OFFLINE", "BBS_WEB_SKIP_NPM_BUILD"]
