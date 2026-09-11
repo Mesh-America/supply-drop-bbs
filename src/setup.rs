@@ -22,28 +22,8 @@
 use std::{
     fmt::Write as FmtWrite,
     fs,
-    io::Write as IoWrite,
     path::{Path, PathBuf},
 };
-
-/// Write `contents` to `path` atomically: write to a `.tmp` sibling, fsync,
-/// then rename over the destination.
-fn atomic_write_file(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = PathBuf::from(tmp_name);
-    let mut f = fs::File::create(&tmp)?;
-    if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    drop(f);
-    if let Err(e) = fs::rename(&tmp, path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
 
 // ── Existing-config loader ────────────────────────────────────────────────────
 
@@ -1279,7 +1259,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         }
     }
 
-    if let Err(e) = atomic_write_file(&out_path, toml.as_bytes()) {
+    if let Err(e) = bbs_core::config_lock::atomic_write_file(&out_path, toml.as_bytes()) {
         eprintln!("error: could not write {}: {e}", out_path.display());
         std::process::exit(1);
     }
@@ -1361,7 +1341,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
     if let Some(ref hat) = hat_params {
         let yaml_path = companion_yaml_path(&out_path);
         let yaml = build_companion_yaml(hat);
-        if let Err(e) = atomic_write_file(&yaml_path, yaml.as_bytes()) {
+        if let Err(e) = bbs_core::config_lock::atomic_write_file(&yaml_path, yaml.as_bytes()) {
             eprintln!("error: could not write {}: {e}", yaml_path.display());
             std::process::exit(1);
         }
@@ -1881,7 +1861,7 @@ fn migrate_stale_adv_type(yaml_path: &Path) {
         migrated
     };
 
-    match atomic_write_file(yaml_path, migrated.as_bytes()) {
+    match bbs_core::config_lock::atomic_write_file(yaml_path, migrated.as_bytes()) {
         Ok(()) => println!(
             "Corrected {}: adv_type 3 (Room) -> 1 (Chat) — see supply-drop-bbs #281.",
             yaml_path.display()

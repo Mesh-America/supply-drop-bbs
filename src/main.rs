@@ -1676,15 +1676,19 @@ fn read_and_parse_config(path: &std::path::Path) -> toml_edit::DocumentMut {
 /// read-modify-write cycle as one locked critical section. Exits the
 /// process on any I/O error, matching this CLI's existing error-handling
 /// convention for config edits.
+/// `edit` returns `Err` instead of panicking when a section it needs
+/// already exists in `config.toml` but isn't a table (supply-drop-bbs-bn3
+/// / #276) — surfaced here the same way an I/O error already is, not as a
+/// crash.
 fn with_locked_config_edit(
     config_path: Option<&std::path::Path>,
-    edit: impl FnOnce(&mut toml_edit::DocumentMut),
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 ) {
     let path = resolve_config_path_for_edit(config_path);
     let result = bbs_core::config_lock::with_config_lock_sync(&path, || {
         let mut doc = read_and_parse_config(&path);
-        edit(&mut doc);
-        atomic_write_file(&path, doc.to_string().as_bytes())
+        edit(&mut doc).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        bbs_core::config_lock::atomic_write_file(&path, doc.to_string().as_bytes())
     });
     if let Err(e) = result {
         eprintln!("error writing {}: {e}", path.display());
@@ -1692,41 +1696,17 @@ fn with_locked_config_edit(
     }
 }
 
-/// Write `contents` to `path` atomically: write to a `.tmp` sibling, fsync,
-/// then rename over the destination.
-fn atomic_write_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp_name);
-    let mut f = std::fs::File::create(&tmp)?;
-    if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
-
 fn config_edit_bbs_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
     with_locked_config_edit(config_path, |doc| {
-        if doc.get("bbs").is_none() {
-            doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["bbs"][key] = toml_edit::value(value);
+        bbs_core::toml_util::ensure_table(doc, "bbs")?.insert(key, toml_edit::value(value));
+        Ok(())
     });
 }
 
 fn config_edit_bbs_string(config_path: Option<&std::path::Path>, key: &str, value: &str) {
     with_locked_config_edit(config_path, |doc| {
-        if doc.get("bbs").is_none() {
-            doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["bbs"][key] = toml_edit::value(value);
+        bbs_core::toml_util::ensure_table(doc, "bbs")?.insert(key, toml_edit::value(value));
+        Ok(())
     });
 }
 
@@ -1735,6 +1715,7 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
         if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
             bbs.remove(key);
         }
+        Ok(())
     });
 }
 
@@ -1745,21 +1726,18 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
 /// locked round trip.
 fn config_edit_location_floats(config_path: Option<&std::path::Path>, pairs: &[(&str, f64)]) {
     with_locked_config_edit(config_path, |doc| {
-        if doc.get("location").is_none() {
-            doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
+        let location = bbs_core::toml_util::ensure_table(doc, "location")?;
         for (key, value) in pairs {
-            doc["location"][*key] = toml_edit::value(*value);
+            location.insert(key, toml_edit::value(*value));
         }
+        Ok(())
     });
 }
 
 fn config_edit_location_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
     with_locked_config_edit(config_path, |doc| {
-        if doc.get("location").is_none() {
-            doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["location"][key] = toml_edit::value(value);
+        bbs_core::toml_util::ensure_table(doc, "location")?.insert(key, toml_edit::value(value));
+        Ok(())
     });
 }
 
@@ -1772,6 +1750,7 @@ fn config_remove_location_keys(config_path: Option<&std::path::Path>, keys: &[&s
                 location.remove(key);
             }
         }
+        Ok(())
     });
 }
 
@@ -1979,7 +1958,7 @@ fn write_plugin_file_sync(dir: &std::path::Path, cfg: &bbs_plugin_api::ProcessPl
         }
     };
     let path = dir.join(format!("{}.toml", cfg.name));
-    if let Err(e) = atomic_write_file(&path, content.as_bytes()) {
+    if let Err(e) = bbs_core::config_lock::atomic_write_file(&path, content.as_bytes()) {
         eprintln!("error: cannot write {}: {e}", path.display());
         std::process::exit(1);
     }
@@ -2042,8 +2021,12 @@ fn write_plugins(plugins: &[bbs_plugin_api::ProcessPluginConfig], path: &std::pa
 
     let result = bbs_core::config_lock::with_config_lock_sync(path, || {
         let mut doc = read_and_parse_config(path);
-        doc["plugins"]["process"] = toml_edit::Item::ArrayOfTables(aot);
-        atomic_write_file(path, doc.to_string().as_bytes())
+        // ensure_table returns Err instead of panicking when [plugins]
+        // exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            .insert("process", toml_edit::Item::ArrayOfTables(aot));
+        bbs_core::config_lock::atomic_write_file(path, doc.to_string().as_bytes())
     });
     if let Err(e) = result {
         eprintln!("error writing config: {e}");
@@ -2552,22 +2535,24 @@ fn save_radio_config(config_path: Option<&std::path::Path>, r: &ResolvedRadio) {
         let content = std::fs::read_to_string(&path_for_closure)?;
         let mut doc: toml_edit::DocumentMut = content.parse().map_err(std::io::Error::other)?;
 
-        // Ensure [plugins] and [plugins.mesh] exist.
-        if doc.get("plugins").is_none() {
-            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        if doc["plugins"].get("mesh").is_none() {
-            doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        // Write [plugins.mesh.radio] fields.
-        doc["plugins"]["mesh"]["radio"]["frequency_hz"] = toml_edit::value(frequency_hz as i64);
-        doc["plugins"]["mesh"]["radio"]["bandwidth_hz"] = toml_edit::value(bandwidth_hz as i64);
-        doc["plugins"]["mesh"]["radio"]["spreading_factor"] =
-            toml_edit::value(spreading_factor as i64);
-        doc["plugins"]["mesh"]["radio"]["coding_rate"] = toml_edit::value(coding_rate as i64);
-        doc["plugins"]["mesh"]["radio"]["tx_power_dbm"] = toml_edit::value(tx_power_dbm as i64);
+        // ensure_table/ensure_subtable return Err instead of panicking when
+        // a section exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        let plugins = bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(std::io::Error::other)?;
+        let mesh =
+            bbs_core::toml_util::ensure_subtable(plugins, "mesh").map_err(std::io::Error::other)?;
+        let radio =
+            bbs_core::toml_util::ensure_subtable(mesh, "radio").map_err(std::io::Error::other)?;
+        radio.insert("frequency_hz", toml_edit::value(frequency_hz as i64));
+        radio.insert("bandwidth_hz", toml_edit::value(bandwidth_hz as i64));
+        radio.insert(
+            "spreading_factor",
+            toml_edit::value(spreading_factor as i64),
+        );
+        radio.insert("coding_rate", toml_edit::value(coding_rate as i64));
+        radio.insert("tx_power_dbm", toml_edit::value(tx_power_dbm as i64));
 
-        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+        bbs_core::config_lock::atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
     });
 
     if let Err(e) = result {
@@ -2609,15 +2594,15 @@ fn save_path_bytes(config_path: Option<&std::path::Path>, bytes: u8) {
     let result = bbs_core::config_lock::with_config_lock_sync(&path, move || {
         let content = std::fs::read_to_string(&path_for_closure)?;
         let mut doc: toml_edit::DocumentMut = content.parse().map_err(std::io::Error::other)?;
-        if doc.get("plugins").is_none() {
-            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        if doc["plugins"].get("mesh").is_none() {
-            doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["plugins"]["mesh"]["path_bytes"] = toml_edit::value(bytes as i64);
+        // ensure_table/ensure_subtable return Err instead of panicking when
+        // a section exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        let plugins = bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(std::io::Error::other)?;
+        let mesh =
+            bbs_core::toml_util::ensure_subtable(plugins, "mesh").map_err(std::io::Error::other)?;
+        mesh.insert("path_bytes", toml_edit::value(bytes as i64));
 
-        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+        bbs_core::config_lock::atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
     });
 
     if let Err(e) = result {
