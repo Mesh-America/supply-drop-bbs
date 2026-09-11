@@ -78,6 +78,7 @@ case "$1" in
     PYMC_DIR="/opt/pymc-companion"
     PYMC_UNIT="/etc/systemd/system/pymc-companion.service"
     PYMC_SHARE="/usr/share/supply-drop-bbs/pymc-companion"
+    PYMC_CONFIG="/etc/supply-drop-bbs/pymc-companion.yaml"
     # Shared with install.sh's HAT block, which takes the same lock around
     # its own venv/pip writes — without it, `apt upgrade` racing a manual
     # `sudo supply-drop-bbs setup` on the same host could run two
@@ -101,6 +102,28 @@ case "$1" in
           install -m 755 "$PYMC_SHARE/pymc-companion.py" \
             "$PYMC_DIR/pymc-companion.py"
           install -m 644 "$PYMC_SHARE/pymc-companion.service" "$PYMC_UNIT"
+
+          # supply-drop-bbs / #281: adv_type=3 (Room) makes MeshCore
+          # companion apps require a protocol-level login handshake this
+          # BBS doesn't implement, making it unreachable for any
+          # unauthenticated user. #281's fix only changed the code's
+          # *default* for a missing key -- it does nothing for a
+          # pymc-companion.yaml that already has an explicit `adv_type: 3`
+          # line, which is every HAT deployment set up between #100
+          # (2026-06-13) and #281 (v1.1.5, 2026-09-11). This is the
+          # unattended upgrade path (the documented way to update an
+          # existing bridge, per docs/OPERATIONS.md), so it's the one place
+          # that actually reaches already-broken installs without the
+          # operator having to know to do anything. Unconditional and
+          # idempotent (a no-op if already correct, absent, or the file
+          # doesn't exist yet) -- adv_type=3 is never a valid choice for
+          # this application, not a per-deployment customization to
+          # preserve the way radio frequency/region are.
+          if [ -f "$PYMC_CONFIG" ] && grep -Eq '^[[:space:]]*adv_type:[[:space:]]*3([[:space:]]|#|$)' "$PYMC_CONFIG"; then
+            sed -i 's/^\([[:space:]]*adv_type:[[:space:]]*\)3\([[:space:]]\|$\)/\11\2/' "$PYMC_CONFIG"
+            echo "Corrected $PYMC_CONFIG: adv_type 3 (Room) -> 1 (Chat) -- see #281." >&2
+          fi
+
           # timeout bounds a stalled/degraded-network pip against holding
           # dpkg's transaction lock indefinitely on a routine upgrade.
           timeout 60 "$PYMC_DIR/venv/bin/pip" install -q --upgrade openhop-core

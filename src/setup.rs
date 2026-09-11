@@ -1180,6 +1180,16 @@ pub fn run_wizard(config_out: Option<&Path>) {
     if use_mesh && mesh_conn_type == "hat" {
         let yaml_path = companion_yaml_path(&out_path);
         let reconfigure = if yaml_path.exists() {
+            // Declining the reconfigure prompt below leaves this file
+            // byte-for-byte untouched (build_companion_yaml, which carries
+            // the corrected default, only runs when reconfigure is true) —
+            // migrate this one known-bad value regardless of that answer,
+            // same rationale as packaging/postinst's unattended .deb-upgrade
+            // copy of this fix (supply-drop-bbs / #281): adv_type=3 is never
+            // a valid choice for this application, not a per-deployment
+            // setting to preserve the way radio frequency/region are.
+            migrate_stale_adv_type(&yaml_path);
+
             section("MeshCore Pi HAT — existing configuration");
             println!(
                 "A HAT configuration already exists at {}.",
@@ -1820,6 +1830,64 @@ fn configure_hat(
             .into_owned(),
         region: region_choice,
         preset: hat_choice,
+    }
+}
+
+/// Correct a pre-#281 `adv_type: 3` line in an existing `pymc-companion.yaml`
+/// to `adv_type: 1`, in place. Idempotent and safe to call unconditionally —
+/// a no-op if the file is missing, unreadable, or already correct.
+///
+/// Only ever rewrites the exact matched line's trailing digit; every other
+/// byte of the file (formatting, comments, unrelated settings) is preserved.
+fn migrate_stale_adv_type(yaml_path: &Path) {
+    let Ok(content) = std::fs::read_to_string(yaml_path) else {
+        return;
+    };
+
+    let mut changed = false;
+    let migrated: String = content
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("adv_type:") {
+                let value_and_tail = rest.trim_start();
+                if value_and_tail == "3"
+                    || value_and_tail.strip_prefix('3').is_some_and(|tail| {
+                        tail.starts_with(char::is_whitespace) || tail.starts_with('#')
+                    })
+                {
+                    changed = true;
+                    let indent = &line[..line.len() - trimmed.len()];
+                    let tail = &value_and_tail[1..];
+                    return format!("{indent}adv_type: 1{tail}");
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if !changed {
+        return;
+    }
+
+    // Preserve a trailing newline if the original had one — `lines()` +
+    // `join("\n")` drops it.
+    let migrated = if content.ends_with('\n') {
+        format!("{migrated}\n")
+    } else {
+        migrated
+    };
+
+    match atomic_write_file(yaml_path, migrated.as_bytes()) {
+        Ok(()) => println!(
+            "Corrected {}: adv_type 3 (Room) -> 1 (Chat) — see supply-drop-bbs #281.",
+            yaml_path.display()
+        ),
+        Err(e) => eprintln!(
+            "warning: could not migrate adv_type in {}: {e}",
+            yaml_path.display()
+        ),
     }
 }
 
@@ -2499,6 +2567,113 @@ mod build_toml_tests {
         assert!(
             toml.contains("[plugins.mesh.radio]"),
             "serial (the pre-existing, already-working case) must be unaffected by this fix:\n{toml}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod migrate_adv_type_tests {
+    use super::*;
+
+    #[test]
+    fn corrects_bare_adv_type_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pymc-companion.yaml");
+        std::fs::write(
+            &path,
+            "companion:\n  node_name: \"BBS\"\n  adv_type: 3\n  tcp_port: 5000\n",
+        )
+        .unwrap();
+
+        migrate_stale_adv_type(&path);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content,
+            "companion:\n  node_name: \"BBS\"\n  adv_type: 1\n  tcp_port: 5000\n"
+        );
+    }
+
+    #[test]
+    fn corrects_adv_type_3_with_trailing_comment_and_preserves_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pymc-companion.yaml");
+        std::fs::write(
+            &path,
+            "  adv_type: 3  # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor. Default: 3 (Room/BBS).\n",
+        )
+        .unwrap();
+
+        migrate_stale_adv_type(&path);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            content,
+            "  adv_type: 1  # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor. Default: 3 (Room/BBS).\n"
+        );
+    }
+
+    #[test]
+    fn leaves_already_correct_value_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pymc-companion.yaml");
+        let original = "companion:\n  adv_type: 1\n";
+        std::fs::write(&path, original).unwrap();
+
+        migrate_stale_adv_type(&path);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn leaves_other_adv_type_values_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pymc-companion.yaml");
+        // 2 (Repeater) and 4 (Sensor) are real values this migration must
+        // not clobber -- only the specific known-broken default (3) is
+        // being corrected, not every non-Chat choice.
+        let original = "companion:\n  adv_type: 2\n";
+        std::fs::write(&path, original).unwrap();
+
+        migrate_stale_adv_type(&path);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn does_not_false_match_a_longer_number_starting_with_3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pymc-companion.yaml");
+        // Not a real adv_type value, but proves the match requires a
+        // whitespace/comment/EOL boundary right after the "3", not just a
+        // "3" prefix.
+        let original = "companion:\n  adv_type: 30\n";
+        std::fs::write(&path, original).unwrap();
+
+        migrate_stale_adv_type(&path);
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn missing_file_is_a_silent_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("does-not-exist.yaml");
+        migrate_stale_adv_type(&path); // must not panic
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn preserves_file_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pymc-companion.yaml");
+        std::fs::write(&path, "companion:\n  adv_type: 3").unwrap();
+
+        migrate_stale_adv_type(&path);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "companion:\n  adv_type: 1"
         );
     }
 }
