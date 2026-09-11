@@ -1161,7 +1161,9 @@ pub fn run_wizard(config_out: Option<&Path>) {
         );
         Input::with_theme(&theme)
             .with_prompt("BBS name")
-            .default(bbs_core::mesh_name::truncate_mesh_node_name(&bbs_name, true).to_string())
+            .default(bbs_core::mesh_name::truncate_mesh_node_name(
+                &bbs_name, true,
+            ))
             .validate_with(|input: &String| -> Result<(), String> {
                 bbs_core::mesh_name::validate_mesh_node_name(input, true).map_err(|e| e.to_string())
             })
