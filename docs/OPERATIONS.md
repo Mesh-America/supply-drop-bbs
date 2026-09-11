@@ -145,11 +145,17 @@ sudo systemctl start supply-drop-bbs
 ```
 
 ::: info Pi HAT users
-The `.deb` installs the BBS itself. For Pi HAT support you still need
-`pymc-companion` (the Python radio bridge). After the BBS is running, follow
-the [Pi HAT section](#pi-hat-additional-wizard-steps-in-the-installer) below,
-or use the guided setup script (Option 3) which handles the full HAT setup
-automatically.
+The `.deb` installs the BBS itself, but it does **not** perform first-time
+`pymc-companion` (the Python radio bridge) setup — the `.deb` and raw-binary
+methods only ever touch the `supply-drop-bbs` binary on a fresh install (a
+[`.deb` update](#debian-package-update-recommended) *will* keep an
+already-configured `pymc-companion` current, but that's not the same as
+setting one up). If you need Pi HAT support, after the BBS is running use
+[Option 3 — Guided setup script](#option-3--guided-setup-script), which
+installs and configures `pymc-companion` for you (see [what the Pi HAT
+steps do](#pi-hat-additional-wizard-steps-in-the-installer)). There is
+currently no supported way to set up the Pi HAT bridge for the first time
+without it.
 :::
 
 ### Option 2 — Raw binary
@@ -260,15 +266,30 @@ The installer then:
 | 4 | PiMesh-1W (V2) | |
 | 5 | MeshAdv Mini | |
 | 6 | MeshAdv | |
-| 7 | FemtoFox SX1262 1W | Uses gpiod backend |
-| 8 | FemtoFox SX1262 2W | Uses gpiod backend |
+| 7 | FemtoFox SX1262 1W | Uses gpiod backend — see note below |
+| 8 | FemtoFox SX1262 2W | Uses gpiod backend — see note below |
 | 9 | NebraHat 2W | |
-| 10 | RAK6421 + RAK13300x (Slot 1) | Uses gpiod backend |
-| 11 | RAK6421 + RAK13300x (Slot 2) | Uses gpiod backend |
-| 12 | Zindello UltraPeater E22 | Uses gpiod backend |
-| 13 | Zindello UltraPeater E22P | Uses gpiod backend |
+| 10 | RAK6421 + RAK13300x (Slot 1) | Uses gpiod backend — see note below |
+| 11 | RAK6421 + RAK13300x (Slot 2) | Uses gpiod backend — see note below |
+| 12 | Zindello UltraPeater E22 | Uses gpiod backend — see note below |
+| 13 | Zindello UltraPeater E22P | Uses gpiod backend — see note below |
 | 14 | uConsole LoRa Module v1 | |
 | 15 | uConsole LoRa Module v2 | |
+
+::: warning gpiod backend — known upstream bug
+Presets 7, 8, and 10–13 above set `use_gpiod_backend: true`. `openhop_core`'s
+`GPIOPinManager` only wires up its gpiod support under automatic backend
+detection, not when a caller explicitly requests the gpiod backend the way
+`SX1262Radio` does here — the module-level `GPIO` name is left bound to
+whatever it was at import (`None`, on these presets, since `install.sh`'s
+gpiod branch doesn't install `python-periphery` either), so the first real
+GPIO call fails with `TypeError: 'NoneType' object is not callable`, not a
+more obviously-diagnostic error. If you're on one of these presets and hit
+that error, this is a known, tracked issue (supply-drop-bbs-85n /
+[#234](https://github.com/Mesh-America/supply-drop-bbs/issues/234)), not
+something specific to your setup — it needs an upstream fix in
+`openhop_core`, which this project doesn't control.
+:::
 
 ### After installation
 
@@ -445,7 +466,7 @@ automatically if `pymc-companion` restarts.
 
 ### Debian package update (recommended)
 
-`dpkg` stops the running service, replaces the binary, and restarts it automatically — your config and data are untouched.
+`dpkg` stops the running service, replaces the binary, and restarts it automatically — your config and data are untouched. If a Pi HAT bridge (`pymc-companion`) is already configured on this host, it's brought up to date too — script, unit, and `openhop-core` dependency — with no separate step needed.
 
 ```sh
 ARCH=$(dpkg --print-architecture)

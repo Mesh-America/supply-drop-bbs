@@ -573,6 +573,100 @@ async fn advert_location_unshared_when_disabled_and_device_currently_sharing() {
     transport.stop().await.unwrap();
 }
 
+/// Regression guard for supply-drop-bbs / #226: a concurrent admin config
+/// write landing between two SEPARATE, independently-locked reads of
+/// location + share-in-advert (the on-connect `SelfInfo` handler and
+/// `broadcast_self_advert` used to call `host.node_location()` then, several
+/// steps later, `host.share_location_in_advert()`) could pair a stale
+/// sharing flag with a fresh location, overflowing MeshCore's 32-byte advert
+/// limit and getting the advert silently dropped mesh-wide. The fix routes
+/// both call sites through one snapshot, `Host::advert_location_state()`.
+///
+/// `MockHost` already stores both fields behind one `Mutex`, so it can't
+/// reproduce the original race by timing alone — instead this proves the
+/// *call-site discipline* directly: the two separate accessors must never
+/// be called from either advert-send path again, which is exactly the
+/// property that closes the race regardless of what backs a given `Host`
+/// implementation. A future change that reintroduces either call — even
+/// one unrelated to this fix's specific code — fails this test immediately
+/// instead of only showing up as an intermittent, hard-to-reproduce dropped
+/// advert on a live mesh.
+#[tokio::test]
+async fn advert_send_paths_use_atomic_location_snapshot_not_separate_reads() {
+    let host = Arc::new(MockHost::new());
+    host.set_location(Some((37.7749, -122.4194)), true);
+    host.set_node_name(Some("Test BBS".to_owned()));
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    // Drive the on-connect SelfInfo branch (AppStart handshake -> SelfInfo).
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge
+        .send(&self_info_frame_with_policy("Node", ADVERT_LOC_NONE))
+        .await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_OTHER_PARAMS),
+    )
+    .await
+    .expect("expected the connect-time config sync to complete");
+
+    assert_eq!(
+        host.node_location_call_count(),
+        0,
+        "on-connect SelfInfo handling must not call node_location() directly — \
+         use advert_location_state() for one atomic snapshot"
+    );
+    assert_eq!(
+        host.share_location_in_advert_call_count(),
+        0,
+        "on-connect SelfInfo handling must not call share_location_in_advert() \
+         directly — use advert_location_state() for one atomic snapshot"
+    );
+    assert!(
+        host.advert_location_state_call_count() >= 1,
+        "on-connect SelfInfo handling must call advert_location_state() at least once"
+    );
+
+    // Now drive broadcast_self_advert (the periodic-tick / web "send advert"
+    // path) via the advert bus's send-request flag, and confirm the same
+    // discipline holds there too.
+    let combined_calls_before = host.advert_location_state_call_count();
+    host.advert_bus().request_send(true);
+    tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+        .await
+        .expect("expected a command after requesting an advert send");
+    // Let the rest of broadcast_self_advert's steps (which run after the
+    // first frame this test reads) finish before asserting call counts.
+    // Not actually racing the assertions below: broadcast_self_advert's
+    // location_state snapshot (whose call count is what's being asserted)
+    // is taken before any frame is sent, so it's already recorded by the
+    // time read_command() above returns the first frame — this sleep is
+    // only draining the remaining, unread frames the same invocation sends
+    // afterward, so a later test on this same bridge doesn't desync reading
+    // one of them by mistake. Matches this file's existing convention
+    // (search other tests here for the same short-sleep-after-first-frame
+    // idiom).
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert_eq!(
+        host.node_location_call_count(),
+        0,
+        "broadcast_self_advert must not call node_location() directly"
+    );
+    assert_eq!(
+        host.share_location_in_advert_call_count(),
+        0,
+        "broadcast_self_advert must not call share_location_in_advert() directly"
+    );
+    assert!(
+        host.advert_location_state_call_count() > combined_calls_before,
+        "broadcast_self_advert must call advert_location_state() again for its own snapshot"
+    );
+
+    transport.stop().await.unwrap();
+}
+
 /// `OutboundFrame::SetAdvertName`'s payload is `CMD_SET_ADVERT_NAME` + name
 /// bytes + a trailing NUL terminator (matching firmware's C-string
 /// convention) — strip that terminator to get the actual name bytes sent.

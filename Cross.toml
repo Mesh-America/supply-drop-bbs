@@ -1,0 +1,17 @@
+# Config for the `cross` tool (see .github/workflows/release.yml's "Install
+# cross" step) — cross does not forward arbitrary host environment variables
+# into its build containers by default, only a fixed allowlist it recognizes
+# itself (CARGO_*, RUSTFLAGS, etc. — verified against cross's own source).
+# release.yml's top-level `env:` block alone is NOT enough to reach the
+# container; anything added there that the build needs also needs an entry
+# here, or vice versa when removing one.
+#
+# SQLX_OFFLINE isn't on cross's default allowlist, so it's listed explicitly.
+# This project's sqlx macros don't currently set DATABASE_URL anywhere, so in
+# practice they already fall back to the checked-in .sqlx/ metadata cache
+# regardless of this variable's value — but passing it through keeps this
+# container's environment consistent with the plain `cargo build` case (and
+# with ci.yml), rather than relying on that DATABASE_URL absence continuing
+# to hold as the only thing preventing a live-DB connection attempt in CI.
+[build.env]
+passthrough = ["SQLX_OFFLINE"]

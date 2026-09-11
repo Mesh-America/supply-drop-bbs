@@ -15,12 +15,28 @@ companion:
   bind_address: "127.0.0.1"
 
   # Node type advertised on the mesh.
-  # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor. Default: 3 (Room/BBS).
-  adv_type: 3
+  # 1=Chat, 2=Repeater, 3=Room, 4=Sensor. Default: 1 (Chat).
+  #
+  # Leave this at 1. Room/Repeater (2/3) make companion apps require a
+  # protocol-level login handshake before the user can send anything, which
+  # this BBS does not implement — the app never gets past "logging in" and
+  # the user can't reach the BBS's own (message-based) login prompt at all
+  # (supply-drop-bbs / #281).
+  adv_type: 1
 
   # Auto-add bitmask: 0x01=overwrite_oldest 0x02=chat 0x04=repeater 0x08=room
-  # 0x0F adds all types and evicts the oldest when the contact list is full.
+  # 0x10=sensor. 0x0F adds chat/repeater/room (NOT sensor) and evicts the
+  # oldest when the contact list is full. Use 0x1F to also auto-add sensor
+  # contacts.
   autoadd_config: 0x0F
+
+  # Where the contact list (including which contacts are favourited/
+  # protected) is persisted across restarts of this bridge. Without this,
+  # restarting pymc-companion for any reason — an upgrade, a crash, a
+  # reboot — silently loses every contact, and supply-drop-bbs loses its
+  # own "protected contact" state along with it (it's rehydrated from
+  # whatever this bridge reports on reconnect).
+  contacts_db_path: "/var/lib/supply-drop-bbs/pymc-companion-contacts.db"
 
 radio:
   # ── Frequency ─────────────────────────────────────────────────────────────
@@ -36,6 +52,13 @@ radio:
   coding_rate: 5
   tx_power: 22             # dBm
   preamble_length: 17
+  # NOT currently load-bearing like the settings above: openhop_core (and
+  # the old pymc_core) read this into SX1262Radio but never write it to
+  # the radio — no setSyncWord() call or register write anywhere in the
+  # driver. Changing it has no effect on what actually goes over the air
+  # (upstream bug — see supply-drop-bbs-68t / #235). Left here at
+  # MeshCore's documented network ID in case upstream wires it up later;
+  # do not rely on it to isolate a private mesh segment today.
   sync_word: 0x3444        # MeshCore network ID
 
   # ── Hardware pins (BCM GPIO) ───────────────────────────────────────────────

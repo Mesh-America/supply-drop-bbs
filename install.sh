@@ -637,11 +637,22 @@ if [[ "$_mesh_enabled" == true && "$_mesh_conn_type" == "hat" ]]; then
         python3 -m venv "$PYMC_DIR/venv"
     fi
     info "Installing openhop-core (this may take a minute)..."
+    # Shared with packaging/postinst's pymc-companion self-update block,
+    # which takes the same lock around its own venv/pip writes — without
+    # it, an unattended `apt upgrade` (which auto-updates this same venv
+    # on .deb-upgraded Pi HAT hosts, see #243) racing this interactive
+    # wizard could run two unsynchronized `pip install`s against the same
+    # venv concurrently. Blocking (not -n): this is a deliberate,
+    # operator-driven run — briefly waiting out a concurrent unattended
+    # update is preferable to aborting the wizard.
+    exec 9>"$PYMC_DIR/.pymc-companion-update.lock"
+    flock 9
     "$PYMC_DIR/venv/bin/pip" install -q --upgrade pip
     "$PYMC_DIR/venv/bin/pip" install -q openhop-core pyyaml spidev
     if [[ "$_gpiod" == false ]]; then
         "$PYMC_DIR/venv/bin/pip" install -q lgpio python-periphery
     fi
+    flock -u 9
     success "openhop-core installed"
 
     # ── Install companion script ───────────────────────────────────────────────

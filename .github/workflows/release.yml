@@ -16,22 +16,53 @@ jobs:
   # ─── Build release binaries for all deployment targets ─────────────
   build:
     name: Build · ${{ matrix.target }}
-    # Pinned, NOT ubuntu-latest: the runner's glibc becomes the minimum glibc
-    # every release binary requires. ubuntu-latest floats and previously
-    # drifted from 22.04 (glibc 2.35) to 24.04 (glibc 2.39) with no code
-    # change on our side, silently breaking `install.sh`'s binary download on
-    # Raspberry Pi OS Bookworm (glibc 2.36) — see supply-drop-bbs-7je / #238.
-    # ubuntu-22.04 (glibc 2.35) stays compatible with Bookworm and newer.
-    # Do not change this back to ubuntu-latest.
+    # `cross` (see the "Install cross" step below) compiles every target
+    # inside a ghcr.io/cross-rs Docker image, not on this runner directly —
+    # so the runner's own OS/glibc no longer becomes the minimum glibc
+    # release binaries require. That's the fix for supply-drop-bbs-7je /
+    # #238, where an unpinned `ubuntu-latest` runner floated from glibc
+    # 2.35 to 2.39 and silently broke `install.sh`'s binary download on
+    # Raspberry Pi OS Bookworm (glibc 2.36). cross@0.2.5's images (verified
+    # against its Dockerfiles at that exact tag) are Ubuntu 16.04-based —
+    # glibc 2.23 for all three targets here, well under both Bookworm's
+    # 2.36 and the old ubuntu-22.04 pin's 2.35 (these numbers are NOT the
+    # same value, just both comfortably under the 2.36 ceiling that
+    # actually matters) — without needing a runner-image pin at all.
     #
-    # NOT a permanent fix: GitHub is deprecating ubuntu-22.04 runner images
-    # starting 2026-09-17 (brownouts), fully removed 2027-04-17
-    # (actions/runner-images#14254). Before then, this needs a durable
-    # solution decoupled from GitHub's runner-image lifecycle entirely —
-    # e.g. building inside an old-glibc Docker container (manylinux-style),
-    # or switching release targets to musl (static, no glibc dependency).
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    # `runs-on` can therefore float on ubuntu-latest again: the GLIBC FLOOR
+    # specifically is now pinned at the Docker-image level (via the `cross`
+    # tool version below), not tied to the runner OS. This also sidesteps
+    # GitHub's ubuntu-22.04 deprecation brownouts, which begin 2026-09-17
+    # and intentionally fail any job still pinned to that runner image
+    # (actions/runner-images#14254) — pinning runs-on to ubuntu-22.04 today
+    # would start failing release builds within days.
+    #
+    # This is NOT full independence from the runner image, only from its
+    # glibc: the aarch64/armv7 builds still run through cross-rs's own
+    # QEMU-based emulation inside Docker, and Docker/QEMU-level breakage
+    # from a runner-image bump is a real, precedented failure mode
+    # (actions/runner-images#11589 — a QEMU segfault broke a Docker build
+    # purely from a same-label ubuntu-24.04 image version bump, no workflow
+    # change). Smaller, more contained surface than the glibc drift this
+    # migration fixes, but not zero.
+    #
+    # Residual risk (accepted, tracked): cross@0.2.5 pins the `cross` CLI
+    # version, but the Docker images it pulls are resolved by tag, not
+    # content digest — a compromised/repointed ghcr.io/cross-rs tag could
+    # inject into the bind-mounted source tree with nothing here to catch
+    # it (SHA256SUMS is generated from whatever the build already produced).
+    # Consistent with this repo's existing accepted-risk stance on
+    # unverified git/pip content elsewhere (install.sh) — see
+    # supply-drop-bbs-9bs. Digest-pinning is tracked separately
+    # (supply-drop-bbs-kmt / #265) rather than rushed in here.
+    runs-on: ubuntu-latest
+    # Bumped from 60: each matrix job now also pulls a multi-hundred-MB
+    # cross-rs Docker image per build invocation (2 per target — full and
+    # headless) on top of the existing compile time. Not measured against a
+    # real run yet (this workflow only fires on release tags, no dry-run
+    # trigger) — treat as a conservative estimate to revisit after the
+    # first real release under this pipeline.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -40,55 +71,100 @@ jobs:
           - armv7-unknown-linux-gnueabihf
           - x86_64-unknown-linux-gnu
 
+    # Least-privilege default for a job that now hands the checked-out tree
+    # (see persist-credentials below) to a third-party Docker container.
+    permissions:
+      contents: read
+
     steps:
       - uses: actions/checkout@v4
         with:
           # Full history so git-cliff can generate release notes.
           fetch-depth: 0
+          # `cross` bind-mounts the whole working tree, .git included, into
+          # its build container (see the Docker-image residual-risk note
+          # above) — don't hand a real GITHUB_TOKEN to that container. This
+          # job never pushes back to the repo, so it doesn't need one.
+          persist-credentials: false
 
+      # This pin and cross@0.2.5's own supported-Rust-version range (above)
+      # aren't verified against each other anywhere — if this toolchain is
+      # bumped without checking cross@0.2.5 compatibility, the failure mode
+      # is unverified (could be a clear compile error inside the container,
+      # or something subtler). Check both together when bumping either.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96"
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compile toolchain
-        run: |
-          sudo apt-get update
-          case "${{ matrix.target }}" in
-            aarch64-unknown-linux-gnu)
-              sudo apt-get install -y gcc-aarch64-linux-gnu
-              ;;
-            armv7-unknown-linux-gnueabihf)
-              sudo apt-get install -y gcc-arm-linux-gnueabihf
-              ;;
-            x86_64-unknown-linux-gnu)
-              # native on the runner — no extra toolchain needed
-              ;;
-          esac
+      # Provides the per-target ghcr.io/cross-rs/<target> Docker images
+      # (glibc 2.23, Ubuntu 16.04-based — see the `build` job's comment
+      # above) that the `cross build` calls below compile in. Version
+      # pinned for reproducibility; bump deliberately, not silently.
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross@0.2.5
 
+      # Cache key carries a `cross-v1` salt, deliberately different from
+      # this job's pre-migration key (`release-${{ matrix.target }}`): the
+      # cache is populated by whatever built last, and Cargo does not
+      # reliably detect that a *build backend* changed (rust-lang/cargo#12502)
+      # the way it detects source changes. Without a fresh key here, the
+      # first release built after this migration could restore a cache
+      # populated by the OLD native `cargo build` and skip re-linking
+      # inside the `cross` container entirely — silently shipping a
+      # host-glibc-linked binary under the new pipeline, reintroducing the
+      # exact #238 defect this migration exists to fix. Bump the salt again
+      # any time the build moves between native and containerized (or
+      # between container images), not just when dependencies change.
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.target }}
+          key: release-cross-v1-${{ matrix.target }}
 
       # ── Build variants ─────────────────────────────────────────────
       # Uses the `release-min` profile (Cargo.toml):
-      #   opt-level = "z", lto = "thin", codegen-units = 1, strip = "symbols"
+      #   opt-level = "z", lto = "fat", codegen-units = 1, strip = "symbols"
       # Output lands in  target/<triple>/release-min/
       #
       # IMPORTANT: stage the full binary before starting the headless build.
       # Both variants produce  target/<triple>/release-min/supply-drop-bbs;
       # the second build overwrites the first, so we must copy before building.
+      # `cross` bind-mounts the project dir at this same host-visible path
+      # (verified against its mount-finder source), so this still holds —
+      # the container writes to the mount, it doesn't keep its own copy.
+      #
+      # x86_64-unknown-linux-gnu — the runner's own native architecture —
+      # is built through `cross`/Docker here too, not natively, even though
+      # that adds a new failure dependency (image pull/registry/daemon) a
+      # native build wouldn't have had. Deliberate: the goal is one known,
+      # uniform glibc floor across all three targets, not "native arch gets
+      # whatever the runner happens to ship" — the latter is the exact
+      # failure mode (#238) this migration exists to close off.
 
       # 1. Full binary (default features = cli + both mesh transports + process-transport + admin-web)
       - name: Build — full (default features)
-        run: cargo build --profile release-min --target ${{ matrix.target }}
+        run: cross build --profile release-min --target ${{ matrix.target }}
 
       - name: Stage full binary
+        env:
+          # Routed through env, not interpolated directly into the script
+          # below (`TAG="${{ github.ref_name }}"`) — a tag name is operator-
+          # controlled (anyone with tag-push access sets it) and GitHub
+          # substitutes ${{ }} expressions into the YAML *before* bash ever
+          # sees it, so a tag containing e.g. $(...) or backticks would be
+          # executed as shell, not treated as a literal string. This is
+          # GitHub's own documented script-injection anti-pattern — see
+          # https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions#using-an-intermediate-environment-variable.
+          # Confirmed exploitable here via a hostile-audit repro before this
+          # fix (a tag like v1.0.0$(...) matches this workflow's own
+          # `v[0-9]*` trigger). $TAG below is a real environment variable,
+          # which bash never re-interprets as script source.
+          TAG: ${{ github.ref_name }}
         run: |
           TARGET="${{ matrix.target }}"
-          TAG="${{ github.ref_name }}"
           mkdir -p dist
           cp "target/${TARGET}/release-min/supply-drop-bbs" \
              "dist/supply-drop-bbs-${TAG}-${TARGET}"
@@ -98,9 +174,12 @@ jobs:
       # it can use the raw binary. The .deb installs to the standard paths and
       # wires up the systemd unit without requiring a cloned repo or root curl.
       - name: Package as .deb
+        # TAG via env, not interpolated directly — see "Stage full binary"'s
+        # env block above for why (script-injection via a hostile tag name).
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           TARGET="${{ matrix.target }}"
-          TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
 
           case "$TARGET" in
@@ -122,6 +201,7 @@ jobs:
           mkdir -p "${PKG}/lib/udev/rules.d"
           mkdir -p "${PKG}/etc/supply-drop-bbs"
           mkdir -p "${PKG}/var/lib/supply-drop-bbs"
+          mkdir -p "${PKG}/usr/share/supply-drop-bbs/pymc-companion"
 
           # Binary
           cp "dist/supply-drop-bbs-${TAG}-${TARGET}" \
@@ -135,6 +215,16 @@ jobs:
           # udev rule — grants the service serial-port access across distros
           cp packaging/70-supply-drop-bbs.rules \
              "${PKG}/lib/udev/rules.d/70-supply-drop-bbs.rules"
+
+          # pymc-companion (MeshCore Pi HAT bridge) script + unit, bundled so
+          # postinst can self-update an already-configured HAT bridge on
+          # every future .deb upgrade with no cloned repo available (see
+          # supply-drop-bbs-536 / #243) — not used for first-time HAT setup,
+          # which still goes through install.sh's guided wizard.
+          cp contrib/pymc-companion/pymc-companion.py \
+             "${PKG}/usr/share/supply-drop-bbs/pymc-companion/pymc-companion.py"
+          cp contrib/pymc-companion/pymc-companion.service \
+             "${PKG}/usr/share/supply-drop-bbs/pymc-companion/pymc-companion.service"
 
           # control — dpkg extended description continuation lines need exactly
           # one leading space, which is produced here by the YAML indentation.
@@ -162,13 +252,16 @@ jobs:
       # 2. Headless — no admin web UI; smaller binary for resource-constrained nodes
       - name: Build — headless (cli + mesh, no web)
         run: |
-          cargo build --profile release-min --target ${{ matrix.target }} \
+          cross build --profile release-min --target ${{ matrix.target }} \
             --no-default-features --features transport-cli,transport-mesh
 
       - name: Stage headless binary
+        # TAG via env, not interpolated directly — see "Stage full binary"'s
+        # env block above for why (script-injection via a hostile tag name).
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           TARGET="${{ matrix.target }}"
-          TAG="${{ github.ref_name }}"
           cp "target/${TARGET}/release-min/supply-drop-bbs" \
              "dist/supply-drop-bbs-${TAG}-${TARGET}-headless"
 

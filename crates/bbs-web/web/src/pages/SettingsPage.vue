@@ -330,15 +330,33 @@ const accessPolicySaving = ref(false)
 const accessPolicySaveOk = ref<string | null>(null)
 const accessPolicySaveError = ref<string | null>(null)
 
+// Saving with the checkbox on and an empty name sends `guest_room: null` to
+// the API (the "disable" signal) — the box then visibly un-checks itself on
+// the next load with no explanation of why. Block save instead of letting
+// that happen silently.
+const guestRoomNameMissing = computed(
+  () => apGuestRoomEnabled.value && apGuestRoom.value.trim() === ''
+)
+
+const GUEST_ROOM_ERROR = 'Enter a guest room name, or uncheck "Allow unverified users to access a guest room" above.'
+
+// A server-side `guest_room: ""` (empty, non-null — reachable via a
+// hand-edited config.toml or a raw PATCH) must NOT be treated as "enabled
+// with a name": that would trip guestRoomNameMissing immediately on load,
+// blocking Save before the sysop has touched anything.
+function applyAccessPolicy(p: AccessPolicyData) {
+  apRequireVerify.value    = p.require_verify
+  apGuestRoomEnabled.value = !!p.guest_room?.trim()
+  apGuestRoom.value        = p.guest_room ?? ''
+}
+
 async function loadAccessPolicy() {
   accessPolicyLoading.value = true
   accessPolicyError.value = null
   try {
     const p = await api.get<AccessPolicyData>('/api/v1/access-policy')
     accessPolicy.value = p
-    apRequireVerify.value    = p.require_verify
-    apGuestRoomEnabled.value = p.guest_room != null
-    apGuestRoom.value        = p.guest_room ?? ''
+    applyAccessPolicy(p)
   } catch (e: any) {
     accessPolicyError.value = e?.message ?? 'failed to load access policy'
   } finally {
@@ -347,6 +365,11 @@ async function loadAccessPolicy() {
 }
 
 async function saveAccessPolicy() {
+  if (guestRoomNameMissing.value) {
+    accessPolicySaveOk.value = null
+    accessPolicySaveError.value = GUEST_ROOM_ERROR
+    return
+  }
   accessPolicySaving.value   = true
   accessPolicySaveOk.value   = null
   accessPolicySaveError.value = null
@@ -359,9 +382,7 @@ async function saveAccessPolicy() {
     }
     const updated = await api.patch<AccessPolicyData>('/api/v1/access-policy', patch)
     accessPolicy.value       = updated
-    apRequireVerify.value    = updated.require_verify
-    apGuestRoomEnabled.value = updated.guest_room != null
-    apGuestRoom.value        = updated.guest_room ?? ''
+    applyAccessPolicy(updated)
     accessPolicySaveOk.value = 'Access policy updated. Changes take effect immediately.'
   } catch (e: any) {
     accessPolicySaveError.value = e?.message ?? 'failed to save access policy'
@@ -1230,7 +1251,7 @@ chmod g+w {{ configFile }}</pre>
           </p>
         </div>
 
-        <div v-if="apGuestRoomEnabled" class="field">
+        <div v-if="apGuestRoomEnabled" class="field" :class="{ 'has-error': guestRoomNameMissing }">
           <label>Guest room name</label>
           <input
             v-model="apGuestRoom"
@@ -1239,7 +1260,8 @@ chmod g+w {{ configFile }}</pre>
             :disabled="accessPolicyLoading"
             style="max-width: 260px"
           />
-          <p v-if="accessPolicy?.guest_room_id != null" class="hint">
+          <p v-if="guestRoomNameMissing" class="field-error">{{ GUEST_ROOM_ERROR }}</p>
+          <p v-else-if="accessPolicy?.guest_room_id != null" class="hint">
             Room ID: {{ accessPolicy.guest_room_id }}
           </p>
         </div>
@@ -1247,7 +1269,7 @@ chmod g+w {{ configFile }}</pre>
         <div class="actions">
           <button
             type="button"
-            :disabled="accessPolicySaving || accessPolicyLoading"
+            :disabled="accessPolicySaving || accessPolicyLoading || guestRoomNameMissing"
             @click="saveAccessPolicy"
           >
             {{ accessPolicySaving ? 'saving…' : 'save access policy' }}

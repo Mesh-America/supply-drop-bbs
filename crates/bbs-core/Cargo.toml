@@ -17,6 +17,8 @@ bbs-plugin-api.workspace = true
 
 argon2.workspace      = true
 async-trait.workspace = true
+fd-lock.workspace     = true
+libc.workspace        = true
 serde.workspace       = true
 sqlx.workspace        = true
 thiserror.workspace   = true

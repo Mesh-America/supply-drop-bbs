@@ -73,7 +73,10 @@ struct Existing {
     // pymc-companion (HAT)
     region_idx: usize,
     hat_idx: usize,
-    // USB serial radio config (None = not configured)
+    // [plugins.mesh.radio] — applies to every connection type, not just
+    // serial (pushed to the device on every companion-frame connect; see
+    // the comment above the `mesh_radio` prompt for the full explanation).
+    // None = not configured.
     mesh_radio: Option<RadioChoice>,
     // GPS
     latitude: Option<f64>,
@@ -249,7 +252,9 @@ fn load_existing(out_path: &Path) -> Existing {
     let yaml_path = companion_yaml_path(out_path);
     let yaml = fs::read_to_string(&yaml_path).unwrap_or_default();
 
-    // USB serial radio config — reconstruct from [plugins.mesh.radio]
+    // [plugins.mesh.radio] (any connection type) — reconstruct from the
+    // existing config file so re-running the wizard defaults to what's
+    // already there
     let mesh_radio: Option<RadioChoice> = {
         let radio = mesh.and_then(|m| m.get("radio"));
         if let Some(radio) = radio {
@@ -662,18 +667,37 @@ pub fn run_wizard(config_out: Option<&Path>) {
         ex.mesh_path_bytes
     };
 
-    // ── MeshCore radio parameters (serial mode only) ──────────────────────────
+    // ── MeshCore radio parameters (all connection types) ──────────────────────
     //
-    // For HAT mode, radio parameters go into pymc-companion.yaml (handled
-    // later by configure_hat). For TCP mode, openhop_core owns the radio config.
-    // Only USB serial devices are configured here.
+    // [plugins.mesh.radio], if configured, is pushed to the radio on every
+    // companion-frame connect regardless of transport — bbs-mesh's
+    // sync_radio_params_if_configured() runs uniformly off the SelfInfo the
+    // device reports on connect, with no connection-type branching anywhere
+    // near it (verified by tracing crates/bbs-mesh/src/transport.rs). That
+    // includes Pi HAT (connects to pymc-companion over TCP to 127.0.0.1:5000,
+    // the same companion-frame protocol as a direct serial link) and TCP mode
+    // generally. Gating this prompt to "serial" only predates that sync
+    // behavior and left HAT/TCP operators with no way to set it from the
+    // wizard, even though the web admin's "MeshCore radio" section has shown
+    // an "Apply to device" button for every connection type since that sync
+    // behavior was added (its hint text already describes applying on every
+    // connect, regardless of transport). See supply-drop-bbs-xmv / #224.
 
-    let mesh_radio: Option<RadioChoice> = if use_mesh && mesh_conn_type == "serial" {
+    let mesh_radio: Option<RadioChoice> = if use_mesh {
         section("MeshCore radio parameters");
 
         println!("Select a region preset to configure the radio, or choose Custom to");
         println!("enter individual LoRa parameters. Skip if the device is already");
         println!("on the correct frequency.");
+        if mesh_conn_type == "hat" {
+            println!();
+            println!("This sets [plugins.mesh.radio] in config.toml, pushed to the radio");
+            println!("over the companion-frame link on every connect. The Pi HAT setup");
+            println!("step below asks for a region too, to initialise the physical radio");
+            println!("chip at boot — pick the same region both times to avoid a mismatch");
+            println!("(this step's value wins once connected either way, but a matching");
+            println!("choice avoids the radio switching frequency on first connect).");
+        }
         println!();
 
         let configure = Confirm::with_theme(&theme)
@@ -1752,6 +1776,7 @@ const HAT_PRESETS: &[HatPreset] = &[
 struct HatParams {
     bbs_name: String,
     identity_path: String,
+    contacts_db_path: String,
     region: usize,
     preset: usize,
 }
@@ -1787,6 +1812,10 @@ fn configure_hat(
         bbs_name: bbs_name.to_owned(),
         identity_path: data_dir
             .join("companion.key")
+            .to_string_lossy()
+            .into_owned(),
+        contacts_db_path: data_dir
+            .join("pymc-companion-contacts.db")
             .to_string_lossy()
             .into_owned(),
         region: region_choice,
@@ -1828,10 +1857,12 @@ fn build_companion_yaml(p: &HatParams) -> String {
     writeln!(s, "  bind_address: \"127.0.0.1\"").unwrap();
     writeln!(
         s,
-        "  adv_type: 3  # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor"
+        "  adv_type: 1  # 1=Chat, 2=Repeater, 3=Room, 4=Sensor — leave at 1, \
+         see pymc-companion.yaml.example (supply-drop-bbs / #281)"
     )
     .unwrap();
     writeln!(s, "  autoadd_config: 0x0F").unwrap();
+    writeln!(s, "  contacts_db_path: {:?}", p.contacts_db_path).unwrap();
     writeln!(s).unwrap();
     writeln!(s, "radio:").unwrap();
     writeln!(s, "  frequency: {}", r.frequency_hz).unwrap();
@@ -1851,6 +1882,29 @@ fn build_companion_yaml(p: &HatParams) -> String {
     writeln!(s, "  use_dio2_rf: {}", h.dio2).unwrap();
     writeln!(s, "  use_dio3_tcxo: {}", h.dio3).unwrap();
     if h.gpiod {
+        // Known upstream bug (not fixable from this repo): openhop_core's
+        // GPIOPinManager only defines its gpiod wrapper class under the
+        // "auto" backend-detection path, not when a caller explicitly
+        // requests backend="gpiod" the way SX1262Radio does here — the
+        // module-level GPIO name is left bound to whatever it was at
+        // import (None on these presets, since install.sh's gpiod branch
+        // doesn't install python-periphery either), so the first real GPIO
+        // call fails with `TypeError: 'NoneType' object is not callable`,
+        // traced via openhop_core's source (not confirmed on live
+        // hardware). Flagged here so an operator who hits that error on
+        // this preset knows it's a known issue, not something specific to
+        // their setup. See supply-drop-bbs-85n / #234.
+        writeln!(
+            s,
+            "  # NOTE: see supply-drop-bbs-85n / #234 if GPIO calls fail"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "  # with TypeError: 'NoneType' object is not callable --"
+        )
+        .unwrap();
+        writeln!(s, "  # known upstream openhop_core gpiod bug.").unwrap();
         writeln!(s, "  use_gpiod_backend: true").unwrap();
         writeln!(s, "  gpio_chip: {}", h.gpio_chip).unwrap();
     }
@@ -1902,7 +1956,7 @@ struct TomlParams<'a> {
     share_in_advert: bool,
     // Process plugins — preserved verbatim from the previous config
     process_plugins_toml: Option<&'a str>,
-    // USB serial radio config (None = omit section)
+    // [plugins.mesh.radio] (any connection type, None = omit section)
     mesh_radio: Option<&'a RadioChoice>,
 }
 
@@ -1970,8 +2024,11 @@ fn build_toml(p: &TomlParams<'_>) -> String {
         }
     }
 
-    // [plugins.mesh.radio] — only for USB serial with a radio config chosen
-    if p.use_mesh && p.mesh_connection_type == "serial" {
+    // [plugins.mesh.radio] — any connection type, when a radio config was
+    // chosen. See the wizard-side comment above `mesh_radio` for why this
+    // isn't limited to serial: bbs-mesh applies it on every connect
+    // regardless of transport.
+    if p.use_mesh && p.mesh_radio.is_some() {
         match p.mesh_radio {
             Some(RadioChoice::Preset(idx)) => {
                 if let Some(preset) = REGION_PRESETS.get(*idx) {
@@ -2350,4 +2407,98 @@ fn prompt_select<S: ToString>(
 fn cancelled() -> ! {
     println!("\nSetup cancelled.");
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod build_toml_tests {
+    use super::*;
+
+    // bbs-mesh applies [plugins.mesh.radio] on every companion-frame connect
+    // regardless of transport (crates/bbs-mesh/src/transport.rs's
+    // sync_radio_params_if_configured, called unconditionally from the
+    // Connected event handler) — so the wizard must be able to write that
+    // section for every connection type, not just serial (supply-drop-bbs-xmv
+    // / #224). These guard the two conditions that regressed relative to that
+    // runtime behavior.
+
+    fn base_params<'a>(
+        mesh_connection_type: &'a str,
+        mesh_radio: Option<&'a RadioChoice>,
+    ) -> TomlParams<'a> {
+        TomlParams {
+            bbs_name: "Test BBS",
+            data_dir: Path::new("/var/lib/supply-drop-bbs"),
+            use_mesh: true,
+            mesh_connection_type,
+            mesh_serial_port: None,
+            mesh_baud_rate: None,
+            mesh_addr: None,
+            mesh_path_bytes: 3,
+            use_meshtastic: false,
+            meshtastic_connection_type: "serial",
+            meshtastic_serial_port: None,
+            meshtastic_baud_rate: None,
+            meshtastic_addr: None,
+            meshtastic_radio_region: None,
+            meshtastic_radio_preset: None,
+            meshtastic_short_name: None,
+            meshtastic_long_name: None,
+            web_enabled: false,
+            web_bind: None,
+            web_backup_dir: None,
+            latitude: None,
+            longitude: None,
+            share_in_advert: true,
+            process_plugins_toml: None,
+            mesh_radio,
+        }
+    }
+
+    #[test]
+    fn radio_section_written_for_hat_when_configured() {
+        let radio = RadioChoice::Preset(0);
+        let toml = build_toml(&base_params("hat", Some(&radio)));
+        assert!(
+            toml.contains("[plugins.mesh.radio]"),
+            "hat connection with a configured radio must write [plugins.mesh.radio]:\n{toml}"
+        );
+    }
+
+    #[test]
+    fn radio_section_written_for_tcp_when_configured() {
+        let radio = RadioChoice::Custom {
+            frequency_hz: 910_525_000,
+            bandwidth_hz: 62_500,
+            spreading_factor: 7,
+            coding_rate: 5,
+            tx_power_dbm: 22,
+        };
+        let toml = build_toml(&base_params("tcp", Some(&radio)));
+        assert!(
+            toml.contains("[plugins.mesh.radio]"),
+            "tcp connection with a configured radio must write [plugins.mesh.radio]:\n{toml}"
+        );
+        assert!(toml.contains("frequency_hz     = 910525000"));
+    }
+
+    #[test]
+    fn radio_section_omitted_when_not_configured_regardless_of_connection_type() {
+        for conn_type in ["serial", "hat", "tcp"] {
+            let toml = build_toml(&base_params(conn_type, None));
+            assert!(
+                !toml.contains("[plugins.mesh.radio]"),
+                "{conn_type} connection with no radio choice must NOT write [plugins.mesh.radio]:\n{toml}"
+            );
+        }
+    }
+
+    #[test]
+    fn radio_section_still_written_for_serial_when_configured() {
+        let radio = RadioChoice::Preset(0);
+        let toml = build_toml(&base_params("serial", Some(&radio)));
+        assert!(
+            toml.contains("[plugins.mesh.radio]"),
+            "serial (the pre-existing, already-working case) must be unaffected by this fix:\n{toml}"
+        );
+    }
 }

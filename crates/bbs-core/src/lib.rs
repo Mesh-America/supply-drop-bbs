@@ -28,6 +28,7 @@
 //! Domain types + persistence layer. Command processing and the
 //! concrete `Host` implementation come in subsequent commits.
 
+pub mod config_lock;
 pub mod db;
 pub mod host;
 pub mod ids;
