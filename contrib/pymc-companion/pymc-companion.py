@@ -276,8 +276,21 @@ async def run(config: dict) -> None:
 
     node_name = companion_cfg.get("node_name", "Supply Drop BBS")
     # adv_type controls what node type is advertised on the mesh.
-    # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor. Default: 3 (Room/BBS).
-    adv_type_val = int(companion_cfg.get("adv_type", 3))
+    # 1=Chat, 2=Repeater, 3=Room, 4=Sensor. Default: 1 (Chat).
+    #
+    # MUST stay 1 (Chat) unless the BBS itself implements MeshCore's
+    # protocol-level Room/Repeater login handshake (CMD_SEND_LOGIN /
+    # PUSH_CODE_LOGIN_SUCCESS — see crates/meshcore-companion). Companion
+    # apps treat a Room/Repeater-type contact as requiring that login
+    # exchange before the user can send it anything, and never fall back to
+    # a plain direct message. The BBS only understands plain text messages
+    # (its own username/password flow runs *inside* those, as ordinary
+    # message content) — advertising as Room made every companion app try
+    # to log in first and the user could never reach the BBS's actual
+    # login prompt (supply-drop-bbs / #281). adv_type=3 was tried in #100
+    # to fix cosmetic mis-categorization in companion app contact lists;
+    # that trade-off is not worth breaking the core DM flow.
+    adv_type_val = int(companion_cfg.get("adv_type", 1))
     radio_params = {
         "frequency":        radio_kwargs["frequency"],
         "bandwidth":        radio_kwargs["bandwidth"],

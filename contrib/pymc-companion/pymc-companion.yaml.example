@@ -15,8 +15,14 @@ companion:
   bind_address: "127.0.0.1"
 
   # Node type advertised on the mesh.
-  # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor. Default: 3 (Room/BBS).
-  adv_type: 3
+  # 1=Chat, 2=Repeater, 3=Room, 4=Sensor. Default: 1 (Chat).
+  #
+  # Leave this at 1. Room/Repeater (2/3) make companion apps require a
+  # protocol-level login handshake before the user can send anything, which
+  # this BBS does not implement — the app never gets past "logging in" and
+  # the user can't reach the BBS's own (message-based) login prompt at all
+  # (supply-drop-bbs / #281).
+  adv_type: 1
 
   # Auto-add bitmask: 0x01=overwrite_oldest 0x02=chat 0x04=repeater 0x08=room
   # 0x10=sensor. 0x0F adds chat/repeater/room (NOT sensor) and evicts the
