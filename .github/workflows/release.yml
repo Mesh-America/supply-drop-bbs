@@ -201,6 +201,7 @@ jobs:
           mkdir -p "${PKG}/lib/udev/rules.d"
           mkdir -p "${PKG}/etc/supply-drop-bbs"
           mkdir -p "${PKG}/var/lib/supply-drop-bbs"
+          mkdir -p "${PKG}/usr/share/supply-drop-bbs/pymc-companion"
 
           # Binary
           cp "dist/supply-drop-bbs-${TAG}-${TARGET}" \
@@ -214,6 +215,16 @@ jobs:
           # udev rule — grants the service serial-port access across distros
           cp packaging/70-supply-drop-bbs.rules \
              "${PKG}/lib/udev/rules.d/70-supply-drop-bbs.rules"
+
+          # pymc-companion (MeshCore Pi HAT bridge) script + unit, bundled so
+          # postinst can self-update an already-configured HAT bridge on
+          # every future .deb upgrade with no cloned repo available (see
+          # supply-drop-bbs-536 / #243) — not used for first-time HAT setup,
+          # which still goes through install.sh's guided wizard.
+          cp contrib/pymc-companion/pymc-companion.py \
+             "${PKG}/usr/share/supply-drop-bbs/pymc-companion/pymc-companion.py"
+          cp contrib/pymc-companion/pymc-companion.service \
+             "${PKG}/usr/share/supply-drop-bbs/pymc-companion/pymc-companion.service"
 
           # control — dpkg extended description continuation lines need exactly
           # one leading space, which is produced here by the YAML indentation.

@@ -37,6 +37,98 @@ case "$1" in
       udevadm trigger --subsystem-match=tty --action=add || true
     fi
 
+    # ── MeshCore Pi HAT bridge (pymc-companion) self-update ──────────────────
+    # /opt/pymc-companion only exists if a HAT was already configured (by
+    # install.sh's guided wizard — this package has no standalone path to
+    # set one up fresh). On every .deb upgrade, bring an existing bridge's
+    # script/unit/dependency current too, mirroring what install.sh's HAT
+    # block does, so upgrading via `.deb`/`apt upgrade` alone doesn't leave
+    # it silently running stale code forever (see supply-drop-bbs-536 /
+    # #243 — this exact gap caused a real production incident: a host
+    # upgraded via the documented .deb one-liner kept running the
+    # pre-openhop_core pymc-companion.py for hours with no indication
+    # anything was wrong).
+    #
+    # Runs BEFORE supply-drop-bbs.service is (re)started below: the BBS
+    # connects out to pymc-companion (Before=supply-drop-bbs.service in
+    # pymc-companion.service), so restarting the BBS first and bouncing
+    # pymc-companion second would cut the just-reconnected BBS's HAT link
+    # again moments later.
+    #
+    # Accepted risk, not fixed here: `pip install --upgrade` below runs as
+    # root with no version pin, same as install.sh's own openhop-core
+    # install (supply-drop-bbs-9bs's accepted-risk stance covers it there)
+    # — but this path now runs unattended on every future `apt upgrade`,
+    # not just a deliberate one-time wizard run, which is a meaningfully
+    # larger unattended-root-RCE-on-compromised-PyPI-release window. Not
+    # rushed in given #243's own urgency; tracked separately.
+    #
+    # Wrapped so any failure here is a warning, never a fatal error: a
+    # HAT-bridge update problem must not abort the core BBS package
+    # install/upgrade transaction. set +e/set -e brackets the subshell so
+    # it runs as a bare statement, not as an operand of && or || — POSIX
+    # suppresses `set -e` INSIDE a subshell that's part of an AND-OR list
+    # at the outer level (a well-known dash/bash gotcha: `(set -e; false;
+    # cmd) && ok || fail` still runs `cmd` after the `false`, since the
+    # subshell's own errexit gets suppressed too, not just the outer
+    # script's). A bare `(set -e; ...)` statement, with the outer script's
+    # own errexit temporarily off, correctly stops at the first failing
+    # command inside AND doesn't abort the outer postinst script either —
+    # verified both properties with a repro before relying on this.
+    PYMC_DIR="/opt/pymc-companion"
+    PYMC_UNIT="/etc/systemd/system/pymc-companion.service"
+    PYMC_SHARE="/usr/share/supply-drop-bbs/pymc-companion"
+    # Shared with install.sh's HAT block, which takes the same lock around
+    # its own venv/pip writes — without it, `apt upgrade` racing a manual
+    # `sudo supply-drop-bbs setup` on the same host could run two
+    # unsynchronized `pip install`s against the same venv concurrently.
+    PYMC_LOCK="$PYMC_DIR/.pymc-companion-update.lock"
+
+    if [ -d "$PYMC_DIR" ]; then
+      if [ -x "$PYMC_DIR/venv/bin/pip" ]; then
+        echo ""
+        echo "Detected MeshCore Pi HAT bridge at $PYMC_DIR — updating..."
+        set +e
+        (
+          set -e
+          # Non-blocking: if install.sh's HAT setup is running concurrently
+          # and already holds the lock, skip this cycle instead of racing
+          # it or blocking dpkg's own transaction indefinitely. The next
+          # upgrade retries.
+          exec 9>"$PYMC_LOCK"
+          flock -n 9 || { echo "pymc-companion setup is running concurrently -- skipping this update cycle (will retry next upgrade)." >&2; exit 2; }
+
+          install -m 755 "$PYMC_SHARE/pymc-companion.py" \
+            "$PYMC_DIR/pymc-companion.py"
+          install -m 644 "$PYMC_SHARE/pymc-companion.service" "$PYMC_UNIT"
+          # timeout bounds a stalled/degraded-network pip against holding
+          # dpkg's transaction lock indefinitely on a routine upgrade.
+          timeout 60 "$PYMC_DIR/venv/bin/pip" install -q --upgrade openhop-core
+          if command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload
+            systemctl restart pymc-companion.service
+            # Type=simple reports `restart` success as soon as the process
+            # forks, not once it's actually up -- confirm it didn't
+            # immediately crash-loop instead of silently declaring victory.
+            sleep 1
+            systemctl is-active --quiet pymc-companion.service
+          fi
+        )
+        _pymc_status=$?
+        set -e
+        case "$_pymc_status" in
+          0) echo "pymc-companion updated and restarted." ;;
+          2) : ;; # already explained itself above, nothing more to say
+          *) echo "Warning: pymc-companion self-update failed -- update it manually (see docs/OPERATIONS.md). The main supply-drop-bbs service is unaffected." >&2 ;;
+        esac
+        echo ""
+      else
+        echo ""
+        echo "Warning: $PYMC_DIR exists but its venv looks broken (no venv/bin/pip) -- skipping pymc-companion self-update. Reinstall it manually (see docs/OPERATIONS.md)." >&2
+        echo ""
+      fi
+    fi
+
     if command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload || true
 
