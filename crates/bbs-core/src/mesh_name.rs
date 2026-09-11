@@ -107,25 +107,68 @@ pub fn validate_mesh_node_name(s: &str, sharing_location: bool) -> Result<(), In
     Ok(())
 }
 
+/// Whether `c` is a Unicode codepoint that can spoof displayed text without
+/// being caught by [`char::is_control`] — `validate_mesh_node_name` only
+/// rejects `Cc` (Control) characters, not `Cf` (Format): the bidirectional
+/// overrides/embeddings/isolates (e.g. U+202E RIGHT-TO-LEFT OVERRIDE), the
+/// zero-width joiner/non-joiner, and the byte-order mark all fall under
+/// General_Category=Format, not Control, and can make a node name render as
+/// something other than its actual bytes wherever it's displayed.
+///
+/// This covers the Format category specifically (supply-drop-bbs / #228's
+/// reported vector), not every way Unicode can be used to mislead a reader —
+/// stacked combining marks ("zalgo" text, category Mn/Me) and confusable
+/// homoglyphs are different techniques this does not address, and are not
+/// filtered here since Mn is also how ordinary accented text in many
+/// languages is represented; blocking it would break legitimate names.
+fn is_display_spoofing_codepoint(c: char) -> bool {
+    use unicode_properties::UnicodeGeneralCategory as _;
+    c.general_category() == unicode_properties::GeneralCategory::Format
+}
+
+/// Strip Unicode display-spoofing codepoints from `s` — no length
+/// limit applied. For contexts that display `bbs.name` but aren't
+/// constrained by MeshCore's advert byte budget, e.g. the connect-time
+/// welcome banner's `{name}` substitution. [`truncate_mesh_node_name`] is
+/// preferred wherever the advert length budget also applies; this is that
+/// function's stripping step, factored out for callers where it doesn't
+/// (supply-drop-bbs / #228).
+#[must_use]
+pub fn strip_display_spoofing_codepoints(s: &str) -> String {
+    s.chars()
+        .filter(|c| !is_display_spoofing_codepoint(*c))
+        .collect()
+}
+
 /// Truncate `s` to at most [`max_mesh_node_name_bytes`] bytes for the given
 /// `sharing_location` **without splitting a UTF-8 character** — a multi-byte
-/// emoji at the boundary is dropped whole rather than cut mid-codepoint.
+/// emoji at the boundary is dropped whole rather than cut mid-codepoint —
+/// and strip any Unicode display-spoofing codepoints (see
+/// [`strip_display_spoofing_codepoints`]).
 ///
 /// This is the defensive last line of defence on the advert output path: input
 /// is validated up front, but a hand-edited config could still carry an
-/// over-length name — or a valid name could be paired with location-sharing
-/// turned on afterward — and an over-length advert is silently un-deliverable.
+/// over-length or spoofing-capable name — or a valid name could be paired
+/// with location-sharing turned on afterward — and both an over-length
+/// advert and a spoofed display are failure modes this function exists to
+/// close regardless of how the name reached it (supply-drop-bbs / #228).
+///
+/// Stripping runs before the byte-budget trim, so the budget is measured
+/// against what will actually be sent, not bytes that are about to be
+/// removed anyway.
 #[must_use]
-pub fn truncate_mesh_node_name(s: &str, sharing_location: bool) -> &str {
+pub fn truncate_mesh_node_name(s: &str, sharing_location: bool) -> String {
+    let cleaned = strip_display_spoofing_codepoints(s);
+
     let max = max_mesh_node_name_bytes(sharing_location);
-    if s.len() <= max {
-        return s;
+    if cleaned.len() <= max {
+        return cleaned;
     }
     let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
+    while end > 0 && !cleaned.is_char_boundary(end) {
         end -= 1;
     }
-    &s[..end]
+    cleaned[..end].to_owned()
 }
 
 #[cfg(test)]
@@ -246,7 +289,7 @@ mod tests {
             "got {} bytes",
             out.len()
         );
-        assert!(name.starts_with(out));
+        assert!(name.starts_with(&out));
         assert_ne!(out, name, "an over-length name must actually be truncated");
     }
 
@@ -267,7 +310,7 @@ mod tests {
             "got {} bytes",
             out.len()
         );
-        assert!(name.starts_with(out));
+        assert!(name.starts_with(&out));
     }
 
     #[test]
@@ -299,6 +342,82 @@ mod tests {
              plus all 14 'A's), dropping the trailing 🌎 whole rather than \
              emitting a truncated/invalid byte sequence for it"
         );
-        assert!(name.starts_with(out));
+        assert!(name.starts_with(&out));
+    }
+
+    #[test]
+    fn strip_display_spoofing_codepoints_has_no_length_limit() {
+        // Unlike truncate_mesh_node_name, this must never shorten a name
+        // for byte-budget reasons — only spoofing codepoints come out.
+        let long_clean = "a".repeat(100);
+        assert_eq!(strip_display_spoofing_codepoints(&long_clean), long_clean);
+
+        let name = format!("\u{202E}{long_clean}");
+        assert_eq!(strip_display_spoofing_codepoints(&name), long_clean);
+    }
+
+    #[test]
+    fn truncate_strips_rtl_override() {
+        // supply-drop-bbs#228: "Admin" preceded by U+202E RIGHT-TO-LEFT
+        // OVERRIDE renders reversed ("nimdA") wherever it's displayed, even
+        // though the actual bytes are unchanged — a display-spoofing vector
+        // char::is_control() (used by validate_mesh_node_name) never catches,
+        // since U+202E is General_Category=Format, not Control.
+        let name = "\u{202E}Admin BBS";
+        let out = truncate_mesh_node_name(name, false);
+        assert_eq!(out, "Admin BBS");
+        assert!(!out.contains('\u{202E}'));
+    }
+
+    #[test]
+    fn truncate_strips_zero_width_and_bom_characters() {
+        let name = "Mesh\u{200D}\u{200C}\u{FEFF} BBS";
+        let out = truncate_mesh_node_name(name, false);
+        assert_eq!(out, "Mesh BBS");
+    }
+
+    #[test]
+    fn truncate_leaves_legitimate_unicode_untouched() {
+        // Must not over-filter: accented letters and emoji are not Format
+        // codepoints and must survive unchanged.
+        for name in ["Café Node", "🇺🇸 Mesh America BBS", "日本語ノード"] {
+            assert_eq!(truncate_mesh_node_name(name, false), name);
+        }
+    }
+
+    #[test]
+    fn truncate_becomes_empty_for_an_all_spoofing_name() {
+        let name = "\u{202E}\u{200D}\u{200C}";
+        assert_eq!(truncate_mesh_node_name(name, false), "");
+    }
+
+    #[test]
+    fn truncate_strips_and_length_trims_together() {
+        // A name that only overflows the byte budget once you count the
+        // (soon to be removed) spoofing characters must NOT be truncated
+        // short of the real limit — stripping must happen before the
+        // byte-budget trim, not after, so the budget reflects what's
+        // actually sent.
+        let clean = "a".repeat(31);
+        let name = format!("\u{202E}{clean}\u{200D}");
+        assert_eq!(name.len(), 31 + 3 + 3, "fixture sanity: 3-byte codepoints");
+        let out = truncate_mesh_node_name(&name, false);
+        assert_eq!(out, clean, "the full 31 legitimate bytes must survive");
+    }
+
+    #[test]
+    fn validate_does_not_reject_format_codepoints() {
+        // Deliberately documents the current, intentional split: rejection
+        // only happens for Cc (Control) at the three input surfaces;
+        // sanitization of Cf (Format) happens only in
+        // truncate_mesh_node_name, the shared choke point right before
+        // every advert transmission (supply-drop-bbs#228's chosen fix, to
+        // avoid duplicating rejection logic across the CLI, web, and setup
+        // wizard input surfaces, and so it also covers a hand-edited
+        // config.toml that never went through any of them). If this
+        // assertion starts failing, `is_display_spoofing_codepoint`
+        // coverage and `validate_mesh_node_name` have diverged from that
+        // design — reconcile deliberately, don't just update the test.
+        assert!(validate_mesh_node_name("\u{202E}Admin BBS", false).is_ok());
     }
 }

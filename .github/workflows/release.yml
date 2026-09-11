@@ -92,6 +92,13 @@ jobs:
       # bumped without checking cross@0.2.5 compatibility, the failure mode
       # is unverified (could be a clear compile error inside the container,
       # or something subtler). Check both together when bumping either.
+      #
+      # @master below is a floating ref, same shape as the ubuntu-latest
+      # mistake that caused #238 -- but this one is deliberate: it's this
+      # action's own documented, maintainer-recommended pattern for
+      # passing an explicit toolchain input (dtolnay/rust-toolchain only
+      # ever had one tag, v1, and master has since moved past it). Not an
+      # oversight; see supply-drop-bbs-0b9 / #262.
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
         with:

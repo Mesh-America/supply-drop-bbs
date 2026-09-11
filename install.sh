@@ -57,17 +57,21 @@ warn()    { echo -e "${YELLOW}  !${NC} $*"; }
 die()     { echo -e "${RED}  ✗${NC} $*" >&2; exit 1; }
 
 # ── Flag parsing ──────────────────────────────────────────────────────────────
+# UNINSTALL is set from anywhere in the argument list, not just $1 — e.g.
+# `--skip-verify --uninstall` must still uninstall, not silently fall
+# through to a normal install/update (supply-drop-bbs-r18 / #260).
+UNINSTALL=0
 for arg in "$@"; do
     case "$arg" in
         --skip-verify) SKIP_VERIFY=1 ;;
-        --uninstall)   : ;;  # handled below
+        --uninstall)   UNINSTALL=1 ;;
         *) die "Unknown flag: $arg" ;;
     esac
 done
 
 # ── Uninstaller ───────────────────────────────────────────────────────────────
 
-if [[ "${1:-}" == "--uninstall" ]]; then
+if [[ "$UNINSTALL" -eq 1 ]]; then
     echo
     if command -v figlet &>/dev/null; then
         echo -e "${GREEN}$(figlet "Supply Drop" 2>/dev/null || echo "  Supply Drop")${NC}"
@@ -226,26 +230,75 @@ success "Base dependencies installed"
 #   • systemd unit files
 #   • pymc-companion scripts and service file
 # Even when installing a pre-built binary we still want these up to date.
+#
+# Accepted risk (supply-drop-bbs-9bs / #255): this fetches and checks out
+# $SRC_BRANCH over HTTPS with no signature or commit-SHA pinning beyond the
+# branch name — unlike the binary-download path below, which verifies
+# SHA256SUMS. Exploiting this needs a compromised maintainer account, PAT,
+# or CI credential, not a generic network MITM (the transport is HTTPS).
+# Full signed-tag verification would need release-signing infrastructure
+# this project doesn't have yet. The compensating control below is a loud
+# warning on an unexpected non-fast-forward jump — the shape a
+# rewritten-history attack (or a legitimate but surprising force-push)
+# would take.
 
-if [[ -d "$SRC_DIR/.git" ]]; then
+# Health probe, not just directory existence (supply-drop-bbs-6j7 / #257):
+# a `.git` left by an interrupted write (power loss, OOM-kill mid-clone)
+# can exist while being unreadable, so a bare `-d "$SRC_DIR/.git"` check
+# would take the "existing repo" branch forever and loop on the same
+# failing fetch/checkout under `set -e`, with no path back to a clean
+# re-clone.
+_src_dir_is_healthy_repo() {
+    [[ -d "$SRC_DIR/.git" ]] && git -C "$SRC_DIR" rev-parse --verify -q HEAD >/dev/null 2>&1
+}
+
+if [[ -d "$SRC_DIR" ]] && ! _src_dir_is_healthy_repo; then
+    if [[ -d "$SRC_DIR/.git" ]]; then
+        warn "$SRC_DIR/.git exists but looks corrupted (HEAD doesn't resolve) — re-cloning."
+        rm -rf "$SRC_DIR"
+    elif [[ -n "$(ls -A "$SRC_DIR" 2>/dev/null)" ]]; then
+        # Non-empty, non-git SRC_DIR: `git clone` below would fail with only
+        # its own raw, unhelpful error text (supply-drop-bbs-555 / #258).
+        die "$SRC_DIR exists, is not empty, and is not a git repository. Remove or empty it first: sudo rm -rf $SRC_DIR"
+    fi
+fi
+
+if _src_dir_is_healthy_repo; then
     info "Updating Supply Drop BBS source..."
-    # fetch + checkout -B (not `pull --ff-only`) so this self-heals an
-    # existing SRC_DIR left on the wrong branch by an older install — e.g.
-    # one cloned before this pin existed, when a bare `git clone` picked up
-    # whatever the repo's default branch was at the time.
-    #
-    # --force is required, not optional: on a real SRC_DIR with accumulated
-    # history (as opposed to a fresh clone), updating the local
-    # refs/remotes/origin/$SRC_BRANCH ref can be a non-fast-forward relative
-    # to what's already stored there — confirmed on a live host, where the
-    # unforced fetch below failed outright ("[rejected] ... non-fast-forward",
-    # exit 1). Under `set -e` that aborts the whole update instead of
-    # silently leaving a stale checkout, which is at least safe — but it
-    # defeats this block's entire purpose (self-healing an existing SRC_DIR
-    # onto the correct branch), so force it instead of letting it fail.
-    git -C "$SRC_DIR" fetch --depth 1 --force origin "$SRC_BRANCH:refs/remotes/origin/$SRC_BRANCH"
-    git -C "$SRC_DIR" checkout -B "$SRC_BRANCH" "origin/$SRC_BRANCH"
-    success "Source updated"
+
+    _old_head=$(git -C "$SRC_DIR" rev-parse HEAD)
+
+    # `checkout -B` (below) force-resets the branch ref, which is NOT
+    # subject to git's working-tree merge-safety check — an operator's own
+    # local commits on $SRC_BRANCH would otherwise be silently orphaned
+    # with no warning (supply-drop-bbs-p5u / #256). Back them up to a
+    # timestamped branch first, whenever the local HEAD isn't already
+    # reachable from what we're about to fetch (nothing to lose in that
+    # case — the normal, fast-forward-only path).
+    if git -C "$SRC_DIR" fetch --depth 1 --force origin \
+        "$SRC_BRANCH:refs/remotes/origin/$SRC_BRANCH"; then
+        _new_head=$(git -C "$SRC_DIR" rev-parse "origin/$SRC_BRANCH")
+        if [[ "$_old_head" != "$_new_head" ]] \
+            && ! git -C "$SRC_DIR" merge-base --is-ancestor "$_old_head" "$_new_head" 2>/dev/null; then
+            if git -C "$SRC_DIR" cat-file -e "$_old_head" 2>/dev/null; then
+                _backup_branch="pre-update-backup-$(date +%Y%m%d-%H%M%S)"
+                git -C "$SRC_DIR" branch "$_backup_branch" "$_old_head" 2>/dev/null || true
+                warn "$SRC_BRANCH's history diverged from what's already in $SRC_DIR" \
+                     "(local commits, or upstream history was rewritten) —" \
+                     "saved the previous state to branch '$_backup_branch' before updating."
+            fi
+        fi
+        git -C "$SRC_DIR" checkout -B "$SRC_BRANCH" "origin/$SRC_BRANCH"
+        success "Source updated"
+    else
+        # No offline fallback previously existed here — a failed fetch was
+        # a bare `set -e` abort of the whole script, even for a
+        # reconfigure-only run that needs nothing from SRC_DIR's git
+        # history (supply-drop-bbs-85b / #259).
+        warn "Could not fetch $SRC_BRANCH from $REPO — continuing with the" \
+             "existing local source (offline, or a network issue?)." \
+             "Some files may be out of date."
+    fi
 else
     info "Cloning Supply Drop BBS..."
     git clone --depth 1 --branch "$SRC_BRANCH" "$REPO" "$SRC_DIR"
@@ -648,7 +701,12 @@ if [[ "$_mesh_enabled" == true && "$_mesh_conn_type" == "hat" ]]; then
     exec 9>"$PYMC_DIR/.pymc-companion-update.lock"
     flock 9
     "$PYMC_DIR/venv/bin/pip" install -q --upgrade pip
-    "$PYMC_DIR/venv/bin/pip" install -q openhop-core pyyaml spidev
+    # Pinned exact version, not a floating "openhop-core" install — see
+    # OPENHOP_CORE_VERSION's own comment in packaging/postinst for why
+    # (supply-drop-bbs-6zu / #268). Keep this pin in sync with postinst's;
+    # a mismatch just means a wizard-run venv and an apt-upgraded venv can
+    # diverge, not a crash, but there's no reason to let that happen.
+    "$PYMC_DIR/venv/bin/pip" install -q "openhop-core==1.1.3" pyyaml spidev
     if [[ "$_gpiod" == false ]]; then
         "$PYMC_DIR/venv/bin/pip" install -q lgpio python-periphery
     fi

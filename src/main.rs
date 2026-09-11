@@ -275,6 +275,40 @@ enum UserAction {
         /// BBS username whose password will be reset.
         username: String,
     },
+    /// Disable a user account: login is rejected and any live session is
+    /// ended immediately, but the account and its authored messages are
+    /// preserved (this is a softer action than deletion — deleting a user
+    /// additionally reserves the username so no-one else can register it,
+    /// and is not currently exposed as a CLI command).
+    ///
+    /// Equivalent to the in-session `BAN <username>` sysop/aide command and
+    /// the web admin's Users page.
+    Ban {
+        /// BBS username to disable.
+        username: String,
+    },
+    /// Re-enable a previously disabled (`ban`ned) user account.
+    ///
+    /// Equivalent to the in-session `UNBAN <username>` sysop command and the
+    /// web admin's Users page.
+    Unban {
+        /// BBS username to re-enable.
+        username: String,
+    },
+    /// Suspend a user account for a fixed number of days, distinct from a
+    /// permanent `ban`: login is rejected and any live session is ended
+    /// immediately, same as `ban`, but the account reactivates
+    /// automatically once the timeout elapses rather than staying disabled
+    /// until an explicit `unban`.
+    ///
+    /// Equivalent to the in-session `TIMEOUT <username> <days>` sysop/aide
+    /// command and the web admin's Users page.
+    Timeout {
+        /// BBS username to suspend.
+        username: String,
+        /// Suspension length in days (1-5).
+        days: u8,
+    },
 }
 
 #[derive(Subcommand)]
@@ -765,7 +799,13 @@ async fn cmd_run(cli: &Cli) {
     }
 
     info!(
-        name = %cfg.bbs.name,
+        // Sanitized (supply-drop-bbs-wrh / #293): bbs.name is only
+        // validated, not sanitized, against Unicode display-spoofing
+        // codepoints (see validate_mesh_node_name's doc comment) — logging
+        // it raw would let a spoofed name render misleadingly in a
+        // terminal/log viewer, even though it's a sysop-authenticated,
+        // self-only surface.
+        name = %bbs_core::mesh_name::strip_display_spoofing_codepoints(&cfg.bbs.name),
         version = env!("CARGO_PKG_VERSION"),
         "supply-drop-bbs starting"
     );
@@ -778,7 +818,8 @@ async fn cmd_run(cli: &Cli) {
     // shortened. The HAT yaml writer truncates defensively as a fallback.
     if cfg.bbs.name.len() > bbs_core::mesh_name::MAX_MESH_NODE_NAME_BYTES {
         warn!(
-            name = %cfg.bbs.name,
+            // Sanitized — see the "supply-drop-bbs starting" log above.
+            name = %bbs_core::mesh_name::strip_display_spoofing_codepoints(&cfg.bbs.name),
             bytes = cfg.bbs.name.len(),
             max = bbs_core::mesh_name::MAX_MESH_NODE_NAME_BYTES,
             "bbs.name exceeds the MeshCore advert limit; mesh adverts will be truncated \
@@ -967,9 +1008,10 @@ async fn cmd_run(cli: &Cli) {
     // configured name if sharing is later turned off. bbs-mesh::transport
     // re-truncates to the correct, current-state-aware budget at the actual
     // point each advert is sent (see bbs_core::mesh_name).
-    bbs.set_node_name(Some(
-        bbs_core::mesh_name::truncate_mesh_node_name(&cfg.bbs.name, false).to_owned(),
-    ));
+    bbs.set_node_name(Some(bbs_core::mesh_name::truncate_mesh_node_name(
+        &cfg.bbs.name,
+        false,
+    )));
 
     if let Err(e) = bbs.ensure_guest_room().await {
         error!("guest room setup failed: {e}");
@@ -1028,7 +1070,13 @@ async fn cmd_run(cli: &Cli) {
     let mesh_cfg = {
         let mut c = cfg.plugins.mesh.clone();
         // Substitute {name} placeholder before wiring into mesh transport.
-        c.welcome_message = cfg.bbs.welcome_msg.replace("{name}", &cfg.bbs.name);
+        // Sanitized (not just validated at config-set time — a hand-edited
+        // config.toml bypasses that) since this reaches every connecting
+        // user's very first screen; see bbs_core::mesh_name / #228.
+        c.welcome_message = cfg.bbs.welcome_msg.replace(
+            "{name}",
+            &bbs_core::mesh_name::strip_display_spoofing_codepoints(&cfg.bbs.name),
+        );
         c
     };
 
@@ -1649,15 +1697,19 @@ fn read_and_parse_config(path: &std::path::Path) -> toml_edit::DocumentMut {
 /// read-modify-write cycle as one locked critical section. Exits the
 /// process on any I/O error, matching this CLI's existing error-handling
 /// convention for config edits.
+/// `edit` returns `Err` instead of panicking when a section it needs
+/// already exists in `config.toml` but isn't a table (supply-drop-bbs-bn3
+/// / #276) — surfaced here the same way an I/O error already is, not as a
+/// crash.
 fn with_locked_config_edit(
     config_path: Option<&std::path::Path>,
-    edit: impl FnOnce(&mut toml_edit::DocumentMut),
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<(), String>,
 ) {
     let path = resolve_config_path_for_edit(config_path);
     let result = bbs_core::config_lock::with_config_lock_sync(&path, || {
         let mut doc = read_and_parse_config(&path);
-        edit(&mut doc);
-        atomic_write_file(&path, doc.to_string().as_bytes())
+        edit(&mut doc).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        bbs_core::config_lock::atomic_write_file(&path, doc.to_string().as_bytes())
     });
     if let Err(e) = result {
         eprintln!("error writing {}: {e}", path.display());
@@ -1665,41 +1717,17 @@ fn with_locked_config_edit(
     }
 }
 
-/// Write `contents` to `path` atomically: write to a `.tmp` sibling, fsync,
-/// then rename over the destination.
-fn atomic_write_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp_name);
-    let mut f = std::fs::File::create(&tmp)?;
-    if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
-
 fn config_edit_bbs_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
     with_locked_config_edit(config_path, |doc| {
-        if doc.get("bbs").is_none() {
-            doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["bbs"][key] = toml_edit::value(value);
+        bbs_core::toml_util::ensure_table(doc, "bbs")?.insert(key, toml_edit::value(value));
+        Ok(())
     });
 }
 
 fn config_edit_bbs_string(config_path: Option<&std::path::Path>, key: &str, value: &str) {
     with_locked_config_edit(config_path, |doc| {
-        if doc.get("bbs").is_none() {
-            doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["bbs"][key] = toml_edit::value(value);
+        bbs_core::toml_util::ensure_table(doc, "bbs")?.insert(key, toml_edit::value(value));
+        Ok(())
     });
 }
 
@@ -1708,6 +1736,7 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
         if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
             bbs.remove(key);
         }
+        Ok(())
     });
 }
 
@@ -1718,21 +1747,18 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
 /// locked round trip.
 fn config_edit_location_floats(config_path: Option<&std::path::Path>, pairs: &[(&str, f64)]) {
     with_locked_config_edit(config_path, |doc| {
-        if doc.get("location").is_none() {
-            doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
+        let location = bbs_core::toml_util::ensure_table(doc, "location")?;
         for (key, value) in pairs {
-            doc["location"][*key] = toml_edit::value(*value);
+            location.insert(key, toml_edit::value(*value));
         }
+        Ok(())
     });
 }
 
 fn config_edit_location_bool(config_path: Option<&std::path::Path>, key: &str, value: bool) {
     with_locked_config_edit(config_path, |doc| {
-        if doc.get("location").is_none() {
-            doc["location"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["location"][key] = toml_edit::value(value);
+        bbs_core::toml_util::ensure_table(doc, "location")?.insert(key, toml_edit::value(value));
+        Ok(())
     });
 }
 
@@ -1745,6 +1771,7 @@ fn config_remove_location_keys(config_path: Option<&std::path::Path>, keys: &[&s
                 location.remove(key);
             }
         }
+        Ok(())
     });
 }
 
@@ -1952,7 +1979,7 @@ fn write_plugin_file_sync(dir: &std::path::Path, cfg: &bbs_plugin_api::ProcessPl
         }
     };
     let path = dir.join(format!("{}.toml", cfg.name));
-    if let Err(e) = atomic_write_file(&path, content.as_bytes()) {
+    if let Err(e) = bbs_core::config_lock::atomic_write_file(&path, content.as_bytes()) {
         eprintln!("error: cannot write {}: {e}", path.display());
         std::process::exit(1);
     }
@@ -2015,8 +2042,12 @@ fn write_plugins(plugins: &[bbs_plugin_api::ProcessPluginConfig], path: &std::pa
 
     let result = bbs_core::config_lock::with_config_lock_sync(path, || {
         let mut doc = read_and_parse_config(path);
-        doc["plugins"]["process"] = toml_edit::Item::ArrayOfTables(aot);
-        atomic_write_file(path, doc.to_string().as_bytes())
+        // ensure_table returns Err instead of panicking when [plugins]
+        // exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            .insert("process", toml_edit::Item::ArrayOfTables(aot));
+        bbs_core::config_lock::atomic_write_file(path, doc.to_string().as_bytes())
     });
     if let Err(e) = result {
         eprintln!("error writing config: {e}");
@@ -2247,6 +2278,48 @@ async fn cmd_user(cli: &Cli, action: &UserAction) {
             }
         }
 
+        UserAction::Ban { username } => {
+            match host.admin_update_user(username, Some(1), None).await {
+                Ok(()) => println!("disabled: {username} (login rejected, session ended)"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        UserAction::Unban { username } => {
+            match host.admin_update_user(username, Some(0), None).await {
+                Ok(()) => println!("re-enabled: {username}"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        UserAction::Timeout { username, days } => {
+            match host.admin_suspend_user(username, *days).await {
+                Ok(()) => println!("suspended: {username} for {days} day(s)"),
+                Err(bbs_plugin_api::HostError::NotFound(_)) => {
+                    eprintln!("error: user '{username}' not found");
+                    std::process::exit(1);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+
         UserAction::Create { username, sysop } => {
             let password = dialoguer::Password::new()
                 .with_prompt("Password")
@@ -2308,7 +2381,10 @@ async fn cmd_user(cli: &Cli, action: &UserAction) {
                 UserAction::Create { .. }
                 | UserAction::List { .. }
                 | UserAction::Verify { .. }
-                | UserAction::SetPassword { .. } => {
+                | UserAction::SetPassword { .. }
+                | UserAction::Ban { .. }
+                | UserAction::Unban { .. }
+                | UserAction::Timeout { .. } => {
                     unreachable!()
                 }
             };
@@ -2495,22 +2571,24 @@ fn save_radio_config(config_path: Option<&std::path::Path>, r: &ResolvedRadio) {
         let content = std::fs::read_to_string(&path_for_closure)?;
         let mut doc: toml_edit::DocumentMut = content.parse().map_err(std::io::Error::other)?;
 
-        // Ensure [plugins] and [plugins.mesh] exist.
-        if doc.get("plugins").is_none() {
-            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        if doc["plugins"].get("mesh").is_none() {
-            doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        // Write [plugins.mesh.radio] fields.
-        doc["plugins"]["mesh"]["radio"]["frequency_hz"] = toml_edit::value(frequency_hz as i64);
-        doc["plugins"]["mesh"]["radio"]["bandwidth_hz"] = toml_edit::value(bandwidth_hz as i64);
-        doc["plugins"]["mesh"]["radio"]["spreading_factor"] =
-            toml_edit::value(spreading_factor as i64);
-        doc["plugins"]["mesh"]["radio"]["coding_rate"] = toml_edit::value(coding_rate as i64);
-        doc["plugins"]["mesh"]["radio"]["tx_power_dbm"] = toml_edit::value(tx_power_dbm as i64);
+        // ensure_table/ensure_subtable return Err instead of panicking when
+        // a section exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        let plugins = bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(std::io::Error::other)?;
+        let mesh =
+            bbs_core::toml_util::ensure_subtable(plugins, "mesh").map_err(std::io::Error::other)?;
+        let radio =
+            bbs_core::toml_util::ensure_subtable(mesh, "radio").map_err(std::io::Error::other)?;
+        radio.insert("frequency_hz", toml_edit::value(frequency_hz as i64));
+        radio.insert("bandwidth_hz", toml_edit::value(bandwidth_hz as i64));
+        radio.insert(
+            "spreading_factor",
+            toml_edit::value(spreading_factor as i64),
+        );
+        radio.insert("coding_rate", toml_edit::value(coding_rate as i64));
+        radio.insert("tx_power_dbm", toml_edit::value(tx_power_dbm as i64));
 
-        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+        bbs_core::config_lock::atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
     });
 
     if let Err(e) = result {
@@ -2552,15 +2630,15 @@ fn save_path_bytes(config_path: Option<&std::path::Path>, bytes: u8) {
     let result = bbs_core::config_lock::with_config_lock_sync(&path, move || {
         let content = std::fs::read_to_string(&path_for_closure)?;
         let mut doc: toml_edit::DocumentMut = content.parse().map_err(std::io::Error::other)?;
-        if doc.get("plugins").is_none() {
-            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        if doc["plugins"].get("mesh").is_none() {
-            doc["plugins"]["mesh"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        doc["plugins"]["mesh"]["path_bytes"] = toml_edit::value(bytes as i64);
+        // ensure_table/ensure_subtable return Err instead of panicking when
+        // a section exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        let plugins = bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(std::io::Error::other)?;
+        let mesh =
+            bbs_core::toml_util::ensure_subtable(plugins, "mesh").map_err(std::io::Error::other)?;
+        mesh.insert("path_bytes", toml_edit::value(bytes as i64));
 
-        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+        bbs_core::config_lock::atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
     });
 
     if let Err(e) = result {
@@ -3529,6 +3607,51 @@ mod contacts_tests {
                 _ => panic!("expected ContactsAction::Delete"),
             },
             _ => panic!("expected Commands::Contacts"),
+        }
+    }
+
+    // supply-drop-bbs#252: `user ban`/`user unban` — the only one of the
+    // three requested surfaces (BBS sysop/aide command, web UI, CLI) that
+    // was actually missing; the underlying UserStatus::Banned mechanism and
+    // its BBS-command/web-UI exposure already existed.
+    #[test]
+    fn user_ban_captures_the_username_argument() {
+        let cli = parse(&["supply-drop-bbs", "user", "ban", "alice"]);
+        match cli.command {
+            Some(Commands::User { action }) => match action {
+                UserAction::Ban { username } => assert_eq!(username, "alice"),
+                _ => panic!("expected UserAction::Ban"),
+            },
+            _ => panic!("expected Commands::User"),
+        }
+    }
+
+    #[test]
+    fn user_unban_captures_the_username_argument() {
+        let cli = parse(&["supply-drop-bbs", "user", "unban", "alice"]);
+        match cli.command {
+            Some(Commands::User { action }) => match action {
+                UserAction::Unban { username } => assert_eq!(username, "alice"),
+                _ => panic!("expected UserAction::Unban"),
+            },
+            _ => panic!("expected Commands::User"),
+        }
+    }
+
+    // supply-drop-bbs-ax3 / #280: `user timeout` — one of the three
+    // required surfaces (BBS sysop/aide command, web UI, CLI).
+    #[test]
+    fn user_timeout_captures_the_username_and_days_arguments() {
+        let cli = parse(&["supply-drop-bbs", "user", "timeout", "alice", "3"]);
+        match cli.command {
+            Some(Commands::User { action }) => match action {
+                UserAction::Timeout { username, days } => {
+                    assert_eq!(username, "alice");
+                    assert_eq!(days, 3);
+                }
+                _ => panic!("expected UserAction::Timeout"),
+            },
+            _ => panic!("expected Commands::User"),
         }
     }
 

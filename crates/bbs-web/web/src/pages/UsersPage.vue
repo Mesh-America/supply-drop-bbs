@@ -14,6 +14,9 @@ interface UserInfo {
   permission_level: number
   created_at: string
   last_login_at: string | null
+  // Set only when status === 'banned' and this is a time-limited timeout
+  // rather than a permanent ban (supply-drop-bbs-ax3 / #280).
+  suspended_until: string | null
 }
 
 const ALL_USERS = ref<UserInfo[]>([])
@@ -87,6 +90,23 @@ async function doAction(username: string, body: object, okMsg: string) {
 const validate   = (u: string) => doAction(u, { status: 0, permission_level: 10 }, `${u} verified`)
 const ban        = (u: string) => doAction(u, { status: 1 }, `${u} banned`)
 const unban      = (u: string) => doAction(u, { status: 0 }, `${u} unbanned`)
+
+function suspend(u: string) {
+  const raw = prompt(`Suspend ${u} for how many days? (1-5)`, '1')
+  if (raw === null) return
+  const days = Number(raw)
+  if (!Number.isInteger(days) || days < 1 || days > 5) {
+    toast.error('enter a whole number of days from 1 to 5')
+    return
+  }
+  doAction(u, { suspend_days: days }, `${u} suspended for ${days} day(s)`)
+}
+
+function suspensionLabel(u: UserInfo): string {
+  if (u.status !== 'banned') return u.status
+  if (!u.suspended_until) return 'banned'
+  return `suspended until ${new Date(u.suspended_until).toLocaleDateString()}`
+}
 const del        = (u: string) => {
   if (!confirm(`Delete user "${u}"? They will be removed from this list. Recovery is only possible via SQL.`)) return
   doAction(u, { status: 2 }, `${u} deleted`)
@@ -222,7 +242,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
             <button class="link-btn" @click="openDrawer(u)"><strong>{{ u.username }}</strong></button>
           </td>
           <td>{{ u.display_name ?? '—' }}</td>
-          <td :class="u.status === 'banned' ? 'error' : ''">{{ u.status }}</td>
+          <td :class="u.status === 'banned' ? 'error' : ''">{{ suspensionLabel(u) }}</td>
           <td :class="u.permission_level === 0 ? 'warn' : ''">
             <!-- Sysops get an inline dropdown; Aides see plain text (can't promote to sysop) -->
             <select
@@ -255,6 +275,12 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
               @click="ban(u.username)"
             >ban</button>
             <button
+              v-if="u.status !== 'banned'"
+              class="small-btn danger"
+              :disabled="acting"
+              @click="suspend(u.username)"
+            >timeout</button>
+            <button
               v-if="u.status === 'banned'"
               class="small-btn secondary"
               :disabled="acting"
@@ -282,7 +308,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
             <dt>display name</dt>
             <dd>{{ drawerUser.display_name ?? '—' }}</dd>
             <dt>status</dt>
-            <dd :class="drawerUser.status === 'banned' ? 'error' : ''">{{ drawerUser.status }}</dd>
+            <dd :class="drawerUser.status === 'banned' ? 'error' : ''">{{ suspensionLabel(drawerUser) }}</dd>
             <dt>permission level</dt>
             <dd>{{ levelLabel(drawerUser.permission_level) }} ({{ drawerUser.permission_level }})</dd>
             <dt>joined</dt>
@@ -312,6 +338,12 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
               :disabled="acting"
               @click="ban(drawerUser.username); closeDrawer()"
             >ban</button>
+            <button
+              v-if="drawerUser.status !== 'banned'"
+              class="danger"
+              :disabled="acting"
+              @click="suspend(drawerUser.username); closeDrawer()"
+            >timeout</button>
             <button
               v-if="drawerUser.status === 'banned'"
               class="secondary"

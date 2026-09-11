@@ -1104,9 +1104,18 @@ async fn api_update_native_plugin(
         let mut doc = raw
             .parse::<toml_edit::DocumentMut>()
             .map_err(|e| std::io::Error::other(format!("could not parse config file: {e}")))?;
-        doc["plugins"][name_for_edit.as_str()]["enabled"] = toml_edit::value(enabled);
-        atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes())
-            .map_err(|e| std::io::Error::other(format!("could not write config file: {e}")))
+        // ensure_table/ensure_subtable return Err instead of panicking when
+        // a section exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        let plugins = bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let plugin = bbs_core::toml_util::ensure_subtable(plugins, name_for_edit.as_str())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        plugin.insert("enabled", toml_edit::value(enabled));
+        bbs_core::config_lock::atomic_write_file(
+            std::path::Path::new(&path),
+            doc.to_string().as_bytes(),
+        )
+        .map_err(|e| std::io::Error::other(format!("could not write config file: {e}")))
     })
     .await;
 
@@ -1154,7 +1163,17 @@ fn to_advert_response(r: bbs_plugin_api::AdvertRecord) -> AdvertResponse {
     AdvertResponse {
         ts: r.last_seen_secs,
         pubkey: r.pubkey_hex,
-        name: r.name,
+        // `r.name` is a remote mesh node's self-reported display name,
+        // stored verbatim by AdvertBus with no sanitization (bbs-plugin-api
+        // has no dependency on bbs-core, so it can't reach
+        // bbs_core::mesh_name itself) -- any node can broadcast Unicode
+        // display-spoofing codepoints (e.g. U+202E RIGHT-TO-LEFT OVERRIDE)
+        // in its advert, and this is the response every consumer of the
+        // Discovered Contacts / Contacts panels renders. Sanitize at this
+        // display boundary rather than at storage, so protection-eligibility
+        // matching and anything else keyed on the raw name is unaffected
+        // (supply-drop-bbs / #228).
+        name: bbs_core::mesh_name::strip_display_spoofing_codepoints(&r.name),
         adv_type: r.adv_type,
         type_name: adv_type_name(&r.transport, r.adv_type).to_owned(),
         lat: r.lat,
@@ -1454,6 +1473,11 @@ struct UpdateUserBody {
     status: Option<u8>,
     permission_level: Option<u8>,
     password: Option<String>,
+    /// Suspend for this many days (1-5) instead of a permanent ban
+    /// (supply-drop-bbs-ax3 / #280). Mutually exclusive with `status` in
+    /// the same request — send them as separate PATCHes if both are
+    /// somehow needed.
+    suspend_days: Option<u8>,
 }
 
 async fn api_update_user(
@@ -1462,11 +1486,24 @@ async fn api_update_user(
     Path(username): Path<String>,
     Json(body): Json<UpdateUserBody>,
 ) -> Response {
-    if body.status.is_none() && body.permission_level.is_none() && body.password.is_none() {
+    if body.status.is_none()
+        && body.permission_level.is_none()
+        && body.password.is_none()
+        && body.suspend_days.is_none()
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error(
-                "at least one of status, permission_level, or password is required",
+                "at least one of status, permission_level, password, or suspend_days is required",
+            )),
+        )
+            .into_response();
+    }
+    if body.status.is_some() && body.suspend_days.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(
+                "status and suspend_days are mutually exclusive in one request",
             )),
         )
             .into_response();
@@ -1496,15 +1533,16 @@ async fn api_update_user(
         }
     }
 
-    // A sysop must not lock themselves out by changing their own status or
-    // permission level. (Resetting one's own password is still allowed.)
-    if (body.status.is_some() || body.permission_level.is_some())
+    // A sysop must not lock themselves out by changing their own status,
+    // permission level, or suspending themselves. (Resetting one's own
+    // password is still allowed.)
+    if (body.status.is_some() || body.permission_level.is_some() || body.suspend_days.is_some())
         && caller.username.eq_ignore_ascii_case(&username)
     {
         return (
             StatusCode::FORBIDDEN,
             Json(json_error(
-                "you can't change your own status or permission level",
+                "you can't change your own status, permission level, or suspend yourself",
             )),
         )
             .into_response();
@@ -1572,6 +1610,36 @@ async fn api_update_user(
             }
             Err(HostError::NotFound(_)) => {
                 return (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response();
+            }
+            Err(e) => return server_error(&e.to_string()),
+        }
+    }
+
+    if let Some(days) = body.suspend_days {
+        match state.host.admin_suspend_user(&username, days).await {
+            Ok(()) => {
+                // Same rationale as the ban/unban path above: a cached web
+                // token for the now-suspended user must not keep working.
+                state.invalidate_sessions_for(&username);
+                let detail = format!("{{\"days\":{days}}}");
+                if let Err(e) = state
+                    .host
+                    .admin_write_audit(
+                        &actor_str,
+                        "timeout",
+                        Some(username.as_str()),
+                        Some(&detail),
+                    )
+                    .await
+                {
+                    warn!("audit write failed: {e}");
+                }
+            }
+            Err(HostError::NotFound(_)) => {
+                return (StatusCode::NOT_FOUND, Json(json_error("user not found"))).into_response();
+            }
+            Err(HostError::PreconditionFailed(msg)) => {
+                return (StatusCode::BAD_REQUEST, Json(json_error(&msg))).into_response();
             }
             Err(e) => return server_error(&e.to_string()),
         }
@@ -2028,6 +2096,13 @@ struct ConfigResponse {
     /// Server's system timezone (best-effort; TZ env → /etc/timezone → UTC).
     server_timezone: String,
     bbs_name: Option<String>,
+    /// True when `bbs_name` contains Unicode display-spoofing codepoints
+    /// (supply-drop-bbs-wrh / #293) — `validate_mesh_node_name` accepts
+    /// them (see its doc comment), but `truncate_mesh_node_name` silently
+    /// strips them before the name is actually broadcast over the mesh, so
+    /// the stored value and the broadcast value have diverged. Lets the
+    /// settings UI warn the sysop instead of leaving that gap invisible.
+    bbs_name_has_hidden_codepoints: bool,
     bbs_starting_room: Option<String>,
     bbs_welcome_msg: Option<String>,
     bbs_timezone: Option<String>,
@@ -2362,22 +2437,19 @@ fn toml_radio_i32(val: &toml::Value, key: &str) -> Option<i32> {
         .map(|i| i as i32)
 }
 
-/// Set a scalar key in `[plugins.mesh.radio]`, creating the table path as needed.
-fn doc_set_radio_field(doc: &mut toml_edit::DocumentMut, key: &str, val: toml_edit::Value) {
-    // Ensure [plugins] exists as a table
-    if doc.get("plugins").is_none() {
-        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let plugins = doc["plugins"].as_table_mut().unwrap();
-    if plugins.get("mesh").is_none() {
-        plugins.insert("mesh", toml_edit::Item::Table(toml_edit::Table::new()));
-    }
-    let mesh = plugins.get_mut("mesh").unwrap().as_table_mut().unwrap();
-    if mesh.get("radio").is_none() {
-        mesh.insert("radio", toml_edit::Item::Table(toml_edit::Table::new()));
-    }
-    let radio = mesh.get_mut("radio").unwrap().as_table_mut().unwrap();
+/// Set a scalar key in `[plugins.mesh.radio]`, creating the table path as
+/// needed. Returns `Err` (never panics — supply-drop-bbs-bn3 / #276) if any
+/// segment of that path already exists in `config.toml` but isn't a table.
+fn doc_set_radio_field(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    val: toml_edit::Value,
+) -> Result<(), String> {
+    let plugins = bbs_core::toml_util::ensure_table(doc, "plugins")?;
+    let mesh = bbs_core::toml_util::ensure_subtable(plugins, "mesh")?;
+    let radio = bbs_core::toml_util::ensure_subtable(mesh, "radio")?;
     radio.insert(key, toml_edit::Item::Value(val));
+    Ok(())
 }
 
 /// Remove a key from `[plugins.mesh.radio]` if the table path exists.
@@ -2395,17 +2467,17 @@ fn doc_remove_radio_field(doc: &mut toml_edit::DocumentMut, key: &str) {
 
 /// Set a scalar key directly in `[plugins.mesh]` (one level up from
 /// [`doc_set_radio_field`], which nests under `.radio`), creating the table
-/// path as needed.
-fn doc_set_mesh_field(doc: &mut toml_edit::DocumentMut, key: &str, val: toml_edit::Value) {
-    if doc.get("plugins").is_none() {
-        doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-    }
-    let plugins = doc["plugins"].as_table_mut().unwrap();
-    if plugins.get("mesh").is_none() {
-        plugins.insert("mesh", toml_edit::Item::Table(toml_edit::Table::new()));
-    }
-    let mesh = plugins.get_mut("mesh").unwrap().as_table_mut().unwrap();
+/// path as needed. Returns `Err` (never panics — supply-drop-bbs-bn3 /
+/// #276) if any segment of that path already exists but isn't a table.
+fn doc_set_mesh_field(
+    doc: &mut toml_edit::DocumentMut,
+    key: &str,
+    val: toml_edit::Value,
+) -> Result<(), String> {
+    let plugins = bbs_core::toml_util::ensure_table(doc, "plugins")?;
+    let mesh = bbs_core::toml_util::ensure_subtable(plugins, "mesh")?;
     mesh.insert(key, toml_edit::Item::Value(val));
+    Ok(())
 }
 
 /// Remove a key from `[plugins.mesh]` if the table path exists.
@@ -2539,11 +2611,17 @@ async fn api_get_config(
 
     let writable = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
 
+    let bbs_name = toml_str_field(&val, "bbs", "name");
+    let bbs_name_has_hidden_codepoints = bbs_name
+        .as_deref()
+        .is_some_and(|n| bbs_core::mesh_name::strip_display_spoofing_codepoints(n) != n);
+
     let resp = ConfigResponse {
         config_file: Some(path),
         writable,
         server_timezone: system_timezone(),
-        bbs_name: toml_str_field(&val, "bbs", "name"),
+        bbs_name,
+        bbs_name_has_hidden_codepoints,
         bbs_starting_room: toml_str_field(&val, "bbs", "starting_room"),
         bbs_welcome_msg: toml_str_field(&val, "bbs", "welcome_msg"),
         bbs_timezone: toml_str_field(&val, "bbs", "timezone"),
@@ -2562,17 +2640,6 @@ async fn api_get_config(
     };
 
     Json(resp).into_response()
-}
-
-/// What `api_patch_config`'s locked critical section resolves for the
-/// post-write side effects (log-level reload, in-memory `Host` location
-/// state) that run after the lock is released — extracted from `doc`
-/// while still inside the lock, rather than handing the parsed
-/// `toml_edit::DocumentMut` itself back out. See the call site.
-struct PatchConfigOutcome {
-    resolved_logging_level: Option<String>,
-    new_location: Option<Option<(f64, f64)>>,
-    new_share_in_advert: Option<bool>,
 }
 
 async fn api_patch_config(
@@ -2603,8 +2670,22 @@ async fn api_patch_config(
     // concurrent writer invalidate what was just checked before this
     // request's own write lands, e.g. defeating the mesh-name byte-budget
     // cross-check below by racing a location/name change in between.
+    //
+    // The in-memory side effects (log-level reload, `Host` location state)
+    // below are applied INSIDE this same locked section too, right after
+    // the file write succeeds — not after the lock is released
+    // (supply-drop-bbs-zea / #278). Two concurrent PATCH requests each
+    // holding the lock only for their own turn still apply their side
+    // effects in the same order their file writes committed in; applying
+    // them after release let a slower request's stale side effects land
+    // after a faster, later request's ones, leaving in-memory state
+    // permanently diverged from what was actually on disk. Both side
+    // effects are synchronous (no `.await`), so this doesn't block a tokio
+    // worker any more than the file write itself already does on this
+    // blocking-pool thread.
     let path_for_lock = std::path::PathBuf::from(&path);
-    let write_result: std::io::Result<PatchConfigOutcome> =
+    let state_for_lock = Arc::clone(&state);
+    let write_result: std::io::Result<()> =
         bbs_core::config_lock::with_config_lock(&path_for_lock, move || {
             let raw = std::fs::read_to_string(&path)
                 .map_err(|e| std::io::Error::other(format!("could not read config file: {e}")))?;
@@ -2646,16 +2727,30 @@ async fn api_patch_config(
 
             // Apply patches — only touch keys explicitly present in the request.
             if let Some(v) = patch.bbs_name {
-                doc["bbs"]["name"] = toml_edit::value(v);
+                // ensure_table/ensure_subtable return Err instead of
+                // panicking when a section exists but isn't a table
+                // (supply-drop-bbs-bn3 / #276) — mapped to InvalidInput so
+                // it comes back as a 400 like the other validation errors
+                // in this closure, instead of a 500 or (under release-min)
+                // a process abort.
+                bbs_core::toml_util::ensure_table(&mut doc, "bbs")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("name", toml_edit::value(v));
             }
             if let Some(v) = patch.bbs_starting_room {
-                doc["bbs"]["starting_room"] = toml_edit::value(v);
+                bbs_core::toml_util::ensure_table(&mut doc, "bbs")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("starting_room", toml_edit::value(v));
             }
             if let Some(v) = patch.bbs_welcome_msg {
-                doc["bbs"]["welcome_msg"] = toml_edit::value(v);
+                bbs_core::toml_util::ensure_table(&mut doc, "bbs")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("welcome_msg", toml_edit::value(v));
             }
             if let Some(v) = patch.bbs_timezone {
-                doc["bbs"]["timezone"] = toml_edit::value(v);
+                bbs_core::toml_util::ensure_table(&mut doc, "bbs")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("timezone", toml_edit::value(v));
             }
             // Latitude/longitude: absent → leave unchanged, `null` → remove
             // the key, a number → set it.
@@ -2664,59 +2759,87 @@ async fn api_patch_config(
             if let Some(v) = patch.location_latitude {
                 match v {
                     None => doc_remove_key(&mut doc, "location", "latitude"),
-                    Some(f) => doc["location"]["latitude"] = toml_edit::value(f),
+                    Some(f) => {
+                        bbs_core::toml_util::ensure_table(&mut doc, "location")
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                            .insert("latitude", toml_edit::value(f));
+                    }
                 }
             }
             if let Some(v) = patch.location_longitude {
                 match v {
                     None => doc_remove_key(&mut doc, "location", "longitude"),
-                    Some(f) => doc["location"]["longitude"] = toml_edit::value(f),
+                    Some(f) => {
+                        bbs_core::toml_util::ensure_table(&mut doc, "location")
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                            .insert("longitude", toml_edit::value(f));
+                    }
                 }
             }
             let share_in_advert_touched = patch.location_share_in_advert.is_some();
             if let Some(v) = patch.location_share_in_advert {
-                doc["location"]["share_in_advert"] = toml_edit::value(v);
+                bbs_core::toml_util::ensure_table(&mut doc, "location")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("share_in_advert", toml_edit::value(v));
             }
             if let Some(v) = patch.backup_enabled {
-                doc["backup"]["enabled"] = toml_edit::value(v);
+                bbs_core::toml_util::ensure_table(&mut doc, "backup")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("enabled", toml_edit::value(v));
             }
             if let Some(v) = patch.backup_interval_hours {
-                doc["backup"]["interval_hours"] = toml_edit::value(v as i64);
+                bbs_core::toml_util::ensure_table(&mut doc, "backup")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("interval_hours", toml_edit::value(v as i64));
             }
             if let Some(v) = patch.backup_keep_daily {
-                doc["backup"]["keep_daily"] = toml_edit::value(v as i64);
+                bbs_core::toml_util::ensure_table(&mut doc, "backup")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("keep_daily", toml_edit::value(v as i64));
             }
             if let Some(v) = patch.backup_keep_weekly {
-                doc["backup"]["keep_weekly"] = toml_edit::value(v as i64);
+                bbs_core::toml_util::ensure_table(&mut doc, "backup")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("keep_weekly", toml_edit::value(v as i64));
             }
             if let Some(v) = patch.security_session_web_secs {
-                doc["security"]["session_lifetime_web_secs"] = toml_edit::value(v as i64);
+                bbs_core::toml_util::ensure_table(&mut doc, "security")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("session_lifetime_web_secs", toml_edit::value(v as i64));
             }
             if let Some(v) = patch.security_session_mesh_secs {
-                doc["security"]["session_lifetime_mesh_secs"] = toml_edit::value(v as i64);
+                bbs_core::toml_util::ensure_table(&mut doc, "security")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("session_lifetime_mesh_secs", toml_edit::value(v as i64));
             }
             if let Some(v) = patch.security_login_rate_per_min {
-                doc["security"]["login_rate_per_min"] = toml_edit::value(v as i64);
+                bbs_core::toml_util::ensure_table(&mut doc, "security")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("login_rate_per_min", toml_edit::value(v as i64));
             }
             if let Some(v) = patch.security_command_rate_per_min {
-                doc["security"]["command_rate_per_min"] = toml_edit::value(v as i64);
+                bbs_core::toml_util::ensure_table(&mut doc, "security")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("command_rate_per_min", toml_edit::value(v as i64));
             }
             let logging_level_changed = patch.logging_level.is_some();
             if let Some(v) = patch.logging_level {
-                doc["logging"]["level"] = toml_edit::value(v.to_ascii_uppercase());
+                bbs_core::toml_util::ensure_table(&mut doc, "logging")
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+                    .insert("level", toml_edit::value(v.to_ascii_uppercase()));
             }
 
-            atomic_write_file(std::path::Path::new(&path), doc.to_string().as_bytes())
-                .map_err(|e| std::io::Error::other(format!("could not write config file: {e}")))?;
+            bbs_core::config_lock::atomic_write_file(
+                std::path::Path::new(&path),
+                doc.to_string().as_bytes(),
+            )
+            .map_err(|e| std::io::Error::other(format!("could not write config file: {e}")))?;
 
-            // Resolve whatever the post-write side effects (below, outside
-            // the lock) need from the now-written `doc`, into the small,
-            // cheap-to-move `PatchConfigOutcome` rather than handing the
-            // whole parsed `doc` back out — `toml_edit::DocumentMut` does
-            // satisfy `with_config_lock`'s `Send + 'static` bound (verified
-            // against toml_edit 0.22.27), so this isn't required for that;
-            // it's simpler to reason about a handful of named fields at the
-            // call site than a full `DocumentMut`.
+            // Resolve the in-memory side effects from the now-written `doc`
+            // and apply them right here, still inside the lock (see this
+            // function's opening comment / #278) — rather than handing
+            // values back out for the caller to apply after the lock is
+            // released.
             let resolved_logging_level = logging_level_changed
                 .then(|| {
                     doc.get("logging")
@@ -2745,51 +2868,44 @@ async fn api_patch_config(
                     .unwrap_or(true)
             });
 
-            Ok(PatchConfigOutcome {
-                resolved_logging_level,
-                new_location,
-                new_share_in_advert,
-            })
+            // Apply log level change immediately without a restart.
+            if let Some(level) = resolved_logging_level {
+                if let Some(reload) = state_for_lock
+                    .log_reload
+                    .lock()
+                    .expect("log_reload poisoned")
+                    .as_ref()
+                {
+                    if let Err(e) = reload(&level) {
+                        warn!("log level reload failed: {e}");
+                    } else {
+                        info!(level, "log level changed at runtime");
+                    }
+                }
+            }
+
+            // Update in-memory GPS location so the mesh transport picks it
+            // up on next reconnect without a restart. One call, not two
+            // independent writes — see Host::set_advert_location_state's
+            // doc comment (supply-drop-bbs / #274).
+            state_for_lock
+                .host
+                .set_advert_location_state(new_location, new_share_in_advert);
+
+            Ok(())
         })
         .await;
 
-    let outcome = match write_result {
-        Ok(outcome) => outcome,
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-            return (StatusCode::BAD_REQUEST, Json(json_error(&e.to_string()))).into_response();
-        }
-        Err(e) => {
-            return (
+    if let Err(e) = write_result {
+        return if e.kind() == std::io::ErrorKind::InvalidInput {
+            (StatusCode::BAD_REQUEST, Json(json_error(&e.to_string()))).into_response()
+        } else {
+            (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json_error(&format!("{e}"))),
             )
-                .into_response();
-        }
-    };
-
-    // Apply log level change immediately without a restart.
-    if let Some(level) = outcome.resolved_logging_level {
-        if let Some(reload) = state
-            .log_reload
-            .lock()
-            .expect("log_reload poisoned")
-            .as_ref()
-        {
-            if let Err(e) = reload(&level) {
-                warn!("log level reload failed: {e}");
-            } else {
-                info!(level, "log level changed at runtime");
-            }
-        }
-    }
-
-    // Update in-memory GPS location so the mesh transport picks it up on next
-    // reconnect without a restart.
-    if let Some(new_location) = outcome.new_location {
-        state.host.set_node_location(new_location);
-    }
-    if let Some(share_in_advert) = outcome.new_share_in_advert {
-        state.host.set_share_location_in_advert(share_in_advert);
+                .into_response()
+        };
     }
 
     // Audit log — best-effort.
@@ -2993,10 +3109,16 @@ async fn api_patch_radio_config(
 
         // Apply patches — absent → leave unchanged, `null` → clear the key, a
         // value → set it.
+        // doc_set_radio_field/doc_set_mesh_field return Err instead of
+        // panicking when a section exists but isn't a table
+        // (supply-drop-bbs-bn3 / #276) — map to InvalidInput so it comes
+        // back as a 400, same as the other validation errors in this
+        // closure, instead of a 500 or (under release-min) a process abort.
         if let Some(v) = patch.preset {
             match v {
                 None => doc_remove_radio_field(&mut doc, "preset"),
-                Some(s) => doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s)),
+                Some(s) => doc_set_radio_field(&mut doc, "preset", toml_edit::Value::from(s))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             }
         }
         if let Some(v) = patch.frequency_hz {
@@ -3004,6 +3126,7 @@ async fn api_patch_radio_config(
                 None => doc_remove_radio_field(&mut doc, "frequency_hz"),
                 Some(n) => {
                     doc_set_radio_field(&mut doc, "frequency_hz", toml_edit::Value::from(n as i64))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
                 }
             }
         }
@@ -3012,6 +3135,7 @@ async fn api_patch_radio_config(
                 None => doc_remove_radio_field(&mut doc, "bandwidth_hz"),
                 Some(n) => {
                     doc_set_radio_field(&mut doc, "bandwidth_hz", toml_edit::Value::from(n as i64))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
                 }
             }
         }
@@ -3022,7 +3146,8 @@ async fn api_patch_radio_config(
                     &mut doc,
                     "spreading_factor",
                     toml_edit::Value::from(n as i64),
-                ),
+                )
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             }
         }
         if let Some(v) = patch.coding_rate {
@@ -3030,13 +3155,15 @@ async fn api_patch_radio_config(
                 None => doc_remove_radio_field(&mut doc, "coding_rate"),
                 Some(n) => {
                     doc_set_radio_field(&mut doc, "coding_rate", toml_edit::Value::from(n as i64))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
                 }
             }
         }
         if let Some(v) = patch.tx_power_dbm {
             match v {
                 None => doc_remove_radio_field(&mut doc, "tx_power_dbm"),
-                Some(n) => doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n)),
+                Some(n) => doc_set_radio_field(&mut doc, "tx_power_dbm", toml_edit::Value::from(n))
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?,
             }
         }
         if let Some(v) = patch.path_bytes {
@@ -3044,13 +3171,14 @@ async fn api_patch_radio_config(
                 None => doc_remove_mesh_field(&mut doc, "path_bytes"),
                 Some(n) if n == 2 || n == 3 => {
                     doc_set_mesh_field(&mut doc, "path_bytes", toml_edit::Value::from(n))
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
                 }
                 Some(_) => {} // out-of-range value: silently ignored, same as before
             }
         }
 
         let serialized = doc.to_string();
-        atomic_write_file(
+        bbs_core::config_lock::atomic_write_file(
             std::path::Path::new(&path_for_closure),
             serialized.as_bytes(),
         )
@@ -3219,25 +3347,14 @@ async fn save_meshtastic_radio_to_config(
             .map_err(std::io::Error::other)?;
 
         // Ensure [plugins.meshtastic.radio] table path exists.
-        if doc.get("plugins").is_none() {
-            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let plugins = doc["plugins"].as_table_mut().unwrap();
-        if plugins.get("meshtastic").is_none() {
-            plugins.insert(
-                "meshtastic",
-                toml_edit::Item::Table(toml_edit::Table::new()),
-            );
-        }
-        let mt = plugins
-            .get_mut("meshtastic")
-            .unwrap()
-            .as_table_mut()
-            .unwrap();
-        if mt.get("radio").is_none() {
-            mt.insert("radio", toml_edit::Item::Table(toml_edit::Table::new()));
-        }
-        let radio = mt.get_mut("radio").unwrap().as_table_mut().unwrap();
+        // ensure_table/ensure_subtable return Err instead of panicking when
+        // a section exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        let plugins = bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(std::io::Error::other)?;
+        let mt = bbs_core::toml_util::ensure_subtable(plugins, "meshtastic")
+            .map_err(std::io::Error::other)?;
+        let radio =
+            bbs_core::toml_util::ensure_subtable(mt, "radio").map_err(std::io::Error::other)?;
 
         if region_int != 0 {
             radio.insert(
@@ -3266,7 +3383,7 @@ async fn save_meshtastic_radio_to_config(
             toml_edit::Item::Value(toml_edit::Value::from(tx_enabled)),
         );
 
-        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+        bbs_core::config_lock::atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
     })
     .await
     .map_err(|e| format!("{e}"))?;
@@ -3298,21 +3415,12 @@ async fn save_meshtastic_owner_to_config(
             .parse::<toml_edit::DocumentMut>()
             .map_err(std::io::Error::other)?;
 
-        if doc.get("plugins").is_none() {
-            doc["plugins"] = toml_edit::Item::Table(toml_edit::Table::new());
-        }
-        let plugins = doc["plugins"].as_table_mut().unwrap();
-        if plugins.get("meshtastic").is_none() {
-            plugins.insert(
-                "meshtastic",
-                toml_edit::Item::Table(toml_edit::Table::new()),
-            );
-        }
-        let mt = plugins
-            .get_mut("meshtastic")
-            .unwrap()
-            .as_table_mut()
-            .unwrap();
+        // ensure_table/ensure_subtable return Err instead of panicking when
+        // a section exists but isn't a table (supply-drop-bbs-bn3 / #276).
+        let plugins = bbs_core::toml_util::ensure_table(&mut doc, "plugins")
+            .map_err(std::io::Error::other)?;
+        let mt = bbs_core::toml_util::ensure_subtable(plugins, "meshtastic")
+            .map_err(std::io::Error::other)?;
 
         if let Some(sn) = short_name {
             mt.insert(
@@ -3327,7 +3435,7 @@ async fn save_meshtastic_owner_to_config(
             );
         }
 
-        atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+        bbs_core::config_lock::atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
     })
     .await
     .map_err(|e| format!("{e}"))?;
@@ -4252,28 +4360,6 @@ async fn spa_handler(uri: axum::http::Uri) -> Response {
     }
 }
 
-// ── File helpers ──────────────────────────────────────────────────────────────
-
-/// Write `contents` to `path` atomically: write to a `.tmp` sibling, fsync,
-/// then rename over the destination. The caller's data is never half-visible.
-fn atomic_write_file(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut tmp_name = path.as_os_str().to_owned();
-    tmp_name.push(".tmp");
-    let tmp = std::path::PathBuf::from(tmp_name);
-    let mut f = std::fs::File::create(&tmp)?;
-    if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    drop(f);
-    if let Err(e) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
-    }
-    Ok(())
-}
-
 // ── Serde helpers ─────────────────────────────────────────────────────────────
 
 /// Deserializer for a PATCH field that must distinguish "omitted" from
@@ -4870,6 +4956,116 @@ mod tests {
             .collect();
         assert_eq!(by_name.get("Protected"), Some(&true));
         assert_eq!(by_name.get("Unprotected"), Some(&false));
+    }
+
+    // supply-drop-bbs#228: a remote mesh node's self-reported advert name is
+    // stored verbatim by AdvertBus (bbs-plugin-api has no dependency on
+    // bbs-core, so it can't sanitize on ingestion) -- any node can broadcast
+    // Unicode display-spoofing codepoints, and GET /api/v1/adverts is what
+    // the web admin's Discovered Contacts panel renders directly.
+    #[tokio::test]
+    async fn api_adverts_strips_display_spoofing_codepoints_from_remote_names() {
+        let (state, mock) = test_state();
+        let bus = mock.advert_bus();
+        bus.upsert(
+            dummy_key(1),
+            "\u{202E}Admin BBS".into(),
+            1,
+            0,
+            0,
+            "meshcore",
+        );
+
+        let resp = api_adverts(State(state)).await.into_response();
+        let body = body_json(resp).await;
+        let entries = body.as_array().expect("array response");
+        assert_eq!(entries.len(), 1);
+        let name = entries[0]["name"].as_str().unwrap();
+        assert_eq!(name, "Admin BBS");
+        assert!(!name.contains('\u{202E}'));
+    }
+
+    // supply-drop-bbs-bn3 / #276: a malformed config.toml (a scalar where a
+    // table is expected) must produce a clean 4xx response, not a panic
+    // that aborts the whole process under the release-min profile's
+    // `panic = "abort"`.
+    #[tokio::test]
+    async fn api_patch_config_against_non_table_section_returns_400_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        // `bbs` is a scalar here, not a table -- exactly the shape
+        // `doc["bbs"]["name"] = ...` used to panic on.
+        std::fs::write(&config_path, "bbs = 1\n").unwrap();
+
+        let host: Arc<dyn Host> = Arc::new(MockHost::new());
+        let config = WebConfig {
+            config_path: Some(config_path.to_str().unwrap().to_owned()),
+            ..WebConfig::default()
+        };
+        let state = Arc::new(AppState::new(host, config));
+
+        let patch: ConfigPatch = serde_json::from_str(r#"{"bbs_name":"New Name"}"#).unwrap();
+        let resp = api_patch_config(State(state), Extension(sysop()), Json(patch))
+            .await
+            .into_response();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a non-table [bbs] section must produce a 400, not a panic or a 500"
+        );
+
+        // The malformed file must be untouched -- a failed write must never
+        // reach atomic_write_file's rename step.
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "bbs = 1\n");
+    }
+
+    // supply-drop-bbs-wrh / #293: GET /config flags a bbs.name that
+    // validate_mesh_node_name accepts (it deliberately allows Format
+    // codepoints) but truncate_mesh_node_name would strip before actually
+    // broadcasting it -- the stored and broadcast values have diverged.
+    #[tokio::test]
+    async fn api_get_config_flags_bbs_name_with_hidden_codepoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[bbs]\nname = \"\u{202E}Admin BBS\"\n").unwrap();
+
+        let host: Arc<dyn Host> = Arc::new(MockHost::new());
+        let config = WebConfig {
+            config_path: Some(config_path.to_str().unwrap().to_owned()),
+            ..WebConfig::default()
+        };
+        let state = Arc::new(AppState::new(host, config));
+
+        let resp = api_get_config(State(state), Extension(sysop()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["bbs_name"].as_str(), Some("\u{202E}Admin BBS"));
+        assert_eq!(body["bbs_name_has_hidden_codepoints"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn api_get_config_does_not_flag_a_clean_bbs_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[bbs]\nname = \"Admin BBS\"\n").unwrap();
+
+        let host: Arc<dyn Host> = Arc::new(MockHost::new());
+        let config = WebConfig {
+            config_path: Some(config_path.to_str().unwrap().to_owned()),
+            ..WebConfig::default()
+        };
+        let state = Arc::new(AppState::new(host, config));
+
+        let resp = api_get_config(State(state), Extension(sysop()))
+            .await
+            .into_response();
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["bbs_name_has_hidden_codepoints"].as_bool(),
+            Some(false)
+        );
     }
 
     // T039b: GET /api/v1/contacts returns only protected records.

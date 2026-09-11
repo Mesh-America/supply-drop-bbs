@@ -7,6 +7,10 @@ interface ConfigData {
   writable: boolean
   server_timezone: string
   bbs_name: string | null
+  // True when bbs_name contains Unicode display-spoofing codepoints that
+  // are stripped before the name is actually broadcast over the mesh — the
+  // stored and broadcast values have diverged (supply-drop-bbs-wrh / #293).
+  bbs_name_has_hidden_codepoints: boolean
   bbs_starting_room: string | null
   bbs_welcome_msg: string | null
   bbs_timezone: string | null
@@ -56,6 +60,7 @@ const form = ref({
 
 const configFile = ref<string | null>(null)
 const writable = ref(false)
+const bbsNameHasHiddenCodepoints = ref(false)
 const loading = ref(false)
 const saving = ref(false)
 
@@ -119,6 +124,7 @@ const timezones = computed<string[]>(() => {
 function populateForm(c: ConfigData) {
   configFile.value = c.config_file
   writable.value = c.writable
+  bbsNameHasHiddenCodepoints.value = c.bbs_name_has_hidden_codepoints
 
   form.value.bbs_name          = c.bbs_name          ?? 'Supply Drop BBS'
   form.value.bbs_starting_room = c.bbs_starting_room ?? 'Lobby'
@@ -1056,8 +1062,13 @@ chmod g+w {{ configFile }}</pre>
 
         <div class="field" :class="{ 'has-error': validationErrors.bbs_name }">
           <label>Name</label>
-          <input v-model="form.bbs_name" type="text" />
+          <input v-model="form.bbs_name" type="text" @input="bbsNameHasHiddenCodepoints = false" />
           <p v-if="validationErrors.bbs_name" class="field-error">{{ validationErrors.bbs_name }}</p>
+          <p v-else-if="bbsNameHasHiddenCodepoints" class="field-error">
+            This name contains hidden formatting characters (e.g. a right-to-left override) that
+            are stripped before it's actually broadcast over the mesh — what's saved here and
+            what nearby nodes see may not match. Retype the name to clear this.
+          </p>
           <p v-else class="hint">Display name shown to users on connect. Also the MeshCore advert
             name — max 31 bytes (23 if sharing GPS location below); emoji count as several bytes
             each.</p>

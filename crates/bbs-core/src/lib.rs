@@ -36,6 +36,7 @@ pub mod mesh_name;
 pub mod message;
 pub mod room;
 pub mod timestamp;
+pub mod toml_util;
 pub mod user;
 
 // ── Re-exports of the most-used items ────────────────────────────

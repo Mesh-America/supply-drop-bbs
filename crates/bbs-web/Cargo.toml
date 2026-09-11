@@ -32,5 +32,8 @@ toml.workspace           = true
 toml_edit.workspace      = true
 zip.workspace            = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true

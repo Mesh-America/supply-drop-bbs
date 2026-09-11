@@ -82,6 +82,49 @@ To be filled in once the Rust workspace is bootstrapped. Watch
 - Markdown: 80-char-ish lines for prose, no hard limit for tables or
   code blocks.
 
+## CI & release workflow conventions
+
+These apply to `.github/workflows/*.yml` and are enforced by review, not by
+tooling — read this before adding or changing a workflow.
+
+- **Don't pin a release-shipping build's glibc floor to the runner OS.**
+  `release.yml`'s `build` job floats on `runs-on: ubuntu-latest` on purpose:
+  every target is compiled inside a version-pinned `cross`/Docker image
+  (glibc 2.23, well under any target's actual floor), so the runner image's
+  own glibc never becomes the binary's minimum. Pinning `runs-on` to a fixed
+  Ubuntu version instead (as `release.yml` briefly did) doesn't add safety —
+  it adds an expiry date: GitHub deprecates old runner images and starts
+  failing jobs pinned to them (see `actions/runner-images#14254`), which is
+  exactly what forced this move. `ci.yml` and `docs.yml` can stay on
+  `ubuntu-latest` freely since neither ships a binary. See
+  `supply-drop-bbs-6x6` / `supply-drop-bbs-mnc` (#239, #261) for the
+  incident and follow-up this convention exists to prevent from recurring
+  in some future release-shipping workflow.
+- **Third-party GitHub Actions are pinned by version tag, not commit SHA** —
+  a deliberate, repo-wide choice (`supply-drop-bbs-cgy` / #264), not an
+  oversight. GitHub's own hardening guidance recommends SHA-pinning, and
+  it's a real supply-chain improvement; the tradeoff is a manual-maintenance
+  burden this repo doesn't currently have tooling for (no
+  `.github/dependabot.yml` `github-actions` ecosystem entry exists yet to
+  keep SHA pins current). Revisit this stance if that changes. Until then,
+  match the existing pattern (`actions/checkout@v4`, `Swatinem/rust-cache@v2`,
+  etc.) rather than SHA-pinning ad hoc in just one file.
+- **`dtolnay/rust-toolchain@master` is an intentional exception** to both of
+  the above — it's a floating ref, but it's the action's own documented
+  pattern for passing an explicit toolchain input, not a drift risk like the
+  `ubuntu-latest`/`runs-on` case. See the inline comment at each of its call
+  sites (`supply-drop-bbs-0b9` / #262).
+- **`cross`'s per-target Docker images (`ghcr.io/cross-rs/<target>`) are
+  tag-pinned, not digest-pinned** — an accepted, documented risk
+  (`supply-drop-bbs-kmt` / #265), consistent with the stance above: the
+  `cross` CLI version itself *is* pinned (via `taiki-e/install-action`),
+  which bounds which image tags it resolves, but a compromised/repointed
+  tag within that range wouldn't be caught by anything in this pipeline
+  today. See the `build` job's own comment in `release.yml` for the full
+  reasoning; this generally matches this repo's existing accepted-risk
+  stance on unverified git/pip content (`install.sh`, `supply-drop-bbs-9bs`
+  / #255).
+
 ## Code of conduct
 
 Read [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md). It applies to every

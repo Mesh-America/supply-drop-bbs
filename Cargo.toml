@@ -68,7 +68,7 @@ resolver = "2"
 members  = ["crates/*"]
 
 [workspace.package]
-version = "1.1.6"
+version = "1.2.0"
 edition      = "2021"
 authors      = ["Mesh-America"]
 repository   = "https://github.com/Mesh-America/supply-drop-bbs"
@@ -77,14 +77,14 @@ rust-version = "1.88"
 # Shared dependencies. As we add real deps (sqlx, axum, etc.) they
 # go here so every workspace member uses the same version.
 [workspace.dependencies]
-bbs-core              = { path = "crates/bbs-core",              version = "1.1.6" }
-bbs-plugin-api        = { path = "crates/bbs-plugin-api",        version = "1.1.6" }
-bbs-cli               = { path = "crates/bbs-cli",               version = "1.1.6" }
-bbs-mesh              = { path = "crates/bbs-mesh",              version = "1.1.6" }
-bbs-meshtastic        = { path = "crates/bbs-meshtastic",        version = "1.1.6" }
-bbs-web               = { path = "crates/bbs-web",              version = "1.1.6" }
-bbs-process-transport = { path = "crates/bbs-process-transport", version = "1.1.6" }
-meshcore-companion    = { path = "crates/meshcore-companion",    version = "1.1.6" }
+bbs-core              = { path = "crates/bbs-core",              version = "1.2.0" }
+bbs-plugin-api        = { path = "crates/bbs-plugin-api",        version = "1.2.0" }
+bbs-cli               = { path = "crates/bbs-cli",               version = "1.2.0" }
+bbs-mesh              = { path = "crates/bbs-mesh",              version = "1.2.0" }
+bbs-meshtastic        = { path = "crates/bbs-meshtastic",        version = "1.2.0" }
+bbs-web               = { path = "crates/bbs-web",              version = "1.2.0" }
+bbs-process-transport = { path = "crates/bbs-process-transport", version = "1.2.0" }
+meshcore-companion    = { path = "crates/meshcore-companion",    version = "1.2.0" }
 
 # Third-party deps. We use loose version constraints (semver-major)
 # so cargo can pick patch updates; the lockfile pins the exact
@@ -117,6 +117,15 @@ fd-lock     = "4"
 # O_NOFOLLOW constant for config_lock's symlink-safe lock-file open, via
 # the safe `OpenOptionsExt::custom_flags` — no `unsafe` needed to use it.
 libc        = "0.2"
+# Unicode General_Category + Bidi_Control classification for
+# mesh_name::truncate_mesh_node_name's display-spoofing sanitization
+# (supply-drop-bbs / #228). `icu_properties` already sits in Cargo.lock
+# transitively (via reqwest -> idna), but only reachable from the
+# supply-drop-bbs binary crate, not bbs-core — and it's a much heavier,
+# data-table-driven ICU4X dependency than this single char-classification
+# check warrants. unicode-properties is the small, focused unicode-rs-family
+# crate purpose-built for exactly this.
+unicode-properties = "0.1"
 uuid        = { version = "1", features = ["v4", "serde"] }
 axum        = { version = "0.7", features = ["macros", "json", "multipart"] }
 axum-extra  = { version = "0.9", features = ["cookie"] }

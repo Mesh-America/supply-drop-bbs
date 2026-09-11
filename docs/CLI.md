@@ -573,6 +573,57 @@ The new password must be at least 6 characters. The same operation is available 
 
 ---
 
+### `user ban` / `user unban`
+
+```
+supply-drop-bbs user ban <USERNAME> [OPTIONS]
+supply-drop-bbs user unban <USERNAME> [OPTIONS]
+```
+
+Disable (`ban`) or re-enable (`unban`) a user account. A disabled account can't log in and any live session is ended immediately — but the account and its authored messages are preserved. This is a softer action than deletion: deleting additionally reserves the username so no-one else can register it, and isn't currently exposed as a CLI command.
+
+| Argument | Description |
+|----------|-------------|
+| `<USERNAME>` | BBS username to disable/re-enable (case-sensitive) |
+
+```sh
+supply-drop-bbs user ban alice
+# disabled: alice (login rejected, session ended)
+
+supply-drop-bbs user unban alice
+# re-enabled: alice
+```
+
+**Exit codes:** `0` on success; `1` if the user is not found or the database cannot be opened.
+
+Equivalent to the in-BBS `BAN <username>` (Aide+) / `UNBAN <username>` (Sysop) commands, and to the **ban**/**unban** buttons on the web admin's Users page.
+
+---
+
+### `user timeout`
+
+```
+supply-drop-bbs user timeout <USERNAME> <DAYS> [OPTIONS]
+```
+
+Suspend a user account for a fixed number of days, distinct from a permanent `ban`: login is rejected and any live session is ended immediately, same as `ban`, but the account reactivates automatically once the timeout elapses rather than staying disabled until an explicit `unban`. A login attempt during the timeout is told how many days remain. `unban` lifts a timeout early.
+
+| Argument | Description |
+|----------|-------------|
+| `<USERNAME>` | BBS username to suspend (case-sensitive) |
+| `<DAYS>` | Suspension length, `1`-`5` |
+
+```sh
+supply-drop-bbs user timeout alice 3
+# suspended: alice for 3 day(s)
+```
+
+**Exit codes:** `0` on success; `1` if the user is not found, `<DAYS>` is outside `1`-`5`, or the database cannot be opened.
+
+Equivalent to the in-BBS `TIMEOUT <username> <days>` (Aide+) command, and to the **timeout** button on the web admin's Users page.
+
+---
+
 ### `contacts list` / `contacts discovered` / `contacts delete`
 
 ```

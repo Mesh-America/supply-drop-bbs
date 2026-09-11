@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE users SET status = ?, suspended_until = ? WHERE id = ?",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "39a68d66d42eff8381171f1f415efcd3d39f7bdf3bd2cd85bf1e61f837bdb657"
+}

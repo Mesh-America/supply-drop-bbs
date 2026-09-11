@@ -55,14 +55,6 @@ case "$1" in
     # pymc-companion second would cut the just-reconnected BBS's HAT link
     # again moments later.
     #
-    # Accepted risk, not fixed here: `pip install --upgrade` below runs as
-    # root with no version pin, same as install.sh's own openhop-core
-    # install (supply-drop-bbs-9bs's accepted-risk stance covers it there)
-    # — but this path now runs unattended on every future `apt upgrade`,
-    # not just a deliberate one-time wizard run, which is a meaningfully
-    # larger unattended-root-RCE-on-compromised-PyPI-release window. Not
-    # rushed in given #243's own urgency; tracked separately.
-    #
     # Wrapped so any failure here is a warning, never a fatal error: a
     # HAT-bridge update problem must not abort the core BBS package
     # install/upgrade transaction. set +e/set -e brackets the subshell so
@@ -84,6 +76,17 @@ case "$1" in
     # `sudo supply-drop-bbs setup` on the same host could run two
     # unsynchronized `pip install`s against the same venv concurrently.
     PYMC_LOCK="$PYMC_DIR/.pymc-companion-update.lock"
+    # Pinned (supply-drop-bbs-6zu / #268): this path runs `pip install` as
+    # root, unattended, on every future `apt upgrade` of any host with a
+    # HAT configured -- unlike install.sh's own openhop-core install (a
+    # deliberate, one-time, operator-driven wizard run, which #268 also
+    # pins for the same reason but is a smaller window), a floating
+    # `--upgrade` here would give a single compromised openhop-core
+    # release on PyPI unattended root code execution on every such host's
+    # next routine upgrade, no operator action required. Bump this pin
+    # deliberately (and install.sh's matching one) after verifying a new
+    # release, not as a side effect of any other change.
+    OPENHOP_CORE_VERSION="1.1.3"
 
     if [ -d "$PYMC_DIR" ]; then
       if [ -x "$PYMC_DIR/venv/bin/pip" ]; then
@@ -126,7 +129,9 @@ case "$1" in
 
           # timeout bounds a stalled/degraded-network pip against holding
           # dpkg's transaction lock indefinitely on a routine upgrade.
-          timeout 60 "$PYMC_DIR/venv/bin/pip" install -q --upgrade openhop-core
+          # Exact pin, not --upgrade -- see OPENHOP_CORE_VERSION's comment
+          # above for why (supply-drop-bbs-6zu / #268).
+          timeout 60 "$PYMC_DIR/venv/bin/pip" install -q "openhop-core==${OPENHOP_CORE_VERSION}"
           if command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload
             systemctl restart pymc-companion.service
