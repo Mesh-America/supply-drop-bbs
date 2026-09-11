@@ -785,7 +785,13 @@ async fn cmd_run(cli: &Cli) {
     }
 
     info!(
-        name = %cfg.bbs.name,
+        // Sanitized (supply-drop-bbs-wrh / #293): bbs.name is only
+        // validated, not sanitized, against Unicode display-spoofing
+        // codepoints (see validate_mesh_node_name's doc comment) — logging
+        // it raw would let a spoofed name render misleadingly in a
+        // terminal/log viewer, even though it's a sysop-authenticated,
+        // self-only surface.
+        name = %bbs_core::mesh_name::strip_display_spoofing_codepoints(&cfg.bbs.name),
         version = env!("CARGO_PKG_VERSION"),
         "supply-drop-bbs starting"
     );
@@ -798,7 +804,8 @@ async fn cmd_run(cli: &Cli) {
     // shortened. The HAT yaml writer truncates defensively as a fallback.
     if cfg.bbs.name.len() > bbs_core::mesh_name::MAX_MESH_NODE_NAME_BYTES {
         warn!(
-            name = %cfg.bbs.name,
+            // Sanitized — see the "supply-drop-bbs starting" log above.
+            name = %bbs_core::mesh_name::strip_display_spoofing_codepoints(&cfg.bbs.name),
             bytes = cfg.bbs.name.len(),
             max = bbs_core::mesh_name::MAX_MESH_NODE_NAME_BYTES,
             "bbs.name exceeds the MeshCore advert limit; mesh adverts will be truncated \

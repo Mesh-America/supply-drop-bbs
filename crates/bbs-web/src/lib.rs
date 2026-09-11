@@ -2047,6 +2047,13 @@ struct ConfigResponse {
     /// Server's system timezone (best-effort; TZ env → /etc/timezone → UTC).
     server_timezone: String,
     bbs_name: Option<String>,
+    /// True when `bbs_name` contains Unicode display-spoofing codepoints
+    /// (supply-drop-bbs-wrh / #293) — `validate_mesh_node_name` accepts
+    /// them (see its doc comment), but `truncate_mesh_node_name` silently
+    /// strips them before the name is actually broadcast over the mesh, so
+    /// the stored value and the broadcast value have diverged. Lets the
+    /// settings UI warn the sysop instead of leaving that gap invisible.
+    bbs_name_has_hidden_codepoints: bool,
     bbs_starting_room: Option<String>,
     bbs_welcome_msg: Option<String>,
     bbs_timezone: Option<String>,
@@ -2555,11 +2562,17 @@ async fn api_get_config(
 
     let writable = std::fs::OpenOptions::new().write(true).open(&path).is_ok();
 
+    let bbs_name = toml_str_field(&val, "bbs", "name");
+    let bbs_name_has_hidden_codepoints = bbs_name
+        .as_deref()
+        .is_some_and(|n| bbs_core::mesh_name::strip_display_spoofing_codepoints(n) != n);
+
     let resp = ConfigResponse {
         config_file: Some(path),
         writable,
         server_timezone: system_timezone(),
-        bbs_name: toml_str_field(&val, "bbs", "name"),
+        bbs_name,
+        bbs_name_has_hidden_codepoints,
         bbs_starting_room: toml_str_field(&val, "bbs", "starting_room"),
         bbs_welcome_msg: toml_str_field(&val, "bbs", "welcome_msg"),
         bbs_timezone: toml_str_field(&val, "bbs", "timezone"),
@@ -4955,6 +4968,55 @@ mod tests {
         // The malformed file must be untouched -- a failed write must never
         // reach atomic_write_file's rename step.
         assert_eq!(std::fs::read_to_string(&config_path).unwrap(), "bbs = 1\n");
+    }
+
+    // supply-drop-bbs-wrh / #293: GET /config flags a bbs.name that
+    // validate_mesh_node_name accepts (it deliberately allows Format
+    // codepoints) but truncate_mesh_node_name would strip before actually
+    // broadcasting it -- the stored and broadcast values have diverged.
+    #[tokio::test]
+    async fn api_get_config_flags_bbs_name_with_hidden_codepoints() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[bbs]\nname = \"\u{202E}Admin BBS\"\n").unwrap();
+
+        let host: Arc<dyn Host> = Arc::new(MockHost::new());
+        let config = WebConfig {
+            config_path: Some(config_path.to_str().unwrap().to_owned()),
+            ..WebConfig::default()
+        };
+        let state = Arc::new(AppState::new(host, config));
+
+        let resp = api_get_config(State(state), Extension(sysop()))
+            .await
+            .into_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["bbs_name"].as_str(), Some("\u{202E}Admin BBS"));
+        assert_eq!(body["bbs_name_has_hidden_codepoints"].as_bool(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn api_get_config_does_not_flag_a_clean_bbs_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[bbs]\nname = \"Admin BBS\"\n").unwrap();
+
+        let host: Arc<dyn Host> = Arc::new(MockHost::new());
+        let config = WebConfig {
+            config_path: Some(config_path.to_str().unwrap().to_owned()),
+            ..WebConfig::default()
+        };
+        let state = Arc::new(AppState::new(host, config));
+
+        let resp = api_get_config(State(state), Extension(sysop()))
+            .await
+            .into_response();
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["bbs_name_has_hidden_codepoints"].as_bool(),
+            Some(false)
+        );
     }
 
     // T039b: GET /api/v1/contacts returns only protected records.
