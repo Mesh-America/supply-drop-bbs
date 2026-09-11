@@ -1857,7 +1857,8 @@ fn build_companion_yaml(p: &HatParams) -> String {
     writeln!(s, "  bind_address: \"127.0.0.1\"").unwrap();
     writeln!(
         s,
-        "  adv_type: 3  # 1=Chat, 2=Repeater, 3=Room (BBS), 4=Sensor"
+        "  adv_type: 1  # 1=Chat, 2=Repeater, 3=Room, 4=Sensor — leave at 1, \
+         see pymc-companion.yaml.example (supply-drop-bbs / #281)"
     )
     .unwrap();
     writeln!(s, "  autoadd_config: 0x0F").unwrap();
