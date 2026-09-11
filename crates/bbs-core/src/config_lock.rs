@@ -167,21 +167,34 @@ where
 }
 
 /// Write `contents` to `path` atomically: write to a `.tmp` sibling, fsync,
-/// then rename over the destination. Call while holding this module's lock
-/// (see the module doc comment) — this alone does not serialize concurrent
-/// writers, it only prevents a torn/partial `config.toml` from a single
-/// write.
+/// then rename over the destination. When called from a config-mutating
+/// code path, call while holding this module's lock (see the module doc
+/// comment) — this alone does not serialize concurrent writers, it only
+/// prevents a torn/partial file from a single write.
 ///
-/// `src/main.rs` and `bbs-web` each keep their own copy of this helper
-/// (pre-dating this module); this one exists for `bbs-core` callers like
-/// `BbsHost::persist_access_policy`, which had no atomic-write helper of
-/// its own and was writing `config.toml` directly with `std::fs::write`.
-pub(crate) fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+/// The single shared implementation for every caller that needs an atomic
+/// write — `src/main.rs`, `src/setup.rs`, and `bbs-web` each used to keep
+/// their own copy (supply-drop-bbs-ryu / #277); consolidated here so the
+/// `O_NOFOLLOW` protection below only has to be got right once. The `.tmp`
+/// sibling is opened with `O_NOFOLLOW`, matching this module's lock-file
+/// sidecar (see its own comment in `with_config_lock_sync`): without it, a
+/// local process with write access to the target directory could
+/// pre-plant `<path>.tmp` as a symlink to an arbitrary file this process
+/// can write, and every atomic write to that path would silently truncate
+/// that file instead. `O_NOFOLLOW` only affects `open()` when the target
+/// already exists and is a symlink — the normal case, where `.tmp` doesn't
+/// exist yet, is unaffected and still creates it.
+pub fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
     use std::io::Write as _;
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
     let tmp = PathBuf::from(tmp_name);
-    let mut f = std::fs::File::create(&tmp)?;
+    let mut f = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&tmp)?;
     if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
@@ -447,6 +460,45 @@ mod tests {
             "do not touch",
             "the symlink target must be untouched -- O_NOFOLLOW should \
              reject the open before any write is attempted"
+        );
+    }
+
+    /// Same exposure as `lock_sidecar_refuses_to_follow_a_preexisting_symlink`
+    /// above, but for `atomic_write_file`'s `.tmp` sibling instead of the
+    /// lock file (supply-drop-bbs-ryu / #277) -- a local process with write
+    /// access to the target directory could pre-plant `<path>.tmp` as a
+    /// symlink to an arbitrary file this process can write, hoping an
+    /// atomic write truncates that file instead.
+    #[test]
+    fn atomic_write_refuses_to_follow_a_preexisting_tmp_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "original").unwrap();
+
+        let victim_path = dir.path().join("victim.txt");
+        std::fs::write(&victim_path, "do not touch").unwrap();
+        let mut tmp_name = config_path.as_os_str().to_owned();
+        tmp_name.push(".tmp");
+        let tmp_path = PathBuf::from(tmp_name);
+        std::os::unix::fs::symlink(&victim_path, &tmp_path).unwrap();
+
+        let result = atomic_write_file(&config_path, b"malicious content");
+        assert!(
+            result.is_err(),
+            "opening the .tmp sibling through a pre-planted symlink must \
+             fail, not silently follow it"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim_path).unwrap(),
+            "do not touch",
+            "the symlink target must be untouched -- O_NOFOLLOW should \
+             reject the open before any write is attempted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            "original",
+            "a failed .tmp open must never reach the rename step -- the \
+             real file must be untouched too"
         );
     }
 }
