@@ -1857,6 +1857,29 @@ fn build_companion_yaml(p: &HatParams) -> String {
     writeln!(s, "  use_dio2_rf: {}", h.dio2).unwrap();
     writeln!(s, "  use_dio3_tcxo: {}", h.dio3).unwrap();
     if h.gpiod {
+        // Known upstream bug (not fixable from this repo): openhop_core's
+        // GPIOPinManager only defines its gpiod wrapper class under the
+        // "auto" backend-detection path, not when a caller explicitly
+        // requests backend="gpiod" the way SX1262Radio does here — the
+        // module-level GPIO name is left bound to whatever it was at
+        // import (None on these presets, since install.sh's gpiod branch
+        // doesn't install python-periphery either), so the first real GPIO
+        // call fails with `TypeError: 'NoneType' object is not callable`,
+        // traced via openhop_core's source (not confirmed on live
+        // hardware). Flagged here so an operator who hits that error on
+        // this preset knows it's a known issue, not something specific to
+        // their setup. See supply-drop-bbs-85n / #234.
+        writeln!(
+            s,
+            "  # NOTE: see supply-drop-bbs-85n / #234 if GPIO calls fail"
+        )
+        .unwrap();
+        writeln!(
+            s,
+            "  # with TypeError: 'NoneType' object is not callable --"
+        )
+        .unwrap();
+        writeln!(s, "  # known upstream openhop_core gpiod bug.").unwrap();
         writeln!(s, "  use_gpiod_backend: true").unwrap();
         writeln!(s, "  gpio_chip: {}", h.gpio_chip).unwrap();
     }
