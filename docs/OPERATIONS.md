@@ -145,11 +145,17 @@ sudo systemctl start supply-drop-bbs
 ```
 
 ::: info Pi HAT users
-The `.deb` installs the BBS itself. For Pi HAT support you still need
-`pymc-companion` (the Python radio bridge). After the BBS is running, follow
-the [Pi HAT section](#pi-hat-additional-wizard-steps-in-the-installer) below,
-or use the guided setup script (Option 3) which handles the full HAT setup
-automatically.
+The `.deb` installs the BBS itself, but it does **not** perform first-time
+`pymc-companion` (the Python radio bridge) setup — the `.deb` and raw-binary
+methods only ever touch the `supply-drop-bbs` binary on a fresh install (a
+[`.deb` update](#debian-package-update-recommended) *will* keep an
+already-configured `pymc-companion` current, but that's not the same as
+setting one up). If you need Pi HAT support, after the BBS is running use
+[Option 3 — Guided setup script](#option-3--guided-setup-script), which
+installs and configures `pymc-companion` for you (see [what the Pi HAT
+steps do](#pi-hat-additional-wizard-steps-in-the-installer)). There is
+currently no supported way to set up the Pi HAT bridge for the first time
+without it.
 :::
 
 ### Option 2 — Raw binary
@@ -460,7 +466,7 @@ automatically if `pymc-companion` restarts.
 
 ### Debian package update (recommended)
 
-`dpkg` stops the running service, replaces the binary, and restarts it automatically — your config and data are untouched.
+`dpkg` stops the running service, replaces the binary, and restarts it automatically — your config and data are untouched. If a Pi HAT bridge (`pymc-companion`) is already configured on this host, it's brought up to date too — script, unit, and `openhop-core` dependency — with no separate step needed.
 
 ```sh
 ARCH=$(dpkg --print-architecture)
