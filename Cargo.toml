@@ -53,6 +53,9 @@ tokio-serial.workspace       = true
 time.workspace               = true
 reqwest.workspace            = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [lints]
 workspace = true
 
