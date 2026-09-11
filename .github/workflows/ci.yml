@@ -28,6 +28,13 @@ jobs:
         # rust-toolchain.toml pins (1.96). Using @stable here would
         # install the *latest* stable, which then conflicts with
         # rust-toolchain.toml when cargo invokes itself.
+        #
+        # @master is a floating ref, same shape as the ubuntu-latest
+        # mistake that caused #238 -- but this one is deliberate: it's
+        # this action's own documented, maintainer-recommended pattern
+        # for passing an explicit toolchain input (dtolnay/rust-toolchain
+        # only ever had one tag, v1, and master has since moved past it).
+        # Not an oversight; see supply-drop-bbs-0b9 / #262.
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.96"
