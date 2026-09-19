@@ -146,6 +146,22 @@ pub const ADV_TYPE_REPEATER: u8 = 2;
 pub const ADV_TYPE_ROOM: u8 = 3;
 pub const ADV_TYPE_SENSOR: u8 = 4;
 
+// ── Auto-add config (`autoadd_config` byte) ─────────────────────────────────
+// Bit masks, named after the firmware's `AUTO_ADD_*` defines. Bits 1-4 line
+// up with `ADV_TYPE_*` 1-4 and are only consulted when `manual_add_contacts`
+// bit 0 is set; with it clear the firmware auto-adds every type regardless.
+/// Evict the oldest non-favourite contact when the table is full, instead of
+/// refusing the new one. Applies in both auto-add modes.
+pub const AUTO_ADD_OVERWRITE_OLDEST: u8 = 1 << 0;
+/// Auto-add Chat adverts (`ADV_TYPE_CHAT`).
+pub const AUTO_ADD_CHAT: u8 = 1 << 1;
+/// Auto-add Repeater adverts (`ADV_TYPE_REPEATER`).
+pub const AUTO_ADD_REPEATER: u8 = 1 << 2;
+/// Auto-add Room Server adverts (`ADV_TYPE_ROOM`).
+pub const AUTO_ADD_ROOM_SERVER: u8 = 1 << 3;
+/// Auto-add Sensor adverts (`ADV_TYPE_SENSOR`).
+pub const AUTO_ADD_SENSOR: u8 = 1 << 4;
+
 // ── Text types ──────────────────────────────────────────────────────────────
 pub const TXT_TYPE_PLAIN: u8 = 0;
 pub const TXT_TYPE_CLI_DATA: u8 = 1;

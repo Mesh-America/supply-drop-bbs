@@ -27,7 +27,8 @@ companion:
   # Auto-add bitmask: 0x01=overwrite_oldest 0x02=chat 0x04=repeater 0x08=room
   # 0x10=sensor. 0x0F adds chat/repeater/room (NOT sensor) and evicts the
   # oldest when the contact list is full. Use 0x1F to also auto-add sensor
-  # contacts.
+  # contacts. The BBS sets the 0x01 and 0x02 bits itself on every connect if
+  # they are off, so leaving them out here has no lasting effect.
   autoadd_config: 0x0F
 
   # Where the contact list (including which contacts are favourited/
