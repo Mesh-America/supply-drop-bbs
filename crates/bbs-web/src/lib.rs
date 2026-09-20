@@ -3966,6 +3966,9 @@ async fn api_download_backup(
         )
             .into_response();
     }
+    if bbs_core::restore_stage::is_restore_working_file(&filename) {
+        return (StatusCode::NOT_FOUND, Json(json_error("not found"))).into_response();
+    }
 
     let dir = match state.backup_dir() {
         Some(d) => d,
@@ -4012,6 +4015,13 @@ async fn api_delete_backup(
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error("invalid filename")),
+        )
+            .into_response();
+    }
+    if !is_backup_file_name(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("not a backup file")),
         )
             .into_response();
     }

@@ -119,9 +119,15 @@ function startRestoreWait(
   message: string,
   restartByHand: boolean,
   baselineBootId: string | null,
-  unknownOutcome = false
+  unknownOutcome = false,
+  // Whether the request acted on the upload staged on the server (Apply), so
+  // that upload is still there to apply if the notice gives up.
+  actsOnStagedUpload = false
 ) {
   restoreDone.value = true
+  // What was staged before, to give back if the notice gives up: the upload is
+  // still on the server and the Apply button must not vanish with the notice.
+  const wasStaged = restoreStaged.value
   restoreStaged.value = false
   showRestoreWait({
     message,
@@ -133,9 +139,14 @@ function startRestoreWait(
     giveUpAfterSeconds: unknownOutcome ? GIVE_UP_AFTER_SECONDS : undefined,
     onGiveUp: () => {
       restoreDone.value = false
+      restoreStaged.value = actsOnStagedUpload && wasStaged
+      // The request may have got through and confirmed the restore for the next
+      // start even though nothing restarted (no systemd, or the exit failed).
       error.value =
-        'The connection failed and the service did not restart, so the restore was ' +
-        'not applied. Check the service, then try again.'
+        'The connection failed and the service did not restart, so the restore has ' +
+        'not been applied. It may still have been confirmed: if a file named ' +
+        'pending_restore.db is in the data directory, it is applied the next time ' +
+        'the BBS starts. Check the service, then try again.'
     },
   })
 }
@@ -209,17 +220,23 @@ async function restoreBackup(filename: string) {
 // confirmed, and a retry would then replace the safety snapshot of the original
 // data. For those, wait behind the notice and see whether the service restarts
 // (reload) or not (the notice gives up and says the restore was not applied).
-function handleRestoreError(e: unknown, bootId: string | null) {
+function handleRestoreError(e: unknown, bootId: string | null, actsOnStagedUpload = false) {
   if (e instanceof ApiError && e.status === 409) {
     // The server says a restore is already confirmed and restarting.
-    startRestoreWait(e.message, false, bootId)
+    startRestoreWait(e.message, false, bootId, false, actsOnStagedUpload)
     return
   }
   if (e instanceof ApiError && !UNCLEAR_STATUS.includes(e.status)) {
     error.value = e.message
     return
   }
-  startRestoreWait('Connection lost: checking whether the service is restarting', false, bootId, true)
+  startRestoreWait(
+    'Connection lost: checking whether the service is restarting',
+    false,
+    bootId,
+    true,
+    actsOnStagedUpload
+  )
 }
 
 function pickRestoreFile(e: Event) {
@@ -270,9 +287,9 @@ async function applyRestore() {
     const res = await api.post<{ message: string; restart_required?: boolean }>(
       `/api/v1/backups/restore/apply?config=${restoreSettings.value}`
     )
-    startRestoreWait(res.message, res.restart_required === true, bootId)
+    startRestoreWait(res.message, res.restart_required === true, bootId, false, true)
   } catch (e: any) {
-    handleRestoreError(e, bootId)
+    handleRestoreError(e, bootId, true)
   } finally {
     applying.value = false
   }

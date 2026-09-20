@@ -246,10 +246,11 @@ struct SessionRecord {
     /// `None` means "not yet started"; F starts at the first message, R at the last.
     /// Reset to `None` when the room changes.
     current_message_id: Option<MessageId>,
-    /// The confirmation shown for the most recent post, kept until the next
-    /// command. Lets a re-sent bare `.` (e.g. when the confirmation was lost on
-    /// a lossy radio link) re-emit the *same* confirmation idempotently instead
-    /// of returning "Unknown command." See issues #107 and #121.
+    /// The outcome shown for the most recent post or cancelled draft, kept
+    /// until the next command. Lets a re-sent bare `.` (e.g. when the reply was
+    /// lost on a lossy radio link) re-emit the *same* confirmation idempotently
+    /// instead of returning "Unknown command.", and, on a radio, a re-sent bare
+    /// `C` repeat the cancel. See issues #107, #121 and #312.
     last_post_confirmation: Option<String>,
 }
 
@@ -506,9 +507,11 @@ impl Host for BbsHost {
         // Clear the post-confirm idempotency state for any command other than a
         // bare `.` (which the `Command::Unknown` arm handles as a re-confirm).
         // Once the user does anything else, a stray `.` is no longer a retry. (#107)
-        // A bare `C` is the send prompt's cancel, so it counts as a retry too.
+        // A bare `C` is the send prompt's cancel, so on a radio it counts as a
+        // retry too (elsewhere it is just the room command asking for its argument).
+        let is_bare_c = matches!(&cmd, Command::ChangeRoom { target } if target.trim().is_empty());
         let is_repost_dot = matches!(&cmd, Command::Unknown { raw } if raw.trim() == ".")
-            || matches!(&cmd, Command::ChangeRoom { target } if target.trim().is_empty());
+            || (is_bare_c && self.session_on_radio(session).await);
         if !is_repost_dot {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
@@ -1624,7 +1627,10 @@ impl Host for BbsHost {
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
         crate::db::Database::admin_delete_backup(backup_dir, filename)
             .await
-            .map_err(|e| HostError::Storage(format!("{e}")))
+            .map_err(|e| match e {
+                crate::db::StoreError::NotFound => HostError::NotFound(filename.to_owned()),
+                e => HostError::Storage(format!("{e}")),
+            })
     }
 
     async fn admin_stage_restore(
@@ -2170,23 +2176,34 @@ impl BbsHost {
         // agree on what "now" is, even if the wall clock steps between two reads.
         let now = Timestamp::now();
         if now >= until {
-            UserStore::update(
-                &self.db,
-                user.id,
-                None,
-                Some(UserStatus::Active),
-                None,
-                None,
-            )
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-            UserStore::clear_suspension(&self.db, user.id)
+            // One conditional statement: the account is reactivated only if it
+            // is still in this expired timeout. Two separate writes could
+            // reactivate an account a sysop had re-suspended or banned since
+            // it was read, or leave it Active with the expiry still set.
+            let ended = UserStore::end_expired_suspension(&self.db, user.id, now)
                 .await
                 .map_err(|e| HostError::Storage(format!("{e}")))?;
-            let mut user = user;
-            user.status = UserStatus::Active;
-            user.suspended_until = None;
-            return Ok(LoginSuspensionCheck::Allowed(user));
+            if ended {
+                let mut user = user;
+                user.status = UserStatus::Active;
+                user.suspended_until = None;
+                return Ok(LoginSuspensionCheck::Allowed(user));
+            }
+            // The row changed since it was read. Go by what it is now, and
+            // refuse if it can't be read.
+            let fresh = UserStore::get_by_id(&self.db, user.id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            return Ok(match fresh {
+                Some(u) if u.status == UserStatus::Active => LoginSuspensionCheck::Allowed(u),
+                Some(u) if u.status == UserStatus::Banned => match u.suspended_until {
+                    Some(until) => LoginSuspensionCheck::Suspended {
+                        days_remaining: suspension_days_remaining(until, now),
+                    },
+                    None => LoginSuspensionCheck::PermanentlyBanned,
+                },
+                _ => LoginSuspensionCheck::PermanentlyBanned,
+            });
         }
         Ok(LoginSuspensionCheck::Suspended {
             days_remaining: suspension_days_remaining(until, now),
@@ -3746,10 +3763,13 @@ impl BbsHost {
         if target.trim().is_empty() {
             // A bare `C` right after a draft was posted or cancelled is a retry
             // of the send prompt's `C` (its reply was lost): repeat the outcome.
+            // Only on a radio, where replies get lost; on the CLI or web a bare
+            // `C` is someone asking how to change room, not a retry.
             let outcome = {
                 let sessions = self.sessions.read().await;
                 sessions
                     .get(&session)
+                    .filter(|r| matches!(r.transport.as_str(), "meshcore" | "meshtastic"))
                     .and_then(|r| r.last_post_confirmation.clone())
             };
             if let Some(outcome) = outcome {
@@ -5854,13 +5874,16 @@ fn draft_preview(recipient: Option<&Username>, body: &str, on_radio: bool) -> St
 }
 
 /// `s` cut to at most `max` bytes on a character boundary, ending in "…" when
-/// anything was removed.
+/// anything was removed. When `max` is too small to hold the ellipsis the result
+/// is empty, so the limit holds either way.
 fn clip_to_bytes(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
     const ELLIPSIS: &str = "…";
     if s.len() <= max {
         return std::borrow::Cow::Borrowed(s);
     }
-    let keep = max.saturating_sub(ELLIPSIS.len());
+    let Some(keep) = max.checked_sub(ELLIPSIS.len()) else {
+        return std::borrow::Cow::Borrowed("");
+    };
     let mut end = 0;
     for (i, c) in s.char_indices() {
         if i + c.len_utf8() > keep {
@@ -10001,7 +10024,7 @@ mod tests {
     #[tokio::test]
     async fn a_retried_c_or_dot_repeats_the_outcome() {
         let (host, _db) = make_host().await;
-        let sid = host.create_session("test").await.unwrap();
+        let sid = host.create_session("meshcore").await.unwrap();
         register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
         let text = |r: Response| match r {
             Response::Text(t) => t,
@@ -10050,6 +10073,44 @@ mod tests {
         assert!(text(r).starts_with("Usage: C"));
     }
 
+    /// Off a radio there is no lost reply to repeat: a bare `C` after a post is
+    /// the room command asking for its argument, not a replay of the post.
+    #[tokio::test]
+    async fn a_bare_c_after_a_post_is_the_room_command_off_radio() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("cli").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("real".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&reply(&host, sid, ".").await, Response::Text(t) if t.contains("Message posted"))
+        );
+        let r = host
+            .process_command(sid, Command::parse("C", false))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Text(t) if t.starts_with("Usage: C")),
+            "{r:?}"
+        );
+        // That `C` was a command of its own, so the post's slot is gone and a
+        // later `.` is not a replay of "Message posted.".
+        let r = host
+            .process_command(sid, Command::parse(".", false))
+            .await
+            .unwrap();
+        assert!(
+            !matches!(&r, Response::Text(t) if t.contains("Message posted")),
+            "{r:?}"
+        );
+    }
+
     /// `C` typed while a draft is pending reaches the workflow on every transport
     /// (it is a reply, not a room command) and is a room command otherwise.
     #[test]
@@ -10089,7 +10150,11 @@ mod tests {
         // A draft that just fits is left alone.
         let fits = "y".repeat(RADIO_DRAFT_PREVIEW_MAX_BYTES - SUFFIX.len());
         assert_eq!(draft_preview(None, &fits, true), format!("{fits}{SUFFIX}"));
-        assert_eq!(clip_to_bytes("abc", 0), "…");
+        // Too small for the ellipsis: empty, never over the limit.
+        for max in 0.."…".len() {
+            assert_eq!(clip_to_bytes("abcdef", max), "", "{max}");
+        }
+        assert_eq!(clip_to_bytes("abcdef", "…".len()), "…");
     }
 
     /// End to end on a radio session: a long draft still shows how to send or cancel.

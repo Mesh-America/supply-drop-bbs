@@ -50,11 +50,15 @@ export interface RestartWatchOptions {
   baselineBootId: string | null
   /** Called once, when the restarted service answers. */
   onRestarted: () => void
+  /** Called before every poll with the seconds waited so far. */
+  onTick?: (elapsedSeconds: number) => void
   /**
-   * Called before every poll with the seconds waited so far and whether the
-   * previous poll was answered by the same process as `baselineBootId`.
+   * Called after every poll that did not find a restart, with the seconds
+   * waited when it finished and whether that poll was answered by the same
+   * process as `baselineBootId`. Unlike a value carried over from an earlier
+   * poll, this reflects the answer that has just arrived.
    */
-  onTick?: (elapsedSeconds: number, sameProcessAnswering: boolean) => void
+  onPolled?: (elapsedSeconds: number, sameProcessAnswering: boolean) => void
   intervalMs?: number
   requestTimeoutMs?: number
   fetchFn?: typeof fetch
@@ -63,14 +67,16 @@ export interface RestartWatchOptions {
 export function watchForRestart(opts: RestartWatchOptions): () => void {
   const interval = opts.intervalMs ?? 1500
   const doFetch = opts.fetchFn ?? fetch
-  const started = Date.now()
+  // A monotonic clock: the wall clock can be stepped by NTP or a suspend/resume
+  // while waiting, which would move the give-up point.
+  const started = performance.now()
+  const elapsed = () => Math.floor((performance.now() - started) / 1000)
   let stopped = false
   let inFlight = false
   // Consecutive failed polls, and the longest such run. Without a baseline id
   // a single failed poll can be a proxy blip; a real restart takes several.
   let downStreak = 0
   let longestDown = 0
-  let sameProcess = false
 
   const stop = () => {
     stopped = true
@@ -81,18 +87,18 @@ export function watchForRestart(opts: RestartWatchOptions): () => void {
     // A slow answer must not stack up further polls.
     if (stopped || inFlight) return
     inFlight = true
-    opts.onTick?.(Math.floor((Date.now() - started) / 1000), sameProcess)
+    opts.onTick?.(elapsed())
     try {
       const health = await getHealth(doFetch, opts.requestTimeoutMs)
       if (stopped) return
       if (health === null) {
         downStreak++
         longestDown = Math.max(longestDown, downStreak)
-        sameProcess = false
+        opts.onPolled?.(elapsed(), false)
         return
       }
       downStreak = 0
-      sameProcess =
+      const sameProcess =
         opts.baselineBootId !== null && health.boot_id === opts.baselineBootId
       const restarted =
         opts.baselineBootId !== null
@@ -101,7 +107,9 @@ export function watchForRestart(opts: RestartWatchOptions): () => void {
       if (restarted) {
         stop()
         opts.onRestarted()
+        return
       }
+      opts.onPolled?.(elapsed(), sameProcess)
     } finally {
       inFlight = false
     }

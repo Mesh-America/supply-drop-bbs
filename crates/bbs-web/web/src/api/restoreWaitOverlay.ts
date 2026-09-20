@@ -23,9 +23,10 @@ export interface RestoreWaitOptions {
   /**
    * For a request whose outcome is unknown (it failed before an answer). A
    * confirmed restore makes the service exit within a moment, so if the same
-   * process is still answering after this many seconds no restart is coming
-   * and the restore was not applied: dismiss the notice and call `onGiveUp`.
-   * Not used when the server itself confirmed the restore.
+   * process is still answering after this many seconds no restart is coming:
+   * dismiss the notice and call `onGiveUp`. The restore has not been applied
+   * by a restart at that point, though the request may still have confirmed it
+   * for the next start. Not used when the server itself confirmed the restore.
    */
   giveUpAfterSeconds?: number
   onGiveUp?: () => void
@@ -143,8 +144,16 @@ export function showRestoreWait(opts: RestoreWaitOptions): void {
   let slowShown = false
   const stop = watchForRestart({
     baselineBootId: opts.baselineBootId,
-    onTick: (seconds, sameProcessAnswering) => {
+    onTick: (seconds) => {
       timer.textContent = `waiting ${seconds}s`
+      if (seconds >= SLOW_AFTER_SECONDS && !slowShown) {
+        slowShown = true
+        slow.style.display = 'flex'
+        reload.focus()
+      }
+    },
+    // Judged on the answer that has just come back, not on an earlier poll's.
+    onPolled: (seconds, sameProcessAnswering) => {
       if (
         opts.giveUpAfterSeconds !== undefined &&
         seconds >= opts.giveUpAfterSeconds &&
@@ -154,12 +163,6 @@ export function showRestoreWait(opts: RestoreWaitOptions): void {
         overlay.remove()
         app?.removeAttribute('inert')
         opts.onGiveUp?.()
-        return
-      }
-      if (seconds >= SLOW_AFTER_SECONDS && !slowShown) {
-        slowShown = true
-        slow.style.display = 'flex'
-        reload.focus()
       }
     },
     onRestarted: () => window.location.reload(),

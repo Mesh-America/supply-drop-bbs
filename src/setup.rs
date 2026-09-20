@@ -2248,18 +2248,46 @@ struct PortChoice {
 ///
 /// If `existing` (the port in the current config) matches no detected port, for
 /// example because the radio is unplugged, a "keep current" row comes first so
-/// re-running the wizard doesn't silently replace it.
+/// re-running the wizard doesn't silently replace it. An alias the wizard does
+/// not trust (see [`trusted_aliases`]) matches no port by name either, so the
+/// row also says when it resolves to a device that is present.
 fn port_choices(ports: &[PortInfo], existing: Option<&str>) -> Vec<PortChoice> {
+    port_choices_with(ports, existing, |path| {
+        std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+}
+
+/// [`port_choices`] with the way a configured path is resolved to the device it
+/// points at supplied by the caller (the filesystem, in the wizard).
+fn port_choices_with(
+    ports: &[PortInfo],
+    existing: Option<&str>,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Vec<PortChoice> {
     let mut choices: Vec<PortChoice> = Vec::new();
     if let Some(e) = existing.filter(|e| !e.is_empty()) {
         let detected = ports
             .iter()
             .any(|p| p.name == e || p.by_id.as_deref() == Some(e));
         if !detected {
+            // Only a by-id alias is called "not reliable": another name (a
+            // sysop's own udev symlink, a by-path name) is theirs to judge.
+            let present_as = Some(e)
+                .filter(|e| e.starts_with("/dev/serial/by-id/"))
+                .and_then(&resolve)
+                .filter(|t| ports.iter().any(|p| p.name == *t));
+            let note = match present_as {
+                Some(device) => {
+                    format!("present as {device}, but this name is not a reliable one")
+                }
+                None => "not in the detected list".to_owned(),
+            };
             choices.push(PortChoice {
                 value: e.to_owned(),
                 device: e.to_owned(),
-                label: format!("Keep current: {e}  (not in the detected list)"),
+                label: format!("Keep current: {e}  ({note})"),
                 stable: false,
             });
         }
@@ -2316,6 +2344,28 @@ struct UsbIdentity {
     serial: Option<String>,
 }
 
+/// Whether a USB serial number is a factory placeholder that many units of the
+/// same board share (`0001` on many CP210x boards, all zeros, `12345678`). An
+/// alias built from one is not tied to a single device: a second board of that
+/// model would get the same name, even though none is attached now.
+fn is_placeholder_serial(serial: &str) -> bool {
+    let s = serial.trim();
+    let mut chars = s.chars();
+    let repeated = chars.next().is_some_and(|first| chars.all(|c| c == first));
+    // Four digits or fewer is a counter, not a per-unit serial.
+    let short_number = s.len() <= 4 && s.chars().all(|c| c.is_ascii_digit());
+    let known = [
+        "0123456789",
+        "1234567890",
+        "12345678",
+        "123456789",
+        "0123456789ABCDEF",
+    ]
+    .iter()
+    .any(|k| s.eq_ignore_ascii_case(k));
+    repeated || short_number || known
+}
+
 /// Keeps the alias of each port only where it can be trusted to name that one
 /// device. `ids[i]` and `aliases[i]` describe port `i`; `None` in `ids` means
 /// not a USB port.
@@ -2333,7 +2383,11 @@ fn trusted_aliases(ids: &[Option<UsbIdentity>], aliases: &[Option<String>]) -> V
         .map(|i| {
             let id = ids[i].as_ref()?;
             let alias = aliases.get(i)?.as_ref()?;
-            if id.serial.as_deref().is_none_or(str::is_empty) {
+            if id
+                .serial
+                .as_deref()
+                .is_none_or(|s| s.is_empty() || is_placeholder_serial(s))
+            {
                 return None;
             }
             let group: Vec<usize> = (0..ids.len())
@@ -2987,14 +3041,53 @@ mod serial_port_menu_tests {
     #[test]
     fn two_boards_sharing_a_serial_lose_their_alias() {
         let ids = [
-            usb(0x10C4, 0xEA60, Some("0001")),
-            usb(0x10C4, 0xEA60, Some("0001")),
+            usb(0x10C4, 0xEA60, Some("SN-7431")),
+            usb(0x10C4, 0xEA60, Some("SN-7431")),
         ];
         let one_link = [
-            some("/dev/serial/by-id/usb-Silicon_Labs_CP2102_0001-if00"),
+            some("/dev/serial/by-id/usb-Silicon_Labs_CP2102_SN-7431-if00"),
             None,
         ];
         assert_eq!(trusted_aliases(&ids, &one_link), [None, None]);
+    }
+
+    // Many CP210x boards ship with the serial "0001". One such board on its own
+    // has no duplicate to expose it, but the alias would name whichever board
+    // is attached next.
+    #[test]
+    fn a_factory_placeholder_serial_loses_its_alias_even_when_alone() {
+        for placeholder in ["0001", "0000", "00000000", "12345678", "0123456789", "A"] {
+            let ids = [usb(0x10C4, 0xEA60, Some(placeholder))];
+            let aliases = [some(ALIAS_A)];
+            assert_eq!(trusted_aliases(&ids, &aliases), [None], "{placeholder}");
+        }
+        for real in ["D42292EF51268EE1", "01E66D357489801B", "FT123", "SN-7431"] {
+            assert!(!is_placeholder_serial(real), "{real}");
+        }
+    }
+
+    // An untrusted alias in the config matches no detected port by name, but
+    // the device is there: the row must not claim otherwise.
+    #[test]
+    fn keep_current_says_when_the_configured_name_points_at_a_present_device() {
+        let ports = [port("/dev/ttyACM0", Some("CP2102"), None)];
+        let existing = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_0001-if00";
+        let present = port_choices_with(&ports, Some(existing), |p| {
+            (p == existing).then(|| "/dev/ttyACM0".to_owned())
+        });
+        assert!(
+            present[0].label.contains("present as /dev/ttyACM0"),
+            "{}",
+            present[0].label
+        );
+        assert!(!present[0].label.contains("not in the detected list"));
+
+        let unplugged = port_choices_with(&ports, Some(existing), |_| None);
+        assert!(
+            unplugged[0].label.contains("not in the detected list"),
+            "{}",
+            unplugged[0].label
+        );
     }
 
     #[test]
@@ -3029,8 +3122,8 @@ mod serial_port_menu_tests {
     #[test]
     fn the_same_serial_on_different_products_is_independent() {
         let ids = [
-            usb(0x10C4, 0xEA60, Some("0001")),
-            usb(0x303A, 0x1001, Some("0001")),
+            usb(0x10C4, 0xEA60, Some("SN-7431")),
+            usb(0x303A, 0x1001, Some("SN-7431")),
         ];
         let aliases = [some(ALIAS_A), some(ALIAS_B)];
         assert_eq!(trusted_aliases(&ids, &aliases), aliases);
@@ -3040,8 +3133,8 @@ mod serial_port_menu_tests {
     fn a_non_usb_port_or_a_port_without_a_link_has_no_alias() {
         let ids = [
             None,
-            usb(0x303A, 0x1001, Some("A")),
-            usb(0x303A, 0x1001, Some("B")),
+            usb(0x303A, 0x1001, Some("SERIAL-A")),
+            usb(0x303A, 0x1001, Some("SERIAL-B")),
         ];
         let aliases = [some(ALIAS_A), None, some(ALIAS_B)];
         assert_eq!(trusted_aliases(&ids, &aliases), [None, None, some(ALIAS_B)]);

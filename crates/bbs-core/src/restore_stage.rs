@@ -37,11 +37,23 @@ pub fn backup_filename_is_safe(filename: &str) -> bool {
         && !filename.contains('\0')
 }
 
+/// Whether `filename` is one of the restore's own working files (a staged or
+/// confirmed restore, or a pre-restore snapshot), which share the data
+/// directory and so may share the backup directory. They are not backups.
+#[must_use]
+pub fn is_restore_working_file(filename: &str) -> bool {
+    filename.starts_with("pending_restore") || filename.starts_with("pre-restore-safety-")
+}
+
 /// The two kinds of file a backup can be: a `.zip` bundle or a legacy `.db`.
 /// The backup list, the restore endpoint and the admin UI all use this rule.
+///
+/// The restore's own working files are not backups even though they end in
+/// `.db`: with the backup directory set to the data directory they would
+/// otherwise be listed, downloadable, deletable and stageable by name.
 #[must_use]
 pub fn is_backup_file_name(filename: &str) -> bool {
-    filename.ends_with(".db") || filename.ends_with(".zip")
+    (filename.ends_with(".db") || filename.ends_with(".zip")) && !is_restore_working_file(filename)
 }
 
 /// Why staging a restore failed.
@@ -274,6 +286,11 @@ mod tests {
             "x.db.tmp",
             "a.zip.bak",
             "",
+            // The restore's own files, which share the data directory when
+            // the backup directory is set to it.
+            "pending_restore.db",
+            "pending_restore.staged.db",
+            "pre-restore-safety-1789869375.db",
         ] {
             assert!(!is_backup_file_name(no), "{no}");
         }

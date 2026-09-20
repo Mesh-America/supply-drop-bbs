@@ -672,8 +672,11 @@ and `.restore.tmp` files) once they have gone an hour untouched.
 Before the swap, the current database is copied to
 `pre-restore-safety-<unix-seconds>.db` in the data directory. The three most
 recent snapshots are kept and older ones are deleted after each restore, so the
-snapshot of your original data survives a second restore. To roll back to a
-snapshot, restore it like any other backup:
+snapshot of your original data survives a second restore. The snapshots and
+`pending_restore*` files are not backups: if the backup directory is the data
+directory they are not listed, downloaded, deleted or staged by name, so stage a
+snapshot by its path, as below. To roll back to a snapshot, restore it like any
+other backup:
 
 ```sh
 supply-drop-bbs restore stage /var/lib/supply-drop-bbs/pre-restore-safety-<unix-seconds>.db

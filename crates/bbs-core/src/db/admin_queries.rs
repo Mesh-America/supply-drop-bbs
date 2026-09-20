@@ -461,6 +461,7 @@ impl Database {
     ///
     /// Returns `StoreError::Decode("invalid filename")` if the filename
     /// contains path traversal characters (`/`, `\`, `..`).
+    /// Returns [`StoreError::NotFound`] if there is no such file.
     /// Like [`Self::admin_list_backups`] it needs no open database.
     pub async fn admin_delete_backup(backup_dir: &str, filename: &str) -> Result<(), StoreError> {
         if !crate::restore_stage::backup_filename_is_safe(filename) {
@@ -470,16 +471,18 @@ impl Database {
         // (or be the data directory), and this must never remove those.
         if !crate::restore_stage::is_backup_file_name(filename) {
             return Err(StoreError::Decode(
-                "not a backup file (only .db and .zip backups can be deleted)".into(),
+                "not a backup file (only backup .db and .zip files can be deleted, not the restore's own files)".into(),
             ));
         }
 
         let dir = Path::new(backup_dir);
         let db_path = dir.join(filename);
 
-        tokio::fs::remove_file(&db_path)
-            .await
-            .map_err(|e| StoreError::Decode(format!("delete backup: {e}")))?;
+        match tokio::fs::remove_file(&db_path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(StoreError::NotFound),
+            Err(e) => return Err(StoreError::Decode(format!("delete backup: {e}"))),
+        }
 
         // Best-effort: for legacy .db backups also remove the sidecar _config.toml.
         // .zip backups are self-contained so there is nothing extra to clean up.
@@ -1194,6 +1197,17 @@ mod tests {
             .await
             .is_err());
         assert!(d.join("notes.txt").exists());
+        // A backup that isn't there is "not found", not a storage failure.
+        assert!(matches!(
+            Database::admin_delete_backup(&path, "backup_missing.zip").await,
+            Err(StoreError::NotFound)
+        ));
+        // The restore's own files are not backups, even in a shared directory.
+        std::fs::write(d.join("pending_restore.db"), b"keep").unwrap();
+        assert!(Database::admin_delete_backup(&path, "pending_restore.db")
+            .await
+            .is_err());
+        assert!(d.join("pending_restore.db").exists());
         for bad in ["../x.zip", "a/b.zip", "..", ""] {
             assert!(
                 Database::admin_delete_backup(&path, bad).await.is_err(),

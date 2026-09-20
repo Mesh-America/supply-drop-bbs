@@ -39,6 +39,59 @@ async fn insert_user_and_fetch_by_username() {
     assert!(fetched.last_login_at.is_none());
 }
 
+/// Ending an expired timeout is one conditional write: it applies only to an
+/// account that is still Banned with an expiry that has passed, so a login that
+/// read the row a moment ago cannot undo a sysop's later ban, re-suspension or
+/// unban.
+#[tokio::test]
+async fn end_expired_suspension_only_applies_to_a_timeout_that_has_run_out() {
+    use bbs_core::UserStatus;
+    let (db, _dir) = test_db().await;
+    let now = Timestamp::now();
+    let hour = time::Duration::hours(1);
+    let past = Timestamp::from_utc(now.as_offset_datetime() - hour);
+    let future = Timestamp::from_utc(now.as_offset_datetime() + hour);
+    let id = db
+        .create(
+            &Username::new("alice").unwrap(),
+            None,
+            PermissionLevel::User,
+            now,
+        )
+        .await
+        .unwrap();
+
+    // Active: nothing to end.
+    assert!(!db.end_expired_suspension(id, now).await.unwrap());
+
+    // A timeout still running is left alone.
+    db.suspend(id, future).await.unwrap();
+    assert!(!db.end_expired_suspension(id, now).await.unwrap());
+    assert_eq!(
+        db.get_by_id(id).await.unwrap().unwrap().status,
+        UserStatus::Banned
+    );
+
+    // A permanent ban (no expiry) is left alone.
+    db.update(id, None, Some(UserStatus::Banned), None, None)
+        .await
+        .unwrap();
+    db.clear_suspension(id).await.unwrap();
+    assert!(!db.end_expired_suspension(id, now).await.unwrap());
+    assert_eq!(
+        db.get_by_id(id).await.unwrap().unwrap().status,
+        UserStatus::Banned
+    );
+
+    // An expired timeout ends: Active, expiry cleared, once.
+    db.suspend(id, past).await.unwrap();
+    assert!(db.end_expired_suspension(id, now).await.unwrap());
+    let after = db.get_by_id(id).await.unwrap().unwrap();
+    assert_eq!(after.status, UserStatus::Active);
+    assert!(after.suspended_until.is_none());
+    assert!(!db.end_expired_suspension(id, now).await.unwrap());
+}
+
 #[tokio::test]
 async fn duplicate_username_returns_conflict() {
     let (db, _dir) = test_db().await;

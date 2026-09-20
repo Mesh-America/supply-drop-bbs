@@ -327,7 +327,7 @@ It only reads the directory, so it works when the database is broken.
 
 #### `backup delete`
 
-Deletes one backup by the name `backup list` shows, after a confirmation prompt (`--yes` skips it; without a terminal to ask on the command fails unless you pass it). A legacy `.db` backup's `_config.toml` sidecar goes with it. Names that are not a plain `.db` or `.zip` file name in the backup directory are refused. Like `backup list` it needs no working database. Automatic pruning (`[backup] keep_daily` / `keep_weekly`) is separate and unchanged.
+Deletes one backup by the name `backup list` shows, after a confirmation prompt (`--yes` skips it; without a terminal to ask on the command fails unless you pass it). A legacy `.db` backup's `_config.toml` sidecar goes with it. Names that are not a plain `.db` or `.zip` file name in the backup directory are refused. Like `backup list` it needs no working database. Automatic pruning (`[backup] keep_daily` / `keep_weekly`) is separate and, like this command, leaves the restore's own files (`pending_restore*`, `pre-restore-safety-*`) alone.
 
 ---
 
@@ -379,7 +379,7 @@ backup](OPERATIONS.md#restoring-from-a-backup). Pass `--no-config` to restore th
 database only.
 
 Pass `--yes` to `apply` to skip the interactive confirmation prompt for
-scripted/non-interactive use:
+scripted/non-interactive use. Without `--yes` and without a terminal to ask on, the command exits with an error instead of confirming anything:
 
 ```sh
 supply-drop-bbs restore apply --yes
