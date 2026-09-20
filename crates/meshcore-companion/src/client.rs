@@ -65,6 +65,7 @@ use crate::{
     decode_inbound, encode_outbound,
     error::FrameDecodeError,
     frame::{InboundFrame, OutboundFrame},
+    scope::FloodScope,
     types::SelfInfo,
 };
 
@@ -89,6 +90,12 @@ pub struct ClientConfig {
 
     /// Maximum delay between reconnect attempts.
     pub reconnect_delay_max: Duration,
+
+    /// A flood scope to set as the radio's default before [`ClientEvent::Connected`]
+    /// is emitted, so the first thing the application does on a connection (an
+    /// advert, say) already uses it. Sent once per radio (by public key) while
+    /// the client runs; see [`FloodScope`]. `None` leaves the radio's scope alone.
+    pub default_flood_scope: Option<FloodScope>,
 }
 
 impl ClientConfig {
@@ -99,6 +106,7 @@ impl ClientConfig {
             app_target_version: crate::constants::APP_TARGET_VER_V3,
             reconnect_delay_initial: Duration::from_secs(1),
             reconnect_delay_max: Duration::from_secs(60),
+            default_flood_scope: None,
         }
     }
 }
@@ -123,6 +131,9 @@ pub struct SerialConfig {
 
     /// Maximum delay between reconnect attempts.
     pub reconnect_delay_max: Duration,
+
+    /// See [`ClientConfig::default_flood_scope`].
+    pub default_flood_scope: Option<FloodScope>,
 }
 
 /// Events emitted by [`CompanionClient`].
@@ -260,10 +271,13 @@ async fn run_tcp_worker(
     event_tx: mpsc::Sender<ClientEvent>,
 ) {
     let mut backoff = config.reconnect_delay_initial;
+    // The radio and scope the default flood scope was last settled for, kept
+    // across reconnects so a link blip does not rewrite the radio's flash.
+    let mut scope_memory = ScopeMemory::default();
 
     loop {
         debug!(addr = %config.addr, "companion/tcp: connecting");
-        match attempt_tcp_session(&config, &mut cmd_rx, &event_tx).await {
+        match attempt_tcp_session(&config, &mut cmd_rx, &event_tx, &mut scope_memory).await {
             SessionOutcome::Shutdown => {
                 info!("companion/tcp: clean shutdown");
                 break;
@@ -295,6 +309,7 @@ async fn attempt_tcp_session(
     config: &ClientConfig,
     cmd_rx: &mut mpsc::Receiver<OutboundFrame>,
     event_tx: &mpsc::Sender<ClientEvent>,
+    scope_memory: &mut ScopeMemory,
 ) -> SessionOutcome {
     let stream = match TcpStream::connect(config.addr).await {
         Ok(s) => s,
@@ -315,6 +330,8 @@ async fn attempt_tcp_session(
         config.app_target_version,
         cmd_rx,
         event_tx,
+        config.default_flood_scope.as_ref(),
+        scope_memory,
     )
     .await
     {
@@ -331,10 +348,13 @@ async fn run_serial_worker(
     event_tx: mpsc::Sender<ClientEvent>,
 ) {
     let mut backoff = config.reconnect_delay_initial;
+    // The radio and scope the default flood scope was last settled for, kept
+    // across reconnects so a link blip does not rewrite the radio's flash.
+    let mut scope_memory = ScopeMemory::default();
 
     loop {
         debug!(port = %config.port, baud = config.baud_rate, "companion/serial: opening port");
-        match attempt_serial_session(&config, &mut cmd_rx, &event_tx).await {
+        match attempt_serial_session(&config, &mut cmd_rx, &event_tx, &mut scope_memory).await {
             SessionOutcome::Shutdown => {
                 info!("companion/serial: clean shutdown");
                 break;
@@ -391,6 +411,7 @@ async fn attempt_serial_session(
     config: &SerialConfig,
     cmd_rx: &mut mpsc::Receiver<OutboundFrame>,
     event_tx: &mpsc::Sender<ClientEvent>,
+    scope_memory: &mut ScopeMemory,
 ) -> SessionOutcome {
     let stream = match tokio_serial::new(&config.port, config.baud_rate).open_native_async() {
         Ok(s) => s,
@@ -418,6 +439,8 @@ async fn attempt_serial_session(
         config.app_target_version,
         cmd_rx,
         event_tx,
+        config.default_flood_scope.as_ref(),
+        scope_memory,
     )
     .await
     {
@@ -442,6 +465,176 @@ enum SessionOutcome {
     IoError(io::Error, bool),
 }
 
+/// The radio and flood scope the default-scope exchange last ran for, whatever
+/// its outcome. A radio that refused, or reported back a different scope, is not
+/// asked again while the client runs, so it is not rewritten on every reconnect.
+type ScopeMemory = Option<([u8; 32], FloodScope)>;
+
+/// How long to wait for the radio's reply to each of the two scope commands.
+const SCOPE_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Set the radio's default flood scope and read it back, during the handshake.
+///
+/// This is the one place the replies can be told from anything else: nothing
+/// but `AppStart` has been sent on the connection and the command queue is not
+/// being read yet, so the next reply frame after each command is its answer
+/// (replies carry no request id). Doing it here, before `Connected`, also means
+/// the scope is set before the application sends its first command.
+///
+/// A radio that rejects the command (firmware without it) is logged and left as
+/// it is; only I/O errors and a silent radio end the session.
+async fn apply_default_flood_scope<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    radio: [u8; 32],
+    scope: &FloodScope,
+    memory: &mut ScopeMemory,
+) -> io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let done = Some((radio, scope.clone()));
+    if *memory == done {
+        return Ok(());
+    }
+    info!(region = %scope.name, "companion: setting the radio's default flood scope");
+
+    // The Set.
+    writer
+        .write_all(&encode_outbound(&OutboundFrame::SetDefaultFloodScope {
+            scope: scope.clone(),
+        }))
+        .await?;
+    writer.flush().await?;
+    let Some(set_reply) = next_scope_reply(reader, memory, &done).await? else {
+        warn!(
+            region = %scope.name,
+            "companion: could not read the radio's reply to the default flood scope, so \
+             it is unknown whether adverts are scoped; not asked again until the BBS restarts"
+        );
+        *memory = done;
+        return Ok(());
+    };
+    match set_reply {
+        InboundFrame::Ok => {}
+        InboundFrame::Err { error_code } => {
+            warn!(
+                region = %scope.name,
+                error_code,
+                "companion: the radio rejected the default flood scope (firmware without \
+                 the command?), so its adverts are not scoped as configured; not asked \
+                 again until the BBS restarts"
+            );
+            *memory = done;
+            return Ok(());
+        }
+        other => {
+            debug!("companion: unexpected reply to the default flood scope: {other:?}");
+        }
+    }
+
+    // The Get: what the radio kept, and its key.
+    writer
+        .write_all(&encode_outbound(&OutboundFrame::GetDefaultFloodScope))
+        .await?;
+    writer.flush().await?;
+    let reply = next_scope_reply(reader, memory, &done).await?;
+    *memory = done;
+    let Some(reply) = reply else {
+        debug!("companion: could not decode the radio's default flood scope read-back");
+        return Ok(());
+    };
+    match reply {
+        InboundFrame::DefaultFloodScope(Some(seen)) if seen == *scope => {
+            let key: String = seen.key.iter().map(|b| format!("{b:02x}")).collect();
+            info!(region = %seen.name, key = %key, "companion: radio default flood scope set");
+        }
+        InboundFrame::DefaultFloodScope(seen) => warn!(
+            sent = %scope.name,
+            radio = seen.as_ref().map_or("(none)", |s| s.name.as_str()),
+            "companion: the radio did not keep the default flood scope that was set, \
+             so its adverts are not scoped as configured; not asked again until the \
+             BBS restarts"
+        ),
+        other => debug!(
+            "companion: could not read the default flood scope back ({other:?}); \
+             the Set was accepted"
+        ),
+    }
+    Ok(())
+}
+
+/// A frame that arrived whole but did not decode. Kept apart from other
+/// `InvalidData` errors (a bad length) because the reader is still in step after
+/// it, so a caller that can carry on may.
+#[derive(Debug)]
+struct UndecodableFrame(String);
+
+impl std::fmt::Display for UndecodableFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for UndecodableFrame {}
+
+fn is_undecodable_frame(e: &io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<UndecodableFrame>())
+}
+
+/// The next solicited reply (`Ok`, `Err` or the scope answer), discarding the
+/// unsolicited push frames a busy radio interleaves, as the handshake does.
+/// `None` if a frame came in that could not be decoded: the reader is still in
+/// step, but whether it was the reply is unknown, so the caller stops the
+/// exchange rather than guess. If the radio stays silent the exchange is
+/// recorded as settled (so the next connection does not repeat it) and the
+/// session ends with a timeout: the reader may be part-way through a frame and
+/// cannot safely be reused.
+async fn next_scope_reply<R>(
+    reader: &mut R,
+    memory: &mut ScopeMemory,
+    done: &ScopeMemory,
+) -> io::Result<Option<InboundFrame>>
+where
+    R: AsyncRead + Unpin,
+{
+    let read = timeout(SCOPE_REPLY_TIMEOUT, async {
+        loop {
+            match read_frame(reader).await {
+                Ok(
+                    f @ (InboundFrame::Ok
+                    | InboundFrame::Err { .. }
+                    | InboundFrame::DefaultFloodScope(_)),
+                ) => return Ok(Some(f)),
+                // Discarded, as in the AppStart handshake. Visible at debug in
+                // case a message frame is among them.
+                Ok(other) => {
+                    debug!("companion: discarding frame during flood scope setup: {other:?}");
+                }
+                Err(e) if is_undecodable_frame(&e) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    })
+    .await;
+    match read {
+        Ok(result) => result,
+        Err(_) => {
+            warn!(
+                "companion: the radio did not answer the default flood scope command; \
+                 giving up on it until the BBS restarts"
+            );
+            *memory = done.clone();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "no reply to the default flood scope command",
+            ))
+        }
+    }
+}
+
 /// Handshake + event loop shared by TCP and serial sessions.
 ///
 /// Works for any `AsyncRead`/`AsyncWrite` pair.  Returns when the session
@@ -456,6 +649,8 @@ async fn run_session<R, W>(
     app_target_version: u8,
     cmd_rx: &mut mpsc::Receiver<OutboundFrame>,
     event_tx: &mpsc::Sender<ClientEvent>,
+    default_flood_scope: Option<&FloodScope>,
+    scope_memory: &mut ScopeMemory,
 ) -> SessionOutcome
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -533,6 +728,23 @@ where
 
     if let Some(ref info) = self_info {
         info!(node = %info.node_name, "companion: handshake complete");
+    }
+    // Set the default flood scope before the application hears `Connected` (and
+    // so before it sends anything, the on-connect advert included). Skipped on a
+    // radio that gave no SelfInfo, since the exchange is keyed by its public key.
+    if let (Some(info), Some(scope)) = (&self_info, default_flood_scope) {
+        if let Err(e) =
+            apply_default_flood_scope(&mut reader, writer, info.pubkey, scope, scope_memory).await
+        {
+            return SessionOutcome::IoError(e, false);
+        }
+    }
+
+    if default_flood_scope.is_some() && self_info.is_none() {
+        warn!(
+            "companion: the radio gave no SelfInfo, so the default flood scope was not \
+             set: its adverts are not scoped as configured"
+        );
     }
     if event_tx
         .send(ClientEvent::Connected { self_info })
@@ -650,8 +862,9 @@ async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<InboundF
         payload
     );
 
-    decode_inbound(&payload)
-        .map_err(|e: FrameDecodeError| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    decode_inbound(&payload).map_err(|e: FrameDecodeError| {
+        io::Error::new(io::ErrorKind::InvalidData, UndecodableFrame(e.to_string()))
+    })
 }
 
 #[cfg(test)]

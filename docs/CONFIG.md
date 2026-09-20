@@ -306,6 +306,7 @@ arrive.
 | `workflow_timeout_secs`| integer | `300` | no       | Seconds a node may sit awaiting a workflow reply before the transport cancels the stale workflow and treats the node's next message as a fresh command. On a lossy multi-hop link a prompt reply (e.g. "Choose a password:") can be lost, stranding the node — every message it then sends is consumed as workflow input whose "try again" response is *also* lost, and only `cancel` breaks the loop. The timer is reset per workflow *stage* (a changed prompt), so a legitimately-progressing multi-step flow is not cut short. `0` disables the timeout. |
 | `path_bytes`        | integer | `3`     | no       | Bytes each hop adds to a flooded packet's routing path (MeshCore's path-hash width): `2` or `3`. More bytes make path-hash collisions — and the mis-routes they cause — less likely on a dense mesh, at the cost of a little more airtime per packet and a lower maximum hop count. Pushed to the radio on every connect. Values other than `2` or `3` are clamped into range. Also settable via the setup wizard ("MeshCore routing"), the web admin **Settings → MeshCore radio** page, or per-device with `supply-drop-bbs node set-path-bytes <2\|3>` (add `--save` to also write it here). |
 | `advert_on_connect` | bool    | `true`  | no       | Broadcast a self-advert each time the radio (re)connects. An advert is how other nodes and repeaters discover the BBS and learn (or refresh) a route back to it, so advertising on connect means the mesh relearns the BBS promptly after a restart or link blip rather than waiting for the radio firmware's own advert schedule (which a companion device may run rarely). Adverts are flooded so they propagate mesh-wide. **In addition, the BBS broadcasts a periodic flood advert once every 24 hours on a fixed schedule — this is not configurable.** |
+| `advert_scope`      | string  | unset   | no       | A MeshCore flood scope (region) to set on the radio, such as `"usa"` or `"#usa"`, so adverts stay inside that region. Set on the radio at connect, before the on-connect advert. It also applies to everything else the BBS floods. See [Advert scope](#advert-scope-region). Unset or empty leaves the radio's scope alone. |
 
 > **Check the confirm rate before enabling retransmission.** Retransmission
 > relies on the radio returning an end-to-end delivery confirmation
@@ -326,6 +327,34 @@ arrive.
 > — a duplicate message is preferable to silence, and inbound commands are
 > deduplicated separately. The per-attempt wait is the device's own timeout
 > hint, clamped to the 4–30 s range.
+
+### Advert scope (region)
+
+`advert_scope` keeps the BBS's adverts inside a MeshCore region, for a large
+mesh where flooded adverts add noise. It is the region's name, written with or
+without a leading `#` and at most 30 bytes. The name is hashed as written, so
+`USA` and `usa` are different regions.
+
+The BBS sets the radio's default flood scope to that region at connect, before
+it sends the on-connect advert; the radio keeps it, so the advert every 24 hours
+is scoped too. The BBS sends it once per radio for as long as it runs and logs
+what the radio reports back (the region and its key).
+
+**This scopes everything the radio floods, not only adverts.** The radio holds
+one default scope, and its replies to users and channel messages use it as well.
+A scoped flood is passed on only by repeaters set up for that region, so check
+that the repeaters between the BBS and your users know it before turning this
+on. Leave it unset to change nothing, including a scope you set in the MeshCore
+app. An invalid name (empty after the `#`, over 30 bytes, or containing a control
+character) fails `config check`. Which other characters MeshCore accepts in a
+region name is not checked here, so a name the repeaters don't know is only
+noticed when adverts stop crossing them.
+
+Removing `advert_scope` later does not undo it: the radio keeps the scope it was
+given, and the BBS cannot clear it (the radio refuses an empty one). Clear it in
+the MeshCore app. If the radio rejects the setting (firmware without the
+command) or reports a different scope, the BBS logs a warning and does not try
+again until it is restarted.
 
 ### Contact protection
 

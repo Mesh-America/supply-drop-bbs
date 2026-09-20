@@ -22,6 +22,7 @@
 use crate::{
     constants::*,
     error::FrameDecodeError,
+    scope::{FloodScope, MAX_REGION_NAME_BYTES},
     types::{
         BattAndStorage, ChannelInfo, ChannelMsg, Contact, ContactMsg, DeviceInfo, ExportedContact,
         LoginSuccess, SelfInfo, SentResult,
@@ -75,6 +76,9 @@ pub enum InboundFrame {
         /// than 1.14.0). Bytes after the second are ignored.
         max_hops: Option<u8>,
     },
+    /// Reply to `GetDefaultFloodScope`. `None` when the radio has no default
+    /// scope set (the reply then carries no name or key).
+    DefaultFloodScope(Option<FloodScope>),
     // Raw body for less-common resp codes we parse on demand:
     Stats {
         stats_type: u8,
@@ -242,6 +246,11 @@ pub enum OutboundFrame {
     GetStats {
         stats_type: u8,
     },
+    /// Set the radio's persistent default flood scope (see [`FloodScope`]).
+    SetDefaultFloodScope {
+        scope: FloodScope,
+    },
+    GetDefaultFloodScope,
     SetFloodScope {
         key: Option<[u8; 16]>,
     },
@@ -474,6 +483,24 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
                 config: body[0],
                 max_hops: body.get(1).copied(),
             })
+        }
+        RESP_CODE_DEFAULT_FLOOD_SCOPE => {
+            // [name×31 NUL-padded][key×16], or nothing at all when unset.
+            if body.is_empty() {
+                return Ok(InboundFrame::DefaultFloodScope(None));
+            }
+            need!(31 + 16);
+            let name = read_cstr(&body[..31])?;
+            if name.is_empty() {
+                // A full-size reply with a blank name is the same as none.
+                return Ok(InboundFrame::DefaultFloodScope(None));
+            }
+            let mut key = [0u8; 16];
+            key.copy_from_slice(&body[31..47]);
+            Ok(InboundFrame::DefaultFloodScope(Some(FloodScope {
+                name,
+                key,
+            })))
         }
         RESP_CODE_STATS => {
             need!(1);
@@ -772,6 +799,17 @@ fn build_payload(frame: &OutboundFrame) -> Vec<u8> {
             p.push(CMD_GET_STATS);
             p.push(*stats_type);
         }
+        OutboundFrame::SetDefaultFloodScope { scope } => {
+            p.push(CMD_SET_DEFAULT_FLOOD_SCOPE);
+            // A 31-byte field that ends in a NUL: longer names are cut, which
+            // `FloodScope::for_region` never produces.
+            let name = scope.name.as_bytes();
+            let n = name.len().min(MAX_REGION_NAME_BYTES);
+            p.extend_from_slice(&name[..n]);
+            p.resize(1 + 31, 0);
+            p.extend_from_slice(&scope.key);
+        }
+        OutboundFrame::GetDefaultFloodScope => p.push(CMD_GET_DEFAULT_FLOOD_SCOPE),
         OutboundFrame::SetFloodScope { key } => {
             p.push(CMD_SET_FLOOD_SCOPE);
             p.push(0); // reserved byte
