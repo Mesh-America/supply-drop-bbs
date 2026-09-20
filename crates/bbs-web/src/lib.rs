@@ -47,6 +47,7 @@
 //! │  │  GET  /api/v1/backups              (auth)       │    │
 //! │  │  GET  /api/v1/backups/:filename    (auth)       │    │
 //! │  │  DELETE /api/v1/backups/:filename  (auth)       │    │
+//! │  │  POST /api/v1/backups/:filename/restore (auth)  │    │
 //! │  │  POST /api/v1/backups/restore      (auth)       │    │
 //! │  │  POST /api/v1/backups/restore/apply(auth)       │    │
 //! │  │  GET  /api/v1/plugins              (auth)       │    │
@@ -241,12 +242,13 @@ struct AppState {
     ///
     /// Sourced from `[backup] directory` in the operator config and injected
     /// by the host binary after plugin init via [`WebPlugin::set_backup_dir`].
-    /// When `None` the backup endpoints return 503.
+    /// When `None` the backup endpoints return 400 (`backup_dir not configured`).
     backup_dir: std::sync::Mutex<Option<String>>,
     /// The BBS's data directory, sourced from `[bbs] data_dir` and injected
     /// by the host binary after plugin init via [`WebPlugin::set_data_dir`].
-    /// Used to stage an uploaded restore file where `main.rs`'s startup
-    /// check will find it (issue #195).
+    /// Used to stage a restore (an uploaded file, or a backup already in the
+    /// backup directory) where `main.rs`'s startup check will find it
+    /// (issues #195 and #309).
     data_dir: std::sync::Mutex<Option<String>>,
     /// Serializes the whole validate-and-stage / confirm sequence for a
     /// restore so two concurrent uploads (or an upload racing a confirm)
@@ -254,6 +256,11 @@ struct AppState {
     /// mutex, not `std::sync::Mutex`, since the guard must be held across
     /// `.await` points (file I/O, running migrations against the upload).
     restore_lock: tokio::sync::Mutex<()>,
+    /// Set once a confirmed restore has scheduled the process exit. The exit
+    /// happens shortly after the confirm releases `restore_lock`, so this
+    /// keeps a queued restore request from overwriting the confirmed file in
+    /// that window.
+    restore_confirmed: AtomicBool,
     sessions: Mutex<HashMap<String, WebSession>>,
     started_at: Instant,
     log_tx: broadcast::Sender<String>,
@@ -285,6 +292,7 @@ impl AppState {
             backup_dir: std::sync::Mutex::new(None),
             data_dir: std::sync::Mutex::new(None),
             restore_lock: tokio::sync::Mutex::new(()),
+            restore_confirmed: AtomicBool::new(false),
             sessions: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             log_tx,
@@ -703,6 +711,7 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/backups/:filename",
             get(api_download_backup).delete(api_delete_backup),
         )
+        .route("/backups/:filename/restore", post(api_stage_backup_restore))
         .route(
             "/backups/restore",
             post(api_upload_restore).layer(DefaultBodyLimit::max(RESTORE_UPLOAD_MAX_BYTES)),
@@ -4018,8 +4027,7 @@ async fn api_download_backup(
     if caller.permission_level < 100 {
         return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
     }
-    // Path traversal protection.
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    if !backup_filename_is_safe(&filename) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error("invalid filename")),
@@ -4067,8 +4075,8 @@ async fn api_delete_backup(
     if caller.permission_level < 100 {
         return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
     }
-    // Path traversal guard — mirrors the check in api_download_backup (SYN-13).
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    // Path traversal guard (SYN-13).
+    if !backup_filename_is_safe(&filename) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error("invalid filename")),
@@ -4093,6 +4101,296 @@ async fn api_delete_backup(
         }
         Err(e) => server_error(&e.to_string()),
     }
+}
+
+/// A backup filename is a single path component inside the backup directory:
+/// non-empty, with no path separators, no `..`, no `.` and no NUL.
+fn backup_filename_is_safe(filename: &str) -> bool {
+    !filename.is_empty()
+        && filename != "."
+        && !filename.contains('/')
+        && !filename.contains('\\')
+        && !filename.contains("..")
+        && !filename.contains('\0')
+}
+
+/// Removes its file when dropped, best effort. Covers every early return and a
+/// request future dropped mid-copy (a client disconnect), so a temporary
+/// restore copy is not left behind in the data directory. After a successful
+/// stage the file has been renamed away and the removal is a harmless no-op.
+struct TempFileGuard(std::path::PathBuf);
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Copies `source` to a new file `dest` that is owner-only (0600) from the
+/// moment it exists. `tokio::fs::copy` keeps the source's mode, which would
+/// leave a world-readable database copy readable until a later chmod and
+/// would leave a read-only backup unable to be migrated in place.
+async fn copy_backup_private(
+    source: &std::path::Path,
+    dest: &std::path::Path,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::io::AsyncWriteExt as _;
+        let mut src = tokio::fs::File::open(source).await?;
+        let mut dst = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dest)
+            .await?;
+        tokio::io::copy(&mut src, &mut dst).await?;
+        dst.flush().await?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::fs::copy(source, dest).await.map(|_| ())
+    }
+}
+
+/// 409 for a restore request that arrives after a confirmed restore has
+/// scheduled the process exit (see `AppState::restore_confirmed`).
+fn restore_already_confirmed() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json_error(
+            "a restore is already confirmed and the service is restarting",
+        )),
+    )
+        .into_response()
+}
+
+/// Query string of `POST /api/v1/backups/:filename/restore`.
+#[derive(Debug, Default, Deserialize)]
+struct StageBackupQuery {
+    /// Confirm the restore in the same request, without releasing the restore
+    /// lock in between (see `api_stage_backup_restore`).
+    #[serde(default)]
+    apply: bool,
+}
+
+/// Confirms the staged restore: promotes it to the name `main.rs`'s startup
+/// check acts on, then, when running under systemd, exits so the service
+/// manager restarts the process and the swap happens. Without systemd there is
+/// nothing to restart the process, so the restore is confirmed and the
+/// operator restarts the BBS themselves; the swap then happens on that start.
+/// The response says which of the two happened in `restart_required`.
+/// Taking the lock guard by reference makes holding `restore_lock` a
+/// compile-time requirement of every caller.
+///
+/// The work runs in a spawned task: a client that disconnects mid-request
+/// drops the handler's future, and dropping it between promoting the file
+/// and scheduling the exit would leave a confirmed restore armed with the
+/// process still running, to be applied by some later unrelated restart.
+async fn confirm_staged_restore(
+    state: &Arc<AppState>,
+    caller: &CurrentUser,
+    data_dir: &str,
+    _restore_guard: &tokio::sync::MutexGuard<'_, ()>,
+) -> Response {
+    let state = Arc::clone(state);
+    let caller = caller.clone();
+    let data_dir = data_dir.to_owned();
+    match tokio::spawn(async move { confirm_staged_restore_now(&state, &caller, &data_dir).await })
+        .await
+    {
+        Ok(response) => response,
+        Err(e) => server_error(&format!("confirming the restore: {e}")),
+    }
+}
+
+/// The body of `confirm_staged_restore`, run to completion in its own task.
+async fn confirm_staged_restore_now(
+    state: &AppState,
+    caller: &CurrentUser,
+    data_dir: &str,
+) -> Response {
+    if let Err(e) = state.host.admin_apply_staged_restore(data_dir).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error(&format!(
+                "the staged restore could not be confirmed: {e}"
+            ))),
+        )
+            .into_response();
+    }
+
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", caller.username),
+            "restore_applied",
+            None,
+            None,
+        )
+        .await;
+
+    if std::env::var("INVOCATION_ID").is_err() {
+        tracing::warn!(
+            "web admin: database restore confirmed — not running under systemd, \
+             restart the BBS to apply it"
+        );
+        return Json(serde_json::json!({
+            "message": "restore confirmed — not running under systemd, so restart \
+                        the BBS yourself to apply it",
+            "restart_required": true
+        }))
+        .into_response();
+    }
+
+    tracing::warn!("web admin: database restore confirmed — exiting to apply it on restart");
+    state.restore_confirmed.store(true, Ordering::SeqCst);
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        std::process::exit(1);
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(serde_json::json!({
+            "message": "restore applying — service is restarting",
+            "restart_required": false
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/v1/backups/:filename/restore` — validates a backup that is
+/// already in the backup directory and stages it for restore, so a sysop can
+/// restore it straight from the Backups page without downloading and
+/// re-uploading it (issue #309). On its own it does NOT confirm anything:
+/// the destructive step stays the separate `api_apply_restore` call
+/// (issue #195). With `?apply=true` (only `true` or `false` parse) it also
+/// confirms the restore before returning, under the same lock hold, so a
+/// concurrent web upload or stage can't slip a different database in between
+/// the two steps; that is what the Backups page uses. The lock is in-process,
+/// so it does not cover the CLI's `restore stage`, which is a separate process.
+///
+/// The backup is copied into the data directory first and the copy is what
+/// gets staged, because `Database::stage_restore` consumes the file it is
+/// given (it renames it into place and may rewrite it while extracting a
+/// zip). The original stays in the backup directory untouched. Symlinks are
+/// not followed, and files above the same 2 GiB cap as the upload endpoint
+/// are refused (use `supply-drop-bbs restore stage` for those).
+async fn api_stage_backup_restore(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(filename): Path<String>,
+    Query(query): Query<StageBackupQuery>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    if !backup_filename_is_safe(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("invalid filename")),
+        )
+            .into_response();
+    }
+    // The two kinds of file the backup list returns.
+    if !(filename.ends_with(".db") || filename.ends_with(".zip")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("only .db and .zip backups can be restored")),
+        )
+            .into_response();
+    }
+    let Some(backup_dir) = state.backup_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("backup_dir not configured")),
+        )
+            .into_response();
+    };
+    let Some(data_dir) = state.data_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("data_dir not configured")),
+        )
+            .into_response();
+    };
+    // Same lock as the upload and confirm handlers: they all share the one
+    // pending_restore.staged.db path.
+    let restore_guard = state.restore_lock.lock().await;
+    if state.restore_confirmed.load(Ordering::SeqCst) {
+        return restore_already_confirmed();
+    }
+
+    let source = std::path::Path::new(&backup_dir).join(&filename);
+    match tokio::fs::symlink_metadata(&source).await {
+        Ok(meta) if meta.is_file() => {
+            if meta.len() > RESTORE_UPLOAD_MAX_BYTES as u64 {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json_error(
+                        "backup is larger than the web UI restores (2 GiB); use \
+                         `supply-drop-bbs restore stage <file>` instead",
+                    )),
+                )
+                    .into_response();
+            }
+        }
+        // A symlink, directory or other special file.
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("backup is not a regular file")),
+            )
+                .into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, Json(json_error("backup not found"))).into_response()
+        }
+        Err(e) => return server_error(&e.to_string()),
+    }
+
+    // In data_dir itself so stage_restore's rename onto its staged path
+    // stays on one filesystem, as in api_upload_restore. The guard removes the
+    // copy on every path where stage_restore doesn't move it.
+    let tmp_path =
+        std::path::Path::new(&data_dir).join(format!("restore_backup_{}.tmp", Uuid::new_v4()));
+    let _tmp_guard = TempFileGuard(tmp_path.clone());
+    if let Err(e) = copy_backup_private(&source, &tmp_path).await {
+        return server_error(&format!("copying backup: {e}"));
+    }
+
+    if let Err(e) = state
+        .host
+        .admin_stage_restore(&tmp_path.to_string_lossy(), &data_dir)
+        .await
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json_error(&e.to_string())),
+        )
+            .into_response();
+    }
+
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", caller.username),
+            "restore_staged",
+            Some(&filename),
+            None,
+        )
+        .await;
+
+    if query.apply {
+        return confirm_staged_restore(&state, &caller, &data_dir, &restore_guard).await;
+    }
+    Json(serde_json::json!({
+        "message": "backup validated and staged — confirm it with \
+                    POST /api/v1/backups/restore/apply"
+    }))
+    .into_response()
 }
 
 /// axum's own default multipart/request body limit is 2 MiB — far too small
@@ -4138,6 +4436,9 @@ async fn api_upload_restore(
     // confirm) can't interleave with this one's validate-then-rename onto
     // the shared pending_restore.staged.db path.
     let _restore_guard = state.restore_lock.lock().await;
+    if state.restore_confirmed.load(Ordering::SeqCst) {
+        return restore_already_confirmed();
+    }
 
     let field = match multipart.next_field().await {
         Ok(Some(f)) => f,
@@ -4174,6 +4475,10 @@ async fn api_upload_restore(
     // as-is here regardless of format.
     let tmp_path =
         std::path::Path::new(&data_dir).join(format!("restore_upload_{}.tmp", Uuid::new_v4()));
+    // On failure stage_restore never moves the file, and a failed or cut-off
+    // write can leave a partial one; the guard removes it on every such path
+    // so a rejected upload doesn't leave junk in data_dir.
+    let _tmp_guard = TempFileGuard(tmp_path.clone());
     if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
         return server_error(&format!("saving upload: {e}"));
     }
@@ -4182,11 +4487,6 @@ async fn api_upload_restore(
         .host
         .admin_stage_restore(&tmp_path.to_string_lossy(), &data_dir)
         .await;
-    // On failure stage_restore never moves the file — clean it up here so
-    // a rejected upload doesn't leave junk in data_dir.
-    if result.is_err() {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-    }
 
     match result {
         Ok(()) => {
@@ -4213,13 +4513,17 @@ async fn api_upload_restore(
 }
 
 /// `POST /api/v1/backups/restore/apply` — confirms a previously-staged
-/// restore (see `api_upload_restore`) by promoting it from its inert staged
-/// name to the name `main.rs`'s startup check actually looks for
-/// (`admin_apply_staged_restore`), then exits the process so systemd's
-/// `Restart=always` brings up a fresh instance that performs the swap.
-/// Reuses `api_restart`'s exact systemd-presence gate and delayed-exit
-/// pattern, since the safe way to apply a restore and the safe way to
-/// restart the service are the same mechanism (issue #195).
+/// restore (see `api_upload_restore` and `api_stage_backup_restore`) by
+/// promoting it from its inert staged name to the name `main.rs`'s startup
+/// check actually looks for (`admin_apply_staged_restore`), then exits the
+/// process so systemd's `Restart=always` brings up a fresh instance that
+/// performs the swap. Outside systemd nothing would restart the process, so
+/// it confirms and leaves the restart to the operator (see
+/// `confirm_staged_restore`). Under systemd it uses `api_restart`'s
+/// delayed-exit pattern, since the safe way to apply a restore and the safe way
+/// to restart the service are the same mechanism (issue #195). Before this
+/// change it refused with a 400 outside systemd without confirming anything,
+/// so a manual restart applied nothing.
 ///
 /// Confirming and staging are deliberately two different filesystem states:
 /// an earlier version of this feature staged directly under the name
@@ -4246,50 +4550,12 @@ async fn api_apply_restore(
     };
     // Same lock api_upload_restore holds, so a confirm can't run while an
     // upload is still mid-validate/rename against the same staged path.
-    let _restore_guard = state.restore_lock.lock().await;
-
-    if std::env::var("INVOCATION_ID").is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json_error(
-                "not running under systemd — restart manually to apply the \
-                 staged restore: sudo systemctl restart supply-drop-bbs",
-            )),
-        )
-            .into_response();
+    let restore_guard = state.restore_lock.lock().await;
+    if state.restore_confirmed.load(Ordering::SeqCst) {
+        return restore_already_confirmed();
     }
 
-    if let Err(e) = state.host.admin_apply_staged_restore(&data_dir).await {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json_error(&format!(
-                "no restore is staged, or it could not be confirmed: {e}"
-            ))),
-        )
-            .into_response();
-    }
-
-    let _ = state
-        .host
-        .admin_write_audit(
-            &format!("web:{}", caller.username),
-            "restore_applied",
-            None,
-            None,
-        )
-        .await;
-
-    tracing::warn!("web admin: database restore confirmed — exiting to apply it on restart");
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        std::process::exit(1);
-    });
-
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "message": "restore applying — service is restarting" })),
-    )
-        .into_response()
+    confirm_staged_restore(&state, &caller, &data_dir, &restore_guard).await
 }
 
 // ── Domain event formatting ───────────────────────────────────────────────────
@@ -5372,5 +5638,431 @@ mod tests {
             mock.removed_meshtastic_favorites().is_empty(),
             "no removal call should be attempted without a node_num to target"
         );
+    }
+
+    // Issue #309: restoring a backup that is already on the server, straight
+    // from the Backups page. These run against a real BbsHost and real backup
+    // files so the validation and staging are the production code paths.
+    mod stage_backup_restore_tests {
+        use super::*;
+
+        struct Fixture {
+            state: Arc<AppState>,
+            backup_dir: tempfile::TempDir,
+            data_dir: tempfile::TempDir,
+            _live_db: tempfile::NamedTempFile,
+        }
+
+        async fn fixture() -> Fixture {
+            let live_db = tempfile::NamedTempFile::new().unwrap();
+            let db = bbs_core::Database::open(&live_db.path().to_string_lossy())
+                .await
+                .expect("open database");
+            let host: Arc<dyn Host> = Arc::new(bbs_core::BbsHost::new(db));
+            let state = Arc::new(AppState::new(host, WebConfig::default()));
+            let backup_dir = tempfile::tempdir().unwrap();
+            let data_dir = tempfile::tempdir().unwrap();
+            *state.backup_dir.lock().unwrap() = Some(backup_dir.path().to_string_lossy().into());
+            *state.data_dir.lock().unwrap() = Some(data_dir.path().to_string_lossy().into());
+            Fixture {
+                state,
+                backup_dir,
+                data_dir,
+                _live_db: live_db,
+            }
+        }
+
+        /// A genuine `.db` backup, produced by the host's own backup routine
+        /// (the Backups page zips this and deletes the `.db`).
+        async fn make_db_backup(f: &Fixture) -> String {
+            f.state
+                .host
+                .admin_trigger_backup(&f.backup_dir.path().to_string_lossy())
+                .await
+                .expect("create backup")
+                .filename
+        }
+
+        async fn stage(f: &Fixture, caller: CurrentUser, name: &str) -> Response {
+            stage_with(f, caller, name, false).await
+        }
+
+        async fn stage_with(f: &Fixture, caller: CurrentUser, name: &str, apply: bool) -> Response {
+            api_stage_backup_restore(
+                State(Arc::clone(&f.state)),
+                Extension(caller),
+                Path(name.to_owned()),
+                Query(StageBackupQuery { apply }),
+            )
+            .await
+        }
+
+        /// Under systemd a confirm exits the process 500 ms later, which would
+        /// kill the test binary, so the tests that confirm skip themselves there.
+        fn running_under_systemd() -> bool {
+            let under = std::env::var("INVOCATION_ID").is_ok();
+            if under {
+                eprintln!("skipped: INVOCATION_ID is set (running under systemd)");
+            }
+            under
+        }
+
+        /// Files in data_dir, so a test can prove nothing was left behind.
+        fn data_dir_files(f: &Fixture) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(f.data_dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        #[tokio::test]
+        async fn stages_a_db_backup_and_leaves_the_original_untouched() {
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            let original = f.backup_dir.path().join(&name);
+            let before = std::fs::read(&original).unwrap();
+
+            let resp = stage(&f, sysop(), &name).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            assert_eq!(
+                data_dir_files(&f),
+                vec!["pending_restore.staged.db".to_owned()],
+                "only the inert staged file may be left; staging alone must not \
+                 create pending_restore.db, which is what triggers the swap"
+            );
+            assert_eq!(
+                std::fs::read(&original).unwrap(),
+                before,
+                "the backup in the backup directory must be unchanged"
+            );
+        }
+
+        #[tokio::test]
+        async fn stages_a_zip_bundle() {
+            use std::io::Write as _;
+            let f = fixture().await;
+            let db_name = make_db_backup(&f).await;
+            let db_path = f.backup_dir.path().join(&db_name);
+            // The shape api_trigger_backup produces: the .db inside a .zip.
+            let zip_name = db_name.trim_end_matches(".db").to_owned() + ".zip";
+            let mut zip = zip::ZipWriter::new(
+                std::fs::File::create(f.backup_dir.path().join(&zip_name)).unwrap(),
+            );
+            zip.start_file(&db_name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&std::fs::read(&db_path).unwrap()).unwrap();
+            // The real bundle also carries the config, which restore ignores.
+            zip.start_file("config.toml", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"[bbs]\nname = \"Restored\"\n").unwrap();
+            zip.finish().unwrap();
+            std::fs::remove_file(&db_path).unwrap();
+
+            let resp = stage(&f, sysop(), &zip_name).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                data_dir_files(&f),
+                vec!["pending_restore.staged.db".to_owned()]
+            );
+            assert!(
+                f.backup_dir.path().join(&zip_name).exists(),
+                "the zip must stay in the backup directory"
+            );
+        }
+
+        #[tokio::test]
+        async fn records_an_audit_entry_naming_the_backup() {
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            assert_eq!(stage(&f, sysop(), &name).await.status(), StatusCode::OK);
+
+            let entries = f
+                .state
+                .host
+                .admin_audit_log(10, 0, Some("restore_staged"))
+                .await
+                .unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].actor, "web:sysop");
+            assert_eq!(entries[0].target.as_deref(), Some(name.as_str()));
+        }
+
+        #[tokio::test]
+        async fn non_sysop_is_forbidden_and_nothing_is_staged() {
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            let resp = stage(&f, regular_user(), &name).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        #[tokio::test]
+        async fn rejects_path_traversal_and_bad_names() {
+            let f = fixture().await;
+            for bad in [
+                "../backup.db",
+                "..\\backup.db",
+                "sub/backup.db",
+                "sub\\backup.db",
+                "a..b.db",
+                "nul\0.db",
+            ] {
+                let resp = stage(&f, sysop(), bad).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "name {bad:?}");
+            }
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        #[tokio::test]
+        async fn only_db_and_zip_backups_can_be_restored() {
+            let f = fixture().await;
+            for name in [
+                "config.toml",
+                "notes.txt",
+                "backup_20260101_000000",
+                "x.db.tmp",
+            ] {
+                std::fs::write(f.backup_dir.path().join(name), b"x").unwrap();
+                let resp = stage(&f, sysop(), name).await;
+                assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "name {name:?}");
+            }
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        #[tokio::test]
+        async fn missing_backup_is_not_found() {
+            let f = fixture().await;
+            let resp = stage(&f, sysop(), "backup_19990101_000000.db").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_directory_named_like_a_backup_is_rejected() {
+            let f = fixture().await;
+            std::fs::create_dir(f.backup_dir.path().join("looks_like.db")).unwrap();
+            let resp = stage(&f, sysop(), "looks_like.db").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        #[tokio::test]
+        async fn an_invalid_database_is_rejected_and_leaves_nothing_behind() {
+            let f = fixture().await;
+            let bogus = f.backup_dir.path().join("backup_bogus.db");
+            std::fs::write(&bogus, b"this is not a sqlite database").unwrap();
+
+            let resp = stage(&f, sysop(), "backup_bogus.db").await;
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(
+                data_dir_files(&f).is_empty(),
+                "a rejected backup must not leave a temp copy or a staged file"
+            );
+            assert!(bogus.exists(), "the rejected file itself is not deleted");
+        }
+
+        #[tokio::test]
+        async fn unconfigured_directories_are_bad_requests() {
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+
+            *f.state.backup_dir.lock().unwrap() = None;
+            assert_eq!(
+                stage(&f, sysop(), &name).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+
+            *f.state.backup_dir.lock().unwrap() =
+                Some(f.backup_dir.path().to_string_lossy().into());
+            *f.state.data_dir.lock().unwrap() = None;
+            assert_eq!(
+                stage(&f, sysop(), &name).await.status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+
+        #[tokio::test]
+        async fn apply_query_confirms_the_restore_in_the_same_request() {
+            if running_under_systemd() {
+                return;
+            }
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+
+            let resp = stage_with(&f, sysop(), &name, true).await;
+            // Outside systemd nothing restarts the process, so the restore is
+            // confirmed and the operator is told to restart.
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            assert_eq!(
+                body["restart_required"], true,
+                "clients must not have to parse the message to learn this: {body}"
+            );
+            assert!(
+                body["message"].as_str().unwrap().contains("restart"),
+                "message must tell the operator to restart: {body}"
+            );
+            assert_eq!(
+                data_dir_files(&f),
+                vec!["pending_restore.db".to_owned()],
+                "the staged file is promoted to the name startup acts on"
+            );
+
+            let entries = f
+                .state
+                .host
+                .admin_audit_log(10, 0, None)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.action)
+                .collect::<Vec<_>>();
+            assert!(entries.contains(&"restore_staged".to_owned()));
+            assert!(entries.contains(&"restore_applied".to_owned()));
+        }
+
+        // Between a systemd confirm scheduling the exit and the exit itself,
+        // a queued restore request must not overwrite the confirmed file.
+        #[tokio::test]
+        async fn a_confirmed_restore_refuses_further_restore_requests() {
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            f.state.restore_confirmed.store(true, Ordering::SeqCst);
+
+            assert_eq!(
+                stage(&f, sysop(), &name).await.status(),
+                StatusCode::CONFLICT
+            );
+            let apply = api_apply_restore(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(apply.status(), StatusCode::CONFLICT);
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        #[tokio::test]
+        async fn without_the_apply_query_nothing_is_confirmed() {
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            let resp = stage_with(&f, sysop(), &name, false).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(!data_dir_files(&f).contains(&"pending_restore.db".to_owned()));
+        }
+
+        // The confirm endpoint must promote the staged file and only then care
+        // about systemd: refusing before promoting left a staged restore that
+        // a manual restart would not apply.
+        #[tokio::test]
+        async fn confirm_promotes_the_staged_file_even_without_systemd() {
+            if running_under_systemd() {
+                return;
+            }
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            assert_eq!(stage(&f, sysop(), &name).await.status(), StatusCode::OK);
+
+            let resp = api_apply_restore(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(data_dir_files(&f), vec!["pending_restore.db".to_owned()]);
+        }
+
+        #[tokio::test]
+        async fn confirm_with_nothing_staged_is_a_bad_request() {
+            if running_under_systemd() {
+                return;
+            }
+            let f = fixture().await;
+            let resp = api_apply_restore(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        #[tokio::test]
+        async fn oversized_backup_is_refused_before_any_copy() {
+            let f = fixture().await;
+            let big = f.backup_dir.path().join("backup_huge.db");
+            // Sparse: sets the length without writing the bytes.
+            std::fs::File::create(&big)
+                .unwrap()
+                .set_len(RESTORE_UPLOAD_MAX_BYTES as u64 + 1)
+                .unwrap();
+            let resp = stage(&f, sysop(), "backup_huge.db").await;
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(data_dir_files(&f).is_empty(), "nothing may be copied");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_symlink_in_the_backup_directory_is_not_followed() {
+            let f = fixture().await;
+            let real = make_db_backup(&f).await;
+            let link = f.backup_dir.path().join("backup_link.db");
+            std::os::unix::fs::symlink(f.backup_dir.path().join(&real), &link).unwrap();
+            let resp = stage(&f, sysop(), "backup_link.db").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        // fs::copy keeps the source's mode; a read-only backup must still stage
+        // (the migration check writes to the copy) and the copy must not stay
+        // group- or world-readable.
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_read_only_backup_stages_and_the_copy_is_private() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            let original = f.backup_dir.path().join(&name);
+            std::fs::set_permissions(&original, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+            let resp = stage(&f, sysop(), &name).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let staged = f.data_dir.path().join("pending_restore.staged.db");
+            let mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the staged copy must be owner-only");
+            let original_mode = std::fs::metadata(&original).unwrap().permissions().mode() & 0o777;
+            assert_eq!(original_mode, 0o444, "the backup's own mode is untouched");
+        }
+
+        #[test]
+        fn filename_guard_rejects_empty_dot_dotdot_separators_and_nul() {
+            for bad in [
+                "", ".", "..", "../x.db", "a/b.db", "a\\b.db", "a\0.db", "x..db",
+            ] {
+                assert!(!backup_filename_is_safe(bad), "{bad:?} must be rejected");
+            }
+            for good in [
+                "backup_20260101_000000.db",
+                "backup_20260101_000000.zip",
+                "my backup.db",
+            ] {
+                assert!(backup_filename_is_safe(good), "{good:?} must be accepted");
+            }
+        }
+
+        // A dropped request future (client disconnect) runs the guard's Drop,
+        // which is what removes the temporary copy in that case.
+        #[test]
+        fn temp_file_guard_removes_its_file_when_dropped() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("restore_backup_x.tmp");
+            std::fs::write(&path, b"partial copy").unwrap();
+            {
+                let _guard = TempFileGuard(path.clone());
+            }
+            assert!(!path.exists());
+            // Removing a file that was already renamed away is not an error.
+            drop(TempFileGuard(path));
+        }
+
+        // The new `/backups/:filename/restore` route sits next to the static
+        // `/backups/restore` and `/backups/restore/apply` routes. axum panics
+        // at router build time on a route conflict, so building it is the test.
+        #[tokio::test]
+        async fn router_builds_with_the_new_route() {
+            let f = fixture().await;
+            let _router = build_router(Arc::clone(&f.state));
+        }
     }
 }

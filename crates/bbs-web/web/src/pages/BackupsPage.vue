@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { api, request } from '../api/client'
+import { api, request, ApiError } from '../api/client'
 
 interface BackupRecord {
   filename: string
@@ -19,6 +19,7 @@ const settings = ref<Settings | null>(null)
 const loading = ref(false)
 const triggering = ref(false)
 const deleting = ref<string | null>(null)
+const restoring = ref<string | null>(null)
 const error = ref<string | null>(null)
 const actionOk = ref<string | null>(null)
 
@@ -26,9 +27,23 @@ const restoreFile = ref<File | null>(null)
 const uploading = ref(false)
 const applying = ref(false)
 const restoreStaged = ref(false)
+// Set once a restore has been confirmed: the list is stale and the service is
+// about to restart (or waiting for the operator to restart it).
+const restoreDone = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
 
 const backupDirConfigured = computed(() => settings.value?.backup_dir != null)
+// Any action in flight, or a confirmed restore waiting on the restart. Every
+// button that changes backups or the database is disabled while this is true.
+const busy = computed(
+  () =>
+    triggering.value ||
+    deleting.value !== null ||
+    restoring.value !== null ||
+    uploading.value ||
+    applying.value ||
+    restoreDone.value
+)
 
 function fmtSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
@@ -90,6 +105,62 @@ async function deleteBackup(filename: string) {
   }
 }
 
+// What to tell the sysop after a confirmed restore: either the service is
+// restarting itself (systemd), or they have to restart it.
+function restartNote(res: { message: string; restart_required?: boolean }): string {
+  return res.restart_required
+    ? `${res.message}. Reload this page after you restart it.`
+    : `${res.message}. This page may stop responding for a few seconds.`
+}
+
+// Restores a backup that is already on the server. One request stages it
+// (the server validates it first) and confirms it under a single lock, so a
+// concurrent upload can't be applied in its place; after one confirmation here
+// the service restarts on the restored database. Only the newest pre-restore
+// safety snapshot is kept, so a second restore replaces the first one's.
+async function restoreBackup(filename: string) {
+  if (busy.value) return
+  if (!confirm(
+    `Restore ${filename}?\n\n` +
+    'This REPLACES the current database with this backup and restarts the ' +
+    'service (without systemd you restart it yourself). Anything written ' +
+    'since the backup was made is lost. A safety snapshot of the current ' +
+    'database is saved in the data directory first, but only the most recent ' +
+    'snapshot is kept, so a second restore replaces it.'
+  )) return
+  restoring.value = filename
+  error.value = null
+  actionOk.value = null
+  try {
+    const res = await api.post<{ message: string; restart_required?: boolean }>(
+      `/api/v1/backups/${encodeURIComponent(filename)}/restore?apply=true`
+    )
+    actionOk.value = restartNote(res)
+    restoreDone.value = true
+    restoreStaged.value = false
+  } catch (e: any) {
+    if (e instanceof ApiError) {
+      error.value = e.message
+    } else {
+      connectionDropped()
+    }
+  } finally {
+    restoring.value = null
+  }
+}
+
+// The request never got an answer (the connection dropped or timed out). A
+// confirmed restore restarts the service, which drops connections, so the
+// restore may well have been applied. Don't offer a retry: a second restore
+// would replace the safety snapshot of the original data.
+function connectionDropped() {
+  actionOk.value =
+    'The connection dropped before the server answered. If the restore was ' +
+    'confirmed the service is restarting: reload this page in a few seconds ' +
+    'and check the data before restoring again.'
+  restoreDone.value = true
+}
+
 function pickRestoreFile(e: Event) {
   const input = e.target as HTMLInputElement
   restoreFile.value = input.files?.[0] ?? null
@@ -125,20 +196,29 @@ async function uploadRestoreFile() {
 // file swapped in. A pre-restore safety snapshot of the CURRENT database is
 // taken automatically before anything is overwritten.
 async function applyRestore() {
+  if (busy.value) return
   if (!confirm(
     'This will REPLACE the current database with the staged backup and ' +
-    'restart the service now. A safety snapshot of the current database ' +
-    'is taken first. Continue?'
+    'restart the service (without systemd you restart it yourself). A safety ' +
+    'snapshot of the current database is saved in the data directory first, ' +
+    'but only the most recent snapshot is kept. Continue?'
   )) return
   applying.value = true
   error.value = null
   actionOk.value = null
   try {
-    await api.post('/api/v1/backups/restore/apply')
-    actionOk.value = 'Restore applying. The service is restarting, and this page will stop responding for a few seconds.'
+    const res = await api.post<{ message: string; restart_required?: boolean }>(
+      '/api/v1/backups/restore/apply'
+    )
+    actionOk.value = restartNote(res)
+    restoreDone.value = true
     restoreStaged.value = false
   } catch (e: any) {
-    error.value = e?.message ?? 'restore failed to apply'
+    if (e instanceof ApiError) {
+      error.value = e.message
+    } else {
+      connectionDropped()
+    }
   } finally {
     applying.value = false
   }
@@ -155,7 +235,7 @@ onMounted(load)
         <p class="muted">SQLite database + config snapshots</p>
       </div>
       <div class="controls">
-        <button @click="triggerBackup" :disabled="triggering || !backupDirConfigured"
+        <button @click="triggerBackup" :disabled="busy || !backupDirConfigured"
           :title="!backupDirConfigured ? 'backup_dir not configured' : ''">
           {{ triggering ? 'backing up…' : 'create backup' }}
         </button>
@@ -176,19 +256,19 @@ onMounted(load)
     <section class="restore-panel">
       <h2>restore from backup</h2>
       <p class="muted small">
-        Upload a <code>.db</code> or <code>.zip</code> backup, from this system or another, to
-        replace the current database. The file is validated before anything changes; nothing
-        is applied until you confirm below.
+        To restore a backup listed below, use its <strong>restore</strong> button. To restore
+        one from another system, upload its <code>.db</code> or <code>.zip</code> here. The file
+        is validated before anything changes; nothing is applied until you confirm below.
       </p>
       <div class="restore-controls">
         <input
           ref="fileInput"
           type="file"
           accept=".db,.zip"
-          :disabled="uploading"
+          :disabled="busy"
           @change="pickRestoreFile"
         />
-        <button @click="uploadRestoreFile" :disabled="!restoreFile || uploading">
+        <button @click="uploadRestoreFile" :disabled="!restoreFile || busy">
           {{ uploading ? 'validating…' : 'upload & validate' }}
         </button>
       </div>
@@ -198,7 +278,7 @@ onMounted(load)
           database</strong> and restarts the service. A safety snapshot of the current
           database is taken automatically first.
         </p>
-        <button class="danger" @click="applyRestore" :disabled="applying">
+        <button class="danger" @click="applyRestore" :disabled="busy">
           {{ applying ? 'applying…' : 'apply restore (restarts service)' }}
         </button>
       </div>
@@ -242,8 +322,13 @@ onMounted(load)
           </td>
           <td class="muted small">{{ fmtDate(b.created_at) }}</td>
           <td class="action-col">
+            <button class="small-btn" @click="restoreBackup(b.filename)"
+              :disabled="busy"
+              title="Replace the current database with this backup and restart the service">
+              {{ restoring === b.filename ? '…' : 'restore' }}
+            </button>
             <button class="danger small-btn" @click="deleteBackup(b.filename)"
-              :disabled="deleting === b.filename">
+              :disabled="busy">
               {{ deleting === b.filename ? '…' : 'delete' }}
             </button>
           </td>
@@ -299,7 +384,8 @@ p { margin: 0; }
 .config-link:hover { color: var(--accent); }
 
 .size-col { white-space: nowrap; }
-.action-col { text-align: right; }
+.action-col { text-align: right; white-space: nowrap; }
+.action-col .small-btn + .small-btn { margin-left: 0.4rem; }
 .small-btn { padding: 0.2rem 0.55rem; font-size: 0.8em; }
 .danger { border-color: var(--error, #c0392b); color: var(--error, #c0392b); background: transparent; }
 .danger:hover:not(:disabled) { background: color-mix(in srgb, var(--error, #c0392b) 10%, transparent); }
