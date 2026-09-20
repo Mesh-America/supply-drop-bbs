@@ -149,8 +149,7 @@ const RESTORE_LIMITS =
   'This REPLACES the current database. Settings kept in config.toml, such as ' +
   'the BBS name, are NOT restored, and anything written since the backup was ' +
   'made is lost. A safety snapshot of the current database is saved in the ' +
-  'data directory first, but only the most recent snapshot is kept, so a ' +
-  'second restore replaces it.'
+  'data directory first; the last three snapshots are kept.'
 
 // Restores a backup that is already on the server. One request stages it
 // (the server validates it first) and confirms it under a single lock, so a

@@ -22,7 +22,7 @@ mod setup;
 
 use std::{path::PathBuf, sync::Arc};
 
-use bbs_core::{BbsHost, Database};
+use bbs_core::{restore_apply::ApplyOutcome, BbsHost, Database};
 use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
@@ -691,32 +691,6 @@ async fn open_database(path: &std::path::Path) -> Database {
     }
 }
 
-/// Delete every `pre-restore-safety-*.db` file in `data_dir` except `keep`,
-/// so repeated restores don't accumulate an unbounded number of
-/// full-database-sized snapshots on disk — a real concern on the
-/// SD-card-class storage this project targets.
-fn prune_old_restore_safety_snapshots(data_dir: &std::path::Path, keep: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(data_dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path == keep {
-            continue;
-        }
-        let is_old_snapshot = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("pre-restore-safety-") && n.ends_with(".db"))
-            .unwrap_or(false);
-        if is_old_snapshot {
-            if let Err(e) = std::fs::remove_file(&path) {
-                warn!(path = %path.display(), "could not prune old restore safety snapshot: {e}");
-            }
-        }
-    }
-}
-
 /// Delete the temporary copies the web admin's restore endpoints leave in
 /// `data_dir` when a request is cut off before it finishes
 /// (`restore_upload_<uuid>.tmp` and `restore_backup_<uuid>.tmp`). Each is a
@@ -917,72 +891,56 @@ async fn cmd_run(cli: &Cli) {
         .path
         .as_ref()
         .expect("database.path set by resolve()");
-    let pending_restore = data_dir.join("pending_restore.db");
-    if pending_restore.exists() {
-        info!(path = %pending_restore.display(), "applying staged database restore");
-
-        // Safety net: snapshot the current live database before overwriting
-        // it, so a bad or wrong-system upload doesn't destroy data with no
-        // way back. No live connection exists yet in THIS process, but that
-        // doesn't mean the file is checkpoint-clean: every restart path in
-        // this binary (this restore flow and the pre-existing api_restart
-        // alike) exits via std::process::exit, which skips the checkpoint a
-        // clean connection close would otherwise run, and this project
-        // raises wal_autocheckpoint to 10000 pages — so a live,
-        // un-checkpointed WAL sidecar next to db_path is the normal case
-        // here, not a rare one. Checkpoint it into the main file first, or
-        // a plain file copy could silently miss recently committed messages.
-        if db_path_for_restore.exists() {
-            if let Err(e) = Database::checkpoint_wal(&db_path_for_restore.to_string_lossy()).await {
+    // A restore that can't be applied never stops startup (a crash loop under
+    // `Restart=always` would take the web admin, the place to sort it out,
+    // down with it): the live database is left as it was and the outcome is
+    // logged here, and recorded in the audit log below once the database is
+    // open (the sysop's only in-app trace of a restore that did not go as the
+    // UI promised).
+    let mut restore_audit: Option<(&str, String)> = None;
+    match bbs_core::restore_apply::apply_pending_restore(data_dir, db_path_for_restore).await {
+        ApplyOutcome::NothingPending => {}
+        ApplyOutcome::Applied {
+            snapshot,
+            snapshot_has_wal_copy,
+        } => {
+            restore_audit = Some((
+                "restore_completed",
+                snapshot.as_ref().map_or_else(
+                    || "no previous database to snapshot".to_owned(),
+                    |s| format!("previous database saved as {}", s.display()),
+                ),
+            ));
+            match &snapshot {
+                Some(s) => info!(
+                    snapshot = %s.display(),
+                    "database restore applied; the previous database is saved as the snapshot"
+                ),
+                None => info!("database restore applied"),
+            }
+            if snapshot_has_wal_copy {
                 warn!(
-                    "could not checkpoint the live database's WAL before \
-                     snapshotting it — proceeding with a plain file copy \
-                     anyway, which may miss very recent messages: {e}"
+                    "the previous database had commits that could not be checkpointed; \
+                     a copy of its -wal file sits next to the snapshot and must stay with it"
                 );
             }
-
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let safety_path = data_dir.join(format!("pre-restore-safety-{stamp}.db"));
-            if let Err(e) = std::fs::copy(db_path_for_restore, &safety_path) {
-                let _ = std::fs::remove_file(&safety_path);
-                error!("could not snapshot the live database before restoring — aborting restore, database left untouched: {e}");
-                std::process::exit(1);
+        }
+        ApplyOutcome::Rejected { reason, set_aside } => {
+            restore_audit = Some(("restore_failed", reason.clone()));
+            error!(
+                "database restore NOT applied, continuing with the existing database \
+                 unchanged: {reason}"
+            );
+            match set_aside {
+                Some(p) => warn!(
+                    path = %p.display(),
+                    "the restore file was set aside so it is not retried on every start"
+                ),
+                None => warn!(
+                    "the restore file could not be set aside and will be retried on the next start"
+                ),
             }
-            info!(path = %safety_path.display(), "pre-restore safety snapshot saved");
-
-            // Keep only the snapshot just taken — an unbounded number of
-            // full-database-sized files would otherwise accumulate across
-            // repeated restores.
-            prune_old_restore_safety_snapshots(data_dir, &safety_path);
         }
-
-        if let Err(e) = std::fs::rename(&pending_restore, db_path_for_restore) {
-            // `rename` can fail across filesystems (EXDEV) — data_dir and
-            // database.path are configured independently and aren't
-            // guaranteed to share one. Fall back to copy+delete, matching
-            // the identical fallback `stage_restore`'s own rename already
-            // has for the same reason.
-            if let Err(copy_err) = std::fs::copy(&pending_restore, db_path_for_restore) {
-                error!(
-                    "could not apply staged restore (rename failed: {e}; \
-                     copy fallback also failed: {copy_err})"
-                );
-                std::process::exit(1);
-            }
-            let _ = std::fs::remove_file(&pending_restore);
-        }
-        // The old live database's WAL/SHM sidecars (if any) now refer to
-        // data that no longer exists at this path — remove them so the
-        // restored file starts clean rather than SQLite trying to replay a
-        // stale WAL against it.
-        for ext in ["-wal", "-shm"] {
-            let sidecar = PathBuf::from(format!("{}{ext}", db_path_for_restore.display()));
-            let _ = std::fs::remove_file(sidecar);
-        }
-        info!("database restore applied — continuing startup with the restored database");
     }
 
     // ── 4. Database ───────────────────────────────────────────────────────────
@@ -1044,6 +1002,16 @@ async fn cmd_run(cli: &Cli) {
     // configured name if sharing is later turned off. bbs-mesh::transport
     // re-truncates to the correct, current-state-aware budget at the actual
     // point each advert is sent (see bbs_core::mesh_name).
+    if let Some((action, detail)) = restore_audit {
+        use bbs_plugin_api::Host as _;
+        if let Err(e) = bbs
+            .admin_write_audit("system", action, None, Some(&detail))
+            .await
+        {
+            warn!("could not record the restore outcome in the audit log: {e}");
+        }
+    }
+
     bbs.set_node_name(Some(bbs_core::mesh_name::truncate_mesh_node_name(
         &cfg.bbs.name,
         false,

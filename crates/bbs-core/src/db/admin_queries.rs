@@ -8,12 +8,13 @@
 //! `cargo sqlx prepare` on every addition.
 
 use super::{error::StoreError, Database};
+use crate::restore_apply::sibling_with_suffix;
 use bbs_plugin_api::{
     AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity, AdminMessageRecord, AdminReports,
     AdminRoomSummary, AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminWeeklySignups,
 };
 use sqlx::Row;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tracing;
 
 // async_trait rewrites the callers in host.rs into closures that Clippy's
@@ -492,15 +493,18 @@ impl Database {
     /// firing after any exit — silently applied a restore nobody had
     /// confirmed yet (issue #195).
     ///
-    /// Validation has four tiers: a cheap SQLite file-format check; a check
+    /// Validation has five tiers: a cheap SQLite file-format check; a check
     /// that the file already has migration history of its own (see below);
     /// running this binary's own embedded migrations against the uploaded
     /// file directly — the same mechanism `Database::open` uses on the live
     /// database, just pointed at the candidate file instead, which lets an
     /// older-schema backup be upgraded in place as part of staging it (this
     /// means "validation" can mutate the uploaded file's on-disk bytes, not
-    /// merely inspect them); and finally the same room-walk-order
-    /// structural check `Database::open` runs after migrating.
+    /// merely inspect them); the same room-walk-order structural check
+    /// `Database::open` runs after migrating; and finally SQLite's own
+    /// `PRAGMA quick_check`, which catches page-level damage in tables the
+    /// other checks never read (it makes staging take time proportional to the
+    /// file size).
     ///
     /// The migration history check is load-bearing, not redundant: every
     /// migration in `crates/bbs-core/migrations/` is written to be safely
@@ -619,14 +623,28 @@ impl Database {
         // after migrating (see db/mod.rs) — check it here too, on the same
         // still-open pool, before staging. Without this, a candidate file
         // that migrates cleanly but has a corrupt room linked-list would
-        // only be caught AFTER the destructive swap in main.rs, whose only
-        // failure handling is to exit — there is no automatic rollback to
-        // the pre-restore safety snapshot.
+        // only be caught AFTER the swap at startup (`restore_apply`), when the
+        // restore can no longer be refused up front.
         let invariant_result = if migrate_result.is_ok() {
             Some(super::invariants::verify_room_walk_order(&pool).await)
         } else {
             None
         };
+        // The checks above only read the migration bookkeeping and the `rooms`
+        // table, so a file whose damage is elsewhere (messages, users, indexes)
+        // would pass them and only fail after the swap. `quick_check` walks every
+        // b-tree page (not the index-versus-table cross-checks, so it stays
+        // linear in file size). `(1)` stops at the first problem.
+        let integrity_result: Option<Result<Vec<String>, sqlx::Error>> =
+            if matches!(invariant_result, Some(Ok(_))) {
+                Some(
+                    sqlx::query_scalar("PRAGMA quick_check(1)")
+                        .fetch_all(&pool)
+                        .await,
+                )
+            } else {
+                None
+            };
         pool.close().await;
         // Best-effort: a VACUUM INTO backup (this project's own admin_backup)
         // is produced in DELETE journal mode and carries no sidecars, but
@@ -644,6 +662,18 @@ impl Database {
             return Err(StoreError::Decode(format!(
                 "uploaded file has a broken room structure ({e}) — not a \
                  healthy supply-drop-bbs database"
+            )));
+        }
+        let damage = match integrity_result {
+            Some(Ok(rows)) if rows.len() == 1 && rows[0] == "ok" => None,
+            Some(Ok(rows)) => Some(rows.join("; ")),
+            Some(Err(e)) => Some(e.to_string()),
+            None => None,
+        };
+        if let Some(damage) = damage {
+            return Err(StoreError::Decode(format!(
+                "uploaded file failed SQLite's integrity check ({damage}) — it is \
+                 damaged and cannot be restored"
             )));
         }
 
@@ -752,13 +782,6 @@ async fn classify_upload(path: &Path) -> Result<UploadKind, StoreError> {
             "not a SQLite database file or a recognized backup zip (bad header)".into(),
         ))
     }
-}
-
-/// `path` with `suffix` appended to its file name, in the same directory.
-fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(suffix);
-    path.with_file_name(name)
 }
 
 /// How much of a zip entry is copied between free-space re-checks.
@@ -876,10 +899,10 @@ fn extract_single_db_with_chunk(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_upload, extract_single_db_from_zip, extract_single_db_with_chunk,
-        sibling_with_suffix, StoreError, UploadKind,
+        classify_upload, extract_single_db_from_zip, extract_single_db_with_chunk, StoreError,
+        UploadKind,
     };
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     // Issue #195: `admin_backup`'s zip-bundling caller never offers a raw
     // `.db` for download, only the `.zip` bundle it always produces — so
@@ -1136,13 +1159,5 @@ mod tests {
             classify_upload(&dir.path().join("absent")).await,
             Err(StoreError::Decode(_))
         ));
-    }
-
-    #[test]
-    fn sibling_keeps_the_directory_and_appends_to_the_name() {
-        assert_eq!(
-            sibling_with_suffix(Path::new("/data/up.zip"), ".extract"),
-            Path::new("/data/up.zip.extract")
-        );
     }
 }

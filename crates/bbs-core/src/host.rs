@@ -10012,6 +10012,86 @@ mod tests {
         );
     }
 
+    /// A backup that migrates cleanly and has a healthy `rooms` table, but with
+    /// damage in a different table. The migration and room checks never read
+    /// that table, so only SQLite's own integrity check can refuse it.
+    async fn backup_with_a_second_table(
+        host: &BbsHost,
+        dir: &std::path::Path,
+        corrupt_its_root_page: bool,
+    ) -> std::path::PathBuf {
+        use sqlx::sqlite::SqliteConnectOptions;
+        let path = dir.join("source_backup.db");
+        host.db.admin_backup(&path.to_string_lossy()).await.unwrap();
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE extra_data (id INTEGER PRIMARY KEY, blob BLOB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            sqlx::query("INSERT INTO extra_data (blob) VALUES (randomblob(900))")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let root: i64 =
+            sqlx::query_scalar("SELECT rootpage FROM sqlite_master WHERE name = 'extra_data'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        if corrupt_its_root_page {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(((root - 1) * page_size) as u64))
+                .unwrap();
+            f.write_all(&vec![0xFFu8; page_size as usize]).unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn stage_restore_rejects_page_damage_outside_the_tables_the_other_checks_read() {
+        let (host, _live_db_file) = make_host().await;
+
+        // Control: the same extra table, undamaged, stages fine, so the
+        // rejection below is down to the damage and not to the extra table.
+        let ok_dir = tempfile::tempdir().unwrap();
+        let ok_backup = backup_with_a_second_table(&host, ok_dir.path(), false).await;
+        host.admin_stage_restore(
+            &ok_backup.to_string_lossy(),
+            &ok_dir.path().to_string_lossy(),
+        )
+        .await
+        .expect("an undamaged backup with an extra table must stage");
+
+        let bad_dir = tempfile::tempdir().unwrap();
+        let bad_backup = backup_with_a_second_table(&host, bad_dir.path(), true).await;
+        let err = host
+            .admin_stage_restore(
+                &bad_backup.to_string_lossy(),
+                &bad_dir.path().to_string_lossy(),
+            )
+            .await
+            .expect_err("a damaged backup must be rejected");
+        assert!(err.to_string().contains("integrity check"), "{err}");
+        assert!(
+            !bad_dir.path().join("pending_restore.staged.db").exists(),
+            "a rejected upload must not be staged for restore"
+        );
+    }
+
     /// Confirming a staged restore must promote it to `pending_restore.db`
     /// — the only name main.rs's startup check watches for — and must not
     /// create that name before confirmation happens (issue #195: an

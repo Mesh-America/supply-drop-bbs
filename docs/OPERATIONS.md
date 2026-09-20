@@ -617,16 +617,35 @@ goes), failing with a message instead of leaving a half-written file; the check
 is skipped if the free space can't be read.
 
 Before the swap, the current database is copied to
-`pre-restore-safety-<unix-seconds>.db` in the data directory. Only the most
-recent of these snapshots is kept, so a second restore replaces the first
-one's. Copy the snapshot elsewhere before restoring again if you may need it.
-To roll back to it, restore it like any other backup:
+`pre-restore-safety-<unix-seconds>.db` in the data directory. The three most
+recent snapshots are kept and older ones are deleted after each restore, so the
+snapshot of your original data survives a second restore. To roll back to a
+snapshot, restore it like any other backup:
 
 ```sh
 supply-drop-bbs restore stage /var/lib/supply-drop-bbs/pre-restore-safety-<unix-seconds>.db
 supply-drop-bbs restore apply
 sudo systemctl restart supply-drop-bbs
 ```
+
+If a `pre-restore-safety-<unix-seconds>.db-wal` file sits beside the snapshot, the
+database it was taken from could not be opened (it was probably damaged), so its
+`-wal` file was kept as it was rather than lost. Keep the two together. That file
+holds commits the `.db` alone does not, and staging the `.db` by itself, as the
+commands above do, leaves them out. To get at them, open the pair together with
+the `sqlite3` tool (for a damaged one, its `.recover` command) before staging.
+
+A restore that cannot be applied never stops the BBS from starting. If there is
+no room for the snapshot, the live database is open in another process, or the
+snapshot or the swap fails, the live database is left as it was, the log says
+`database restore NOT applied` with the reason, an audit log entry
+`restore_failed` records it, and the confirmed file is renamed to
+`pending_restore.failed.db` so it is not retried on every start. The web page
+that confirmed the restore cannot see this, so check the audit log or the logs
+if the data did not change. Fix the cause and stage the restore again, or delete
+`pending_restore.failed.db`. A successful restore is recorded as
+`restore_completed`. Staging also runs SQLite's integrity check on the file and
+refuses one with damaged pages, which takes time proportional to its size.
 
 A restore that is confirmed but not yet applied (the BBS wasn't restarted)
 is a file named `pending_restore.db` in the data directory. Delete it before
