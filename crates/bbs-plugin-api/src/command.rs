@@ -192,7 +192,8 @@ pub enum Command {
     // ── Message posting / deletion ────────────────────────────────────
     /// Compose a message. (E)
     ///
-    /// Both paths require a lone `.` to confirm before the message is posted:
+    /// Both paths require a lone `.` to confirm before the message is posted;
+    /// a lone `C` at that prompt discards the draft instead:
     ///
     /// - `body` is `Some`: the inline text is staged as a draft
     ///   (`AwaitingConfirmation`) and the user must reply with `.` to send.
