@@ -12,6 +12,14 @@ use std::path::Path;
 /// whatever else is writing to the same disk.
 pub const HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
 
+/// How much of a file may be written between free-space checks. Kept well under
+/// [`HEADROOM_BYTES`], so a check that passes still leaves room for the next
+/// chunk plus whatever else is writing to the disk.
+pub const RECHECK_INTERVAL_BYTES: u64 = 4 * 1024 * 1024;
+
+// A check that passes must leave room for the next chunk plus other writers.
+const _: () = assert!(RECHECK_INTERVAL_BYTES * 2 <= HEADROOM_BYTES);
+
 /// The space (bytes) available to unprivileged writers on the filesystem
 /// holding `path`, or `None` if it can't be read. `path` must exist.
 #[must_use]
@@ -19,8 +27,22 @@ pub const HEADROOM_BYTES: u64 = 16 * 1024 * 1024;
 pub fn available_bytes(path: &Path) -> Option<u64> {
     let v = rustix::fs::statvfs(path).ok()?;
     // f_bavail counts blocks of f_frsize bytes (not f_bsize) available to
-    // non-root, which is what a service user actually gets.
-    v.f_bavail.checked_mul(v.f_frsize)
+    // non-root, which is what a service user actually gets. Some filesystems
+    // report a zero fragment size; fall back to the block size rather than
+    // reading that as "no space" (which would refuse every restore).
+    bytes_available(v.f_bavail, v.f_frsize, v.f_bsize)
+}
+
+/// Free bytes from statvfs numbers: `bavail` blocks of `frsize` bytes, or of
+/// `bsize` when the fragment size is reported as zero. `None` if neither is
+/// usable.
+#[cfg(any(target_os = "linux", test))]
+fn bytes_available(bavail: u64, frsize: u64, bsize: u64) -> Option<u64> {
+    let unit = if frsize == 0 { bsize } else { frsize };
+    if unit == 0 {
+        return None;
+    }
+    bavail.checked_mul(unit)
 }
 
 /// See the Linux version.
@@ -82,6 +104,17 @@ mod tests {
     #[test]
     fn a_huge_request_cannot_overflow() {
         assert!(check(Some(1), Path::new("/d"), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn free_bytes_use_the_fragment_size_then_the_block_size() {
+        assert_eq!(bytes_available(10, 4096, 512), Some(40_960));
+        // Zero fragment size: fall back to the block size instead of "no space".
+        assert_eq!(bytes_available(10, 0, 512), Some(5_120));
+        // Nothing usable: unknown, which passes the check.
+        assert_eq!(bytes_available(10, 0, 0), None);
+        // Overflow is unknown, not a wrap.
+        assert_eq!(bytes_available(u64::MAX, 2, 0), None);
     }
 
     #[cfg(target_os = "linux")]

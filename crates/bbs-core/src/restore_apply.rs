@@ -183,6 +183,10 @@ async fn apply(
     // tie to the database it was written for, so left beside the restored file
     // SQLite would replay it onto that file. Move them away before the swap,
     // and put them back if the swap fails so the live database keeps its own.
+    // Flush the file first: if that fails nothing has been moved yet.
+    sync_file_blocking(pending)
+        .await
+        .map_err(|e| format!("flushing the staged restore file to disk: {e}"))?;
     let moved = move_sidecars_aside(db_path)?;
     if let Err(e) = install(pending, db_path) {
         restore_sidecars(&moved);
@@ -191,7 +195,7 @@ async fn apply(
     for (_, aside) in &moved {
         let _ = std::fs::remove_file(aside);
     }
-    sync_dir(db_path.parent());
+    sync_dir(Some(dir_of(db_path)));
     info!("database restore applied");
     Ok((snapshot, has_wal_copy))
 }
@@ -252,6 +256,12 @@ async fn snapshot_live(data_dir: &Path, db_path: &Path) -> Result<(PathBuf, bool
                         snapshotted safely; stop the other process and stage the restore again"
                     .into(),
             );
+        }
+        Err(e) if is_busy_or_locked(&e) => {
+            return Err(format!(
+                "the live database is busy or locked ({e}), so it cannot be snapshotted \
+                 safely; stop whatever is using it and stage the restore again"
+            ));
         }
         Err(e) => {
             warn!(
@@ -328,6 +338,45 @@ fn next_snapshot_path(data_dir: &Path) -> PathBuf {
     }
 }
 
+/// The directory a path lives in; "." for a bare file name, whose `parent()` is
+/// the empty path (which `statvfs` and `open` reject).
+pub(crate) fn dir_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// Flush a file's contents to disk. A rename of a file whose data is not yet
+/// durable can, after a power loss, leave an empty or torn file where the
+/// database should be, so a failure here (an I/O error from the disk) stops the
+/// rename that would have followed.
+pub(crate) fn sync_file(path: &Path) -> std::io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
+}
+
+/// [`sync_file`] off the async runtime: a restore-sized file can have gigabytes
+/// of unwritten pages, and the flush blocks for as long as the disk takes.
+pub(crate) async fn sync_file_blocking(path: &Path) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sync_file(&path))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+/// SQLite reports "busy" and "locked" as errors when another process holds the
+/// database mid-recovery: that is a live database, not a damaged one.
+fn is_busy_or_locked(e: &crate::db::DbOpenError) -> bool {
+    let crate::db::DbOpenError::Connect(sqlx::Error::Database(db)) = e else {
+        return false;
+    };
+    // The primary result code is the low byte (SQLITE_BUSY 5, SQLITE_LOCKED 6),
+    // whether sqlx hands back the primary or an extended code.
+    db.code()
+        .and_then(|c| c.parse::<i64>().ok())
+        .is_some_and(|c| matches!(c & 0xff, 5 | 6))
+}
+
 /// Put `pending` at `db_path`. A rename is atomic but fails across
 /// filesystems (`database.path` and the data directory are configured
 /// independently), so that case copies to a temp file beside `db_path` and
@@ -342,7 +391,7 @@ fn install(pending: &Path, db_path: &Path) -> Result<(), String> {
 
 fn install_by_copy(pending: &Path, db_path: &Path) -> Result<(), String> {
     let tmp = sibling_with_suffix(db_path, ".restore.tmp");
-    let dir = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = dir_of(db_path);
     ensure_free_space(dir, file_len(pending))?;
     let swapped = (|| -> std::io::Result<()> {
         std::fs::copy(pending, &tmp)?;
@@ -777,6 +826,70 @@ mod tests {
         assert!(left.contains(&"pre-restore-safety-2.db".to_owned()));
         assert!(!left.contains(&"pre-restore-safety-1.db".to_owned()));
         assert!(dir.path().join("pre-restore-safety-notes.txt").exists());
+    }
+
+    // SQLite says "busy" or "locked" when another process holds the database
+    // mid-recovery. That is a live database, not a damaged one, and swapping the
+    // file under it (or copying it mid-write) would be wrong.
+    #[derive(Debug)]
+    struct FakeSqliteError(&'static str);
+    impl std::fmt::Display for FakeSqliteError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "sqlite error {}", self.0)
+        }
+    }
+    impl std::error::Error for FakeSqliteError {}
+    impl sqlx::error::DatabaseError for FakeSqliteError {
+        fn message(&self) -> &str {
+            "fake"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    fn open_error(code: &'static str) -> crate::db::DbOpenError {
+        crate::db::DbOpenError::Connect(sqlx::Error::Database(Box::new(FakeSqliteError(code))))
+    }
+
+    #[test]
+    fn busy_and_locked_are_told_apart_from_damage() {
+        // BUSY 5, LOCKED 6, and extended codes whose low byte is 5 or 6.
+        for busy in ["5", "6", "261", "517", "262"] {
+            assert!(is_busy_or_locked(&open_error(busy)), "{busy}");
+        }
+        // NOTADB 26, CORRUPT 11, CANTOPEN 14: the file itself is the problem.
+        for damaged in ["26", "11", "14", "not-a-number"] {
+            assert!(!is_busy_or_locked(&open_error(damaged)), "{damaged}");
+        }
+        assert!(!is_busy_or_locked(&crate::db::DbOpenError::Connect(
+            sqlx::Error::PoolTimedOut
+        )));
+        assert!(!is_busy_or_locked(&crate::db::DbOpenError::RoomOrder(
+            "x".into()
+        )));
+    }
+
+    // A bare relative `database.path` has an empty parent, which `statvfs` and
+    // `open` reject; it must mean the current directory.
+    #[test]
+    fn a_bare_file_name_lives_in_the_current_directory() {
+        assert_eq!(dir_of(Path::new("bbs.sqlite")), Path::new("."));
+        assert_eq!(dir_of(Path::new("data/bbs.sqlite")), Path::new("data"));
+        assert_eq!(dir_of(Path::new("/var/lib/x.db")), Path::new("/var/lib"));
+        assert_eq!(dir_of(Path::new("/x.db")), Path::new("/"));
     }
 
     // The snapshot just taken is never pruned, even if older ones carry
