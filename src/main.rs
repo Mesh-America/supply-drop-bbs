@@ -2291,7 +2291,8 @@ fn resolve_stage_source(arg: &std::path::Path, backup_dir: &std::path::Path) -> 
     let bare_name = arg
         .to_str()
         .filter(|_| arg.file_name().is_some_and(|f| f == arg.as_os_str()))
-        .filter(|n| bbs_core::restore_stage::backup_filename_is_safe(n));
+        .filter(|n| bbs_core::restore_stage::backup_filename_is_safe(n))
+        .filter(|n| !bbs_core::restore_stage::is_restore_working_file(n));
     if let Some(name) = bare_name {
         let candidate = backup_dir.join(name);
         if candidate.is_file() {
@@ -2301,11 +2302,25 @@ fn resolve_stage_source(arg: &std::path::Path, backup_dir: &std::path::Path) -> 
     arg.to_path_buf()
 }
 
+/// A file name made safe to print in a terminal: control characters (an escape
+/// sequence in a name would otherwise be run by the operator's terminal) show
+/// as `?`.
+fn printable_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// The `backup list` table.
 fn format_backup_list(records: &[bbs_plugin_api::AdminBackupRecord]) -> String {
-    let width = records
+    let names: Vec<String> = records
         .iter()
-        .map(|r| r.filename.len())
+        .map(|r| printable_name(&r.filename))
+        .collect();
+    // Widths in characters, which is what `{:<width$}` pads to (not bytes).
+    let width = names
+        .iter()
+        .map(|n| n.chars().count())
         .max()
         .unwrap_or(0)
         .max("name".len());
@@ -2313,22 +2328,21 @@ fn format_backup_list(records: &[bbs_plugin_api::AdminBackupRecord]) -> String {
         "{:<width$}  {:>10}  {:<19}  settings\n",
         "name", "size", "created (UTC)"
     );
-    for r in records {
-        let created = r
-            .created_at
-            .get(..19)
-            .unwrap_or(&r.created_at)
-            .replace('T', " ");
+    for (r, name) in records.iter().zip(&names) {
+        let created = printable_name(
+            &r.created_at
+                .get(..19)
+                .unwrap_or(&r.created_at)
+                .replace('T', " "),
+        );
         let settings = if r.config_filename.is_some() {
             "yes"
         } else {
             "no"
         };
         out.push_str(&format!(
-            "{:<width$}  {:>10}  {:<19}  {settings}\n",
-            r.filename,
+            "{name:<width$}  {:>10}  {created:<19}  {settings}\n",
             fmt_bytes(r.size_bytes),
-            created
         ));
     }
     out
@@ -2487,8 +2501,18 @@ async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
                          destructive operation. Continue?",
                     )
                     .default(false)
-                    .interact()
-                    .unwrap_or(false);
+                    .interact();
+                let confirmed = match confirmed {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // No terminal to ask on (cron, a pipe): fail rather than
+                        // exit 0 for a restore that was not confirmed.
+                        eprintln!(
+                            "error: cannot ask for confirmation ({e}); pass --yes to confirm"
+                        );
+                        std::process::exit(1);
+                    }
+                };
                 if !confirmed {
                     println!("Aborted — nothing was confirmed.");
                     return;
@@ -4128,6 +4152,22 @@ mod backup_cli_tests {
         );
         assert_eq!(col(lines[0], "settings"), col(lines[1], "yes"), "{text}");
         assert_eq!(col(lines[0], "settings"), col(lines[2], "no"), "{text}");
+    }
+
+    #[test]
+    fn names_with_control_characters_or_multibyte_letters_stay_aligned() {
+        let text = format_backup_list(&[
+            record("backup_\u{1b}[31mred.zip", 1, "2026-09-20T10:15:00Z", true),
+            record("sauvegarde_é_日本.zip", 1, "2026-09-20T10:15:00Z", false),
+            record("b.zip", 1, "2026-09-20T10:15:00Z", false),
+        ]);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("backup_?[31mred.zip"), "{text}");
+        // Every row's date starts at the same character column.
+        let col = |l: &str| l.chars().take_while(|c| *c != '2').count();
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(col(lines[0]), col(lines[1]), "{text}");
+        assert_eq!(col(lines[0]), col(lines[2]), "{text}");
     }
 
     #[test]

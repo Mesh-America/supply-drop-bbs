@@ -199,8 +199,12 @@ fn merge_protected_bit(
     }
 }
 
+/// Whether a protect/unprotect stamped `t` still counts as recent at `now`. A
+/// stamp in the future (the clock was set back since) counts only if it is
+/// within the window too: `saturating_sub` would read any future stamp as zero
+/// seconds old and keep it live for as long as it stayed ahead.
 fn within_grace(t: u64, now: u64) -> bool {
-    now.saturating_sub(t) < PROTECT_GRACE_SECS
+    t.abs_diff(now) < PROTECT_GRACE_SECS
 }
 
 fn prefix6(pubkey: &[u8; 32]) -> [u8; 6] {
@@ -1171,6 +1175,18 @@ fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stamp_far_in_the_future_is_not_within_the_grace_window() {
+        let now = 1_000_000;
+        assert!(within_grace(now, now));
+        assert!(within_grace(now - (PROTECT_GRACE_SECS - 1), now));
+        assert!(!within_grace(now - PROTECT_GRACE_SECS, now));
+        // The clock set back a little: still recent. Set back a lot: not.
+        assert!(within_grace(now + 5, now));
+        assert!(!within_grace(now + PROTECT_GRACE_SECS, now));
+        assert!(!within_grace(u64::MAX, now));
+    }
 
     fn dummy_key(byte: u8) -> [u8; 32] {
         [byte; 32]

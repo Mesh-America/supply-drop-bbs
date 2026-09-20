@@ -526,6 +526,12 @@ The inline form is preferred on LoRa and other lossy links because the
 confirmation step makes the send idempotent: if "Message posted." never arrives,
 sending `.` safely retries without creating a duplicate.
 
+The BBS ignores a message identical to your previous one if it arrives within
+ten seconds, so a `.` or `C` you send again straight away gets no reply; wait
+ten seconds and send it once more. On Meshtastic with a command prefix set, a
+lone `.` or `C` still counts as your answer while a draft is waiting, but after
+the post has gone through a repeat of it needs the prefix to be recognised.
+
 ### Delete a message
 
 ```
