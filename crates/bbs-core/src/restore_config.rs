@@ -17,8 +17,9 @@
 //! * how it is reached: the whole `[plugins.web]` and `[plugins.cli]` tables
 //!   (bind address, origin, cookies, CSP, socket and its permissions);
 //! * what it executes: `[[plugins.process]]`, which names commands to run;
-//! * the hardware: how each radio is connected, and the security section, whose
-//!   password-hashing cost is tuned to this machine's speed.
+//! * the hardware: how each radio is connected, its `[radio]` settings, whether
+//!   it is `enabled`, and the security section, whose password-hashing cost is
+//!   tuned to this machine's speed.
 //!
 //! A bundle from another host would otherwise point the admin UI or a radio
 //! somewhere that doesn't exist here, or run a command that isn't installed
@@ -61,12 +62,17 @@ pub const MACHINE_SPECIFIC_KEYS: &[&[&str]] = &[
     &["plugins", "mesh", "addr"],
     &["plugins", "mesh", "serial_port"],
     &["plugins", "mesh", "baud_rate"],
-    &["plugins", "mesh", "hat"],
+    &["plugins", "mesh", "radio"],
+    &["plugins", "mesh", "enabled"],
+    &["plugins", "mesh", "app_target_version"],
+    &["plugins", "mesh", "protected_contact_cap"],
     &["plugins", "meshtastic", "connection_type"],
     &["plugins", "meshtastic", "addr"],
     &["plugins", "meshtastic", "serial_port"],
     &["plugins", "meshtastic", "baud_rate"],
-    &["plugins", "meshtastic", "hat"],
+    &["plugins", "meshtastic", "radio"],
+    &["plugins", "meshtastic", "enabled"],
+    &["plugins", "meshtastic", "protected_contact_cap"],
 ];
 
 /// Check that `text` is a TOML document a restore can work with.
@@ -175,15 +181,18 @@ pub fn pre_restore_path(config_path: &Path) -> PathBuf {
 ///
 /// # Errors
 /// A message if either file can't be read, the merge fails, or the file can't
-/// be written (for example when the service user can't write to it). Nothing
-/// is changed on error.
+/// be written (for example when the service user can't write to it). The
+/// running config is left in place on error; a `.pre-restore` copy written
+/// before the failure is left too.
 pub fn apply_config(config_path: &Path, restored: &Path) -> Result<ConfigApplied, String> {
     let restored_text = read_capped(restored)?;
-    let previous = pre_restore_path(config_path);
-    let target = config_path.to_path_buf();
+    // Write to the file a symlinked config points at, not over the link.
+    let config_path = resolve(config_path);
+    let previous = pre_restore_path(&config_path);
+    let target = config_path.clone();
     let previous_for_lock = previous.clone();
 
-    let had_current = crate::config_lock::with_config_lock_sync(config_path, move || {
+    let had_current = crate::config_lock::with_config_lock_sync(&config_path, move || {
         let current_text = match std::fs::read_to_string(&target) {
             Ok(t) => Some(t),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -191,17 +200,24 @@ pub fn apply_config(config_path: &Path, restored: &Path) -> Result<ConfigApplied
         };
         let merged = merge_for_restore(current_text.as_deref().unwrap_or(""), &restored_text)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        if current_text.is_some() {
-            std::fs::copy(&target, &previous_for_lock)?;
-        }
-        crate::config_lock::atomic_write_file(&target, merged.as_bytes())?;
-        if current_text.is_some() {
-            // The atomic write makes a new file; give it the old one's mode
-            // (an operator may have tightened it).
-            let perms = std::fs::metadata(&previous_for_lock)?.permissions();
-            std::fs::set_permissions(&target, perms)?;
-        }
-        Ok(current_text.is_some())
+        // The new file (and the saved copy of the old one) take the old file's
+        // mode and owner: the write makes a new file, which would otherwise
+        // belong to whoever is running (root, for the CLI) and lose a mode the
+        // operator tightened.
+        let identity = match &current_text {
+            Some(old) => {
+                let meta = std::fs::metadata(&target)?;
+                crate::config_lock::atomic_write_file_as(
+                    &previous_for_lock,
+                    old.as_bytes(),
+                    Some(&meta),
+                )?;
+                Some(meta)
+            }
+            None => None,
+        };
+        crate::config_lock::atomic_write_file_as(&target, merged.as_bytes(), identity.as_ref())?;
+        Ok(identity.is_some())
     })
     .map_err(|e| {
         if e.kind() == std::io::ErrorKind::InvalidData {
@@ -222,18 +238,27 @@ pub fn apply_config(config_path: &Path, restored: &Path) -> Result<ConfigApplied
 /// # Errors
 /// A message if the saved copy can't be put back.
 pub fn revert_config(config_path: &Path, applied: &ConfigApplied) -> Result<(), String> {
+    let config_path = resolve(config_path);
     let Some(previous) = &applied.previous else {
         // There was no config before: remove the one the restore created.
-        return std::fs::remove_file(config_path)
+        return std::fs::remove_file(&config_path)
             .map_err(|e| format!("could not remove {}: {e}", config_path.display()));
     };
     let text = std::fs::read(previous)
         .map_err(|e| format!("could not read {}: {e}", previous.display()))?;
-    let target = config_path.to_path_buf();
-    crate::config_lock::with_config_lock_sync(config_path, move || {
-        crate::config_lock::atomic_write_file(&target, &text)
+    let target = config_path.clone();
+    let previous = previous.clone();
+    crate::config_lock::with_config_lock_sync(&config_path, move || {
+        // The saved copy carries the original file's mode and owner.
+        let meta = std::fs::metadata(&previous)?;
+        crate::config_lock::atomic_write_file_as(&target, &text, Some(&meta))
     })
     .map_err(|e| format!("could not put the previous config back: {e}"))
+}
+
+/// `path` with symlinks resolved, or `path` itself if it doesn't exist yet.
+fn resolve(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Keep the config [`apply_config`] wrote only if `loads` accepts it. `loads`
@@ -350,7 +375,8 @@ enabled = true
             Some("/dev/serial/by-id/usb-here")
         );
         assert_eq!(m["plugins"]["mesh"]["baud_rate"].as_integer(), Some(115200));
-        assert_eq!(m["plugins"]["mesh"]["enabled"].as_bool(), Some(true));
+        // Whether the radio runs is this machine's too: unset here stays unset.
+        assert!(m["plugins"]["mesh"].get("enabled").is_none());
     }
 
     // What a foreign or hostile backup must not be able to change: what the
@@ -453,25 +479,37 @@ interval_hours = 0
 
     #[test]
     fn a_machine_specific_table_is_kept_whole_and_created_when_missing() {
-        let current = "[plugins.mesh.hat]\npreset = \"zebrahat\"\n";
-        let restored = "[plugins.mesh]\nenabled = true\n";
+        let current = "[plugins.mesh.radio]\npreset = \"zebrahat\"\n";
+        let restored = "[plugins.mesh]\nname = \"restored\"\n";
         let m = merged(current, restored);
         assert_eq!(
-            m["plugins"]["mesh"]["hat"]["preset"].as_str(),
+            m["plugins"]["mesh"]["radio"]["preset"].as_str(),
             Some("zebrahat")
         );
-        assert_eq!(m["plugins"]["mesh"]["enabled"].as_bool(), Some(true));
+        assert_eq!(m["plugins"]["mesh"]["name"].as_str(), Some("restored"));
 
-        // And a hat table the current config lacks is dropped.
+        // And a radio table the current config lacks is dropped.
         let none = merged(
             "[bbs]\nname = \"x\"\n",
-            "[plugins.mesh.hat]\npreset = \"other\"\n",
+            "[plugins.mesh.radio]\npreset = \"other\"\n",
         );
         assert!(none
             .get("plugins")
             .and_then(|p| p.get("mesh"))
-            .and_then(|m| m.get("hat"))
+            .and_then(|m| m.get("radio"))
             .is_none());
+    }
+
+    #[test]
+    fn whether_a_radio_plugin_runs_stays_with_this_machine() {
+        // A backup taken on a machine with the radio enabled must not switch
+        // the radio on (or off) on a machine whose hardware differs.
+        let m = merged(
+            "[plugins.mesh]\nenabled = false\n[plugins.meshtastic]\nenabled = true\n",
+            "[plugins.mesh]\nenabled = true\n[plugins.meshtastic]\nenabled = false\n",
+        );
+        assert_eq!(m["plugins"]["mesh"]["enabled"].as_bool(), Some(false));
+        assert_eq!(m["plugins"]["meshtastic"]["enabled"].as_bool(), Some(true));
     }
 
     #[test]
@@ -599,9 +637,45 @@ interval_hours = 0
         std::fs::write(&cfg, "[bbs]\nname = \"Old\"\n").unwrap();
         std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o640)).unwrap();
         std::fs::write(&staged, "[bbs]\nname = \"New\"\n").unwrap();
-        apply_config(&cfg, &staged).unwrap();
-        let mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o640, "{mode:o}");
+        let applied = apply_config(&cfg, &staged).unwrap();
+        let mode_of = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode_of(&cfg), 0o640);
+        assert_eq!(mode_of(&applied.previous.clone().unwrap()), 0o640);
+
+        // Putting the old file back must not reset its mode either.
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o600)).unwrap();
+        revert_config(&cfg, &applied).unwrap();
+        assert_eq!(mode_of(&cfg), 0o640);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_stays_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.toml");
+        let link = dir.path().join("config.toml");
+        let staged = dir.path().join(STAGED_CONFIG_NAME);
+        std::fs::write(&real, "[bbs]\nname = \"Old\"\n").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::fs::write(&staged, "[bbs]\nname = \"New\"\n").unwrap();
+
+        let applied = apply_config(&link, &staged).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&real)
+            .unwrap()
+            .contains("name = \"New\""));
+
+        revert_config(&link, &applied).unwrap();
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&real)
+            .unwrap()
+            .contains("name = \"Old\""));
     }
 
     #[test]
