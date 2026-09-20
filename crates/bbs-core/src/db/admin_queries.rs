@@ -410,9 +410,22 @@ impl Database {
                 })
                 .unwrap_or_default();
 
-            // For legacy .db files check for a sidecar _config.toml.
-            // For .zip files the config is already inside the archive.
-            let (config_filename, config_size_bytes) = if name.ends_with(".db") {
+            // For legacy .db files check for a sidecar _config.toml. A .zip bundle
+            // carries its config inside, so look for it there.
+            let (config_filename, config_size_bytes) = if name.ends_with(".zip") {
+                let zip_path = path.clone();
+                match tokio::task::spawn_blocking(move || {
+                    crate::backup_bundle::bundled_config_size(&zip_path)
+                })
+                .await
+                {
+                    Ok(Some(size)) => (
+                        Some(crate::backup_bundle::CONFIG_ENTRY.to_owned()),
+                        Some(size),
+                    ),
+                    _ => (None, None),
+                }
+            } else if name.ends_with(".db") {
                 let config_name = format!("{}_config.toml", name.trim_end_matches(".db"));
                 match tokio::fs::metadata(dir.join(&config_name)).await {
                     Ok(m) => (Some(config_name), Some(m.len())),
@@ -548,19 +561,26 @@ impl Database {
             .await
             .map_err(|e| StoreError::Decode(format!("read uploaded file: {e}")))?
             .len();
+        // The config.toml a zip bundle carries, held until the database is staged.
+        let mut config_text: Option<String> = None;
         match classify_upload(uploaded_path).await? {
             UploadKind::Zip => {
                 let extract_path = sibling_with_suffix(uploaded_path, ".extract.tmp");
                 let (src, dest) = (uploaded_path.to_path_buf(), extract_path.clone());
                 let extracted = tokio::task::spawn_blocking(move || {
-                    extract_single_db_from_zip(&src, &dest, MAX_RESTORE_DB_BYTES)
+                    let config = extract_optional_config(&src)?;
+                    extract_single_db_from_zip(&src, &dest, MAX_RESTORE_DB_BYTES)?;
+                    Ok::<_, String>(config)
                 })
                 .await
                 .map_err(|e| StoreError::Decode(format!("extracting zip upload: {e}")))?
                 .map_err(StoreError::Decode);
-                if let Err(e) = extracted {
-                    let _ = tokio::fs::remove_file(&extract_path).await;
-                    return Err(e);
+                match extracted {
+                    Ok(config) => config_text = config,
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&extract_path).await;
+                        return Err(e);
+                    }
                 }
                 // Same directory as the upload, so this replaces the zip with
                 // the database it held atomically.
@@ -675,6 +695,12 @@ impl Database {
         }
 
         let staged_path = data_dir.join("pending_restore.staged.db");
+        // A config staged earlier belongs to the database staged earlier. Clear
+        // it before the new database lands, so no crash can leave the new
+        // database next to the old one's settings (the worst a crash now leaves
+        // is a database with no settings, which restores the data only).
+        let _ =
+            tokio::fs::remove_file(data_dir.join(crate::restore_config::STAGED_CONFIG_NAME)).await;
         // `rename` is atomic but fails across filesystems (EXDEV) — the
         // upload's temp file and data_dir are not guaranteed to share one,
         // so fall back to copy+delete on that specific failure.
@@ -695,6 +721,13 @@ impl Database {
             let _ = tokio::fs::remove_file(uploaded_path).await;
         }
 
+        // The staged config always describes the staged database: a bundle
+        // without one clears any config staged by an earlier upload.
+        if let Err(e) = stage_config(data_dir, config_text.as_deref()).await {
+            let _ = tokio::fs::remove_file(&staged_path).await;
+            return Err(e);
+        }
+
         Ok(())
     }
 
@@ -712,6 +745,21 @@ impl Database {
     /// Public for the same reason as `stage_restore`: confirming a restore
     /// must not require the live database to open cleanly first.
     pub async fn admin_apply_staged_restore(data_dir: &Path) -> Result<(), StoreError> {
+        Self::admin_apply_staged_restore_with(data_dir, true).await
+    }
+
+    /// [`Self::admin_apply_staged_restore`], choosing whether the `config.toml`
+    /// staged with the database (from a backup bundle) is confirmed with it.
+    /// With `include_config` false it is discarded and only the database is
+    /// restored. Either way no config staged earlier can be left to be applied
+    /// with a different database.
+    ///
+    /// # Errors
+    /// As [`Self::admin_apply_staged_restore`].
+    pub async fn admin_apply_staged_restore_with(
+        data_dir: &Path,
+        include_config: bool,
+    ) -> Result<(), StoreError> {
         let staged_path = data_dir.join("pending_restore.staged.db");
         if !staged_path.exists() {
             return Err(StoreError::Decode("no restore is currently staged".into()));
@@ -723,6 +771,10 @@ impl Database {
             ));
         }
 
+        // A confirmed config left by an earlier restore is removed before the new
+        // database is confirmed, so it can never pair with it.
+        let _ =
+            tokio::fs::remove_file(data_dir.join(crate::restore_config::PENDING_CONFIG_NAME)).await;
         let confirmed_path = data_dir.join("pending_restore.db");
         if tokio::fs::rename(&staged_path, &confirmed_path)
             .await
@@ -733,8 +785,77 @@ impl Database {
                 .map_err(|e| StoreError::Decode(format!("confirm restore file: {e}")))?;
             let _ = tokio::fs::remove_file(&staged_path).await;
         }
+
+        // The database is confirmed; now its config. A stale confirmed config
+        // from an earlier restore is removed first so it can never pair with
+        // this database.
+        let staged_config = data_dir.join(crate::restore_config::STAGED_CONFIG_NAME);
+        let pending_config = data_dir.join(crate::restore_config::PENDING_CONFIG_NAME);
+        if include_config && staged_config.exists() {
+            if tokio::fs::rename(&staged_config, &pending_config)
+                .await
+                .is_err()
+            {
+                // Not fatal: the database restore stands without the settings.
+                tracing::warn!(
+                    "could not confirm the staged config.toml; restoring the database only"
+                );
+                let _ = tokio::fs::remove_file(&staged_config).await;
+            }
+        } else {
+            let _ = tokio::fs::remove_file(&staged_config).await;
+        }
         Ok(())
     }
+}
+
+/// The `config.toml` entry of a backup bundle, if it has one and it is usable.
+/// Read into memory (it is a few KiB; anything over the cap is refused) and
+/// checked to be TOML, so a bundle with a damaged config is refused when it is
+/// staged rather than when it is applied.
+pub(crate) fn extract_optional_config(zip_path: &Path) -> Result<Option<String>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("reading zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("reading zip: {e}"))?;
+    let mut entry = match archive.by_name("config.toml") {
+        Ok(e) => e,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(e) => return Err(format!("reading config.toml from the zip: {e}")),
+    };
+    let mut text = String::new();
+    (&mut entry)
+        .take(crate::restore_config::MAX_CONFIG_BYTES + 1)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("reading config.toml from the zip: {e}"))?;
+    if text.len() as u64 > crate::restore_config::MAX_CONFIG_BYTES {
+        return Err("the config.toml in the backup is too large".into());
+    }
+    crate::restore_config::validate_staged_config(&text)?;
+    Ok(Some(text))
+}
+
+/// Stage (or, with `None`, clear) the config that goes with the staged
+/// database. Written private and flushed, as the database is.
+async fn stage_config(data_dir: &Path, text: Option<&str>) -> Result<(), StoreError> {
+    let path = data_dir.join(crate::restore_config::STAGED_CONFIG_NAME);
+    let Some(text) = text else {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Ok(());
+    };
+    let text = text.to_owned();
+    let data_dir_owned = data_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = create_private(&path)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        crate::restore_stage::hand_to_dir_owner(data_dir_owned.as_path(), &path);
+        Ok(())
+    })
+    .await
+    .map_err(|e| StoreError::Decode(format!("staging config.toml: {e}")))?
+    .map_err(|e| StoreError::Decode(format!("staging config.toml: {e}")))
 }
 
 /// Read just the first 16 bytes of `path` and check them against the SQLite
@@ -971,6 +1092,49 @@ mod tests {
              than silently picking one"
         );
         assert!(!out.exists());
+    }
+
+    // The restore side reads exactly what a backup bundle holds.
+    #[test]
+    fn the_config_a_bundle_carries_is_what_restore_extracts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("b.db");
+        let cfg = dir.path().join("config.toml");
+        let zip = dir.path().join("b.zip");
+        std::fs::write(&db, b"SQLite format 3 db").unwrap();
+        std::fs::write(
+            &cfg,
+            "[bbs]
+name = \"X\"
+",
+        )
+        .unwrap();
+        crate::backup_bundle::write_bundle(&db, "b.db", Some(&cfg), &zip).unwrap();
+        assert_eq!(
+            super::extract_optional_config(&zip).unwrap().as_deref(),
+            Some(
+                "[bbs]
+name = \"X\"
+"
+            )
+        );
+
+        // A bundle with no config, and a zip with no config at all, give None.
+        crate::backup_bundle::write_bundle(&db, "b.db", None, &zip).unwrap();
+        assert_eq!(super::extract_optional_config(&zip).unwrap(), None);
+    }
+
+    #[test]
+    fn a_config_that_is_not_toml_or_is_too_big_is_refused_when_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("b.db");
+        std::fs::write(&db, b"db").unwrap();
+        let bad = dir.path().join("bad.toml");
+        std::fs::write(&bad, "[[[ nope").unwrap();
+        let zip = dir.path().join("bad.zip");
+        crate::backup_bundle::write_bundle(&db, "b.db", Some(&bad), &zip).unwrap();
+        let err = super::extract_optional_config(&zip).unwrap_err();
+        assert!(err.contains("not valid TOML"), "{err}");
     }
 
     #[test]

@@ -414,6 +414,22 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_stage_restore".into()))
     }
 
+    /// Take a backup and return it as a `.zip` bundle holding the database and,
+    /// when `config_path` names a readable file, the `config.toml` it runs with
+    /// (so a restore can bring the settings back too). The returned record
+    /// names the zip; its `config_filename` is set when the config went in.
+    /// Prefer this over `admin_trigger_backup`, which writes the bare database.
+    async fn admin_trigger_backup_bundle(
+        &self,
+        backup_dir: &str,
+        config_path: Option<&str>,
+    ) -> Result<AdminBackupRecord, HostError> {
+        let _ = (backup_dir, config_path);
+        Err(HostError::NotSupported(
+            "admin_trigger_backup_bundle".into(),
+        ))
+    }
+
     /// Stage a restore from a backup file already on the server, such as one in
     /// the backup directory: copy `source_path` into `data_dir` (the source is
     /// never touched or followed through a symlink, and files over the web UI's
@@ -438,6 +454,19 @@ pub trait Host: Send + Sync {
     async fn admin_apply_staged_restore(&self, data_dir: &str) -> Result<(), HostError> {
         let _ = data_dir;
         Err(HostError::NotSupported("admin_apply_staged_restore".into()))
+    }
+
+    /// [`Self::admin_apply_staged_restore`] choosing whether the `config.toml`
+    /// that came with the staged backup is restored along with the database.
+    async fn admin_apply_staged_restore_with(
+        &self,
+        data_dir: &str,
+        include_config: bool,
+    ) -> Result<(), HostError> {
+        let _ = (data_dir, include_config);
+        Err(HostError::NotSupported(
+            "admin_apply_staged_restore_with".into(),
+        ))
     }
 
     // ── Audit log ────────────────────────────────────────────────────────────────

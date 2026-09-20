@@ -24,6 +24,9 @@ const restoring = ref<string | null>(null)
 const error = ref<string | null>(null)
 const actionOk = ref<string | null>(null)
 
+// Restore the backup's settings (config.toml) along with the database. On by
+// default: a restore that leaves the settings behind looks half done.
+const restoreSettings = ref(true)
 const restoreFile = ref<File | null>(null)
 const uploading = ref(false)
 const applying = ref(false)
@@ -145,11 +148,30 @@ const GIVE_UP_AFTER_SECONDS = 20
 // plain error.
 const UNCLEAR_STATUS = [502, 503, 504]
 
-const RESTORE_LIMITS =
-  'This REPLACES the current database. Settings kept in config.toml, such as ' +
-  'the BBS name, are NOT restored, and anything written since the backup was ' +
-  'made is lost. A safety snapshot of the current database is saved in the ' +
-  'data directory first; the last three snapshots are kept.'
+// What the confirmation dialogs say. `hasSettings` is whether the backup being
+// restored carries a config.toml (undefined when that isn't known, as for an
+// upload that is already staged).
+function restoreLimits(hasSettings?: boolean): string {
+  const snapshot =
+    'A safety snapshot of the current database is saved in the data directory ' +
+    'first; the last three snapshots are kept.'
+  if (!restoreSettings.value) {
+    return (
+      'This REPLACES the current database only. The current settings ' +
+      '(config.toml) are left as they are. Anything written since the backup ' +
+      'was made is lost. ' + snapshot
+    )
+  }
+  const settings =
+    hasSettings === false
+      ? 'This backup has no settings (config.toml), so only the database is restored. '
+      : 'Its settings (config.toml, such as the BBS name) are restored too; paths, ' +
+        "the web and CLI plugins, the database, backup and security sections and the radio connection keep this machine's values. "
+  return (
+    'This REPLACES the current database. ' + settings +
+    'Anything written since the backup was made is lost. ' + snapshot
+  )
+}
 
 // Restores a backup that is already on the server. One request stages it
 // (the server validates it first) and confirms it under a single lock, so a
@@ -157,8 +179,10 @@ const RESTORE_LIMITS =
 // the service restarts on the restored database.
 async function restoreBackup(filename: string) {
   if (busy.value) return
+  const record = backups.value.find((b) => b.filename === filename)
+  const hasSettings = filename.endsWith('.zip') && !!record?.config_filename
   if (!confirm(
-    `Restore ${filename}?\n\n${RESTORE_LIMITS}\n\n` +
+    `Restore ${filename}?\n\n${restoreLimits(hasSettings)}\n\n` +
     'The service then restarts (without systemd you restart it yourself).'
   )) return
   restoring.value = filename
@@ -169,7 +193,7 @@ async function restoreBackup(filename: string) {
   const bootId = await fetchBootId()
   try {
     const res = await api.post<{ message: string; restart_required?: boolean }>(
-      `/api/v1/backups/${encodeURIComponent(filename)}/restore?apply=true`
+      `/api/v1/backups/${encodeURIComponent(filename)}/restore?apply=true&config=${restoreSettings.value}`
     )
     startRestoreWait(res.message, res.restart_required === true, bootId)
   } catch (e: any) {
@@ -235,7 +259,7 @@ async function uploadRestoreFile() {
 async function applyRestore() {
   if (busy.value) return
   if (!confirm(
-    `Apply the staged backup?\n\n${RESTORE_LIMITS}\n\n` +
+    `Apply the staged backup?\n\n${restoreLimits()}\n\n` +
     'The service then restarts (without systemd you restart it yourself).'
   )) return
   applying.value = true
@@ -244,7 +268,7 @@ async function applyRestore() {
   const bootId = await fetchBootId()
   try {
     const res = await api.post<{ message: string; restart_required?: boolean }>(
-      '/api/v1/backups/restore/apply'
+      `/api/v1/backups/restore/apply?config=${restoreSettings.value}`
     )
     startRestoreWait(res.message, res.restart_required === true, bootId)
   } catch (e: any) {
@@ -290,6 +314,12 @@ onMounted(load)
         one from another system, upload its <code>.db</code> or <code>.zip</code> here. The file
         is validated before anything changes; nothing is applied until you confirm below.
       </p>
+      <label class="settings-toggle">
+        <input type="checkbox" v-model="restoreSettings" :disabled="busy" />
+        Also restore the backup's settings (<code>config.toml</code>: BBS name, welcome
+        message, and so on). Settings that belong to this machine (paths, the web and CLI
+        plugins, the database, backup and security sections, the radio connection) are kept.
+      </label>
       <div class="restore-controls">
         <input
           ref="fileInput"
@@ -318,7 +348,7 @@ onMounted(load)
     <p v-if="actionOk" class="ok">{{ actionOk }}</p>
 
     <p v-if="backupDirConfigured && !loading && backups.length === 0 && !error" class="muted">
-      No backups found. Automatic backups (`.db` files) are created on the configured interval
+      No backups found. Automatic backups (`.zip` bundles of the database and settings) are created on the configured interval
       and will appear here. You can also create one manually above.
     </p>
 
@@ -338,15 +368,20 @@ onMounted(load)
               <a :href="downloadUrl(b.filename)" class="dl-link" :download="b.filename">
                 {{ b.filename }}
               </a>
-              <a v-if="b.config_filename" :href="downloadUrl(b.config_filename)"
+              <a v-if="b.config_filename && b.filename.endsWith('.db')"
+                :href="downloadUrl(b.config_filename)"
                 class="dl-link config-link" :download="b.config_filename">
                 config
               </a>
+              <span v-else-if="b.config_filename" class="muted small"
+                title="This backup includes config.toml, so a restore can bring the settings back">
+                + settings
+              </span>
             </div>
           </td>
           <td class="size-col">
             {{ fmtSize(b.size_bytes) }}
-            <span v-if="b.config_size_bytes" class="muted small">
+            <span v-if="b.config_size_bytes && b.filename.endsWith('.db')" class="muted small">
               + {{ fmtSize(b.config_size_bytes) }}
             </span>
           </td>
@@ -389,6 +424,8 @@ p { margin: 0; }
   border-radius: 4px;
 }
 .restore-panel h2 { margin: 0; font-size: 1em; }
+.settings-toggle { display: flex; align-items: flex-start; gap: 0.5rem; font-size: 0.9em; line-height: 1.4; }
+.settings-toggle input { margin-top: 0.2rem; }
 .restore-controls { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; }
 .restore-staged {
   display: flex;

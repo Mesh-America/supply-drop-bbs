@@ -293,19 +293,20 @@ supply-drop-bbs run    --config /etc/supply-drop-bbs/config.toml
 supply-drop-bbs backup [OPTIONS]
 ```
 
-Trigger an immediate database backup (`VACUUM INTO`) and exit. The backup lands in `<data_dir>/backups/` (or the configured `[backup] directory`) with a timestamp filename. The running BBS service does not need to be stopped — `VACUUM INTO` is non-blocking and consistent.
+Trigger an immediate backup and exit. The backup lands in `<data_dir>/backups/` (or the configured `[backup] directory`) as a timestamped `.zip` holding the database (`VACUUM INTO`, non-blocking and consistent, so the running BBS service does not need to be stopped) and the `config.toml` it loaded, so a restore can bring the settings back too. If no config file is found the zip holds the database only, and the command says so.
 
 On success, prints the filename, size in bytes, and destination directory:
 
 ```
-Backup created: backup_20260511_142301.db
+Backup created: backup_20260511_142301.zip
   size:     2097152 bytes
+  settings: config.toml included
   location: /var/lib/supply-drop-bbs/backups
 ```
 
-> Produces a raw `.db` file. The web UI's "create backup" button produces a
-> `.zip` bundling the same `.db` with `config.toml` — `restore stage` below
-> accepts either.
+> The automatic backups and the web UI's "create backup" button make the same
+> bundle. Older backups are bare `.db` files; `restore stage` below accepts
+> either.
 
 ---
 
@@ -347,6 +348,12 @@ supply-drop-bbs restore apply
 # Restore confirmed.
 # Restart the BBS to apply it, e.g.: sudo systemctl restart supply-drop-bbs
 ```
+
+By default a `.zip` backup's `config.toml` (the settings) is restored with the
+database, apart from the parts that belong to this machine (paths, the web and CLI
+plugins, the database, backup and security sections, the radio connection); see [Restoring from a
+backup](OPERATIONS.md#restoring-from-a-backup). Pass `--no-config` to restore the
+database only.
 
 Pass `--yes` to `apply` to skip the interactive confirmation prompt for
 scripted/non-interactive use:

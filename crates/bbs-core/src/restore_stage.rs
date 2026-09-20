@@ -120,14 +120,18 @@ pub async fn new_private_temp(
     let file = opts.open(&path).await?;
     // From here on the guard owns the cleanup.
     let temp = TempFile(path);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if let Ok(dir) = std::fs::metadata(data_dir) {
-            let _ = std::os::unix::fs::chown(temp.path(), Some(dir.uid()), Some(dir.gid()));
-        }
-    }
+    hand_to_dir_owner(data_dir, temp.path());
     Ok((temp, file))
+}
+
+/// Give `path` to the owner (user and group) of `dir`, best effort. For the
+/// service user this changes nothing; for a `restore stage` run as root it keeps
+/// the files the service will read from being root-owned and unreadable to it.
+pub(crate) fn hand_to_dir_owner(dir: &Path, path: &Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    if let Ok(meta) = std::fs::metadata(dir) {
+        let _ = std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()));
+    }
 }
 
 /// How [`stage_copy`] treats its source.

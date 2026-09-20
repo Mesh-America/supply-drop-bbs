@@ -557,9 +557,14 @@ sudo systemctl start supply-drop-bbs
 
 ### Automatic backups
 
-If `[backup] enabled = true` (default), the BBS runs
-`VACUUM INTO 'backup-YYYY-MM-DD-HHMMSS.sqlite'` on the configured interval.
-Backups land in `<data_dir>/backups`. `VACUUM INTO` is non-blocking.
+If `[backup] enabled = true` (default), the BBS takes a backup on the configured
+interval. Each backup is one `backup_YYYYMMDD_HHMMSS.zip` in `<data_dir>/backups`
+holding the database (made with `VACUUM INTO`, which is non-blocking) and the
+`config.toml` the BBS is running with, so the settings (the BBS name, welcome
+message, timezone, location and so on) are backed up with the data. The bundle
+is readable only by the service user, since the database holds password hashes.
+If the config file can't be found or read, the BBS logs a warning and the backup
+holds the database alone; the Backups page marks the ones that include settings.
 
 Retention defaults: 7 daily + 4 weekly. Configurable.
 
@@ -570,6 +575,9 @@ supply-drop-bbs backup
 ```
 
 Or use the **create backup** button on the **Backups** page of the web admin UI.
+Both make the same `.zip` bundle as the automatic backups. `supply-drop-bbs
+backup` includes the config file it loaded, so pass `--config` if it is not in
+one of the default places.
 
 ### Off-host backups
 
@@ -597,8 +605,7 @@ full-screen notice and blocks everything else, then reloads by itself once the
 restarted service answers (to the login screen, since sessions don't survive a
 restart). If it hasn't seen the restart after two minutes it offers a reload
 button. To restore a backup from another system, upload
-the file instead (a raw `.db` or the `.zip` the web UI's own "create backup"
-button produces), then confirm the restore once it validates. From the
+the file instead (a `.zip` bundle from a backup, or a raw `.db`), then confirm the restore once it validates. From the
 command line, or with an upload, staging and confirming are separate steps:
 nothing changes until you confirm, and the database is only swapped the next
 time the BBS process starts. The command line works even when the live database
@@ -606,8 +613,38 @@ is broken (see [Corrupted database](#corrupted-database)) — staging and
 confirming never require the live database to open successfully; the web UI
 needs a running BBS.
 
-A restore replaces the database only. The `config.toml` inside a `.zip` backup
-is not restored, and anything written since the backup was made is lost.
+A restore brings back the database and, from a `.zip` bundle that has one, the
+settings in its `config.toml`. Anything written since the backup was made is
+lost. Backups made before bundles carried the settings (bare `.db` files, or
+older zips without a config) restore the database only.
+
+Some settings belong to this machine, or decide what it runs and who can reach
+it, so they are not taken from the backup: they keep this machine's current
+values (or stay unset if this machine doesn't set them). They are:
+
+- where things live: `bbs.data_dir`, `logging.file`, and the whole `[database]`
+  and `[backup]` sections (which also keeps this machine's backup schedule and
+  retention);
+- how the BBS is reached: the whole `[plugins.web]` and `[plugins.cli]` tables;
+- what it executes: `[[plugins.process]]`;
+- the hardware and its cost settings: each radio's `connection_type`, `addr`,
+  `serial_port`, `baud_rate` and `hat`, and the whole `[security]` section
+  (password-hashing cost is tuned to the machine).
+
+A backup taken on another host, or a hostile one, would otherwise point the
+admin UI or a radio somewhere that doesn't exist here, or run a command. Everything
+else comes from the backup: the other `[bbs]` settings (name, welcome message,
+starting room, timezone and so on), `[location]`, `[logging]` apart from the
+file, and the rest of the mesh and Meshtastic settings.
+
+The web UI has a checkbox, on by default, to restore the settings; clear it (or
+use `supply-drop-bbs restore apply --no-config`) to restore the database only.
+The settings are applied when the BBS starts, after the database swap. The
+config file it replaces is saved as `config.toml.pre-restore` next to it. If the
+restored file doesn't load, or the service user can't write the config file,
+the previous settings stay, the database restore still stands, the log says why
+and the audit log entry `restore_completed` records it. The log level and log
+format from the backup take effect at the restart after that.
 
 Staging a restore checks the file without loading it into memory, and a `.zip` is
 streamed to disk while it is extracted. A database larger than 4 GiB, raw or
@@ -786,7 +823,7 @@ snapshot of whatever's currently at the live path is taken automatically
 before the swap.
 
 ```sh
-sudo -u supply-drop supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/<file>.db
+sudo -u supply-drop supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/<file>.zip
 sudo -u supply-drop supply-drop-bbs restore apply --yes
 sudo systemctl restart supply-drop-bbs
 ```
@@ -799,10 +836,13 @@ sudo systemctl stop supply-drop-bbs
 sudo mv /var/lib/supply-drop-bbs/bbs.sqlite /var/lib/supply-drop-bbs/bbs.sqlite.corrupt
 sudo mv /var/lib/supply-drop-bbs/bbs.sqlite-wal /var/lib/supply-drop-bbs/bbs.sqlite-wal.corrupt 2>/dev/null || true
 ls -lt /var/lib/supply-drop-bbs/backups/
-sudo cp /var/lib/supply-drop-bbs/backups/<latest>.sqlite /var/lib/supply-drop-bbs/bbs.sqlite
+sudo unzip -p /var/lib/supply-drop-bbs/backups/<latest>.zip '*.db' > /var/lib/supply-drop-bbs/bbs.sqlite
 sudo chown supply-drop:supply-drop /var/lib/supply-drop-bbs/bbs.sqlite
 sudo systemctl start supply-drop-bbs
 ```
+
+To read the settings a backup carries without restoring it, run
+`unzip -p <backup>.zip config.toml`.
 
 The fallback skips all of `restore`'s validation (SQLite-format check,
 migration-history check, room-structure check) — only use it when the CLI
