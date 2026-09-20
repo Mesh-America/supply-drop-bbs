@@ -579,6 +579,10 @@ Both make the same `.zip` bundle as the automatic backups. `supply-drop-bbs
 backup` includes the config file it loaded, so pass `--config` if it is not in
 one of the default places.
 
+To see and remove backups from the command line, use `supply-drop-bbs backup
+list` and `supply-drop-bbs backup delete <name>`; they work even when the
+database is broken. See [the CLI reference](CLI.md).
+
 ### Off-host backups
 
 ```sh

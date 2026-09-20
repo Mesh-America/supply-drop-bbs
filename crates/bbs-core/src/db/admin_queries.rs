@@ -358,9 +358,11 @@ impl Database {
         Ok(())
     }
 
-    /// List `.zip` and legacy `.db` backup files in `backup_dir`.
-    pub(crate) async fn admin_list_backups(
-        &self,
+    /// List `.zip` and legacy `.db` backup files in `backup_dir`, newest first.
+    ///
+    /// Only reads the directory, so (like `stage_restore`) it needs no open
+    /// database: the CLI lists backups even when the live database is broken.
+    pub async fn admin_list_backups(
         backup_dir: &str,
     ) -> Result<Vec<AdminBackupRecord>, StoreError> {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -387,7 +389,9 @@ impl Database {
                 .to_owned();
             // Accept zip (new) and db (legacy); the rule is shared with the
             // restore endpoint, and it skips the `_config.toml` sidecar files.
-            if !crate::restore_stage::is_backup_file_name(&name) {
+            if !crate::restore_stage::is_backup_file_name(&name)
+                || !crate::restore_stage::backup_filename_is_safe(&name)
+            {
                 continue;
             }
             let Ok(meta) = tokio::fs::metadata(&path).await else {
@@ -444,7 +448,11 @@ impl Database {
             });
         }
 
-        records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        records.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.filename.cmp(&a.filename))
+        });
         Ok(records)
     }
 
@@ -453,13 +461,17 @@ impl Database {
     ///
     /// Returns `StoreError::Decode("invalid filename")` if the filename
     /// contains path traversal characters (`/`, `\`, `..`).
-    pub(crate) async fn admin_delete_backup(
-        &self,
-        backup_dir: &str,
-        filename: &str,
-    ) -> Result<(), StoreError> {
+    /// Like [`Self::admin_list_backups`] it needs no open database.
+    pub async fn admin_delete_backup(backup_dir: &str, filename: &str) -> Result<(), StoreError> {
         if !crate::restore_stage::backup_filename_is_safe(filename) {
             return Err(StoreError::Decode("invalid filename".into()));
+        }
+        // Only backups: the backup directory can be shared with other files
+        // (or be the data directory), and this must never remove those.
+        if !crate::restore_stage::is_backup_file_name(filename) {
+            return Err(StoreError::Decode(
+                "not a backup file (only .db and .zip backups can be deleted)".into(),
+            ));
         }
 
         let dir = Path::new(backup_dir);
@@ -1092,6 +1104,88 @@ mod tests {
              than silently picking one"
         );
         assert!(!out.exists());
+    }
+
+    // Listing and deleting only read the directory: no database is open.
+    #[tokio::test]
+    async fn backups_can_be_listed_and_deleted_without_a_database() {
+        use crate::db::Database;
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        let path = d.to_string_lossy().into_owned();
+        // A zip with settings, a zip without, a legacy db with a sidecar config,
+        // and files that are not backups.
+        let db = d.join("b.db");
+        std::fs::write(&db, b"db").unwrap();
+        let cfg = d.join("config.toml");
+        std::fs::write(&cfg, "[bbs]\nname = \"X\"\n").unwrap();
+        crate::backup_bundle::write_bundle(&db, "b.db", Some(&cfg), &d.join("backup_a.zip"))
+            .unwrap();
+        crate::backup_bundle::write_bundle(&db, "b.db", None, &d.join("backup_b.zip")).unwrap();
+        std::fs::write(d.join("backup_c.db"), b"db").unwrap();
+        std::fs::write(d.join("backup_c_config.toml"), b"x").unwrap();
+        std::fs::write(d.join("notes.txt"), b"x").unwrap();
+        std::fs::remove_file(&db).unwrap();
+        std::fs::remove_file(&cfg).unwrap();
+
+        let listed = Database::admin_list_backups(&path).await.unwrap();
+        let mut names: Vec<(&str, bool)> = listed
+            .iter()
+            .map(|r| (r.filename.as_str(), r.config_filename.is_some()))
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                ("backup_a.zip", true),
+                ("backup_b.zip", false),
+                ("backup_c.db", true)
+            ]
+        );
+
+        Database::admin_delete_backup(&path, "backup_a.zip")
+            .await
+            .unwrap();
+        Database::admin_delete_backup(&path, "backup_c.db")
+            .await
+            .unwrap();
+        assert!(
+            !d.join("backup_c_config.toml").exists(),
+            "the sidecar goes with it"
+        );
+        assert!(d.join("notes.txt").exists());
+        assert_eq!(Database::admin_list_backups(&path).await.unwrap().len(), 1);
+
+        // Names that leave the directory are refused, and nothing outside goes.
+        let outside = d.parent().unwrap().join("outside-victim.zip");
+        std::fs::write(&outside, b"keep").unwrap();
+        let outside_rel = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        assert!(Database::admin_delete_backup(&path, &outside_rel)
+            .await
+            .is_err());
+        assert!(
+            outside.exists(),
+            "a file outside the backup directory must survive"
+        );
+        let _ = std::fs::remove_file(&outside);
+        // Only backups can be deleted: not the notes file next to them.
+        assert!(Database::admin_delete_backup(&path, "notes.txt")
+            .await
+            .is_err());
+        assert!(d.join("notes.txt").exists());
+        for bad in ["../x.zip", "a/b.zip", "..", ""] {
+            assert!(
+                Database::admin_delete_backup(&path, bad).await.is_err(),
+                "{bad:?}"
+            );
+        }
+        // Missing directory is an empty list, not an error.
+        assert!(
+            Database::admin_list_backups(&d.join("absent").to_string_lossy())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // The restore side reads exactly what a backup bundle holds.

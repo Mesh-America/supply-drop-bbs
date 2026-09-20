@@ -95,8 +95,15 @@ enum Commands {
     /// Apply any pending database migrations.
     Migrate,
 
-    /// Trigger an immediate database backup.
-    Backup,
+    /// Create, list or delete backups. With no subcommand, creates a backup.
+    ///
+    /// A backup is a `.zip` holding the database and the `config.toml` the BBS
+    /// runs with. Listing and deleting only read the backup directory, so they
+    /// work even when the database is broken.
+    Backup {
+        #[command(subcommand)]
+        action: Option<BackupAction>,
+    },
 
     /// Validate and apply a database restore from a backup file.
     ///
@@ -182,6 +189,23 @@ enum Commands {
     },
 }
 
+/// What `backup` does. Bare `backup` is `backup create`.
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Take a backup now (the default when no subcommand is given).
+    Create,
+    /// List the backups in the backup directory, newest first.
+    List,
+    /// Delete a backup from the backup directory.
+    Delete {
+        /// The backup's file name, as `backup list` shows it.
+        name: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum RestoreAction {
     /// Validate a backup file and stage it for restore, without touching
@@ -194,7 +218,8 @@ enum RestoreAction {
     /// place, and a room-structure check. Staging never applies anything;
     /// run `apply` afterward to confirm it.
     Stage {
-        /// Path to a `.db` or `.zip` backup file.
+        /// Path to a `.db` or `.zip` backup file, or just the name of one in
+        /// the backup directory (as `backup list` shows it).
         path: PathBuf,
     },
 
@@ -624,7 +649,11 @@ async fn main() {
         Some(Commands::Setup) => cmd_setup(config_path.as_deref()),
         Some(Commands::Config { action }) => cmd_config(config_path.as_deref(), action),
         Some(Commands::Migrate) => cmd_migrate(&cli).await,
-        Some(Commands::Backup) => cmd_backup(&cli).await,
+        Some(Commands::Backup { ref action }) => match action {
+            None | Some(BackupAction::Create) => cmd_backup(&cli).await,
+            Some(BackupAction::List) => cmd_backup_list(&cli).await,
+            Some(BackupAction::Delete { name, yes }) => cmd_backup_delete(&cli, name, *yes).await,
+        },
         Some(Commands::Restore { ref action }) => cmd_restore(&cli, action).await,
         Some(Commands::User { ref action }) => cmd_user(&cli, action).await,
         Some(Commands::Room { ref action }) => cmd_room(&cli, action).await,
@@ -2252,6 +2281,142 @@ async fn cmd_backup(cli: &Cli) {
     }
 }
 
+/// The file `restore stage` should read for the argument the operator typed. A
+/// bare file name (no directory part) is the backup of that name in the backup
+/// directory, so a name copied from `backup list` works even if an older copy
+/// of the same name sits in the current directory; a name with a directory part
+/// is a path and is used as it is. Anything that is not a file is returned
+/// unchanged, for the caller to report.
+fn resolve_stage_source(arg: &std::path::Path, backup_dir: &std::path::Path) -> PathBuf {
+    let bare_name = arg
+        .to_str()
+        .filter(|_| arg.file_name().is_some_and(|f| f == arg.as_os_str()))
+        .filter(|n| bbs_core::restore_stage::backup_filename_is_safe(n));
+    if let Some(name) = bare_name {
+        let candidate = backup_dir.join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    arg.to_path_buf()
+}
+
+/// The `backup list` table.
+fn format_backup_list(records: &[bbs_plugin_api::AdminBackupRecord]) -> String {
+    let width = records
+        .iter()
+        .map(|r| r.filename.len())
+        .max()
+        .unwrap_or(0)
+        .max("name".len());
+    let mut out = format!(
+        "{:<width$}  {:>10}  {:<19}  settings\n",
+        "name", "size", "created (UTC)"
+    );
+    for r in records {
+        let created = r
+            .created_at
+            .get(..19)
+            .unwrap_or(&r.created_at)
+            .replace('T', " ");
+        let settings = if r.config_filename.is_some() {
+            "yes"
+        } else {
+            "no"
+        };
+        out.push_str(&format!(
+            "{:<width$}  {:>10}  {:<19}  {settings}\n",
+            r.filename,
+            fmt_bytes(r.size_bytes),
+            created
+        ));
+    }
+    out
+}
+
+/// List the backups in the backup directory. Reads the directory only, so it
+/// works when the database is broken.
+async fn cmd_backup_list(cli: &Cli) {
+    let cfg = load_config(cli);
+    let backup_dir = cfg
+        .backup
+        .directory
+        .as_ref()
+        .expect("backup.directory set by resolve()");
+    // The listing treats an unreadable directory as empty, which is right for
+    // the web UI but would tell an operator running as the wrong user that their
+    // backups are gone: report anything but "not created yet".
+    if let Err(e) = std::fs::read_dir(backup_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("error: cannot read {}: {e}", backup_dir.display());
+            std::process::exit(1);
+        }
+    }
+    match Database::admin_list_backups(&backup_dir.to_string_lossy()).await {
+        Ok(records) if records.is_empty() => {
+            println!("No backups in {}.", backup_dir.display());
+        }
+        Ok(records) => {
+            print!("{}", format_backup_list(&records));
+            println!("{} backup(s) in {}", records.len(), backup_dir.display());
+        }
+        Err(e) => {
+            eprintln!("error listing backups: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Delete one backup from the backup directory, after confirmation.
+async fn cmd_backup_delete(cli: &Cli, name: &str, yes: bool) {
+    let cfg = load_config(cli);
+    let backup_dir = cfg
+        .backup
+        .directory
+        .as_ref()
+        .expect("backup.directory set by resolve()");
+
+    if !bbs_core::restore_stage::backup_filename_is_safe(name)
+        || !bbs_core::restore_stage::is_backup_file_name(name)
+    {
+        eprintln!("error: '{name}' is not a backup file name (see `supply-drop-bbs backup list`)");
+        std::process::exit(1);
+    }
+    if !backup_dir.join(name).is_file() {
+        eprintln!(
+            "error: no backup named '{name}' in {} (see `supply-drop-bbs backup list`)",
+            backup_dir.display()
+        );
+        std::process::exit(1);
+    }
+    if !yes {
+        let confirmed = match dialoguer::Confirm::new()
+            .with_prompt(format!("Delete backup {name}? This cannot be undone."))
+            .default(false)
+            .interact()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // No terminal to ask on (cron, a pipe): fail rather than report
+                // success for a delete that did not happen.
+                eprintln!("error: cannot ask for confirmation ({e}); pass --yes to delete");
+                std::process::exit(1);
+            }
+        };
+        if !confirmed {
+            println!("Aborted — nothing was deleted.");
+            return;
+        }
+    }
+    match Database::admin_delete_backup(&backup_dir.to_string_lossy(), name).await {
+        Ok(()) => println!("Deleted {name}."),
+        Err(e) => {
+            eprintln!("error deleting backup: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
 async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
     let cfg = load_config(cli);
     let data_dir = cfg
@@ -2267,8 +2432,19 @@ async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
 
     match action {
         RestoreAction::Stage { path } => {
+            let backup_dir = cfg
+                .backup
+                .directory
+                .as_ref()
+                .expect("backup.directory set by resolve()");
+            let resolved = resolve_stage_source(path, backup_dir);
+            let path = &resolved;
             if !path.is_file() {
-                eprintln!("error: {} is not a file", path.display());
+                eprintln!(
+                    "error: {} is not a file (a bare backup name is looked up in {})",
+                    path.display(),
+                    backup_dir.display()
+                );
                 std::process::exit(1);
             }
 
@@ -3890,5 +4066,148 @@ mod restore_temp_sweep_tests {
             "restore_cli_x.txt",
             Some(Duration::from_secs(99999))
         ));
+    }
+}
+
+#[cfg(test)]
+mod backup_cli_tests {
+    use super::{format_backup_list, resolve_stage_source};
+    use bbs_plugin_api::AdminBackupRecord;
+    use std::path::Path;
+
+    fn record(name: &str, size: u64, at: &str, config: bool) -> AdminBackupRecord {
+        AdminBackupRecord {
+            filename: name.into(),
+            size_bytes: size,
+            created_at: at.into(),
+            config_filename: config.then(|| "config.toml".into()),
+            config_size_bytes: config.then_some(10),
+        }
+    }
+
+    #[test]
+    fn the_list_shows_name_size_date_and_whether_settings_are_included() {
+        let text = format_backup_list(&[
+            record(
+                "backup_20260920_101500.zip",
+                2_097_152,
+                "2026-09-20T10:15:00Z",
+                true,
+            ),
+            record(
+                "backup_20260101_000000.db",
+                512,
+                "2026-01-01T00:00:00Z",
+                false,
+            ),
+        ]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            lines[0].starts_with("name") && lines[0].ends_with("settings"),
+            "{text}"
+        );
+        assert!(lines[1].contains("backup_20260920_101500.zip"), "{text}");
+        assert!(lines[1].contains("2026-09-20 10:15:00"), "{text}");
+        assert!(lines[1].ends_with("yes"), "{text}");
+        assert!(
+            lines[2].contains("backup_20260101_000000.db") && lines[2].ends_with("no"),
+            "{text}"
+        );
+        // The columns line up: each one starts at the same offset on every row.
+        let col = |l: &str, needle: &str| l.find(needle).unwrap();
+        assert_eq!(
+            col(lines[0], "created"),
+            col(lines[1], "2026-09-20"),
+            "{text}"
+        );
+        assert_eq!(
+            col(lines[0], "created"),
+            col(lines[2], "2026-01-01"),
+            "{text}"
+        );
+        assert_eq!(col(lines[0], "settings"), col(lines[1], "yes"), "{text}");
+        assert_eq!(col(lines[0], "settings"), col(lines[2], "no"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_list_is_just_the_header() {
+        assert_eq!(format_backup_list(&[]).lines().count(), 1);
+    }
+
+    #[test]
+    fn a_path_that_is_a_file_is_used_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mine.zip");
+        std::fs::write(&file, b"x").unwrap();
+        // Even if the backup directory has a file of the same bare name.
+        std::fs::write(backups.path().join("mine.zip"), b"y").unwrap();
+        assert_eq!(resolve_stage_source(&file, backups.path()), file);
+    }
+
+    #[test]
+    fn bare_backup_is_create_and_the_subcommands_parse() {
+        use super::{BackupAction, Cli, Commands};
+        use clap::Parser as _;
+        let bare = Cli::try_parse_from(["x", "backup"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Some(Commands::Backup { action: None })
+        ));
+        let create = Cli::try_parse_from(["x", "backup", "create"]).unwrap();
+        assert!(matches!(
+            create.command,
+            Some(Commands::Backup {
+                action: Some(BackupAction::Create)
+            })
+        ));
+        let list = Cli::try_parse_from(["x", "--config", "c.toml", "backup", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Some(Commands::Backup {
+                action: Some(BackupAction::List)
+            })
+        ));
+        let del = Cli::try_parse_from(["x", "backup", "delete", "a.zip", "--yes"]).unwrap();
+        match del.command {
+            Some(Commands::Backup {
+                action: Some(BackupAction::Delete { name, yes }),
+            }) => {
+                assert_eq!(name, "a.zip");
+                assert!(yes);
+            }
+            _ => panic!("delete did not parse"),
+        }
+        assert!(Cli::try_parse_from(["x", "backup", "delete"]).is_err());
+    }
+
+    #[test]
+    fn a_bare_name_is_looked_up_in_the_backup_directory() {
+        let backups = tempfile::tempdir().unwrap();
+        std::fs::write(backups.path().join("backup_1.zip"), b"x").unwrap();
+        assert_eq!(
+            resolve_stage_source(Path::new("backup_1.zip"), backups.path()),
+            backups.path().join("backup_1.zip")
+        );
+    }
+
+    #[test]
+    fn anything_else_is_returned_unchanged_for_the_caller_to_report() {
+        let backups = tempfile::tempdir().unwrap();
+        std::fs::write(backups.path().join("backup_1.zip"), b"x").unwrap();
+        for arg in [
+            "absent.zip",
+            "sub/backup_1.zip",
+            "../backup_1.zip",
+            "..",
+            "",
+        ] {
+            assert_eq!(
+                resolve_stage_source(Path::new(arg), backups.path()),
+                Path::new(arg),
+                "{arg:?}"
+            );
+        }
     }
 }

@@ -2568,7 +2568,7 @@ fn print_next_steps(
     println!("  If this software is useful to you, please");
     println!("  consider supporting our mission:");
     println!();
-    println!("    https://meshamerica.com/pitch-in/");
+    println!("    https://meshamerica.com/membership/");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 }
