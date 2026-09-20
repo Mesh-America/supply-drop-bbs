@@ -1562,6 +1562,7 @@ name = "meshcore-companion"
 version = "1.2.0"
 dependencies = [
  "proptest",
+ "sha2",
  "thiserror 1.0.69",
  "tokio",
  "tokio-serial",

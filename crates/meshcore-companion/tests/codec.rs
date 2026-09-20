@@ -11,6 +11,7 @@ use meshcore_companion::{
     decode_inbound, encode_outbound,
     error::FrameDecodeError,
     frame::{InboundFrame, OutboundFrame},
+    scope::FloodScope,
     strip_frame_header,
     types::{BattAndStorage, ChannelMsg, Contact, ContactMsg, LoginSuccess, SentResult},
 };
@@ -812,4 +813,95 @@ fn encode_raw_oversized_payload_panics() {
         code: 0xFF,
         body: oversized_body,
     });
+}
+
+// ── Default flood scope (region) ─────────────────────────────────────────────
+
+#[test]
+fn encode_set_default_flood_scope_pads_the_name_to_31_bytes_then_the_key() {
+    let scope = FloodScope::for_region("#usa").unwrap();
+    let wire_bytes = encode_outbound(&OutboundFrame::SetDefaultFloodScope {
+        scope: scope.clone(),
+    });
+    let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
+    assert_eq!(len, 1 + 31 + 16);
+    let payload = &wire_bytes[3..];
+    assert_eq!(payload[0], CMD_SET_DEFAULT_FLOOD_SCOPE);
+    assert_eq!(&payload[1..4], b"usa");
+    assert!(payload[4..32].iter().all(|b| *b == 0), "NUL padded");
+    assert_eq!(&payload[32..48], &scope.key);
+}
+
+#[test]
+fn a_longest_name_still_ends_in_a_nul() {
+    let name = "x".repeat(30);
+    let wire_bytes = encode_outbound(&OutboundFrame::SetDefaultFloodScope {
+        scope: FloodScope::for_region(&name).unwrap(),
+    });
+    let payload = &wire_bytes[3..];
+    assert_eq!(&payload[1..31], name.as_bytes());
+    assert_eq!(payload[31], 0);
+}
+
+#[test]
+fn encode_get_default_flood_scope() {
+    let wire_bytes = encode_outbound(&OutboundFrame::GetDefaultFloodScope);
+    let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
+    assert_eq!(len, 1);
+    assert_eq!(wire_bytes[3], CMD_GET_DEFAULT_FLOOD_SCOPE);
+}
+
+#[test]
+fn decode_default_flood_scope_with_a_region() {
+    let scope = FloodScope::for_region("usa").unwrap();
+    let mut body = vec![RESP_CODE_DEFAULT_FLOOD_SCOPE];
+    body.extend_from_slice(b"usa");
+    body.resize(1 + 31, 0);
+    body.extend_from_slice(&scope.key);
+    assert_eq!(
+        decode_inbound(&body).unwrap(),
+        InboundFrame::DefaultFloodScope(Some(scope))
+    );
+}
+
+#[test]
+fn decode_default_flood_scope_with_no_scope_set() {
+    // The firmware answers with the response code alone when none is set.
+    assert_eq!(
+        decode_inbound(&[RESP_CODE_DEFAULT_FLOOD_SCOPE]).unwrap(),
+        InboundFrame::DefaultFloodScope(None)
+    );
+}
+
+#[test]
+fn decode_default_flood_scope_truncated_is_an_error_not_a_scope() {
+    let mut body = vec![RESP_CODE_DEFAULT_FLOOD_SCOPE];
+    body.extend_from_slice(b"usa");
+    body.resize(1 + 31 + 10, 0);
+    assert!(decode_inbound(&body).is_err());
+}
+
+#[test]
+fn a_scope_survives_encode_then_decode_of_its_fields() {
+    // What the BBS sends is what a GET then reports back.
+    let sent = FloodScope::for_region("west coast").unwrap();
+    let wire_bytes = encode_outbound(&OutboundFrame::SetDefaultFloodScope {
+        scope: sent.clone(),
+    });
+    let mut reply = wire_bytes[3..].to_vec();
+    reply[0] = RESP_CODE_DEFAULT_FLOOD_SCOPE;
+    assert_eq!(
+        decode_inbound(&reply).unwrap(),
+        InboundFrame::DefaultFloodScope(Some(sent))
+    );
+}
+
+#[test]
+fn decode_default_flood_scope_with_a_blank_name_is_no_scope() {
+    let mut body = vec![RESP_CODE_DEFAULT_FLOOD_SCOPE];
+    body.resize(1 + 31 + 16, 0);
+    assert_eq!(
+        decode_inbound(&body).unwrap(),
+        InboundFrame::DefaultFloodScope(None)
+    );
 }

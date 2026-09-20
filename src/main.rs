@@ -3262,6 +3262,7 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
             // Don't retry on CLI — if the port is unavailable, fail fast.
             reconnect_delay_initial: Duration::from_secs(60),
             reconnect_delay_max: Duration::from_secs(60),
+            default_flood_scope: None,
         };
 
         let mut client = CompanionClient::connect_serial(serial_cfg);

@@ -16,6 +16,7 @@ publish      = false       # candidate for future crates.io publish
 
 [dependencies]
 thiserror.workspace  = true
+sha2.workspace       = true
 tracing.workspace    = true
 tokio-serial.workspace = true
 # net + io-util add TCP and AsyncRead/AsyncWriteExt on top of the workspace feature set.

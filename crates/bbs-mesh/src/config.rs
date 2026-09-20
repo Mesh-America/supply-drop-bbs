@@ -282,6 +282,24 @@ pub struct MeshConfig {
     #[serde(default = "default_true")]
     pub advert_on_connect: bool,
 
+    /// MeshCore flood scope (a "region") to set on the radio, so the BBS's
+    /// adverts (on connect and every 24 hours) and everything else it floods
+    /// reach only repeaters that know the region.
+    ///
+    /// The radio holds one default scope, and its self-advert and every flood
+    /// it starts use it, so this covers DM replies and channel messages as
+    /// well as adverts. A scoped flood is passed on only by repeaters set up for
+    /// that region: check the repeaters between the BBS and your users before
+    /// turning this on.
+    ///
+    /// Written as the region's name, with or without a leading `#`, at most 30
+    /// bytes (`"usa"`, `"#usa"`). Case matters: the name is hashed as written.
+    /// Unset or empty leaves the radio's scope alone, including one set in the
+    /// MeshCore app. Set on the radio at each connect where the BBS has not
+    /// already set it for that radio.
+    #[serde(default, deserialize_with = "deserialize_advert_scope")]
+    pub advert_scope: Option<String>,
+
     /// Radio parameter configuration.
     ///
     /// Stored here for reference and applied on demand via
@@ -317,6 +335,40 @@ pub struct MeshConfig {
     pub protected_contact_cap: usize,
 }
 
+/// What `advert_scope` may be written as. TOML gives a string, but an
+/// environment override (`SUPPLY_DROP__PLUGINS__MESH__ADVERT_SCOPE=2024`) is
+/// type-guessed by the loader, so a name that looks like a number or a boolean
+/// arrives as one.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawScope {
+    Text(String),
+    Int(i64),
+    Bool(bool),
+}
+
+/// Reads `advert_scope`: empty is unset, anything else must be a region name
+/// the radio can hold. A bad name fails the config load, so `config check`
+/// catches a typo rather than a connect logging it later.
+fn deserialize_advert_scope<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    let text = match Option::<RawScope>::deserialize(deserializer)? {
+        None => return Ok(None),
+        Some(RawScope::Text(s)) => s,
+        Some(RawScope::Int(n)) => n.to_string(),
+        Some(RawScope::Bool(b)) => b.to_string(),
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    meshcore_companion::normalize_region_name(&text)
+        .map(Some)
+        .map_err(|e| D::Error::custom(format!("plugins.mesh.advert_scope: {e}")))
+}
+
 impl MeshConfig {
     /// Return the initial reconnect delay as a [`Duration`].
     pub fn reconnect_delay_initial(&self) -> Duration {
@@ -333,6 +385,11 @@ impl MeshConfig {
     /// an out-of-range config value can never send an illegal mode.
     pub fn path_hash_mode(&self) -> u8 {
         self.path_bytes.clamp(2, 3) - 1
+    }
+
+    /// The flood scope to set on the radio, if `advert_scope` is set.
+    pub fn flood_scope(&self) -> Option<meshcore_companion::FloodScope> {
+        meshcore_companion::FloodScope::for_region(self.advert_scope.as_deref()?).ok()
     }
 }
 
@@ -355,6 +412,7 @@ impl Default for MeshConfig {
             reply_max_attempts: default_reply_max_attempts(),
             workflow_timeout_secs: default_workflow_timeout_secs(),
             advert_on_connect: true,
+            advert_scope: None,
             radio: None,
             protected_contact_cap: default_protected_contact_cap(),
         }
@@ -465,5 +523,37 @@ mod tests {
 
         let cfg: MeshConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.advert_on_connect);
+    }
+
+    #[test]
+    fn advert_scope_is_off_unless_set_and_is_stored_as_the_radio_holds_it() {
+        assert_eq!(MeshConfig::default().advert_scope, None);
+        assert!(MeshConfig::default().flood_scope().is_none());
+
+        for (input, stored) in [("usa", "usa"), ("#usa", "usa"), (" #usa ", "usa")] {
+            let cfg: MeshConfig =
+                serde_json::from_str(&format!(r#"{{"advert_scope":"{input}"}}"#)).unwrap();
+            assert_eq!(cfg.advert_scope.as_deref(), Some(stored), "{input:?}");
+            assert_eq!(cfg.flood_scope().unwrap().name, stored);
+        }
+        // Empty means unset.
+        let cfg: MeshConfig = serde_json::from_str(r#"{"advert_scope":""}"#).unwrap();
+        assert_eq!(cfg.advert_scope, None);
+    }
+
+    #[test]
+    fn a_region_name_that_looks_like_a_number_or_a_boolean_is_still_a_name() {
+        // What an environment override delivers for `...ADVERT_SCOPE=2024`.
+        let cfg: MeshConfig = serde_json::from_str(r#"{"advert_scope":2024}"#).unwrap();
+        assert_eq!(cfg.advert_scope.as_deref(), Some("2024"));
+        let cfg: MeshConfig = serde_json::from_str(r#"{"advert_scope":true}"#).unwrap();
+        assert_eq!(cfg.advert_scope.as_deref(), Some("true"));
+    }
+    #[test]
+    fn a_region_name_the_radio_cannot_hold_fails_the_config_load() {
+        let too_long = format!(r#"{{"advert_scope":"{}"}}"#, "x".repeat(31));
+        let err = serde_json::from_str::<MeshConfig>(&too_long).unwrap_err();
+        assert!(err.to_string().contains("advert_scope"), "{err}");
+        assert!(serde_json::from_str::<MeshConfig>(r##"{"advert_scope":"#"}"##).is_err());
     }
 }
