@@ -41,8 +41,8 @@ use bbs_plugin_api::{
 use meshcore_companion::{
     client::{ClientConfig, ClientEvent, CompanionClient, SerialConfig},
     constants::{
-        ADVERT_LOC_NONE, ADVERT_LOC_SHARE, ADV_TYPE_CHAT, MAX_FRAME_SIZE, MAX_PATH_SIZE,
-        TXT_TYPE_PLAIN,
+        ADVERT_LOC_NONE, ADVERT_LOC_SHARE, ADV_TYPE_CHAT, AUTO_ADD_CHAT, AUTO_ADD_OVERWRITE_OLDEST,
+        MAX_FRAME_SIZE, MAX_PATH_SIZE, TXT_TYPE_PLAIN,
     },
     frame::OutboundFrame,
     types::{Contact, SelfInfo},
@@ -249,6 +249,14 @@ fn next_outbound_timestamp() -> u32 {
             Err(observed) => last = observed,
         }
     }
+}
+
+/// The `autoadd_config` value to write so the radio auto-adds Chat nodes and
+/// overwrites the oldest contact when full, or `None` if `current` already
+/// has both bits.  Every other bit is carried over unchanged.
+fn autoadd_config_needed(current: u8) -> Option<u8> {
+    let wanted = current | AUTO_ADD_OVERWRITE_OLDEST | AUTO_ADD_CHAT;
+    (wanted != current).then_some(wanted)
 }
 
 /// Push the device's advert-location-sharing policy bit if it doesn't already
@@ -1203,15 +1211,10 @@ async fn event_loop(
                         // (pubkey-only stubs) via PUSH_CODE_ADVERT (0x80).
                         let _ = cmd_tx.send(OutboundFrame::GetContacts { since: 0 }).await;
 
-                        // Query the radio's autoadd config so we can ensure
-                        // auto-pruning is enabled.  When the contact table is full
-                        // and AUTO_ADD_OVERWRITE_OLDEST (autoadd_config bit 0) is
-                        // set, the firmware evicts the oldest non-favourite entry
-                        // to make room for newly-heard nodes.  Without this, a full
-                        // table (PUSH_CODE_CONTACTS_FULL) prevents new contacts from
-                        // being stored, causing outbound DMs to those nodes to fail.
-                        // The response (InboundFrame::AutoaddConfig) is handled in
-                        // handle_frame, which sets bit 0 if it is currently clear.
+                        // Query the radio's autoadd config so new users can reach
+                        // the BBS.  The rationale and the bits we set are
+                        // documented on the InboundFrame::AutoaddConfig arm in
+                        // handle_frame, which handles the response.
                         let _ = cmd_tx.send(OutboundFrame::GetAutoaddConfig).await;
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
@@ -1757,34 +1760,50 @@ async fn handle_frame(
             );
         }
 
-        // ── Autoadd / autoprune config ────────────────────────────────────────
-        // Response to CMD_GET_AUTOADD_CONFIG sent at startup.
-        // Bit 0 is AUTO_ADD_OVERWRITE_OLDEST: when set, a full contact table
-        // evicts the oldest non-favourite entry to make room for a newly-heard
-        // node (firmware MyMesh::shouldOverwriteWhenFull).  It does NOT control
-        // whether newly-heard nodes are auto-added at all — that is gated by the
-        // separate `manual_add_contacts` pref plus autoadd_config type bits 1-4
-        // (MyMesh::isAutoAddEnabled / shouldAutoAddContactType).  Enable bit 0
-        // so stale contacts are pruned when the table fills.
+        // ── Contact auto-add config ───────────────────────────────────────────
+        // Response to CMD_GET_AUTOADD_CONFIG sent at startup: [autoadd_config]
+        // [autoadd_max_hops].  The BBS supports firmware 1.14.0 or newer; the
+        // autoadd commands date from 1.12.0 and the hop limit byte from 1.14.0.
         //
-        // Note: firmware built with `manual_add_contacts` = 1 (e.g. the Keymind
-        // fork's "cascade" build profile) disables auto-add via a pref this
-        // client never touches.  A BBS radio must not run such a build unless
-        // the transport also clears `manual_add_contacts` (CMD_SET_OTHER_PARAMS
-        // / OutboundFrame::SetOtherParams) or sets autoadd_config bits 1-4.
-        InboundFrame::AutoaddConfig { config } => {
-            if config & 1 == 0 {
+        // Whether a newly-heard node is stored as a contact is decided by
+        // MyMesh::shouldAutoAddContactType: with `manual_add_contacts` bit 0
+        // clear every type is added, otherwise only the types enabled in
+        // autoadd_config (see the AUTO_ADD_* constants).  A radio left in the
+        // second mode without the Chat bit never stores new users, so it cannot
+        // DM them and the firmware drops their DMs (issue #305).  A full table
+        // refuses new contacts unless AUTO_ADD_OVERWRITE_OLDEST is set
+        // (MyMesh::shouldOverwriteWhenFull).
+        //
+        // Set both bits.  A one-byte SET leaves autoadd_max_hops and the
+        // other type bits as the operator configured them.  On a radio that
+        // already auto-adds every type the Chat bit changes nothing, but the
+        // write is still made when it is missing.
+        InboundFrame::AutoaddConfig { config, max_hops } => {
+            match autoadd_config_needed(config) {
+                Some(wanted) => {
+                    info!(
+                        config,
+                        wanted,
+                        "mesh: setting radio autoadd_config to enable Chat auto-add \
+                         and overwrite-oldest so new users can reach the BBS"
+                    );
+                    let _ = cmd_tx
+                        .send(OutboundFrame::SetAutoaddConfig { config: wanted })
+                        .await;
+                }
+                None => debug!(config, "mesh: contact auto-add already configured"),
+            }
+            // autoadd_max_hops is a second gate.  A non-zero N makes the radio
+            // store only nodes heard across fewer than N hops (1 = direct
+            // only).  Left alone; it is the operator's policy to set.
+            if let Some(hops @ 1..) = max_hops {
                 warn!(
-                    config,
-                    "mesh: overwrite-oldest (autoadd_config bit 0) is disabled \
-                     on the radio — enabling it so the oldest contact is evicted \
-                     when the table is full"
+                    max_hops = hops,
+                    "mesh: radio limits contact auto-add by hop count \
+                     (autoadd_max_hops); new users heard across that many hops \
+                     or more are not stored, so they cannot reach the BBS until \
+                     the limit is raised or removed in the MeshCore app"
                 );
-                let _ = cmd_tx
-                    .send(OutboundFrame::SetAutoaddConfig { config: config | 1 })
-                    .await;
-            } else {
-                debug!(config, "mesh: contact overwrite-oldest already enabled");
             }
         }
 
@@ -2823,5 +2842,38 @@ mod resolve_greeting_name_tests {
     fn strips_display_spoofing_codepoints_from_auto_username_too() {
         let name = resolve_greeting_name(Some("\u{202E}alice"), None);
         assert_eq!(name, "alice");
+    }
+}
+
+#[cfg(test)]
+mod autoadd_config_tests {
+    use super::autoadd_config_needed;
+
+    #[test]
+    fn sets_both_bits_when_clear() {
+        assert_eq!(autoadd_config_needed(0x00), Some(0x03));
+    }
+
+    #[test]
+    fn sets_chat_when_only_overwrite_oldest_is_on() {
+        assert_eq!(autoadd_config_needed(0x01), Some(0x03));
+    }
+
+    #[test]
+    fn sets_overwrite_oldest_when_only_chat_is_on() {
+        assert_eq!(autoadd_config_needed(0x02), Some(0x03));
+    }
+
+    #[test]
+    fn no_write_when_both_bits_already_set() {
+        assert_eq!(autoadd_config_needed(0x03), None);
+        // pymc-companion's default: overwrite-oldest + Chat, Repeater and Room.
+        assert_eq!(autoadd_config_needed(0x0F), None);
+    }
+
+    #[test]
+    fn preserves_other_type_and_reserved_bits() {
+        assert_eq!(autoadd_config_needed(0xE1), Some(0xE3));
+        assert_eq!(autoadd_config_needed(0x14), Some(0x17));
     }
 }

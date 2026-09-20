@@ -206,6 +206,13 @@ impl Bridge {
     }
 
     async fn complete_handshake(&mut self, name: &str) {
+        // config=0x03, max_hops=0: Chat auto-add + overwrite-oldest already on.
+        self.complete_handshake_with_autoadd(name, [0x03, 0]).await;
+    }
+
+    /// `complete_handshake` with the radio's autoadd reply (`[autoadd_config,
+    /// autoadd_max_hops]`) chosen by the caller.
+    async fn complete_handshake_with_autoadd(&mut self, name: &str, autoadd: [u8; 2]) {
         // AppStart = 11 bytes: prefix(1) + len(2) + CMD_APP_START(1) + version(1) + zeros(6)
         // Must read all 11 to avoid leaving stale bytes that corrupt read_command().
         let app_start = self.recv_n(11).await;
@@ -244,15 +251,15 @@ impl Bridge {
             get_contacts[0], CMD_GET_CONTACTS,
             "expected CMD_GET_CONTACTS after drain"
         );
-        // Transport queries autoadd config at startup to ensure auto-pruning is
-        // enabled on the radio. Reply with config=1 (already enabled) so the
-        // transport does not emit a follow-up SetAutoaddConfig command.
+        // Transport queries autoadd config at startup to make sure Chat nodes
+        // are auto-added and overwrite-oldest is on. With config=0x03 the
+        // transport emits no follow-up SetAutoaddConfig command.
         let get_autoadd = self.read_command().await;
         assert_eq!(
             get_autoadd[0], CMD_GET_AUTOADD_CONFIG,
             "expected CMD_GET_AUTOADD_CONFIG after CMD_GET_CONTACTS"
         );
-        let autoadd_reply = radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 1]);
+        let autoadd_reply = radio_frame(&[RESP_CODE_AUTOADD_CONFIG, autoadd[0], autoadd[1]]);
         self.send(&autoadd_reply).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -1647,11 +1654,12 @@ async fn unsupported_app_start_with_successful_drain_processes_messages() {
 
     let get_contacts = bridge.read_command().await;
     assert_eq!(get_contacts[0], CMD_GET_CONTACTS);
-    // Transport queries autoadd config; reply with config=1 (already enabled).
+    // Transport queries autoadd config; reply with config=0x03, max_hops=0
+    // (already correct).
     let get_autoadd = bridge.read_command().await;
     assert_eq!(get_autoadd[0], CMD_GET_AUTOADD_CONFIG);
     bridge
-        .send(&radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 1]))
+        .send(&radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 0x03, 0]))
         .await;
     tokio::time::sleep(Duration::from_millis(20)).await;
 
@@ -2987,4 +2995,93 @@ async fn protected_contact_excluded_from_contacts_full_eviction() {
     );
 
     transport.stop().await.unwrap();
+}
+
+// ── autoadd_config enforcement at connect (issue #305) ───────────────────────
+
+/// A radio in manual-add mode with no Chat bit never stores new users as
+/// contacts, so it can't DM them and drops their DMs. The transport must turn
+/// on Chat auto-add and overwrite-oldest by itself.
+#[tokio::test]
+async fn connect_enables_chat_autoadd_and_overwrite_oldest() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge
+        .complete_handshake_with_autoadd("TestNode", [0x00, 0])
+        .await;
+
+    let set = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_AUTOADD_CONFIG),
+    )
+    .await
+    .expect("transport never sent CMD_SET_AUTOADD_CONFIG");
+    assert_eq!(
+        set,
+        vec![
+            CMD_SET_AUTOADD_CONFIG,
+            AUTO_ADD_OVERWRITE_OLDEST | AUTO_ADD_CHAT
+        ]
+    );
+
+    // One write per connect: no duplicate SET follows.
+    let later = drain_command_types(&mut bridge, Duration::from_millis(300)).await;
+    assert!(
+        !later.contains(&CMD_SET_AUTOADD_CONFIG),
+        "CMD_SET_AUTOADD_CONFIG was sent more than once"
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Only the two bits the BBS needs are touched: an operator's Repeater/Sensor
+/// choices (and any reserved bits) survive.
+#[tokio::test]
+async fn connect_autoadd_preserves_other_operator_bits() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    let operator_bits = AUTO_ADD_REPEATER | AUTO_ADD_SENSOR | 0x80; // 0x80: reserved
+    bridge
+        .complete_handshake_with_autoadd("TestNode", [operator_bits, 0])
+        .await;
+
+    let set = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_AUTOADD_CONFIG),
+    )
+    .await
+    .expect("transport never sent CMD_SET_AUTOADD_CONFIG");
+    assert_eq!(
+        set,
+        vec![
+            CMD_SET_AUTOADD_CONFIG,
+            operator_bits | AUTO_ADD_OVERWRITE_OLDEST | AUTO_ADD_CHAT
+        ]
+    );
+
+    transport.stop().await.unwrap();
+}
+
+/// Already-correct config is left alone: no needless flash write on the radio
+/// at every reconnect. Also covers a non-zero `autoadd_max_hops`, which is the
+/// operator's policy and must never be rewritten.
+#[tokio::test]
+async fn connect_autoadd_already_correct_sends_no_write() {
+    // Both bits set (0x03), the pymc-companion default (0x0F), and both bits
+    // set with a hop limit (max_hops=4).
+    for autoadd in [[0x03u8, 0], [0x0F, 0], [0x03, 4]] {
+        let host = Arc::new(MockHost::new());
+        let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+        bridge
+            .complete_handshake_with_autoadd("TestNode", autoadd)
+            .await;
+
+        let sent = drain_command_types(&mut bridge, Duration::from_millis(300)).await;
+        assert!(
+            !sent.contains(&CMD_SET_AUTOADD_CONFIG),
+            "unexpected CMD_SET_AUTOADD_CONFIG for radio reply {autoadd:?}"
+        );
+
+        transport.stop().await.unwrap();
+    }
 }

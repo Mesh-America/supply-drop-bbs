@@ -471,6 +471,15 @@ is a no-op on the wire. This applies *before* any other radio operation (the
 message-queue drain, contact fetch, autoadd query), the same way `path_bytes`
 and the advert name/GPS are synced on every startup.
 
+Separately from `[plugins.mesh.radio]`, and regardless of whether that section
+exists, the BBS also turns on the radio's Chat auto-add and overwrite-oldest
+settings on every connect if they are off. This runs after the message-queue
+drain and contact fetch, and is what lets new users reach the BBS without
+changing the radio's settings in the MeshCore app. A radio's hop limit for
+auto-add can still keep far-away users out. See
+[PROTOCOL.md](PROTOCOL.md#meshcore-contact-auto-add). There is no config key
+for this.
+
 The CLI is for applying (or previewing) a change **without** starting the BBS —
 useful before the service is installed, for a one-off preset test, or to
 resolve a preset into concrete values and `--save` them back into

@@ -113,6 +113,69 @@ fn decode_contacts_full() {
     assert_eq!(frame, InboundFrame::ContactsFull);
 }
 
+#[test]
+fn decode_autoaddconfig_with_max_hops() {
+    let frame = decode_inbound(&[RESP_CODE_AUTOADD_CONFIG, 0x03, 4]).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::AutoaddConfig {
+            config: 0x03,
+            max_hops: Some(4)
+        }
+    );
+}
+
+#[test]
+fn decode_autoaddconfig_without_max_hops() {
+    let frame = decode_inbound(&[RESP_CODE_AUTOADD_CONFIG, 0x01]).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::AutoaddConfig {
+            config: 0x01,
+            max_hops: None
+        }
+    );
+}
+
+#[test]
+fn decode_autoaddconfig_zero_max_hops_is_some_zero() {
+    // 0 means "no limit"; the transport must be able to tell it from a
+    // missing byte.
+    let frame = decode_inbound(&[RESP_CODE_AUTOADD_CONFIG, 0x03, 0]).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::AutoaddConfig {
+            config: 0x03,
+            max_hops: Some(0)
+        }
+    );
+}
+
+#[test]
+fn decode_autoaddconfig_ignores_trailing_bytes() {
+    let frame = decode_inbound(&[RESP_CODE_AUTOADD_CONFIG, 0x03, 2, 0xAA, 0xBB]).unwrap();
+    assert_eq!(
+        frame,
+        InboundFrame::AutoaddConfig {
+            config: 0x03,
+            max_hops: Some(2)
+        }
+    );
+}
+
+#[test]
+fn decode_autoaddconfig_empty_body_is_too_short() {
+    let err = decode_inbound(&[RESP_CODE_AUTOADD_CONFIG]).unwrap_err();
+    assert_eq!(
+        err,
+        FrameDecodeError::BodyTooShort {
+            type_byte: RESP_CODE_AUTOADD_CONFIG,
+            needed: 1,
+            got: 0
+        }
+    );
+}
+
 // ── decode_inbound — small structured frames ──────────────────────────────────
 
 #[test]
@@ -520,6 +583,25 @@ fn encode_sync_next_message() {
     let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
     assert_eq!(len, 1);
     assert_eq!(wire_bytes[3], CMD_SYNC_NEXT_MESSAGE);
+}
+
+#[test]
+fn encode_set_autoaddconfig_is_config_byte_only() {
+    let wire_bytes = encode_outbound(&OutboundFrame::SetAutoaddConfig {
+        config: AUTO_ADD_OVERWRITE_OLDEST | AUTO_ADD_CHAT,
+    });
+    let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
+    assert_eq!(len, 2);
+    assert_eq!(wire_bytes[3], CMD_SET_AUTOADD_CONFIG);
+    assert_eq!(wire_bytes[4], 0x03);
+}
+
+#[test]
+fn encode_get_autoaddconfig() {
+    let wire_bytes = encode_outbound(&OutboundFrame::GetAutoaddConfig);
+    let len = u16::from_le_bytes([wire_bytes[1], wire_bytes[2]]) as usize;
+    assert_eq!(len, 1);
+    assert_eq!(wire_bytes[3], CMD_GET_AUTOADD_CONFIG);
 }
 
 #[test]
