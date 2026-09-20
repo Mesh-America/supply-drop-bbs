@@ -731,6 +731,23 @@ async fn open_database(path: &std::path::Path) -> Database {
     }
 }
 
+/// How long ago `meta`'s file was last written *or* renamed, whichever is more
+/// recent. A rename keeps the modification time but updates the change time, so
+/// a sidecar that sat idle for hours and was only just moved aside for a restore
+/// does not look old. `None` if the clock can't say (a timestamp in the future).
+fn time_since_last_touched(meta: &std::fs::Metadata) -> Option<std::time::Duration> {
+    use std::os::unix::fs::MetadataExt as _;
+    let changed = u64::try_from(meta.ctime())
+        .ok()
+        .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+    let last = match (meta.modified().ok(), changed) {
+        (Some(m), Some(c)) => m.max(c),
+        (Some(t), None) | (None, Some(t)) => t,
+        (None, None) => return None,
+    };
+    last.elapsed().ok()
+}
+
 /// Delete the temporary copies the web admin's restore endpoints leave in
 /// `data_dir` when a request is cut off before it finishes
 /// (`restore_upload_<uuid>.tmp` and `restore_backup_<uuid>.tmp`). Each is a
@@ -748,9 +765,8 @@ fn sweep_stale_restore_temp_files(data_dir: &std::path::Path) {
         let path = entry.path();
         let age = entry
             .metadata()
-            .and_then(|m| m.modified())
             .ok()
-            .and_then(|t| t.elapsed().ok());
+            .and_then(|m| time_since_last_touched(&m));
         let is_stale_copy = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -804,14 +820,24 @@ fn is_stale_bundle_temp(name: &str, age: Option<std::time::Duration>) -> bool {
 /// Whether `name` is a restore temp copy that is safe to delete at startup, given
 /// how long ago it was last written (`None` if unknown).
 fn is_stale_restore_temp(name: &str, age: Option<std::time::Duration>) -> bool {
+    let over_an_hour = age.is_some_and(|a| a > std::time::Duration::from_secs(60 * 60));
+    // Files the restore apply step makes and normally removes itself: a snapshot
+    // being copied, a live sidecar moved aside for the swap, and the copy-fallback
+    // temp file. Left by a process that died mid-restore, each can be a whole
+    // database; the age gate keeps a restore that is running right now safe.
+    if (name.starts_with("pre-restore-safety-") && name.ends_with(".partial"))
+        || name.ends_with(".restore-aside")
+        || name.ends_with(".restore.tmp")
+    {
+        return over_an_hour;
+    }
     if !name.ends_with(".tmp") {
         return false;
     }
     if name.starts_with("restore_upload_") || name.starts_with("restore_backup_") {
         return true;
     }
-    name.starts_with("restore_cli_")
-        && age.is_some_and(|a| a > std::time::Duration::from_secs(60 * 60))
+    name.starts_with("restore_cli_") && over_an_hour
 }
 
 /// The config file to put in a backup bundle: the one this process loaded, as an
@@ -3994,8 +4020,24 @@ mod contacts_tests {
 
 #[cfg(test)]
 mod restore_temp_sweep_tests {
-    use super::{is_stale_restore_temp, sweep_stale_restore_temp_files};
+    use super::{is_stale_restore_temp, sweep_stale_restore_temp_files, time_since_last_touched};
     use std::time::Duration;
+
+    #[test]
+    fn a_file_moved_aside_just_now_is_not_old_even_if_it_was_last_written_long_ago() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("bbs.sqlite-shm");
+        let aside = dir.path().join("bbs.sqlite-shm.restore-aside");
+        let f = std::fs::File::create(&live).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60))
+            .unwrap();
+        drop(f);
+        std::fs::rename(&live, &aside).unwrap();
+
+        // The modification time is three hours old; the rename is not.
+        let age = time_since_last_touched(&std::fs::metadata(&aside).unwrap()).unwrap();
+        assert!(age < Duration::from_secs(60), "{age:?}");
+    }
 
     #[test]
     fn sweep_removes_only_the_web_restore_temp_copies() {
@@ -4030,6 +4072,34 @@ mod restore_temp_sweep_tests {
 
     // A killed `restore stage` leaves a database-sized copy that only the
     // next service start can collect, but a running one must not lose its file.
+    #[test]
+    fn leftovers_from_an_interrupted_restore_apply_are_swept_once_old() {
+        use super::is_stale_restore_temp;
+        let old = Some(Duration::from_secs(3601));
+        let fresh = Some(Duration::from_secs(60));
+        for name in [
+            "pre-restore-safety-1789869375.db.partial",
+            "pre-restore-safety-1789869375.db-wal.partial",
+            "bbs.sqlite-wal.restore-aside",
+            "bbs.sqlite-shm.restore-aside",
+            "bbs.sqlite.restore.tmp",
+        ] {
+            assert!(is_stale_restore_temp(name, old), "{name} when old");
+            assert!(!is_stale_restore_temp(name, fresh), "{name} may be in use");
+            assert!(!is_stale_restore_temp(name, None), "{name} of unknown age");
+        }
+        // Finished snapshots and the live files are never touched.
+        for name in [
+            "pre-restore-safety-1789869375.db",
+            "pre-restore-safety-1789869375.db-wal",
+            "bbs.sqlite",
+            "bbs.sqlite-wal",
+            "pending_restore.db",
+        ] {
+            assert!(!is_stale_restore_temp(name, old), "{name}");
+        }
+    }
+
     #[test]
     fn only_old_backup_bundle_temp_files_are_swept() {
         use super::is_stale_bundle_temp;

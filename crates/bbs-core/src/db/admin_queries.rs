@@ -713,6 +713,11 @@ impl Database {
         // is a database with no settings, which restores the data only).
         let _ =
             tokio::fs::remove_file(data_dir.join(crate::restore_config::STAGED_CONFIG_NAME)).await;
+        // Flush the validated file before it takes its staged name: a rename of
+        // data that is not yet on disk can leave an empty file after a power cut.
+        crate::restore_apply::sync_file_blocking(uploaded_path)
+            .await
+            .map_err(|e| StoreError::Decode(format!("flush restore file: {e}")))?;
         // `rename` is atomic but fails across filesystems (EXDEV) — the
         // upload's temp file and data_dir are not guaranteed to share one,
         // so fall back to copy+delete on that specific failure.
@@ -788,6 +793,9 @@ impl Database {
         let _ =
             tokio::fs::remove_file(data_dir.join(crate::restore_config::PENDING_CONFIG_NAME)).await;
         let confirmed_path = data_dir.join("pending_restore.db");
+        crate::restore_apply::sync_file_blocking(&staged_path)
+            .await
+            .map_err(|e| StoreError::Decode(format!("flush restore file: {e}")))?;
         if tokio::fs::rename(&staged_path, &confirmed_path)
             .await
             .is_err()
@@ -856,14 +864,13 @@ async fn stage_config(data_dir: &Path, text: Option<&str>) -> Result<(), StoreEr
         return Ok(());
     };
     let text = text.to_owned();
-    let data_dir_owned = data_dir.to_path_buf();
     tokio::task::spawn_blocking(move || -> std::io::Result<()> {
         use std::io::Write as _;
+        // Owned by the data directory's owner (see `create_private`), so a
+        // `restore stage` run as root leaves a config the service can read.
         let mut f = create_private(&path)?;
         f.write_all(text.as_bytes())?;
-        f.sync_all()?;
-        crate::restore_stage::hand_to_dir_owner(data_dir_owned.as_path(), &path);
-        Ok(())
+        f.sync_all()
     })
     .await
     .map_err(|e| StoreError::Decode(format!("staging config.toml: {e}")))?
@@ -915,21 +922,35 @@ async fn classify_upload(path: &Path) -> Result<UploadKind, StoreError> {
 }
 
 /// How much of a zip entry is copied between free-space re-checks.
-const COPY_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+const COPY_CHUNK_BYTES: u64 = crate::disk_space::RECHECK_INTERVAL_BYTES;
 
-/// Create (or truncate) `path` writable and, on Unix, owner-only (0600) from the
-/// moment it exists. The extracted file replaces the upload and becomes the
-/// live database, which holds password hashes; the upload itself is created
-/// 0600 by the callers, so the extracted copy must not be more permissive.
+// The re-check has to be more frequent than the headroom, or a write can drain
+// the disk between checks.
+const _: () = assert!(COPY_CHUNK_BYTES * 2 <= crate::disk_space::HEADROOM_BYTES);
+
+/// Create a fresh file at `path`, writable and owner-only (0600) from the moment
+/// it exists, and give it to the directory's owner. It is never an existing
+/// file or a symlink: anything already at `path` is unlinked first, and the
+/// open is `create_new` with `O_NOFOLLOW`, so a planted link can't redirect the
+/// write (or the ownership change, which goes through the open handle, not the
+/// path) to another file when this runs as root. The extracted database and the
+/// staged config become live files the service reads, and the database holds
+/// password hashes.
 fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+    use std::os::unix::fs::OpenOptionsExt as _;
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
-    opts.open(path)
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    crate::restore_stage::hand_fd_to_dir_owner(crate::restore_apply::dir_of(path), &file);
+    Ok(file)
 }
 
 /// Stream the single `.db`-named entry of the zip at `zip_path` to `out_path`
@@ -987,7 +1008,7 @@ fn extract_single_db_with_chunk(
             max_bytes / (1024 * 1024 * 1024)
         ));
     }
-    let out_dir = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let out_dir = crate::restore_apply::dir_of(out_path);
     crate::disk_space::ensure_free_space(out_dir, declared)?;
 
     let copied = (|| -> Result<u64, String> {
@@ -1365,6 +1386,51 @@ name = \"X\"
         let n = extract_single_db_with_chunk(&zip_path, &out, NO_LIMIT, 1024).unwrap();
         assert_eq!(n, 4096);
         assert_eq!(std::fs::read(out).unwrap(), payload);
+    }
+
+    // The extracted database and the staged config are made where a planted
+    // symlink could point at another file. They must be fresh, private files,
+    // and what the link pointed at must be left alone.
+    #[cfg(unix)]
+    #[test]
+    fn create_private_replaces_a_planted_symlink_instead_of_following_it() {
+        use std::io::Write as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        let path = dir.path().join("target.tmp");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        let mut f = super::create_private(&path).unwrap();
+        f.write_all(b"new contents").unwrap();
+        drop(f);
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        assert!(!std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(&path).unwrap(), b"new contents");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // Given to the directory's owner (a no-op unless run as root).
+        let dir_meta = std::fs::metadata(dir.path()).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (dir_meta.uid(), dir_meta.gid()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_private_replaces_an_existing_file_rather_than_reusing_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.tmp");
+        std::fs::write(&path, b"old, world-readable").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(super::create_private(&path).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a reused file would keep its old mode");
     }
 
     // The extracted file becomes the live database, so it must not be readable
