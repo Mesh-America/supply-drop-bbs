@@ -782,6 +782,31 @@ fn sweep_stale_restore_temp_files(data_dir: &std::path::Path) {
     }
 }
 
+/// Remove what a restore that died mid-swap left beside the database at
+/// `db_path` (a sidecar moved aside, the copy-fallback temp file), once it has
+/// gone over an hour untouched. Only those exact names, wherever the database
+/// is, so nothing else in a directory it shares is touched.
+fn sweep_stale_swap_leftovers(db_path: &std::path::Path) {
+    sweep_swap_leftovers_older_than(db_path, std::time::Duration::from_secs(60 * 60));
+}
+
+fn sweep_swap_leftovers_older_than(db_path: &std::path::Path, min_age: std::time::Duration) {
+    for path in bbs_core::restore_apply::swap_leftover_paths(db_path) {
+        let old = std::fs::symlink_metadata(&path)
+            .ok()
+            .and_then(|m| time_since_last_touched(&m))
+            .is_some_and(|age| age >= min_age);
+        if old {
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(path = %path.display(), "removed stale restore leftover"),
+                Err(e) => {
+                    warn!(path = %path.display(), "could not remove stale restore leftover: {e}")
+                }
+            }
+        }
+    }
+}
+
 /// Delete `backup_*.zip.tmp` files in the backup directory that are over an hour
 /// old: a bundle being written when the process died. Each holds a full copy of
 /// the database and, being a `.tmp`, is never listed or pruned. A bundle still
@@ -821,14 +846,12 @@ fn is_stale_bundle_temp(name: &str, age: Option<std::time::Duration>) -> bool {
 /// how long ago it was last written (`None` if unknown).
 fn is_stale_restore_temp(name: &str, age: Option<std::time::Duration>) -> bool {
     let over_an_hour = age.is_some_and(|a| a > std::time::Duration::from_secs(60 * 60));
-    // Files the restore apply step makes and normally removes itself: a snapshot
-    // being copied, a live sidecar moved aside for the swap, and the copy-fallback
-    // temp file. Left by a process that died mid-restore, each can be a whole
-    // database; the age gate keeps a restore that is running right now safe.
-    if (name.starts_with("pre-restore-safety-") && name.ends_with(".partial"))
-        || name.ends_with(".restore-aside")
-        || name.ends_with(".restore.tmp")
-    {
+    // A snapshot the restore apply step was copying into the data directory.
+    // Left by a process that died mid-restore it can be a whole database; the
+    // age gate keeps a restore that is running right now safe. (The files it
+    // leaves beside the database itself are swept by name: see
+    // sweep_stale_swap_leftovers.)
+    if name.starts_with("pre-restore-safety-") && name.ends_with(".partial") {
         return over_an_hour;
     }
     if !name.ends_with(".tmp") {
@@ -1000,6 +1023,9 @@ async fn cmd_run(cli: &Cli) {
 
     // ── 3a. Remove restore temp copies orphaned by an interrupted request ───────
     sweep_stale_restore_temp_files(data_dir);
+    if let Some(db_path) = cfg.database.path.as_deref() {
+        sweep_stale_swap_leftovers(db_path);
+    }
     if let Some(dir) = cfg.backup.directory.as_deref() {
         sweep_stale_bundle_temp_files(dir);
     }
@@ -4104,9 +4130,6 @@ mod restore_temp_sweep_tests {
         for name in [
             "pre-restore-safety-1789869375.db.partial",
             "pre-restore-safety-1789869375.db-wal.partial",
-            "bbs.sqlite-wal.restore-aside",
-            "bbs.sqlite-shm.restore-aside",
-            "bbs.sqlite.restore.tmp",
         ] {
             assert!(is_stale_restore_temp(name, old), "{name} when old");
             assert!(!is_stale_restore_temp(name, fresh), "{name} may be in use");
@@ -4119,8 +4142,51 @@ mod restore_temp_sweep_tests {
             "bbs.sqlite",
             "bbs.sqlite-wal",
             "pending_restore.db",
+            // Not by suffix alone: an operator's own file that happens to end
+            // this way is not ours to delete.
+            "notes.restore-aside",
+            "other.sqlite.restore.tmp",
         ] {
             assert!(!is_stale_restore_temp(name, old), "{name}");
+        }
+    }
+
+    // The files a died-mid-swap restore leaves beside the database are removed
+    // by exact name, in whatever directory the database is in, and nothing else
+    // there is.
+    #[test]
+    fn swap_leftovers_are_swept_by_exact_name_beside_the_database() {
+        use super::sweep_swap_leftovers_older_than;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let db = p.join("bbs.sqlite");
+        let leftovers = [
+            "bbs.sqlite-wal.restore-aside",
+            "bbs.sqlite-shm.restore-aside",
+            "bbs.sqlite.restore.tmp",
+        ];
+        let keep = [
+            "bbs.sqlite",
+            "bbs.sqlite-wal",
+            "other.sqlite-wal.restore-aside",
+            "notes.restore.tmp",
+        ];
+        for name in leftovers.iter().chain(keep.iter()) {
+            std::fs::write(p.join(name), b"x").unwrap();
+        }
+
+        // Fresh ones are left: a restore may be running right now.
+        sweep_swap_leftovers_older_than(&db, Duration::from_secs(3600));
+        for name in leftovers.iter().chain(keep.iter()) {
+            assert!(p.join(name).exists(), "{name} is too new to remove");
+        }
+
+        sweep_swap_leftovers_older_than(&db, Duration::ZERO);
+        for name in leftovers {
+            assert!(!p.join(name).exists(), "{name} should be removed");
+        }
+        for name in keep {
+            assert!(p.join(name).exists(), "{name} must be left alone");
         }
     }
 

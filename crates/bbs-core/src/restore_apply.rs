@@ -390,7 +390,7 @@ fn install(pending: &Path, db_path: &Path) -> Result<(), String> {
 }
 
 fn install_by_copy(pending: &Path, db_path: &Path) -> Result<(), String> {
-    let tmp = sibling_with_suffix(db_path, ".restore.tmp");
+    let tmp = copy_fallback_tmp(db_path);
     let dir = dir_of(db_path);
     ensure_free_space(dir, file_len(pending))?;
     let swapped = (|| -> std::io::Result<()> {
@@ -476,6 +476,25 @@ fn file_len(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
+/// The temp file the copy fallback of a swap writes beside the database.
+fn copy_fallback_tmp(db_path: &Path) -> PathBuf {
+    sibling_with_suffix(db_path, ".restore.tmp")
+}
+
+/// The files a restore that died mid-swap can leave beside the database at
+/// `db_path`: each live sidecar moved aside, and the copy-fallback temp file.
+/// Exact names, so a sweep of these never touches anything else in a directory
+/// the database shares.
+#[must_use]
+pub fn swap_leftover_paths(db_path: &Path) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = SIDECARS
+        .iter()
+        .map(|ext| sibling_with_suffix(&sidecar(db_path, ext), ASIDE_SUFFIX))
+        .collect();
+    paths.push(copy_fallback_tmp(db_path));
+    paths
+}
+
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     sibling_with_suffix(path, suffix)
 }
@@ -491,6 +510,22 @@ pub(crate) fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
 mod tests {
     use super::*;
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+
+    #[test]
+    fn the_leftover_names_are_the_ones_a_swap_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bbs.sqlite");
+        std::fs::write(sidecar(&db, "-wal"), b"w").unwrap();
+        std::fs::write(sidecar(&db, "-shm"), b"s").unwrap();
+        let moved = move_sidecars_aside(&db).unwrap();
+        let mut asides: Vec<PathBuf> = moved.into_iter().map(|(_, aside)| aside).collect();
+        let mut leftovers = swap_leftover_paths(&db);
+        // The copy fallback's temp file is the last name.
+        assert_eq!(leftovers.pop(), Some(copy_fallback_tmp(&db)));
+        asides.sort();
+        leftovers.sort();
+        assert_eq!(asides, leftovers);
+    }
 
     fn s(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| (*n).to_owned()).collect()
