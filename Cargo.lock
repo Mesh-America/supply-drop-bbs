@@ -301,6 +301,7 @@ dependencies = [
  "async-trait",
  "bbs-core",
  "bbs-plugin-api",
+ "bbs-serial-path",
  "meshcore-companion",
  "serde",
  "serde_json",
@@ -316,6 +317,7 @@ version = "1.2.0"
 dependencies = [
  "async-trait",
  "bbs-plugin-api",
+ "bbs-serial-path",
  "prost",
  "serde",
  "tokio",
@@ -348,6 +350,13 @@ dependencies = [
  "toml",
  "toml_edit",
  "tracing",
+]
+
+[[package]]
+name = "bbs-serial-path"
+version = "1.2.0"
+dependencies = [
+ "tempfile",
 ]
 
 [[package]]
@@ -2845,6 +2854,7 @@ dependencies = [
  "bbs-meshtastic",
  "bbs-plugin-api",
  "bbs-process-transport",
+ "bbs-serial-path",
  "bbs-web",
  "clap",
  "dialoguer",

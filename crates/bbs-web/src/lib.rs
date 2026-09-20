@@ -262,6 +262,11 @@ struct AppState {
     /// keeps a queued restore request from overwriting the confirmed file in
     /// that window.
     restore_confirmed: AtomicBool,
+    /// Random per-process id served by the public health endpoint. The
+    /// Backups page compares it before and after a restore to tell that the
+    /// service has restarted, whatever else has changed in the meantime (an
+    /// expired session, a proxy error, a restart too quick to look down).
+    boot_id: String,
     sessions: Mutex<HashMap<String, WebSession>>,
     started_at: Instant,
     log_tx: broadcast::Sender<String>,
@@ -294,6 +299,7 @@ impl AppState {
             data_dir: std::sync::Mutex::new(None),
             restore_lock: tokio::sync::Mutex::new(()),
             restore_confirmed: AtomicBool::new(false),
+            boot_id: Uuid::new_v4().to_string(),
             sessions: Mutex::new(HashMap::new()),
             started_at: Instant::now(),
             log_tx,
@@ -2158,8 +2164,8 @@ struct ConfigPatch {
     logging_level: Option<String>,
 }
 
-async fn api_health() -> Response {
-    Json(serde_json::json!({ "status": "ok" })).into_response()
+async fn api_health(State(state): State<Arc<AppState>>) -> Response {
+    Json(serde_json::json!({ "status": "ok", "boot_id": state.boot_id })).into_response()
 }
 
 async fn api_restart(
@@ -6065,6 +6071,24 @@ mod tests {
             let staged = f.data_dir.path().join("pending_restore.staged.db");
             let mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
+        }
+
+        // The Backups page waits for a restore's restart by watching this id
+        // change, so it must stay the same for the life of a process and
+        // differ between processes.
+        #[tokio::test]
+        async fn health_reports_a_boot_id_that_is_stable_per_process() {
+            let f = fixture().await;
+            let first = body_json(api_health(State(Arc::clone(&f.state))).await).await;
+            let second = body_json(api_health(State(Arc::clone(&f.state))).await).await;
+            assert_eq!(first["status"], "ok");
+            let id = first["boot_id"].as_str().expect("boot_id is a string");
+            assert!(!id.is_empty());
+            assert_eq!(first["boot_id"], second["boot_id"]);
+
+            let (other_state, _mock) = test_state();
+            let other = body_json(api_health(State(other_state)).await).await;
+            assert_ne!(first["boot_id"], other["boot_id"]);
         }
 
         // The new `/backups/:filename/restore` route sits next to the static
