@@ -116,8 +116,8 @@ function restartNote(res: { message: string; restart_required?: boolean }): stri
 // Restores a backup that is already on the server. One request stages it
 // (the server validates it first) and confirms it under a single lock, so a
 // concurrent upload can't be applied in its place; after one confirmation here
-// the service restarts on the restored database. Only the newest pre-restore
-// safety snapshot is kept, so a second restore replaces the first one's.
+// the service restarts on the restored database. The last three pre-restore
+// safety snapshots are kept.
 async function restoreBackup(filename: string) {
   if (busy.value) return
   if (!confirm(
@@ -125,8 +125,8 @@ async function restoreBackup(filename: string) {
     'This REPLACES the current database with this backup and restarts the ' +
     'service (without systemd you restart it yourself). Anything written ' +
     'since the backup was made is lost. A safety snapshot of the current ' +
-    'database is saved in the data directory first, but only the most recent ' +
-    'snapshot is kept, so a second restore replaces it.'
+    'database is saved in the data directory first; the last three snapshots are ' +
+    'kept.'
   )) return
   restoring.value = filename
   error.value = null
@@ -151,8 +151,8 @@ async function restoreBackup(filename: string) {
 
 // The request never got an answer (the connection dropped or timed out). A
 // confirmed restore restarts the service, which drops connections, so the
-// restore may well have been applied. Don't offer a retry: a second restore
-// would replace the safety snapshot of the original data.
+// restore may well have been applied. Don't offer a retry: restoring twice for
+// nothing would only cycle the safety snapshots.
 function connectionDropped() {
   actionOk.value =
     'The connection dropped before the server answered. If the restore was ' +
@@ -200,8 +200,8 @@ async function applyRestore() {
   if (!confirm(
     'This will REPLACE the current database with the staged backup and ' +
     'restart the service (without systemd you restart it yourself). A safety ' +
-    'snapshot of the current database is saved in the data directory first, ' +
-    'but only the most recent snapshot is kept. Continue?'
+    'snapshot of the current database is saved in the data directory first; ' +
+    'the last three snapshots are kept. Continue?'
   )) return
   applying.value = true
   error.value = null
