@@ -47,9 +47,41 @@ pub fn ensure_subtable<'t>(table: &'t mut Table, key: &str) -> Result<&'t mut Ta
         .ok_or_else(|| format!("config.toml: [{key}] exists but is not a table"))
 }
 
+/// Set `table[key]` to the string `value`, keeping the comments around an
+/// existing value. A plain `insert` replaces the whole item, which drops a
+/// hand-written comment on the same line or the line above.
+pub fn set_string_keeping_comments(table: &mut Table, key: &str, value: &str) {
+    if let Some(existing) = table.get_mut(key).and_then(Item::as_value_mut) {
+        let decor = existing.decor().clone();
+        *existing = toml_edit::Value::from(value);
+        *existing.decor_mut() = decor;
+    } else {
+        table.insert(key, toml_edit::value(value));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setting_a_string_keeps_the_comments_around_it() {
+        let mut doc: DocumentMut =
+            "[mesh]\n# region for adverts\nscope = \"old\" # set by hand\nother = 1\n"
+                .parse()
+                .unwrap();
+        let mesh = ensure_table(&mut doc, "mesh").unwrap();
+        set_string_keeping_comments(mesh, "scope", "new");
+        assert_eq!(
+            doc.to_string(),
+            "[mesh]\n# region for adverts\nscope = \"new\" # set by hand\nother = 1\n"
+        );
+
+        // Absent: added like any other key.
+        let mesh = ensure_table(&mut doc, "mesh").unwrap();
+        set_string_keeping_comments(mesh, "fresh", "x");
+        assert_eq!(doc["mesh"]["fresh"].as_str(), Some("x"));
+    }
 
     #[test]
     fn ensure_table_creates_an_absent_section() {

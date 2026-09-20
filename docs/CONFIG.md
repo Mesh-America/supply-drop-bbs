@@ -350,6 +350,8 @@ character) fails `config check`. Which other characters MeshCore accepts in a
 region name is not checked here, so a name the repeaters don't know is only
 noticed when adverts stop crossing them.
 
+It can be set in `config.toml`, by `supply-drop-bbs config advert-scope` (see the [CLI reference](CLI.md#config-advert-scope)), in the setup wizard, or on the web admin Settings page under MeshCore radio.
+
 Removing `advert_scope` later does not undo it: the radio keeps the scope it was
 given, and the BBS cannot clear it (the radio refuses an empty one). Clear it in
 the MeshCore app. If the radio rejects the setting (firmware without the
