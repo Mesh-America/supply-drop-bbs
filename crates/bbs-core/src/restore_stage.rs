@@ -120,17 +120,19 @@ pub async fn new_private_temp(
     let file = opts.open(&path).await?;
     // From here on the guard owns the cleanup.
     let temp = TempFile(path);
-    hand_to_dir_owner(data_dir, temp.path());
+    hand_fd_to_dir_owner(data_dir, &file);
     Ok((temp, file))
 }
 
-/// Give `path` to the owner (user and group) of `dir`, best effort. For the
-/// service user this changes nothing; for a `restore stage` run as root it keeps
-/// the files the service will read from being root-owned and unreadable to it.
-pub(crate) fn hand_to_dir_owner(dir: &Path, path: &Path) {
+/// Give an open file to the owner (user and group) of `dir`, best effort. For
+/// the service user this changes nothing; for a `restore stage` run as root it
+/// keeps the files the service will read from being root-owned and unreadable to
+/// it. It goes through the open handle (`fchown`), never a path, so a symlink
+/// swapped in after the file was created can't redirect the change.
+pub(crate) fn hand_fd_to_dir_owner(dir: &Path, file: &impl std::os::fd::AsFd) {
     use std::os::unix::fs::MetadataExt as _;
     if let Ok(meta) = std::fs::metadata(dir) {
-        let _ = std::os::unix::fs::chown(path, Some(meta.uid()), Some(meta.gid()));
+        let _ = std::os::unix::fs::fchown(file, Some(meta.uid()), Some(meta.gid()));
     }
 }
 
@@ -212,6 +214,7 @@ pub async fn stage_copy(
         let mut limited = tokio::io::AsyncReadExt::take(&mut src, cap);
         let n = tokio::io::copy(&mut limited, &mut dest).await?;
         tokio::io::AsyncWriteExt::flush(&mut dest).await?;
+        dest.sync_all().await?;
         Ok::<u64, std::io::Error>(n)
     }
     .await;
