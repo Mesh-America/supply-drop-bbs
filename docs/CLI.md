@@ -320,9 +320,9 @@ Validate and apply a database restore from a backup file — the CLI
 equivalent of the web UI's Backups page restore flow. Works directly
 against the local database and data directory; no running BBS instance is
 required (unlike `contacts`). Staging and confirming are deliberately two
-separate steps, mirroring the web UI's upload-then-confirm flow: staging
-alone never changes anything, and confirming only takes effect the next
-time the BBS process starts.
+separate steps, as with a web UI upload: staging alone never changes
+anything, and confirming only takes effect the next time the BBS process
+starts.
 
 `stage` accepts either a raw `.db` file or the `.zip` bundle `backup`/the
 web UI produce, and runs the same validation the web upload endpoint does:
@@ -361,8 +361,9 @@ prompt, which prints "Aborted" rather than treating it as an error);
 non-zero if the source path in `stage` isn't a file, the file fails
 validation, or `apply` is run with nothing staged.
 
-> **Web admin:** The same upload/validate/stage/confirm flow is available
-> in the web UI under **Backups** → restore.
+> **Web admin:** The same validate/stage/confirm flow is available in the
+> web UI under **Backups**: each backup in the list has a **restore**
+> button, and a backup from another system can be uploaded there instead.
 
 ---
 

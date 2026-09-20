@@ -548,7 +548,7 @@ Retention defaults: 7 daily + 4 weekly. Configurable.
 supply-drop-bbs backup
 ```
 
-Or use the **Trigger backup** button in the web admin UI.
+Or use the **create backup** button on the **Backups** page of the web admin UI.
 
 ### Off-host backups
 
@@ -566,16 +566,39 @@ supply-drop-bbs restore apply
 sudo systemctl restart supply-drop-bbs
 ```
 
-Or use the **Backups** page in the web admin UI: upload the backup file
-(a raw `.db` or the `.zip` the web UI's own "create backup" button
-produces), then confirm the restore once it validates. Either way,
-staging and confirming are deliberately separate steps — nothing changes
-until you confirm, and the database is only actually swapped the next
-time the BBS process starts. A safety snapshot of the current database is
-taken automatically before the swap; see [Disaster recovery](#disaster-recovery)
-if you need to roll back to it. This works even when the live database is
-broken (see [Corrupted database](#corrupted-database)) — staging and
-confirming never require the live database to open successfully.
+Or use the **Backups** page in the web admin UI. To restore a backup listed
+there, click its **restore** button and confirm. The backup is validated,
+staged and confirmed in one step, and the service then restarts on the
+restored database. That restart needs the BBS running under systemd;
+otherwise the restore is confirmed and the page tells you to restart the BBS
+yourself, which applies it. To restore a backup from another system, upload
+the file instead (a raw `.db` or the `.zip` the web UI's own "create backup"
+button produces), then confirm the restore once it validates. From the
+command line, or with an upload, staging and confirming are separate steps:
+nothing changes until you confirm, and the database is only swapped the next
+time the BBS process starts. The command line works even when the live database
+is broken (see [Corrupted database](#corrupted-database)) — staging and
+confirming never require the live database to open successfully; the web UI
+needs a running BBS.
+
+A restore replaces the database only. The `config.toml` inside a `.zip` backup
+is not restored, and anything written since the backup was made is lost.
+
+Before the swap, the current database is copied to
+`pre-restore-safety-<unix-seconds>.db` in the data directory. Only the most
+recent of these snapshots is kept, so a second restore replaces the first
+one's. Copy the snapshot elsewhere before restoring again if you may need it.
+To roll back to it, restore it like any other backup:
+
+```sh
+supply-drop-bbs restore stage /var/lib/supply-drop-bbs/pre-restore-safety-<unix-seconds>.db
+supply-drop-bbs restore apply
+sudo systemctl restart supply-drop-bbs
+```
+
+A restore that is confirmed but not yet applied (the BBS wasn't restarted)
+is a file named `pending_restore.db` in the data directory. Delete it before
+the next start to cancel the restore.
 
 ## Rooms and access control
 

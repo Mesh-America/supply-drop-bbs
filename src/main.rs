@@ -717,6 +717,37 @@ fn prune_old_restore_safety_snapshots(data_dir: &std::path::Path, keep: &std::pa
     }
 }
 
+/// Delete the temporary copies the web admin's restore endpoints leave in
+/// `data_dir` when a request is cut off before it finishes
+/// (`restore_upload_<uuid>.tmp` and `restore_backup_<uuid>.tmp`). Each is a
+/// full database-sized file, and a name is never reused, so nothing else
+/// would ever remove them. The CLI's fixed `restore_cli_upload.tmp` is not
+/// swept here: the CLI can be running while this process starts.
+fn sweep_stale_restore_temp_files(data_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_stale_copy = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| {
+                (n.starts_with("restore_upload_") || n.starts_with("restore_backup_"))
+                    && n.ends_with(".tmp")
+            })
+            .unwrap_or(false);
+        if is_stale_copy {
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(path = %path.display(), "removed stale restore temp file"),
+                Err(e) => {
+                    warn!(path = %path.display(), "could not remove stale restore temp file: {e}")
+                }
+            }
+        }
+    }
+}
+
 /// Host supervisor — the real `run` path.
 ///
 /// 1. Load + resolve config (apply CLI overrides)
@@ -860,17 +891,22 @@ async fn cmd_run(cli: &Cli) {
         std::process::exit(1);
     }
 
+    // ── 3a. Remove restore temp copies orphaned by an interrupted request ───────
+    sweep_stale_restore_temp_files(data_dir);
+
     // ── 3b. Apply a staged database restore, if one is pending ─────────────────
     // Must run before Database::open (below): this fresh process has no live
     // connections to the database file yet, so swapping it is safe.
     //
     // `pending_restore.db`'s mere presence here is deliberately the ONLY
-    // signal for "the sysop confirmed this restore" — api_upload_restore
-    // (crates/bbs-web/src/lib.rs, issue #195) validates an uploaded file and
-    // stages it under a separate, inert name (`pending_restore.staged.db`)
-    // that this check never looks at; only api_apply_restore promotes it to
-    // this name, then exits so systemd's `Restart=always` brings this
-    // instance back up to perform the swap below. Do not stage directly
+    // signal for "the sysop confirmed this restore" — api_upload_restore and
+    // api_stage_backup_restore (crates/bbs-web/src/lib.rs, issues #195 and
+    // #309) and the CLI's `restore stage` validate a file and stage it under
+    // a separate, inert name (`pending_restore.staged.db`) that this check
+    // never looks at; only a confirm (api_apply_restore, or `restore apply`)
+    // promotes it to this name. Under systemd the web confirm then exits so
+    // `Restart=always` brings this instance back up to perform the swap
+    // below; otherwise the operator restarts the BBS. Do not stage directly
     // under this name from anywhere: doing so would mean ANY unrelated
     // restart between upload and confirmation (a crash, an operator
     // restarting the service for an unrelated reason, systemd firing
@@ -3674,5 +3710,40 @@ mod contacts_tests {
             .find(|a| a.get_id() == "username")
             .expect("username arg exists");
         assert!(username_arg.is_required_set());
+    }
+}
+
+#[cfg(test)]
+mod restore_temp_sweep_tests {
+    use super::sweep_stale_restore_temp_files;
+
+    #[test]
+    fn sweep_removes_only_the_web_restore_temp_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let stale = [
+            "restore_backup_5f6c1a5e-0000-0000-0000-000000000000.tmp",
+            "restore_upload_5f6c1a5e-0000-0000-0000-000000000000.tmp",
+        ];
+        let keep = [
+            "pending_restore.db",
+            "pending_restore.staged.db",
+            "restore_cli_upload.tmp",
+            "pre-restore-safety-1789869375.db",
+            "restore_backup_notes.txt",
+            "bbs.sqlite",
+        ];
+        for name in stale.iter().chain(keep.iter()) {
+            std::fs::write(p.join(name), b"x").unwrap();
+        }
+
+        sweep_stale_restore_temp_files(p);
+
+        for name in stale {
+            assert!(!p.join(name).exists(), "{name} should be removed");
+        }
+        for name in keep {
+            assert!(p.join(name).exists(), "{name} must be left alone");
+        }
     }
 }
