@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { api, request, ApiError } from '../api/client'
+import { fetchBootId, showRestoreWait } from '../api/restoreWaitOverlay'
 
 interface BackupRecord {
   filename: string
@@ -30,6 +31,7 @@ const restoreStaged = ref(false)
 // Set once a restore has been confirmed: the list is stale and the service is
 // about to restart (or waiting for the operator to restart it).
 const restoreDone = ref(false)
+
 const fileInput = ref<HTMLInputElement | null>(null)
 
 const backupDirConfigured = computed(() => settings.value?.backup_dir != null)
@@ -105,60 +107,96 @@ async function deleteBackup(filename: string) {
   }
 }
 
-// What to tell the sysop after a confirmed restore: either the service is
-// restarting itself (systemd), or they have to restart it.
-function restartNote(res: { message: string; restart_required?: boolean }): string {
-  return res.restart_required
-    ? `${res.message}. Reload this page after you restart it.`
-    : `${res.message}. This page may stop responding for a few seconds.`
+// After a confirmed restore the whole UI is blocked behind a full-screen
+// notice until the restarted service answers, then the page reloads (to the
+// login screen: sessions don't survive a restart). The notice lives outside
+// this component so navigating away can't drop it while the restart is still
+// pending. Shared by every path that can confirm a restore.
+function startRestoreWait(
+  message: string,
+  restartByHand: boolean,
+  baselineBootId: string | null,
+  unknownOutcome = false
+) {
+  restoreDone.value = true
+  restoreStaged.value = false
+  showRestoreWait({
+    message,
+    restartByHand,
+    baselineBootId,
+    // A confirmed restore makes the service exit within a moment. If the same
+    // process is still answering well after that, the request never got
+    // through: say so and give the buttons back.
+    giveUpAfterSeconds: unknownOutcome ? GIVE_UP_AFTER_SECONDS : undefined,
+    onGiveUp: () => {
+      restoreDone.value = false
+      error.value =
+        'The connection failed and the service did not restart, so the restore was ' +
+        'not applied. Check the service, then try again.'
+    },
+  })
 }
+
+const GIVE_UP_AFTER_SECONDS = 20
+
+// Answers that leave it unclear whether the restore was triggered: a proxy
+// error (502/503/504) in front of the service. A 409 means the server itself
+// says a restore is already confirmed and restarting. Everything else is a
+// plain error.
+const UNCLEAR_STATUS = [502, 503, 504]
+
+const RESTORE_LIMITS =
+  'This REPLACES the current database. Settings kept in config.toml, such as ' +
+  'the BBS name, are NOT restored, and anything written since the backup was ' +
+  'made is lost. A safety snapshot of the current database is saved in the ' +
+  'data directory first, but only the most recent snapshot is kept, so a ' +
+  'second restore replaces it.'
 
 // Restores a backup that is already on the server. One request stages it
 // (the server validates it first) and confirms it under a single lock, so a
 // concurrent upload can't be applied in its place; after one confirmation here
-// the service restarts on the restored database. Only the newest pre-restore
-// safety snapshot is kept, so a second restore replaces the first one's.
+// the service restarts on the restored database.
 async function restoreBackup(filename: string) {
   if (busy.value) return
   if (!confirm(
-    `Restore ${filename}?\n\n` +
-    'This REPLACES the current database with this backup and restarts the ' +
-    'service (without systemd you restart it yourself). Anything written ' +
-    'since the backup was made is lost. A safety snapshot of the current ' +
-    'database is saved in the data directory first, but only the most recent ' +
-    'snapshot is kept, so a second restore replaces it.'
+    `Restore ${filename}?\n\n${RESTORE_LIMITS}\n\n` +
+    'The service then restarts (without systemd you restart it yourself).'
   )) return
   restoring.value = filename
   error.value = null
   actionOk.value = null
+  // Read before triggering the restore, so a restart quick enough to be over
+  // before the first poll is still recognised.
+  const bootId = await fetchBootId()
   try {
     const res = await api.post<{ message: string; restart_required?: boolean }>(
       `/api/v1/backups/${encodeURIComponent(filename)}/restore?apply=true`
     )
-    actionOk.value = restartNote(res)
-    restoreDone.value = true
-    restoreStaged.value = false
+    startRestoreWait(res.message, res.restart_required === true, bootId)
   } catch (e: any) {
-    if (e instanceof ApiError) {
-      error.value = e.message
-    } else {
-      connectionDropped()
-    }
+    handleRestoreError(e, bootId)
   } finally {
     restoring.value = null
   }
 }
 
-// The request never got an answer (the connection dropped or timed out). A
-// confirmed restore restarts the service, which drops connections, so the
-// restore may well have been applied. Don't offer a retry: a second restore
-// would replace the safety snapshot of the original data.
-function connectionDropped() {
-  actionOk.value =
-    'The connection dropped before the server answered. If the restore was ' +
-    'confirmed the service is restarting: reload this page in a few seconds ' +
-    'and check the data before restoring again.'
-  restoreDone.value = true
+// A failed restore request. The server answers a confirmed restore before it
+// exits, so most failures mean nothing was triggered; but a connection that
+// dropped without an answer, or a proxy error, can hide a restore that was
+// confirmed, and a retry would then replace the safety snapshot of the original
+// data. For those, wait behind the notice and see whether the service restarts
+// (reload) or not (the notice gives up and says the restore was not applied).
+function handleRestoreError(e: unknown, bootId: string | null) {
+  if (e instanceof ApiError && e.status === 409) {
+    // The server says a restore is already confirmed and restarting.
+    startRestoreWait(e.message, false, bootId)
+    return
+  }
+  if (e instanceof ApiError && !UNCLEAR_STATUS.includes(e.status)) {
+    error.value = e.message
+    return
+  }
+  startRestoreWait('Connection lost: checking whether the service is restarting', false, bootId, true)
 }
 
 function pickRestoreFile(e: Event) {
@@ -198,27 +236,20 @@ async function uploadRestoreFile() {
 async function applyRestore() {
   if (busy.value) return
   if (!confirm(
-    'This will REPLACE the current database with the staged backup and ' +
-    'restart the service (without systemd you restart it yourself). A safety ' +
-    'snapshot of the current database is saved in the data directory first, ' +
-    'but only the most recent snapshot is kept. Continue?'
+    `Apply the staged backup?\n\n${RESTORE_LIMITS}\n\n` +
+    'The service then restarts (without systemd you restart it yourself).'
   )) return
   applying.value = true
   error.value = null
   actionOk.value = null
+  const bootId = await fetchBootId()
   try {
     const res = await api.post<{ message: string; restart_required?: boolean }>(
       '/api/v1/backups/restore/apply'
     )
-    actionOk.value = restartNote(res)
-    restoreDone.value = true
-    restoreStaged.value = false
+    startRestoreWait(res.message, res.restart_required === true, bootId)
   } catch (e: any) {
-    if (e instanceof ApiError) {
-      error.value = e.message
-    } else {
-      connectionDropped()
-    }
+    handleRestoreError(e, bootId)
   } finally {
     applying.value = false
   }

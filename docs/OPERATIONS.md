@@ -592,7 +592,11 @@ there, click its **restore** button and confirm. The backup is validated,
 staged and confirmed in one step, and the service then restarts on the
 restored database. That restart needs the BBS running under systemd;
 otherwise the restore is confirmed and the page tells you to restart the BBS
-yourself, which applies it. To restore a backup from another system, upload
+yourself, which applies it. While the restore applies, the page shows a
+full-screen notice and blocks everything else, then reloads by itself once the
+restarted service answers (to the login screen, since sessions don't survive a
+restart). If it hasn't seen the restart after two minutes it offers a reload
+button. To restore a backup from another system, upload
 the file instead (a raw `.db` or the `.zip` the web UI's own "create backup"
 button produces), then confirm the restore once it validates. From the
 command line, or with an upload, staging and confirming are separate steps:
@@ -815,21 +819,18 @@ See [CLI.md](CLI.md) for the full `user` subcommand reference.
 
 ### Health endpoint
 
-If the web admin plugin is enabled, `GET /health` returns:
+If the web admin plugin is enabled, `GET /api/v1/health` answers without a
+login:
 
 ```json
-{
-  "status": "healthy",
-  "uptime_seconds": 1234567,
-  "version": "0.1.0",
-  "bridge_connected": true,
-  "transports": { "mesh": "running", "web": "running" },
-  "db": { "size_bytes": 12345678, "last_backup": "2026-05-08T03:00:00Z" }
-}
+{ "status": "ok", "boot_id": "5f6c1a5e-8d2b-4c0e-9a1f-3b7e2d4c6a10" }
 ```
 
-`status` is `"healthy"` only if every transport reports running and the bridge
-is connected; otherwise `"degraded"`.
+`status` is `"ok"` whenever the web server is answering. `boot_id` is a random
+id created when the BBS process starts, so it changes on every restart; the
+Backups page uses it to tell that the restart after a restore has finished.
+It also lets anyone who can reach the web port see when the BBS restarts. For
+uptime, use the authenticated `GET /api/v1/status`.
 
 ### Mesh link health
 
