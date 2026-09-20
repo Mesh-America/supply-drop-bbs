@@ -666,8 +666,10 @@ The web upload makes the same check before it starts writing and again as it
 goes, and keeps 16 MiB free for the rest of the system. Copies left behind by a
 restore that was cut off are removed when the BBS starts: the web upload and
 backup copies (`restore_upload_*.tmp`, `restore_backup_*.tmp`) at once, and the
-CLI's (`restore_cli_*.tmp`) and the apply step's (`.partial`, `.restore-aside`
-and `.restore.tmp` files) once they have gone an hour untouched.
+CLI's (`restore_cli_*.tmp`), the apply step's `pre-restore-safety-*.partial`
+snapshot copy and the files it leaves beside the database (`<db>-wal.restore-aside`,
+`<db>-shm.restore-aside` and `<db>.restore.tmp`, by those exact names) once they
+have gone an hour untouched.
 
 Before the swap, the current database is copied to
 `pre-restore-safety-<unix-seconds>.db` in the data directory. The three most
