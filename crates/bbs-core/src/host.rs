@@ -1630,6 +1630,32 @@ impl Host for BbsHost {
         .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    async fn admin_stage_backup_restore(
+        &self,
+        source_path: &str,
+        data_dir: &str,
+    ) -> Result<(), HostError> {
+        use crate::restore_stage::{stage_copy, SourceRules, StageError, WEB_RESTORE_MAX_BYTES};
+        stage_copy(
+            std::path::Path::new(source_path),
+            std::path::Path::new(data_dir),
+            "restore_backup_",
+            SourceRules {
+                max_bytes: Some(WEB_RESTORE_MAX_BYTES),
+                follow_symlinks: false,
+            },
+        )
+        .await
+        .map_err(|e| match e {
+            StageError::NotFound => HostError::NotFound("backup not found".into()),
+            StageError::NotRegularFile => HostError::PreconditionFailed(e.to_string()),
+            StageError::TooLarge(m) | StageError::NoSpace(m) | StageError::Rejected(m) => {
+                HostError::Storage(m)
+            }
+            StageError::Io(m) => HostError::Internal(m),
+        })
+    }
+
     async fn admin_apply_staged_restore(&self, data_dir: &str) -> Result<(), HostError> {
         crate::db::Database::admin_apply_staged_restore(std::path::Path::new(data_dir))
             .await
@@ -10009,6 +10035,96 @@ mod tests {
         assert!(
             !staged.exists(),
             "a rejected upload must not be staged for restore"
+        );
+    }
+
+    /// `admin_stage_backup_restore` copies a backup from a directory into the
+    /// data directory, stages the copy and leaves the original alone, and its
+    /// errors carry the variants the web layer turns into status codes.
+    #[tokio::test]
+    async fn stage_backup_restore_stages_a_copy_and_maps_its_errors() {
+        let (host, _live_db_file) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_string_lossy().into_owned();
+
+        let rec = host
+            .admin_trigger_backup(&backups.path().to_string_lossy())
+            .await
+            .unwrap();
+        let src = backups.path().join(&rec.filename);
+        let before = std::fs::read(&src).unwrap();
+
+        host.admin_stage_backup_restore(&src.to_string_lossy(), &data)
+            .await
+            .expect("a genuine backup stages");
+        let left: Vec<String> = std::fs::read_dir(data_dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["pending_restore.staged.db"]);
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            before,
+            "the source is untouched"
+        );
+
+        let missing = backups.path().join("absent.db");
+        assert!(matches!(
+            host.admin_stage_backup_restore(&missing.to_string_lossy(), &data)
+                .await,
+            Err(HostError::NotFound(_))
+        ));
+        let dir = backups.path().join("looks_like.db");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(matches!(
+            host.admin_stage_backup_restore(&dir.to_string_lossy(), &data)
+                .await,
+            Err(HostError::PreconditionFailed(_))
+        ));
+        let bogus = backups.path().join("bogus.db");
+        std::fs::write(&bogus, b"not a database").unwrap();
+        assert!(matches!(
+            host.admin_stage_backup_restore(&bogus.to_string_lossy(), &data)
+                .await,
+            Err(HostError::Storage(_))
+        ));
+
+        // A symlink is refused, not followed.
+        #[cfg(unix)]
+        {
+            let link = backups.path().join("link.db");
+            std::os::unix::fs::symlink(&src, &link).unwrap();
+            assert!(matches!(
+                host.admin_stage_backup_restore(&link.to_string_lossy(), &data)
+                    .await,
+                Err(HostError::PreconditionFailed(_))
+            ));
+        }
+        // Over the web UI's limit: refused before any copy, as a storage error.
+        let huge = backups.path().join("huge.db");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(crate::restore_stage::WEB_RESTORE_MAX_BYTES + 1)
+            .unwrap();
+        let err = host
+            .admin_stage_backup_restore(&huge.to_string_lossy(), &data)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostError::Storage(ref m) if m.contains("limit")),
+            "{err:?}"
+        );
+        let left: Vec<String> = std::fs::read_dir(data_dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            ["pending_restore.staged.db"],
+            "no temp copy may remain"
         );
     }
 

@@ -95,6 +95,7 @@ use axum::routing::{delete, get, patch, post};
 use axum::{Extension, Json, Router};
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
+use bbs_core::restore_stage::{backup_filename_is_safe, is_backup_file_name};
 use bbs_plugin_api::admin::AdminBackupRecord;
 use bbs_plugin_api::error::{HostError, PluginError};
 use bbs_plugin_api::event::{DomainEvent, MessageRecipient};
@@ -4109,57 +4110,6 @@ async fn api_delete_backup(
     }
 }
 
-/// A backup filename is a single path component inside the backup directory:
-/// non-empty, with no path separators, no `..`, no `.` and no NUL.
-fn backup_filename_is_safe(filename: &str) -> bool {
-    !filename.is_empty()
-        && filename != "."
-        && !filename.contains('/')
-        && !filename.contains('\\')
-        && !filename.contains("..")
-        && !filename.contains('\0')
-}
-
-/// Removes its file when dropped, best effort. Covers every early return and a
-/// request future dropped mid-copy (a client disconnect), so a temporary
-/// restore copy is not left behind in the data directory. After a successful
-/// stage the file has been renamed away and the removal is a harmless no-op.
-struct TempFileGuard(std::path::PathBuf);
-
-impl Drop for TempFileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// Copies `source` to a new file `dest` that is owner-only (0600) from the
-/// moment it exists. `tokio::fs::copy` keeps the source's mode, which would
-/// leave a world-readable database copy readable until a later chmod and
-/// would leave a read-only backup unable to be migrated in place.
-async fn copy_backup_private(
-    source: &std::path::Path,
-    dest: &std::path::Path,
-) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use tokio::io::AsyncWriteExt as _;
-        let mut src = tokio::fs::File::open(source).await?;
-        let mut dst = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(dest)
-            .await?;
-        tokio::io::copy(&mut src, &mut dst).await?;
-        dst.flush().await?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::fs::copy(source, dest).await.map(|_| ())
-    }
-}
-
 /// 409 for a restore request that arrives after a confirmed restore has
 /// scheduled the process exit (see `AppState::restore_confirmed`).
 fn restore_already_confirmed() -> Response {
@@ -4301,7 +4251,7 @@ async fn api_stage_backup_restore(
             .into_response();
     }
     // The two kinds of file the backup list returns.
-    if !(filename.ends_with(".db") || filename.ends_with(".zip")) {
+    if !is_backup_file_name(&filename) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error("only .db and .zip backups can be restored")),
@@ -4330,53 +4280,25 @@ async fn api_stage_backup_restore(
     }
 
     let source = std::path::Path::new(&backup_dir).join(&filename);
-    match tokio::fs::symlink_metadata(&source).await {
-        Ok(meta) if meta.is_file() => {
-            if meta.len() > RESTORE_UPLOAD_MAX_BYTES as u64 {
-                return (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    Json(json_error(
-                        "backup is larger than the web UI restores (2 GiB); use \
-                         `supply-drop-bbs restore stage <file>` instead",
-                    )),
-                )
-                    .into_response();
-            }
-        }
-        // A symlink, directory or other special file.
-        Ok(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json_error("backup is not a regular file")),
-            )
-                .into_response()
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (StatusCode::NOT_FOUND, Json(json_error("backup not found"))).into_response()
-        }
-        Err(e) => return server_error(&e.to_string()),
-    }
-
-    // In data_dir itself so stage_restore's rename onto its staged path
-    // stays on one filesystem, as in api_upload_restore. The guard removes the
-    // copy on every path where stage_restore doesn't move it.
-    let tmp_path =
-        std::path::Path::new(&data_dir).join(format!("restore_backup_{}.tmp", Uuid::new_v4()));
-    let _tmp_guard = TempFileGuard(tmp_path.clone());
-    if let Err(e) = copy_backup_private(&source, &tmp_path).await {
-        return server_error(&format!("copying backup: {e}"));
-    }
-
     if let Err(e) = state
         .host
-        .admin_stage_restore(&tmp_path.to_string_lossy(), &data_dir)
+        .admin_stage_backup_restore(&source.to_string_lossy(), &data_dir)
         .await
     {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json_error(&e.to_string())),
-        )
-            .into_response();
+        return match e {
+            HostError::NotFound(_) => {
+                (StatusCode::NOT_FOUND, Json(json_error("backup not found"))).into_response()
+            }
+            HostError::PreconditionFailed(msg) => {
+                (StatusCode::BAD_REQUEST, Json(json_error(&msg))).into_response()
+            }
+            HostError::Internal(msg) => server_error(&msg),
+            other => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json_error(&other.to_string())),
+            )
+                .into_response(),
+        };
     }
 
     let _ = state
@@ -4404,7 +4326,10 @@ async fn api_stage_backup_restore(
 /// the whole API) to a generous ceiling; the endpoint is sysop-gated, so the
 /// only downside of a large cap is disk/memory use by an already-trusted
 /// operator, not an unauthenticated DoS surface.
-const RESTORE_UPLOAD_MAX_BYTES: usize = 2 * 1024 * 1024 * 1024;
+const RESTORE_UPLOAD_MAX_BYTES: usize = bbs_core::restore_stage::WEB_RESTORE_MAX_BYTES as usize;
+
+/// How much of an upload is written between free-space checks.
+const SPACE_RECHECK_BYTES: u64 = 64 * 1024 * 1024;
 
 /// `POST /api/v1/backups/restore` — accepts a multipart file upload,
 /// validates it as a restorable database WITHOUT touching the live one, and
@@ -4463,35 +4388,70 @@ async fn api_upload_restore(
                 .into_response()
         }
     };
-    let bytes = match field.bytes().await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json_error(&format!("reading upload: {e}"))),
-            )
-                .into_response()
-        }
+    // Streamed to a private file in data_dir (not the system temp dir) so the
+    // rename stage_restore performs on success lands on the same filesystem
+    // and is a fast, atomic move rather than a copy, and so a large upload is
+    // never held in memory. stage_restore itself detects and extracts a zip
+    // upload, so the bytes are written as they arrive regardless of format.
+    // `temp` removes the file on every path where stage_restore doesn't move
+    // it: a rejected upload, a failed or cut-off write, a dropped request.
+    let (temp, mut file) = match bbs_core::restore_stage::new_private_temp(
+        std::path::Path::new(&data_dir),
+        "restore_upload_",
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return server_error(&format!("saving upload: {e}")),
     };
-
-    // Write into data_dir itself (not the system temp dir) so the rename
-    // stage_restore performs on success lands on the same filesystem and
-    // is a fast, atomic move rather than a copy. stage_restore itself
-    // detects and extracts a zip upload, so the raw bytes are written
-    // as-is here regardless of format.
-    let tmp_path =
-        std::path::Path::new(&data_dir).join(format!("restore_upload_{}.tmp", Uuid::new_v4()));
-    // On failure stage_restore never moves the file, and a failed or cut-off
-    // write can leave a partial one; the guard removes it on every such path
-    // so a rejected upload doesn't leave junk in data_dir.
-    let _tmp_guard = TempFileGuard(tmp_path.clone());
-    if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+    let mut written: u64 = 0;
+    let mut next_space_check: u64 = SPACE_RECHECK_BYTES;
+    let mut field = field;
+    loop {
+        let chunk = match field.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json_error(&format!("reading upload: {e}"))),
+                )
+                    .into_response()
+            }
+        };
+        written += chunk.len() as u64;
+        if written > bbs_core::restore_stage::WEB_RESTORE_MAX_BYTES {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(json_error(
+                    "upload is larger than the web UI restores (2 GiB); use \
+                     `supply-drop-bbs restore stage <file>` instead",
+                )),
+            )
+                .into_response();
+        }
+        if let Err(e) = tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await {
+            return server_error(&format!("saving upload: {e}"));
+        }
+        // The size isn't known up front, so make sure the disk still has room
+        // as the data arrives rather than only finding out when a write fails.
+        if written >= next_space_check {
+            next_space_check = written + SPACE_RECHECK_BYTES;
+            if let Err(msg) =
+                bbs_core::disk_space::ensure_free_space(std::path::Path::new(&data_dir), 0)
+            {
+                return (StatusCode::INSUFFICIENT_STORAGE, Json(json_error(&msg))).into_response();
+            }
+        }
+    }
+    if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await {
         return server_error(&format!("saving upload: {e}"));
     }
+    drop(file);
 
     let result = state
         .host
-        .admin_stage_restore(&tmp_path.to_string_lossy(), &data_dir)
+        .admin_stage_restore(&temp.path().to_string_lossy(), &data_dir)
         .await;
 
     match result {
@@ -6031,35 +5991,86 @@ mod tests {
             assert_eq!(original_mode, 0o444, "the backup's own mode is untouched");
         }
 
-        #[test]
-        fn filename_guard_rejects_empty_dot_dotdot_separators_and_nul() {
-            for bad in [
-                "", ".", "..", "../x.db", "a/b.db", "a\\b.db", "a\0.db", "x..db",
-            ] {
-                assert!(!backup_filename_is_safe(bad), "{bad:?} must be rejected");
-            }
-            for good in [
-                "backup_20260101_000000.db",
-                "backup_20260101_000000.zip",
-                "my backup.db",
-            ] {
-                assert!(backup_filename_is_safe(good), "{good:?} must be accepted");
-            }
+        // ── upload ────────────────────────────────────────────────────────────
+
+        fn multipart_body(file_bytes: &[u8]) -> (String, Vec<u8>) {
+            let boundary = "----restoretestboundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                     filename=\"backup.db\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(file_bytes);
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            (format!("multipart/form-data; boundary={boundary}"), body)
         }
 
-        // A dropped request future (client disconnect) runs the guard's Drop,
-        // which is what removes the temporary copy in that case.
-        #[test]
-        fn temp_file_guard_removes_its_file_when_dropped() {
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("restore_backup_x.tmp");
-            std::fs::write(&path, b"partial copy").unwrap();
-            {
-                let _guard = TempFileGuard(path.clone());
-            }
-            assert!(!path.exists());
-            // Removing a file that was already renamed away is not an error.
-            drop(TempFileGuard(path));
+        async fn upload(f: &Fixture, caller: CurrentUser, file_bytes: &[u8]) -> Response {
+            use axum::extract::FromRequest as _;
+            let (content_type, body) = multipart_body(file_bytes);
+            // Delivered in small pieces, so the handler's chunk loop runs many
+            // times (a single `Body::from` would arrive as one chunk).
+            let pieces: Vec<Result<axum::body::Bytes, std::convert::Infallible>> = body
+                .chunks(1024)
+                .map(|c| Ok(axum::body::Bytes::copy_from_slice(c)))
+                .collect();
+            let req = Request::builder()
+                .method("POST")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(axum::body::Body::from_stream(tokio_stream::iter(pieces)))
+                .unwrap();
+            let multipart = Multipart::from_request(req, &()).await.unwrap();
+            api_upload_restore(State(Arc::clone(&f.state)), Extension(caller), multipart).await
+        }
+
+        #[tokio::test]
+        async fn an_uploaded_backup_is_streamed_validated_and_staged() {
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            let bytes = std::fs::read(f.backup_dir.path().join(&name)).unwrap();
+
+            let resp = upload(&f, sysop(), &bytes).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                data_dir_files(&f),
+                vec!["pending_restore.staged.db".to_owned()],
+                "only the staged file may remain, no temp copy"
+            );
+            let staged =
+                std::fs::read(f.data_dir.path().join("pending_restore.staged.db")).unwrap();
+            assert!(!staged.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_rejected_upload_leaves_nothing_behind() {
+            let f = fixture().await;
+            let resp = upload(&f, sysop(), b"this is not a sqlite database").await;
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(data_dir_files(&f).is_empty(), "{:?}", data_dir_files(&f));
+        }
+
+        #[tokio::test]
+        async fn a_non_sysop_cannot_upload_and_nothing_is_written() {
+            let f = fixture().await;
+            let resp = upload(&f, regular_user(), b"whatever").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            assert!(data_dir_files(&f).is_empty());
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn the_staged_upload_is_owner_only() {
+            use std::os::unix::fs::PermissionsExt as _;
+            let f = fixture().await;
+            let name = make_db_backup(&f).await;
+            let bytes = std::fs::read(f.backup_dir.path().join(&name)).unwrap();
+            assert_eq!(upload(&f, sysop(), &bytes).await.status(), StatusCode::OK);
+            let staged = f.data_dir.path().join("pending_restore.staged.db");
+            let mode = std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
         }
 
         // The Backups page waits for a restore's restart by watching this id

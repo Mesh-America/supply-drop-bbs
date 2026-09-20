@@ -414,6 +414,23 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_stage_restore".into()))
     }
 
+    /// Stage a restore from a backup file already on the server, such as one in
+    /// the backup directory: copy `source_path` into `data_dir` (the source is
+    /// never touched or followed through a symlink, and files over the web UI's
+    /// 2 GiB limit are refused), validate the copy as `admin_stage_restore`
+    /// does, and stage it. Errors are mapped so callers can pick a status:
+    /// `NotFound` for a missing file, `PreconditionFailed` for something that is
+    /// not a regular file, `Storage` for a file that is too large or fails
+    /// validation (the message says which), `Internal` for an I/O failure.
+    async fn admin_stage_backup_restore(
+        &self,
+        source_path: &str,
+        data_dir: &str,
+    ) -> Result<(), HostError> {
+        let _ = (source_path, data_dir);
+        Err(HostError::NotSupported("admin_stage_backup_restore".into()))
+    }
+
     /// Confirm a previously staged restore (see `admin_stage_restore`) by
     /// promoting it from its inert staged name to the name that actually
     /// triggers the database swap on next startup. Returns an error if

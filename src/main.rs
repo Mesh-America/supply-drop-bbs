@@ -695,22 +695,26 @@ async fn open_database(path: &std::path::Path) -> Database {
 /// `data_dir` when a request is cut off before it finishes
 /// (`restore_upload_<uuid>.tmp` and `restore_backup_<uuid>.tmp`). Each is a
 /// full database-sized file, and a name is never reused, so nothing else
-/// would ever remove them. The CLI's fixed `restore_cli_upload.tmp` is not
-/// swept here: the CLI can be running while this process starts.
+/// would ever remove them. A zip being extracted sits beside its upload as
+/// `<name>.extract.tmp`, which the same rule catches. The CLI's
+/// `restore_cli_<uuid>.tmp` copies are only removed once they are over an hour
+/// old: the CLI can be running while this process starts, but a copy that old
+/// belongs to a `restore stage` that was killed.
 fn sweep_stale_restore_temp_files(data_dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(data_dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
         let is_stale_copy = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| {
-                (n.starts_with("restore_upload_") || n.starts_with("restore_backup_"))
-                    && n.ends_with(".tmp")
-            })
-            .unwrap_or(false);
+            .is_some_and(|n| is_stale_restore_temp(n, age));
         if is_stale_copy {
             match std::fs::remove_file(&path) {
                 Ok(()) => info!(path = %path.display(), "removed stale restore temp file"),
@@ -720,6 +724,19 @@ fn sweep_stale_restore_temp_files(data_dir: &std::path::Path) {
             }
         }
     }
+}
+
+/// Whether `name` is a restore temp copy that is safe to delete at startup, given
+/// how long ago it was last written (`None` if unknown).
+fn is_stale_restore_temp(name: &str, age: Option<std::time::Duration>) -> bool {
+    if !name.ends_with(".tmp") {
+        return false;
+    }
+    if name.starts_with("restore_upload_") || name.starts_with("restore_backup_") {
+        return true;
+    }
+    name.starts_with("restore_cli_")
+        && age.is_some_and(|a| a > std::time::Duration::from_secs(60 * 60))
 }
 
 /// Host supervisor — the real `run` path.
@@ -2139,20 +2156,20 @@ async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
                 std::process::exit(1);
             }
 
-            // Copy into data_dir itself rather than pointing stage_restore
-            // at the operator's own file directly — stage_restore may
-            // overwrite its input in place (e.g. extracting a zip), and
-            // the operator's source file must never be touched.
-            let tmp_path = data_dir.join("restore_cli_upload.tmp");
-            if let Err(e) = tokio::fs::copy(path, &tmp_path).await {
-                eprintln!("error copying {}: {e}", path.display());
-                std::process::exit(1);
-            }
-
-            let result = Database::stage_restore(&tmp_path, data_dir).await;
-            if result.is_err() {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-            }
+            // Copies the operator's file into data_dir first (staging consumes
+            // its input, and their file must never be touched), the same way
+            // the web UI does. No size limit here, and a symlink is followed:
+            // the operator named this path themselves.
+            let result = bbs_core::restore_stage::stage_copy(
+                path,
+                data_dir,
+                "restore_cli_",
+                bbs_core::restore_stage::SourceRules {
+                    max_bytes: None,
+                    follow_symlinks: true,
+                },
+            )
+            .await;
 
             match result {
                 Ok(()) => {
@@ -3683,7 +3700,8 @@ mod contacts_tests {
 
 #[cfg(test)]
 mod restore_temp_sweep_tests {
-    use super::sweep_stale_restore_temp_files;
+    use super::{is_stale_restore_temp, sweep_stale_restore_temp_files};
+    use std::time::Duration;
 
     #[test]
     fn sweep_removes_only_the_web_restore_temp_copies() {
@@ -3692,11 +3710,12 @@ mod restore_temp_sweep_tests {
         let stale = [
             "restore_backup_5f6c1a5e-0000-0000-0000-000000000000.tmp",
             "restore_upload_5f6c1a5e-0000-0000-0000-000000000000.tmp",
+            "restore_upload_5f6c1a5e-0000-0000-0000-000000000000.tmp.extract.tmp",
         ];
         let keep = [
             "pending_restore.db",
             "pending_restore.staged.db",
-            "restore_cli_upload.tmp",
+            "restore_cli_5f6c1a5e-0000-0000-0000-000000000000.tmp",
             "pre-restore-safety-1789869375.db",
             "restore_backup_notes.txt",
             "bbs.sqlite",
@@ -3713,5 +3732,27 @@ mod restore_temp_sweep_tests {
         for name in keep {
             assert!(p.join(name).exists(), "{name} must be left alone");
         }
+    }
+
+    // A killed `restore stage` leaves a database-sized copy that only the
+    // next service start can collect, but a running one must not lose its file.
+    #[test]
+    fn cli_temp_copies_are_swept_only_once_they_are_old() {
+        let cli = "restore_cli_5f6c1a5e-0000-0000-0000-000000000000.tmp";
+        assert!(!is_stale_restore_temp(cli, Some(Duration::from_secs(60))));
+        assert!(!is_stale_restore_temp(cli, Some(Duration::from_secs(3600))));
+        assert!(is_stale_restore_temp(cli, Some(Duration::from_secs(3601))));
+        assert!(!is_stale_restore_temp(cli, None), "unknown age is not old");
+        // The web copies never wait: nothing else is writing them at startup.
+        assert!(is_stale_restore_temp(
+            "restore_upload_x.tmp",
+            Some(Duration::ZERO)
+        ));
+        assert!(is_stale_restore_temp("restore_backup_x.tmp", None));
+        // Only .tmp names, whatever the prefix.
+        assert!(!is_stale_restore_temp(
+            "restore_cli_x.txt",
+            Some(Duration::from_secs(99999))
+        ));
     }
 }

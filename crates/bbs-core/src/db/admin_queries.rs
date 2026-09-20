@@ -380,17 +380,14 @@ impl Database {
         let mut records = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            // Accept zip (new) and db (legacy); skip _config.toml sidecar files.
-            if ext != "zip" && ext != "db" {
-                continue;
-            }
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_owned();
-            if name.ends_with("_config.toml") {
+            // Accept zip (new) and db (legacy); the rule is shared with the
+            // restore endpoint, and it skips the `_config.toml` sidecar files.
+            if !crate::restore_stage::is_backup_file_name(&name) {
                 continue;
             }
             let Ok(meta) = tokio::fs::metadata(&path).await else {
@@ -448,7 +445,7 @@ impl Database {
         backup_dir: &str,
         filename: &str,
     ) -> Result<(), StoreError> {
-        if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        if !crate::restore_stage::backup_filename_is_safe(filename) {
             return Err(StoreError::Decode("invalid filename".into()));
         }
 
