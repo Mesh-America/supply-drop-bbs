@@ -287,11 +287,15 @@ supply-drop-bbs run    --config /etc/supply-drop-bbs/config.toml
 
 ---
 
-### `backup`
+### `backup` / `backup list` / `backup delete`
 
 ```
-supply-drop-bbs backup [OPTIONS]
+supply-drop-bbs backup [create]
+supply-drop-bbs backup list
+supply-drop-bbs backup delete <NAME> [--yes]
 ```
+
+`backup` on its own is the same as `backup create`.
 
 Trigger an immediate backup and exit. The backup lands in `<data_dir>/backups/` (or the configured `[backup] directory`) as a timestamped `.zip` holding the database (`VACUUM INTO`, non-blocking and consistent, so the running BBS service does not need to be stopped) and the `config.toml` it loaded, so a restore can bring the settings back too. If no config file is found the zip holds the database only, and the command says so.
 
@@ -308,14 +312,33 @@ Backup created: backup_20260511_142301.zip
 > bundle. Older backups are bare `.db` files; `restore stage` below accepts
 > either.
 
+#### `backup list`
+
+Lists the backups in the backup directory, newest first, with their size, creation time (UTC) and whether they include the settings (`config.toml`):
+
+```
+name                              size  created (UTC)        settings
+backup_20260920_101500.zip       2.0MB  2026-09-20 10:15:00  yes
+backup_20260101_000000.db         512B  2026-01-01 00:00:00  no
+2 backup(s) in /var/lib/supply-drop-bbs/backups
+```
+
+It only reads the directory, so it works when the database is broken.
+
+#### `backup delete`
+
+Deletes one backup by the name `backup list` shows, after a confirmation prompt (`--yes` skips it; without a terminal to ask on the command fails unless you pass it). A legacy `.db` backup's `_config.toml` sidecar goes with it. Names that are not a plain `.db` or `.zip` file name in the backup directory are refused. Like `backup list` it needs no working database. Automatic pruning (`[backup] keep_daily` / `keep_weekly`) is separate and unchanged.
+
 ---
 
 ### `restore stage` / `restore apply`
 
 ```
-supply-drop-bbs restore stage <PATH>
-supply-drop-bbs restore apply [--yes]
+supply-drop-bbs restore stage <PATH|NAME>
+supply-drop-bbs restore apply [--yes] [--no-config]
 ```
+
+`stage` takes a file path, or just a backup name as `backup list` shows it. A bare name (no directory part) is the backup of that name in the backup directory, even if a file with the same name sits in the current directory; use `./name` to mean that file instead.
 
 Validate and apply a database restore from a backup file — the CLI
 equivalent of the web UI's Backups page restore flow. Works directly

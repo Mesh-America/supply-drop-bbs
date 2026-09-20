@@ -1604,15 +1604,13 @@ impl Host for BbsHost {
         &self,
         backup_dir: &str,
     ) -> Result<Vec<AdminBackupRecord>, HostError> {
-        self.db
-            .admin_list_backups(backup_dir)
+        crate::db::Database::admin_list_backups(backup_dir)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
-        self.db
-            .admin_delete_backup(backup_dir, filename)
+        crate::db::Database::admin_delete_backup(backup_dir, filename)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
