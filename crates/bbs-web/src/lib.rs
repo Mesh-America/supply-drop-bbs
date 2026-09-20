@@ -96,7 +96,6 @@ use axum::{Extension, Json, Router};
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use axum_extra::extract::CookieJar;
 use bbs_core::restore_stage::{backup_filename_is_safe, is_backup_file_name};
-use bbs_plugin_api::admin::AdminBackupRecord;
 use bbs_plugin_api::error::{HostError, PluginError};
 use bbs_plugin_api::event::{DomainEvent, MessageRecipient};
 use bbs_plugin_api::host::Host;
@@ -3905,9 +3904,6 @@ async fn api_trigger_backup(
     if caller.permission_level < 100 {
         return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
     }
-    use std::io::Write as _;
-    use zip::{write::SimpleFileOptions, CompressionMethod};
-
     let dir = match state.backup_dir() {
         Some(d) => d,
         None => {
@@ -3919,86 +3915,15 @@ async fn api_trigger_backup(
         }
     };
 
-    // Step 1: VACUUM INTO a temporary .db file.
-    let record = match state.host.admin_trigger_backup(&dir).await {
-        Ok(r) => r,
-        Err(e) => return server_error(&e.to_string()),
-    };
-
-    // Step 2: Bundle the .db (and config if available) into a single .zip.
-    let db_path = std::path::Path::new(&dir).join(&record.filename);
-    let zip_name = record.filename.trim_end_matches(".db").to_owned() + ".zip";
-    let zip_path = std::path::Path::new(&dir).join(&zip_name);
-    let config_path_opt = state.config.config_path.clone();
-    let db_entry_name = record.filename.clone();
-
-    let zip_result = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-        // Write to a .tmp sibling; rename over the final path only on success
-        // so a crash mid-write never leaves a corrupt zip visible.
-        let mut tmp_name = zip_path.as_os_str().to_owned();
-        tmp_name.push(".tmp");
-        let tmp_zip_path = std::path::PathBuf::from(tmp_name);
-
-        let write_result = (|| -> std::io::Result<()> {
-            let file = std::fs::File::create(&tmp_zip_path)?;
-            let mut zip = zip::ZipWriter::new(file);
-            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
-
-            // Add database.
-            zip.start_file(&db_entry_name, opts)?;
-            zip.write_all(&std::fs::read(&db_path)?)?;
-
-            // Add config (best-effort — log a warning if the path doesn't exist).
-            if let Some(ref cfg) = config_path_opt {
-                if !cfg.is_empty() {
-                    match std::fs::read(cfg) {
-                        Ok(bytes) => {
-                            zip.start_file("config.toml", opts)?;
-                            zip.write_all(&bytes)?;
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "backup: could not include config file '{}': {} \
-                                 — set config_path in [plugins.web] to the full \
-                                 path of your config.toml",
-                                cfg,
-                                e
-                            );
-                        }
-                    }
-                }
-            }
-
-            let inner = zip.finish()?;
-            inner.sync_all()?;
-            drop(inner);
-            std::fs::rename(&tmp_zip_path, &zip_path)
-        })();
-
-        if write_result.is_err() {
-            let _ = std::fs::remove_file(&tmp_zip_path);
-            return write_result.map(|_| 0);
-        }
-
-        // Remove the raw .db now that it is safely inside the zip.
-        let _ = std::fs::remove_file(&db_path);
-
-        Ok(std::fs::metadata(&zip_path)?.len())
-    })
-    .await;
-
-    match zip_result {
-        Ok(Ok(zip_size)) => {
-            let zip_record = AdminBackupRecord {
-                filename: zip_name,
-                size_bytes: zip_size,
-                created_at: record.created_at,
-                config_filename: None,
-                config_size_bytes: None,
-            };
-            (StatusCode::CREATED, Json(zip_record)).into_response()
-        }
-        Ok(Err(e)) => server_error(&e.to_string()),
+    // One `.zip` holding the database and, when the config file's location is
+    // known, the `config.toml` it runs with, so a restore can bring the
+    // settings back too. The automatic and CLI backups make the same bundle.
+    match state
+        .host
+        .admin_trigger_backup_bundle(&dir, state.config.config_path.as_deref())
+        .await
+    {
+        Ok(record) => (StatusCode::CREATED, Json(record)).into_response(),
         Err(e) => server_error(&e.to_string()),
     }
 }
@@ -4123,12 +4048,29 @@ fn restore_already_confirmed() -> Response {
 }
 
 /// Query string of `POST /api/v1/backups/:filename/restore`.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 struct StageBackupQuery {
     /// Confirm the restore in the same request, without releasing the restore
     /// lock in between (see `api_stage_backup_restore`).
     #[serde(default)]
     apply: bool,
+    /// With `apply`, restore the backup's `config.toml` (its settings) too.
+    /// On by default; `config=false` restores the database only.
+    #[serde(default = "restore_config_default")]
+    config: bool,
+}
+
+/// Query string of `POST /api/v1/backups/restore/apply`.
+#[derive(Debug, Deserialize)]
+struct ApplyRestoreQuery {
+    /// Restore the staged backup's `config.toml` (its settings) too. On by
+    /// default; `config=false` restores the database only.
+    #[serde(default = "restore_config_default")]
+    config: bool,
+}
+
+fn restore_config_default() -> bool {
+    true
 }
 
 /// Confirms the staged restore: promotes it to the name `main.rs`'s startup
@@ -4148,13 +4090,16 @@ async fn confirm_staged_restore(
     state: &Arc<AppState>,
     caller: &CurrentUser,
     data_dir: &str,
+    include_config: bool,
     _restore_guard: &tokio::sync::MutexGuard<'_, ()>,
 ) -> Response {
     let state = Arc::clone(state);
     let caller = caller.clone();
     let data_dir = data_dir.to_owned();
-    match tokio::spawn(async move { confirm_staged_restore_now(&state, &caller, &data_dir).await })
-        .await
+    match tokio::spawn(async move {
+        confirm_staged_restore_now(&state, &caller, &data_dir, include_config).await
+    })
+    .await
     {
         Ok(response) => response,
         Err(e) => server_error(&format!("confirming the restore: {e}")),
@@ -4166,8 +4111,13 @@ async fn confirm_staged_restore_now(
     state: &AppState,
     caller: &CurrentUser,
     data_dir: &str,
+    include_config: bool,
 ) -> Response {
-    if let Err(e) = state.host.admin_apply_staged_restore(data_dir).await {
+    if let Err(e) = state
+        .host
+        .admin_apply_staged_restore_with(data_dir, include_config)
+        .await
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(json_error(&format!(
@@ -4183,7 +4133,11 @@ async fn confirm_staged_restore_now(
             &format!("web:{}", caller.username),
             "restore_applied",
             None,
-            None,
+            Some(if include_config {
+                "settings (config.toml) restored too, when the backup has them"
+            } else {
+                "database only; settings not restored"
+            }),
         )
         .await;
 
@@ -4312,7 +4266,8 @@ async fn api_stage_backup_restore(
         .await;
 
     if query.apply {
-        return confirm_staged_restore(&state, &caller, &data_dir, &restore_guard).await;
+        return confirm_staged_restore(&state, &caller, &data_dir, query.config, &restore_guard)
+            .await;
     }
     Json(serde_json::json!({
         "message": "backup validated and staged — confirm it with \
@@ -4500,6 +4455,7 @@ async fn api_upload_restore(
 async fn api_apply_restore(
     State(state): State<Arc<AppState>>,
     Extension(caller): Extension<CurrentUser>,
+    Query(query): Query<ApplyRestoreQuery>,
 ) -> Response {
     if caller.permission_level < 100 {
         return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
@@ -4521,7 +4477,7 @@ async fn api_apply_restore(
         return restore_already_confirmed();
     }
 
-    confirm_staged_restore(&state, &caller, &data_dir, &restore_guard).await
+    confirm_staged_restore(&state, &caller, &data_dir, query.config, &restore_guard).await
 }
 
 // ── Domain event formatting ───────────────────────────────────────────────────
@@ -5653,12 +5609,25 @@ mod tests {
             stage_with(f, caller, name, false).await
         }
 
+        async fn stage_with_config(f: &Fixture, name: &str, apply: bool, config: bool) -> Response {
+            api_stage_backup_restore(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path(name.to_owned()),
+                Query(StageBackupQuery { apply, config }),
+            )
+            .await
+        }
+
         async fn stage_with(f: &Fixture, caller: CurrentUser, name: &str, apply: bool) -> Response {
             api_stage_backup_restore(
                 State(Arc::clone(&f.state)),
                 Extension(caller),
                 Path(name.to_owned()),
-                Query(StageBackupQuery { apply }),
+                Query(StageBackupQuery {
+                    apply,
+                    config: true,
+                }),
             )
             .await
         }
@@ -5720,7 +5689,7 @@ mod tests {
             zip.start_file(&db_name, zip::write::SimpleFileOptions::default())
                 .unwrap();
             zip.write_all(&std::fs::read(&db_path).unwrap()).unwrap();
-            // The real bundle also carries the config, which restore ignores.
+            // The real bundle also carries the config, which is staged with it.
             zip.start_file("config.toml", zip::write::SimpleFileOptions::default())
                 .unwrap();
             zip.write_all(b"[bbs]\nname = \"Restored\"\n").unwrap();
@@ -5731,7 +5700,10 @@ mod tests {
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(
                 data_dir_files(&f),
-                vec!["pending_restore.staged.db".to_owned()]
+                vec![
+                    "pending_restore.staged.config.toml".to_owned(),
+                    "pending_restore.staged.db".to_owned()
+                ]
             );
             assert!(
                 f.backup_dir.path().join(&zip_name).exists(),
@@ -5850,6 +5822,99 @@ mod tests {
             );
         }
 
+        // ── settings travel with the backup ───────────────────────────────────
+
+        async fn make_bundle_with_settings(f: &mut Fixture) -> String {
+            let cfg = f.backup_dir.path().join("source-config.toml");
+            std::fs::write(&cfg, "[bbs]\nname = \"Restored Name\"\n").unwrap();
+            Arc::get_mut(&mut f.state)
+                .expect("the fixture holds the only reference")
+                .config
+                .config_path = Some(cfg.to_string_lossy().into());
+            let resp = api_trigger_backup(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let body = body_json(resp).await;
+            assert!(
+                body["filename"].as_str().unwrap().ends_with(".zip"),
+                "{body}"
+            );
+            assert_eq!(body["config_filename"], "config.toml", "{body}");
+            body["filename"].as_str().unwrap().to_owned()
+        }
+
+        #[tokio::test]
+        async fn create_backup_bundles_the_settings_and_a_restore_stages_them() {
+            let mut f = fixture().await;
+            let name = make_bundle_with_settings(&mut f).await;
+
+            let resp = stage_with_config(&f, &name, false, true).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                data_dir_files(&f),
+                vec![
+                    "pending_restore.staged.config.toml".to_owned(),
+                    "pending_restore.staged.db".to_owned()
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn apply_confirms_the_settings_with_the_database_by_default() {
+            if running_under_systemd() {
+                return;
+            }
+            let mut f = fixture().await;
+            let name = make_bundle_with_settings(&mut f).await;
+            assert_eq!(
+                stage_with_config(&f, &name, true, true).await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(
+                data_dir_files(&f),
+                vec![
+                    "pending_restore.config.toml".to_owned(),
+                    "pending_restore.db".to_owned()
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn config_false_restores_the_database_only() {
+            if running_under_systemd() {
+                return;
+            }
+            let mut f = fixture().await;
+            let name = make_bundle_with_settings(&mut f).await;
+            assert_eq!(
+                stage_with_config(&f, &name, true, false).await.status(),
+                StatusCode::OK
+            );
+            assert_eq!(data_dir_files(&f), vec!["pending_restore.db".to_owned()]);
+        }
+
+        // The upload flow confirms through the apply endpoint, which takes the
+        // same choice.
+        #[tokio::test]
+        async fn the_apply_endpoint_honours_config_false() {
+            if running_under_systemd() {
+                return;
+            }
+            let mut f = fixture().await;
+            let name = make_bundle_with_settings(&mut f).await;
+            assert_eq!(
+                stage_with_config(&f, &name, false, true).await.status(),
+                StatusCode::OK
+            );
+            let resp = api_apply_restore(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Query(ApplyRestoreQuery { config: false }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(data_dir_files(&f), vec!["pending_restore.db".to_owned()]);
+        }
+
         #[tokio::test]
         async fn apply_query_confirms_the_restore_in_the_same_request() {
             if running_under_systemd() {
@@ -5902,7 +5967,12 @@ mod tests {
                 stage(&f, sysop(), &name).await.status(),
                 StatusCode::CONFLICT
             );
-            let apply = api_apply_restore(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            let apply = api_apply_restore(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Query(ApplyRestoreQuery { config: true }),
+            )
+            .await;
             assert_eq!(apply.status(), StatusCode::CONFLICT);
             assert!(data_dir_files(&f).is_empty());
         }
@@ -5928,7 +5998,12 @@ mod tests {
             let name = make_db_backup(&f).await;
             assert_eq!(stage(&f, sysop(), &name).await.status(), StatusCode::OK);
 
-            let resp = api_apply_restore(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            let resp = api_apply_restore(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Query(ApplyRestoreQuery { config: true }),
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(data_dir_files(&f), vec!["pending_restore.db".to_owned()]);
         }
@@ -5939,7 +6014,12 @@ mod tests {
                 return;
             }
             let f = fixture().await;
-            let resp = api_apply_restore(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            let resp = api_apply_restore(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Query(ApplyRestoreQuery { config: true }),
+            )
+            .await;
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
             assert!(data_dir_files(&f).is_empty());
         }

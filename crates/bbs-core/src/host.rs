@@ -1656,10 +1656,70 @@ impl Host for BbsHost {
         })
     }
 
+    async fn admin_trigger_backup_bundle(
+        &self,
+        backup_dir: &str,
+        config_path: Option<&str>,
+    ) -> Result<AdminBackupRecord, HostError> {
+        let record = self.admin_trigger_backup(backup_dir).await?;
+        let db_path = std::path::Path::new(backup_dir).join(&record.filename);
+        let zip_name = record.filename.trim_end_matches(".db").to_owned() + ".zip";
+        let zip_path = std::path::Path::new(backup_dir).join(&zip_name);
+        let config_path = config_path
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from);
+
+        let (db, entry, zip) = (db_path.clone(), record.filename.clone(), zip_path.clone());
+        let bundled = tokio::task::spawn_blocking(move || {
+            let db_len = std::fs::metadata(&db)?.len();
+            if let Some(dir) = zip.parent() {
+                crate::disk_space::ensure_free_space(dir, db_len).map_err(std::io::Error::other)?;
+            }
+            crate::backup_bundle::bundle_and_drop_bare(&db, &entry, config_path.as_deref(), &zip)
+        })
+        .await
+        .map_err(|e| HostError::Storage(format!("bundling the backup: {e}")))?;
+
+        match bundled {
+            Ok(info) => Ok(AdminBackupRecord {
+                filename: zip_name,
+                size_bytes: info.zip_bytes,
+                created_at: record.created_at,
+                config_filename: info
+                    .config_bytes
+                    .map(|_| crate::backup_bundle::CONFIG_ENTRY.to_owned()),
+                config_size_bytes: info.config_bytes,
+            }),
+            Err(e) => {
+                // Never lose the backup that was just taken: the database-only
+                // copy stays, and the caller is told it has no settings.
+                tracing::warn!(
+                    "backup: could not bundle the database with the config ({e}); keeping \
+                     the database-only backup {}",
+                    record.filename
+                );
+                Ok(record)
+            }
+        }
+    }
+
     async fn admin_apply_staged_restore(&self, data_dir: &str) -> Result<(), HostError> {
         crate::db::Database::admin_apply_staged_restore(std::path::Path::new(data_dir))
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_apply_staged_restore_with(
+        &self,
+        data_dir: &str,
+        include_config: bool,
+    ) -> Result<(), HostError> {
+        crate::db::Database::admin_apply_staged_restore_with(
+            std::path::Path::new(data_dir),
+            include_config,
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
     async fn admin_write_audit(
@@ -10125,6 +10185,202 @@ mod tests {
             left,
             ["pending_restore.staged.db"],
             "no temp copy may remain"
+        );
+    }
+
+    // ── backup bundles carry the settings, and a restore brings them back ────
+
+    /// A bundle of the live database with `config_text` as its config.toml.
+    async fn make_bundle(
+        host: &BbsHost,
+        backups: &std::path::Path,
+        config_text: &str,
+    ) -> (String, std::path::PathBuf) {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path().join("config.toml");
+        std::fs::write(&cfg, config_text).unwrap();
+        let rec = host
+            .admin_trigger_backup_bundle(&backups.to_string_lossy(), Some(&cfg.to_string_lossy()))
+            .await
+            .unwrap();
+        assert!(rec.filename.ends_with(".zip"), "{rec:?}");
+        assert_eq!(rec.config_filename.as_deref(), Some("config.toml"));
+        (rec.filename.clone(), backups.join(&rec.filename))
+    }
+
+    #[tokio::test]
+    async fn a_backup_bundle_is_listed_with_its_settings_and_holds_no_stray_db() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (name, _path) = make_bundle(&host, backups.path(), "[bbs]\nname = \"Mine\"\n").await;
+
+        let listed = host
+            .admin_list_backups(&backups.path().to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].filename, name);
+        assert_eq!(listed[0].config_filename.as_deref(), Some("config.toml"));
+        assert_eq!(listed[0].config_size_bytes, Some(20));
+        let files: Vec<String> = std::fs::read_dir(backups.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, [name], "only the zip may be left");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_without_a_known_config_is_a_database_only_zip() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let rec = host
+            .admin_trigger_backup_bundle(&backups.path().to_string_lossy(), None)
+            .await
+            .unwrap();
+        assert!(rec.filename.ends_with(".zip"));
+        assert_eq!(rec.config_filename, None);
+        let listed = host
+            .admin_list_backups(&backups.path().to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(listed[0].config_filename, None);
+    }
+
+    // The whole path: back up with settings, restore, and the BBS name (and the
+    // other settings in the file) come back, while this machine's own paths and
+    // radio connection stay.
+    #[tokio::test]
+    async fn restoring_a_bundle_brings_back_the_settings_and_keeps_machine_specific_keys() {
+        use crate::restore_apply::{apply_pending_restore, ApplyOutcome, ConfigOutcome};
+
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (_name, zip) = make_bundle(
+            &host,
+            backups.path(),
+            "[bbs]\nname = \"The Old Name\"\nwelcome_msg = \"Welcome back\"\ndata_dir = \"/old/box\"\n\
+             [plugins.web]\nbind = \"0.0.0.0:9\"\n",
+        )
+        .await;
+
+        // The "current" machine: a different name and paths.
+        let data_dir = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[bbs]\nname = \"The New Name\"\ndata_dir = \"/this/box\"\n\
+             [plugins.web]\nbind = \"127.0.0.1:8080\"\n",
+        )
+        .unwrap();
+
+        let data = data_dir.path().to_string_lossy().into_owned();
+        host.admin_stage_backup_restore(&zip.to_string_lossy(), &data)
+            .await
+            .expect("the bundle stages");
+        assert!(
+            data_dir
+                .path()
+                .join(crate::restore_config::STAGED_CONFIG_NAME)
+                .exists(),
+            "the settings are staged with the database"
+        );
+        host.admin_apply_staged_restore_with(&data, true)
+            .await
+            .unwrap();
+        assert!(data_dir
+            .path()
+            .join(crate::restore_config::PENDING_CONFIG_NAME)
+            .exists());
+
+        // "Next start": the live database is a different file.
+        let live_db = data_dir.path().join("bbs.sqlite");
+        let out = apply_pending_restore(data_dir.path(), &live_db, Some(&cfg)).await;
+        let ApplyOutcome::Applied {
+            config: ConfigOutcome::Applied(_),
+            ..
+        } = out
+        else {
+            panic!("{out:?}");
+        };
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("name = \"The Old Name\""), "{text}");
+        assert!(text.contains("welcome_msg = \"Welcome back\""), "{text}");
+        assert!(text.contains("data_dir = \"/this/box\""), "{text}");
+        assert!(text.contains("bind = \"127.0.0.1:8080\""), "{text}");
+        assert!(!text.contains("0.0.0.0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn choosing_database_only_discards_the_settings() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (_n, zip) = make_bundle(&host, backups.path(), "[bbs]\nname = \"X\"\n").await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_string_lossy().into_owned();
+
+        host.admin_stage_backup_restore(&zip.to_string_lossy(), &data)
+            .await
+            .unwrap();
+        host.admin_apply_staged_restore_with(&data, false)
+            .await
+            .unwrap();
+
+        assert!(data_dir.path().join("pending_restore.db").exists());
+        for name in [
+            crate::restore_config::STAGED_CONFIG_NAME,
+            crate::restore_config::PENDING_CONFIG_NAME,
+        ] {
+            assert!(!data_dir.path().join(name).exists(), "{name}");
+        }
+    }
+
+    // A staged config always belongs to the staged database: staging a bare
+    // database afterwards must not leave the earlier bundle's settings to be
+    // confirmed with it.
+    #[tokio::test]
+    async fn staging_a_database_without_settings_clears_earlier_staged_settings() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (_n, zip) = make_bundle(&host, backups.path(), "[bbs]\nname = \"X\"\n").await;
+        let bare = host
+            .admin_trigger_backup(&backups.path().to_string_lossy())
+            .await
+            .unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_string_lossy().into_owned();
+        let staged_cfg = data_dir
+            .path()
+            .join(crate::restore_config::STAGED_CONFIG_NAME);
+
+        host.admin_stage_backup_restore(&zip.to_string_lossy(), &data)
+            .await
+            .unwrap();
+        assert!(staged_cfg.exists());
+        host.admin_stage_backup_restore(
+            &backups.path().join(&bare.filename).to_string_lossy(),
+            &data,
+        )
+        .await
+        .unwrap();
+        assert!(!staged_cfg.exists(), "the bare database has no settings");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_with_an_unparseable_config_is_refused_at_staging() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (_n, zip) = make_bundle(&host, backups.path(), "[bbs\nname = ").await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let err = host
+            .admin_stage_backup_restore(&zip.to_string_lossy(), &data_dir.path().to_string_lossy())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+        assert!(
+            std::fs::read_dir(data_dir.path()).unwrap().next().is_none(),
+            "nothing may be staged or left behind"
         );
     }
 

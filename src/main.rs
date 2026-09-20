@@ -22,7 +22,10 @@ mod setup;
 
 use std::{path::PathBuf, sync::Arc};
 
-use bbs_core::{restore_apply::ApplyOutcome, BbsHost, Database};
+use bbs_core::{
+    restore_apply::{ApplyOutcome, ConfigOutcome},
+    BbsHost, Database,
+};
 use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
@@ -206,6 +209,13 @@ enum RestoreAction {
         /// prompt — for scripted/non-interactive use.
         #[arg(long)]
         yes: bool,
+        /// Restore the database only. By default a backup bundle's
+        /// `config.toml` (the settings: BBS name, welcome message, and so on)
+        /// is restored with it; the parts that belong to this machine (paths, the
+        /// web and CLI plugins, the database, backup and security sections, the
+        /// radio connection) always keep this machine's values.
+        #[arg(long)]
+        no_config: bool,
     },
 }
 
@@ -726,6 +736,41 @@ fn sweep_stale_restore_temp_files(data_dir: &std::path::Path) {
     }
 }
 
+/// Delete `backup_*.zip.tmp` files in the backup directory that are over an hour
+/// old: a bundle being written when the process died. Each holds a full copy of
+/// the database and, being a `.tmp`, is never listed or pruned. A bundle still
+/// being written (a backup running as this starts) is younger and left alone.
+fn sweep_stale_bundle_temp_files(backup_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(backup_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        let stale = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| is_stale_bundle_temp(n, age));
+        if stale {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => info!(path = %entry.path().display(), "removed stale backup temp file"),
+                Err(e) => {
+                    warn!(path = %entry.path().display(), "could not remove stale backup temp file: {e}")
+                }
+            }
+        }
+    }
+}
+
+fn is_stale_bundle_temp(name: &str, age: Option<std::time::Duration>) -> bool {
+    name.starts_with("backup_")
+        && name.ends_with(".zip.tmp")
+        && age.is_some_and(|a| a > std::time::Duration::from_secs(60 * 60))
+}
+
 /// Whether `name` is a restore temp copy that is safe to delete at startup, given
 /// how long ago it was last written (`None` if unknown).
 fn is_stale_restore_temp(name: &str, age: Option<std::time::Duration>) -> bool {
@@ -737,6 +782,40 @@ fn is_stale_restore_temp(name: &str, age: Option<std::time::Duration>) -> bool {
     }
     name.starts_with("restore_cli_")
         && age.is_some_and(|a| a > std::time::Duration::from_secs(60 * 60))
+}
+
+/// The config file to put in a backup bundle: the one this process loaded, as an
+/// absolute path (the service starts from `/`, so a relative one would not
+/// resolve later). `None` if the config came from defaults alone.
+fn bundled_config_path(cli: &Cli) -> Option<String> {
+    config::resolve_config_path(cli.config.as_deref())
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Apply the `--data-dir` and `--log-level` command-line overrides to a loaded
+/// config.
+///
+/// `--data-dir` clears the derived paths (DB, log file, backup dir, CLI socket)
+/// so that `resolve()` re-derives them under the new data dir. Callers who want
+/// to keep an explicit `database.path` can set it in the TOML.
+fn apply_cli_overrides(mut cfg: config::Config, cli: &Cli) -> Result<config::Config, String> {
+    if let Some(ref dd) = cli.data_dir {
+        cfg.bbs.data_dir = Some(dd.clone());
+        cfg.database.path = None;
+        cfg.logging.file = None;
+        cfg.backup.directory = None;
+        #[cfg(feature = "transport-cli")]
+        {
+            cfg.plugins.cli.socket = None;
+        }
+        cfg = cfg.resolve();
+    }
+    if let Some(ref level_str) = cli.log_level {
+        use std::str::FromStr;
+        cfg.logging.level = config::LogLevel::from_str(level_str).map_err(|e| e.to_string())?;
+    }
+    Ok(cfg)
 }
 
 /// Host supervisor — the real `run` path.
@@ -759,35 +838,17 @@ async fn cmd_run(cli: &Cli) {
         }
     };
 
-    // Apply --data-dir override.  When this flag is set we clear the
-    // derived paths (DB, log file, backup dir, CLI socket) so that
-    // resolve() re-derives them under the new data_dir.  Callers who
-    // want to keep an explicit database.path can set it in the TOML.
-    if let Some(ref dd) = cli.data_dir {
-        cfg.bbs.data_dir = Some(dd.clone());
-        cfg.database.path = None;
-        cfg.logging.file = None;
-        cfg.backup.directory = None;
-        #[cfg(feature = "transport-cli")]
-        {
-            cfg.plugins.cli.socket = None;
-        }
-        cfg = cfg.resolve();
-    }
-
-    // Apply --log-level override; parsed before tracing init so we can
-    // announce the stomp (ADR-0009) in the first log line.
+    // Apply the --data-dir and --log-level overrides. The log level is parsed
+    // before tracing init so we can announce the stomp (ADR-0009) in the first
+    // log line.
     let cli_level_str = cli.log_level.clone();
-    if let Some(ref level_str) = cli_level_str {
-        use std::str::FromStr;
-        match config::LogLevel::from_str(level_str) {
-            Ok(l) => cfg.logging.level = l,
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
+    cfg = match apply_cli_overrides(cfg, cli) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
-    }
+    };
 
     // ── 2. Tracing ────────────────────────────────────────────────────────────
 
@@ -871,11 +932,10 @@ async fn cmd_run(cli: &Cli) {
     }
 
     // ── 3. Data directory ─────────────────────────────────────────────────────
-    let data_dir = cfg
-        .bbs
-        .data_dir
-        .as_ref()
-        .expect("data_dir set by resolve()");
+    // Owned, because a restore can replace `cfg` below (the data directory
+    // itself is a machine-specific key a restore keeps).
+    let data_dir_owned = cfg.bbs.data_dir.clone().expect("data_dir set by resolve()");
+    let data_dir = &data_dir_owned;
 
     if let Err(e) = std::fs::create_dir_all(data_dir) {
         error!(path = %data_dir.display(), "could not create data directory: {e}");
@@ -884,6 +944,9 @@ async fn cmd_run(cli: &Cli) {
 
     // ── 3a. Remove restore temp copies orphaned by an interrupted request ───────
     sweep_stale_restore_temp_files(data_dir);
+    if let Some(dir) = cfg.backup.directory.as_deref() {
+        sweep_stale_bundle_temp_files(dir);
+    }
 
     // ── 3b. Apply a staged database restore, if one is pending ─────────────────
     // Must run before Database::open (below): this fresh process has no live
@@ -906,7 +969,7 @@ async fn cmd_run(cli: &Cli) {
     let db_path_for_restore = cfg
         .database
         .path
-        .as_ref()
+        .clone()
         .expect("database.path set by resolve()");
     // A restore that can't be applied never stops startup (a crash loop under
     // `Restart=always` would take the web admin, the place to sort it out,
@@ -915,19 +978,66 @@ async fn cmd_run(cli: &Cli) {
     // open (the sysop's only in-app trace of a restore that did not go as the
     // UI promised).
     let mut restore_audit: Option<(&str, String)> = None;
-    match bbs_core::restore_apply::apply_pending_restore(data_dir, db_path_for_restore).await {
+    let config_path = config::resolve_config_path(cli.config.as_deref());
+    match bbs_core::restore_apply::apply_pending_restore(
+        data_dir,
+        &db_path_for_restore,
+        config_path.as_deref(),
+    )
+    .await
+    {
         ApplyOutcome::NothingPending => {}
         ApplyOutcome::Applied {
             snapshot,
             snapshot_has_wal_copy,
+            config,
         } => {
-            restore_audit = Some((
-                "restore_completed",
-                snapshot.as_ref().map_or_else(
-                    || "no previous database to snapshot".to_owned(),
-                    |s| format!("previous database saved as {}", s.display()),
-                ),
-            ));
+            let mut detail = snapshot.as_ref().map_or_else(
+                || "no previous database to snapshot".to_owned(),
+                |s| format!("previous database saved as {}", s.display()),
+            );
+            match config {
+                ConfigOutcome::NotIncluded => {}
+                ConfigOutcome::Failed(why) => {
+                    warn!(
+                        "the database was restored but its settings (config.toml) were NOT: {why}"
+                    );
+                    detail.push_str(&format!("; settings NOT restored: {why}"));
+                }
+                ConfigOutcome::Applied(applied) => {
+                    // Keep the new config only if it loads: one that does not
+                    // would stop every later start, so put the old one back.
+                    let path = config_path
+                        .as_deref()
+                        .expect("a config was applied, so its path is known");
+                    let reloaded = bbs_core::restore_config::settle_applied(path, &applied, || {
+                        config::load(cli.config.as_deref())
+                            .map_err(|e| e.to_string())
+                            .and_then(|c| apply_cli_overrides(c, cli))
+                    });
+                    match reloaded {
+                        Ok(new_cfg) => {
+                            cfg = new_cfg;
+                            info!(
+                                "settings restored from the backup (config.toml); the log level \
+                                 and format take effect at the next restart"
+                            );
+                            detail.push_str("; settings restored from the backup");
+                        }
+                        Err(why) => {
+                            error!(
+                                "the config.toml from the backup does not load ({why}); the \
+                                 previous one was kept"
+                            );
+                            detail.push_str(&format!(
+                                "; settings NOT restored: the config.toml in the backup does \
+                                 not load ({why})"
+                            ));
+                        }
+                    }
+                }
+            }
+            restore_audit = Some(("restore_completed", detail));
             match &snapshot {
                 Some(s) => info!(
                     snapshot = %s.display(),
@@ -1049,6 +1159,7 @@ async fn cmd_run(cli: &Cli) {
             let keep_weekly = cfg.backup.keep_weekly;
             let interval_hours = cfg.backup.interval_hours;
             let host_backup = Arc::clone(&host);
+            let backup_config_path = bundled_config_path(cli);
             info!(
                 dir = %backup_dir.display(),
                 interval_hours,
@@ -1065,9 +1176,16 @@ async fn cmd_run(cli: &Cli) {
                         continue;
                     }
                     let dir_str = backup_dir.to_string_lossy();
-                    match host_backup.admin_trigger_backup(&dir_str).await {
+                    match host_backup
+                        .admin_trigger_backup_bundle(&dir_str, backup_config_path.as_deref())
+                        .await
+                    {
                         Ok(rec) => {
-                            info!(filename = %rec.filename, "automatic backup completed");
+                            info!(
+                                filename = %rec.filename,
+                                settings_included = rec.config_filename.is_some(),
+                                "automatic backup completed"
+                            );
                             prune_backups(&host_backup, &dir_str, keep_daily, keep_weekly).await;
                         }
                         Err(e) => warn!("automatic backup failed: {e}"),
@@ -1143,22 +1261,9 @@ async fn cmd_run(cli: &Cli) {
         // Resolve the config file to an absolute path so the web plugin can
         // bundle the correct config.toml into backup zips regardless of the
         // process working directory (e.g. systemd starts from /).
-        let cfg_abs: Option<String> = if let Some(ref p) = cli.config {
-            p.canonicalize()
-                .ok()
-                .map(|abs| abs.to_string_lossy().into_owned())
-        } else {
-            // No --config flag: try the same search order as config::load so
-            // we can still find the file that was actually loaded.
-            [
-                std::path::PathBuf::from("config.toml"),
-                std::path::PathBuf::from("/etc/supply-drop-bbs/config.toml"),
-            ]
-            .iter()
-            .find(|p| p.exists())
-            .and_then(|p| p.canonicalize().ok())
-            .map(|abs| abs.to_string_lossy().into_owned())
-        };
+        // The same file the config loader and the backups use, so the settings page
+        // and every backup bundle agree on which config this is.
+        let cfg_abs: Option<String> = bundled_config_path(cli);
         let wp = init_web_plugin(
             &cfg.plugins.web,
             Arc::clone(&host),
@@ -2123,10 +2228,21 @@ async fn cmd_backup(cli: &Cli) {
     }
 
     let dir_str = backup_dir.to_string_lossy();
-    match host.admin_trigger_backup(&dir_str).await {
+    match host
+        .admin_trigger_backup_bundle(&dir_str, bundled_config_path(cli).as_deref())
+        .await
+    {
         Ok(rec) => {
             println!("Backup created: {}", rec.filename);
             println!("  size:     {} bytes", rec.size_bytes);
+            if rec.config_filename.is_some() {
+                println!("  settings: config.toml included");
+            } else {
+                println!(
+                    "  settings: NOT included (no readable config.toml was found; \
+                     pass --config to include one)"
+                );
+            }
             println!("  location: {}", backup_dir.display());
         }
         Err(e) => {
@@ -2185,13 +2301,14 @@ async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
                 }
             }
         }
-        RestoreAction::Apply { yes } => {
+        RestoreAction::Apply { yes, no_config } => {
             if !*yes {
                 let confirmed = dialoguer::Confirm::new()
                     .with_prompt(
-                        "This will replace the live database the next time the BBS starts. \
-                         A safety snapshot of the current database is taken first, but this \
-                         is still a destructive operation. Continue?",
+                        "This will replace the live database (and, if the backup has them, \
+                         its settings) the next time the BBS starts. A safety snapshot of \
+                         the current database is taken first, but this is still a \
+                         destructive operation. Continue?",
                     )
                     .default(false)
                     .interact()
@@ -2202,7 +2319,7 @@ async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
                 }
             }
 
-            match Database::admin_apply_staged_restore(data_dir).await {
+            match Database::admin_apply_staged_restore_with(data_dir, !*no_config).await {
                 Ok(()) => {
                     println!("Restore confirmed.");
                     println!(
@@ -3736,6 +3853,25 @@ mod restore_temp_sweep_tests {
 
     // A killed `restore stage` leaves a database-sized copy that only the
     // next service start can collect, but a running one must not lose its file.
+    #[test]
+    fn only_old_backup_bundle_temp_files_are_swept() {
+        use super::is_stale_bundle_temp;
+        let old = Some(Duration::from_secs(3601));
+        assert!(is_stale_bundle_temp("backup_20260101_000000.zip.tmp", old));
+        assert!(!is_stale_bundle_temp(
+            "backup_20260101_000000.zip.tmp",
+            Some(Duration::from_secs(60))
+        ));
+        assert!(!is_stale_bundle_temp(
+            "backup_20260101_000000.zip.tmp",
+            None
+        ));
+        // Real backups and anything else are never touched.
+        assert!(!is_stale_bundle_temp("backup_20260101_000000.zip", old));
+        assert!(!is_stale_bundle_temp("backup_20260101_000000.db", old));
+        assert!(!is_stale_bundle_temp("notes.zip.tmp", old));
+    }
+
     #[test]
     fn cli_temp_copies_are_swept_only_once_they_are_old() {
         let cli = "restore_cli_5f6c1a5e-0000-0000-0000-000000000000.tmp";

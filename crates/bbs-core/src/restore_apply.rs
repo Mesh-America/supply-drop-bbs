@@ -25,6 +25,7 @@ use tracing::{info, warn};
 
 use crate::db::Database;
 use crate::disk_space::ensure_free_space;
+use crate::restore_config::{apply_config, ConfigApplied, PENDING_CONFIG_NAME};
 
 /// How many `pre-restore-safety-*.db` snapshots are kept, the newest first.
 /// One is not enough: restoring A and then B would delete the snapshot of the
@@ -38,6 +39,21 @@ const SNAPSHOT_PREFIX: &str = "pre-restore-safety-";
 const SNAPSHOT_SUFFIX: &str = ".db";
 const ASIDE_SUFFIX: &str = ".restore-aside";
 const SIDECARS: [&str; 2] = ["-wal", "-shm"];
+
+/// What became of the settings that came with a restored backup.
+#[derive(Debug)]
+pub enum ConfigOutcome {
+    /// The restore carried no config (a raw `.db`, an older zip, or the sysop
+    /// chose not to restore settings).
+    NotIncluded,
+    /// The config file was replaced (its machine-specific keys kept). The
+    /// caller must check that it loads and, if it does not, revert it with
+    /// [`crate::restore_config::revert_config`].
+    Applied(ConfigApplied),
+    /// The config could not be applied; the running one is unchanged. The
+    /// database restore stands.
+    Failed(String),
+}
 
 /// What [`apply_pending_restore`] did.
 #[derive(Debug)]
@@ -53,6 +69,8 @@ pub enum ApplyOutcome {
         /// a byte copy of its `-wal` sidecar sits next to the snapshot as
         /// `pre-restore-safety-<n>.db-wal` and must stay with it.
         snapshot_has_wal_copy: bool,
+        /// What happened to the `config.toml` that came with the backup.
+        config: ConfigOutcome,
     },
     /// The restore could not be applied. The live database was not changed.
     Rejected {
@@ -65,10 +83,26 @@ pub enum ApplyOutcome {
 }
 
 /// Apply `data_dir/pending_restore.db` over the database at `db_path`, if there
-/// is one. Never exits or panics on a failed restore; see the module docs.
-pub async fn apply_pending_restore(data_dir: &Path, db_path: &Path) -> ApplyOutcome {
+/// is one, and then the config that came with it over the one at
+/// `config_path` (`None` if the location of the config file is not known).
+/// Never exits or panics on a failed restore; see the module docs.
+pub async fn apply_pending_restore(
+    data_dir: &Path,
+    db_path: &Path,
+    config_path: Option<&Path>,
+) -> ApplyOutcome {
     let pending = data_dir.join(PENDING_NAME);
+    let pending_config = data_dir.join(PENDING_CONFIG_NAME);
     if !pending.exists() {
+        // A confirmed config belongs to a confirmed database; alone it must
+        // never be applied.
+        if std::fs::remove_file(&pending_config).is_ok() {
+            warn!(
+                "discarded a restored config.toml that had no database restore to go with it \
+                 (the restart between confirming a restore and applying it may have been \
+                 interrupted)"
+            );
+        }
         return ApplyOutcome::NothingPending;
     }
     info!(path = %pending.display(), "applying staged database restore");
@@ -76,16 +110,44 @@ pub async fn apply_pending_restore(data_dir: &Path, db_path: &Path) -> ApplyOutc
     match apply(data_dir, db_path, &pending).await {
         Ok((snapshot, snapshot_has_wal_copy)) => {
             prune_old_snapshots(data_dir, snapshot.as_deref());
+            let config = apply_pending_config(&pending_config, config_path);
             ApplyOutcome::Applied {
                 snapshot,
                 snapshot_has_wal_copy,
+                config,
             }
         }
-        Err(reason) => ApplyOutcome::Rejected {
-            reason,
-            set_aside: set_aside(data_dir, &pending, FAILED_NAME),
-        },
+        Err(reason) => {
+            // The settings go with the database that was not restored.
+            let _ = std::fs::remove_file(&pending_config);
+            ApplyOutcome::Rejected {
+                reason,
+                set_aside: set_aside(data_dir, &pending, FAILED_NAME),
+            }
+        }
     }
+}
+
+/// Apply the confirmed config, if there is one, and remove it either way so it
+/// is not applied again on the next start.
+fn apply_pending_config(pending_config: &Path, config_path: Option<&Path>) -> ConfigOutcome {
+    if !pending_config.exists() {
+        return ConfigOutcome::NotIncluded;
+    }
+    let outcome = match config_path {
+        None => ConfigOutcome::Failed(
+            "the location of the config file is not known, so it was not restored".into(),
+        ),
+        Some(path) => match apply_config(path, pending_config) {
+            Ok(applied) => {
+                info!(path = %path.display(), "config.toml restored from the backup");
+                ConfigOutcome::Applied(applied)
+            }
+            Err(e) => ConfigOutcome::Failed(e),
+        },
+    };
+    let _ = std::fs::remove_file(pending_config);
+    outcome
 }
 
 /// Move the pending file to `pending_restore.failed.db` so it isn't retried on
@@ -509,7 +571,7 @@ mod tests {
         let db = dir.path().join("bbs.sqlite");
         plain_db(&db, &["live"]).await;
         assert!(matches!(
-            apply_pending_restore(dir.path(), &db).await,
+            apply_pending_restore(dir.path(), &db, None).await,
             ApplyOutcome::NothingPending
         ));
         assert_eq!(rows(&db).await, ["live"]);
@@ -523,10 +585,11 @@ mod tests {
         plain_db(&db, &["live"]).await;
         plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
 
-        let out = apply_pending_restore(dir.path(), &db).await;
+        let out = apply_pending_restore(dir.path(), &db, None).await;
         let ApplyOutcome::Applied {
             snapshot,
             snapshot_has_wal_copy,
+            ..
         } = out
         else {
             panic!("{out:?}");
@@ -552,7 +615,7 @@ mod tests {
         );
         plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
 
-        let out = apply_pending_restore(dir.path(), &db).await;
+        let out = apply_pending_restore(dir.path(), &db, None).await;
         drop(live);
         let ApplyOutcome::Applied {
             snapshot: Some(snapshot),
@@ -598,7 +661,7 @@ mod tests {
         let pending = dir.path().join("pending_restore.db");
         plain_db(&pending, &["restored"]).await;
 
-        let out = apply_pending_restore(dir.path(), &db).await;
+        let out = apply_pending_restore(dir.path(), &db, None).await;
         let ApplyOutcome::Rejected { reason, set_aside } = out else {
             panic!("{out:?}");
         };
@@ -629,10 +692,11 @@ mod tests {
         std::fs::write(sidecar(&db, "-shm"), b"stale shm bytes").unwrap();
         plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
 
-        let out = apply_pending_restore(dir.path(), &db).await;
+        let out = apply_pending_restore(dir.path(), &db, None).await;
         let ApplyOutcome::Applied {
             snapshot: Some(snapshot),
             snapshot_has_wal_copy,
+            ..
         } = out
         else {
             panic!("{out:?}");
@@ -667,7 +731,7 @@ mod tests {
         // the rename nor the copy fallback can install it.
         std::fs::create_dir(dir.path().join("pending_restore.db")).unwrap();
 
-        let out = apply_pending_restore(dir.path(), &db).await;
+        let out = apply_pending_restore(dir.path(), &db, None).await;
         let ApplyOutcome::Rejected { reason, .. } = out else {
             panic!("{out:?}");
         };
@@ -702,7 +766,7 @@ mod tests {
         let ApplyOutcome::Applied {
             snapshot: Some(new),
             ..
-        } = apply_pending_restore(dir.path(), &db).await
+        } = apply_pending_restore(dir.path(), &db, None).await
         else {
             panic!("restore should apply");
         };
@@ -733,7 +797,7 @@ mod tests {
         let ApplyOutcome::Applied {
             snapshot: Some(new),
             ..
-        } = apply_pending_restore(dir.path(), &db).await
+        } = apply_pending_restore(dir.path(), &db, None).await
         else {
             panic!("restore should apply");
         };
@@ -746,7 +810,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("bbs.sqlite");
         plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
-        let out = apply_pending_restore(dir.path(), &db).await;
+        let out = apply_pending_restore(dir.path(), &db, None).await;
         assert!(
             matches!(out, ApplyOutcome::Applied { snapshot: None, .. }),
             "{out:?}"
@@ -765,7 +829,7 @@ mod tests {
         std::fs::create_dir(&db).unwrap();
         plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
 
-        let out = apply_pending_restore(dir.path(), &db).await;
+        let out = apply_pending_restore(dir.path(), &db, None).await;
         let ApplyOutcome::Rejected { reason, set_aside } = out else {
             panic!("{out:?}");
         };
@@ -782,7 +846,7 @@ mod tests {
 
         // With the pending file set aside, the next start is a plain start.
         assert!(matches!(
-            apply_pending_restore(dir.path(), &db).await,
+            apply_pending_restore(dir.path(), &db, None).await,
             ApplyOutcome::NothingPending
         ));
     }
@@ -796,7 +860,7 @@ mod tests {
         // nor the copy fallback can put the file there.
         let bad_db = dir.path().join("no-such-dir").join("bbs.sqlite");
 
-        let out = apply_pending_restore(dir.path(), &bad_db).await;
+        let out = apply_pending_restore(dir.path(), &bad_db, None).await;
         let ApplyOutcome::Rejected { reason, set_aside } = out else {
             panic!("{out:?}");
         };
@@ -831,6 +895,156 @@ mod tests {
         assert!(!err.is_empty());
         assert_eq!(std::fs::read(&db).unwrap(), b"live");
         assert!(!sibling_with_suffix(&db, ".restore.tmp").exists());
+    }
+
+    // ── settings that come with the backup ────────────────────────────────
+
+    fn stage_config_file(dir: &Path, text: &str) {
+        std::fs::write(dir.join(PENDING_CONFIG_NAME), text).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_config_from_the_backup_is_applied_after_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bbs.sqlite");
+        plain_db(&db, &["live"]).await;
+        plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "[bbs]\nname = \"Old Name\"\ndata_dir = \"/here\"\n").unwrap();
+        stage_config_file(
+            dir.path(),
+            "[bbs]\nname = \"Restored Name\"\ndata_dir = \"/elsewhere\"\n",
+        );
+
+        let out = apply_pending_restore(dir.path(), &db, Some(&cfg)).await;
+        let ApplyOutcome::Applied {
+            config: ConfigOutcome::Applied(applied),
+            ..
+        } = out
+        else {
+            panic!("{out:?}");
+        };
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("name = \"Restored Name\""), "{text}");
+        assert!(
+            text.contains("data_dir = \"/here\""),
+            "machine-specific keys stay: {text}"
+        );
+        assert!(applied.previous.is_some_and(|p| p.exists()));
+        assert!(
+            !dir.path().join(PENDING_CONFIG_NAME).exists(),
+            "the confirmed config is consumed so it can't be applied twice"
+        );
+        assert_eq!(rows(&db).await, ["restored"]);
+    }
+
+    #[tokio::test]
+    async fn a_restore_without_a_config_leaves_the_config_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bbs.sqlite");
+        plain_db(&db, &["live"]).await;
+        plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "[bbs]\nname = \"Mine\"\n").unwrap();
+
+        let out = apply_pending_restore(dir.path(), &db, Some(&cfg)).await;
+        assert!(
+            matches!(
+                out,
+                ApplyOutcome::Applied {
+                    config: ConfigOutcome::NotIncluded,
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "[bbs]\nname = \"Mine\"\n"
+        );
+    }
+
+    // The settings are secondary: if they can't be applied the data restore
+    // stands and the running config is untouched.
+    #[tokio::test]
+    async fn a_config_that_cannot_be_applied_does_not_undo_the_database_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bbs.sqlite");
+        plain_db(&db, &["live"]).await;
+        plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "[bbs]\nname = \"Mine\"\n").unwrap();
+        stage_config_file(dir.path(), "[[[ not toml");
+
+        let out = apply_pending_restore(dir.path(), &db, Some(&cfg)).await;
+        assert!(
+            matches!(
+                out,
+                ApplyOutcome::Applied {
+                    config: ConfigOutcome::Failed(_),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+        assert_eq!(rows(&db).await, ["restored"]);
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "[bbs]\nname = \"Mine\"\n"
+        );
+        assert!(!dir.path().join(PENDING_CONFIG_NAME).exists());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_config_location_is_reported_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("bbs.sqlite");
+        plain_db(&db, &["live"]).await;
+        plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
+        stage_config_file(dir.path(), "[bbs]\nname = \"X\"\n");
+
+        let out = apply_pending_restore(dir.path(), &db, None).await;
+        assert!(
+            matches!(
+                out,
+                ApplyOutcome::Applied {
+                    config: ConfigOutcome::Failed(_),
+                    ..
+                }
+            ),
+            "{out:?}"
+        );
+    }
+
+    // A failed database restore must not apply the settings that went with it,
+    // and a config with no database restore behind it is never applied.
+    #[tokio::test]
+    async fn the_config_is_never_applied_without_its_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        std::fs::write(&cfg, "[bbs]\nname = \"Mine\"\n").unwrap();
+
+        // Database restore fails (database.path in a missing directory).
+        let bad_db = dir.path().join("no-such-dir").join("bbs.sqlite");
+        plain_db(&dir.path().join("pending_restore.db"), &["restored"]).await;
+        stage_config_file(dir.path(), "[bbs]\nname = \"Restored\"\n");
+        let out = apply_pending_restore(dir.path(), &bad_db, Some(&cfg)).await;
+        assert!(matches!(out, ApplyOutcome::Rejected { .. }), "{out:?}");
+        assert!(!dir.path().join(PENDING_CONFIG_NAME).exists());
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "[bbs]\nname = \"Mine\"\n"
+        );
+
+        // An orphan config with nothing to restore is discarded, not applied.
+        stage_config_file(dir.path(), "[bbs]\nname = \"Orphan\"\n");
+        let out = apply_pending_restore(dir.path(), &bad_db, Some(&cfg)).await;
+        assert!(matches!(out, ApplyOutcome::NothingPending), "{out:?}");
+        assert!(!dir.path().join(PENDING_CONFIG_NAME).exists());
+        assert_eq!(
+            std::fs::read_to_string(&cfg).unwrap(),
+            "[bbs]\nname = \"Mine\"\n"
+        );
     }
 
     #[test]
