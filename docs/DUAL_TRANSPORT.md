@@ -99,7 +99,7 @@ preset = "zebrahat"  # see preset table below
 [plugins.mesh]
 enabled         = true
 connection_type = "serial"
-serial_port     = "/dev/ttyACM0"  # adjust to match your device
+serial_port     = "/dev/serial/by-id/usb-Heltec_HT-n5262_01E66D357489801B-if00"  # see the note below
 baud_rate       = 115200
 ```
 
@@ -121,9 +121,20 @@ baud_rate       = 115200
 [plugins.meshtastic]
 enabled         = true
 connection_type = "serial"
-serial_port     = "/dev/ttyUSB0"  # adjust to match your device
+serial_port     = "/dev/serial/by-id/usb-Heltec_HT-n5262_D42292EF51268EE1-if00"  # see the note below
 baud_rate       = 115200
 ```
+
+**Use the `/dev/serial/by-id/...` names for USB radios, especially with two radios.**
+`/dev/ttyACM0` and `/dev/ttyACM1` are numbered in the order the radios attach, so
+they can swap whenever a radio is unplugged and plugged back in (on WSL2, after a
+`usbipd attach`) or after a reboot. The BBS would then speak MeshCore to the
+Meshtastic radio and Meshtastic to the MeshCore radio, and the only symptom is
+handshake timeouts. The `by-id` name includes the USB serial number, so it stays
+with the radio, and two boards of the same model get different names as long as each reports its own serial number (a board with none, or two sharing one, cannot be told apart this way; the wizard then keeps the plain path). List
+them with `ls -l /dev/serial/by-id/` (add `-L` on a single entry to see the device it resolves to). The setup wizard writes these names when
+they exist, and the BBS logs a warning at connect if a numbered name is used and a
+stable alias is available.
 
 ### Optional: command prefix
 
@@ -185,7 +196,7 @@ If the MeshCore HAT transport logs a connection error, check that `openhop_core`
 systemctl status pymc-companion
 ```
 
-If either transport logs a serial error, confirm the port name with `dmesg | grep tty` and update `serial_port` in the config. If the error is `Permission denied (os error 13)`, the service user lacks access to the port's group — see [OPERATIONS.md → Serial port: Permission denied](OPERATIONS.md#serial-port-permission-denied).
+If either transport logs a serial error, confirm the port with `ls -l /dev/serial/by-id/` (or `dmesg | grep tty`) and update `serial_port` in the config. Handshake timeouts on a working setup after re-attaching a radio usually mean the `ttyACMn` numbers swapped; see the note under the USB device examples above. If the error is `Permission denied (os error 13)`, the service user lacks access to the port's group — see [OPERATIONS.md → Serial port: Permission denied](OPERATIONS.md#serial-port-permission-denied).
 
 To turn on verbose logging for just one transport without making everything noisy:
 

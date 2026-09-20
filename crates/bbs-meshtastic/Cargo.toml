@@ -11,6 +11,7 @@ publish          = false
 
 [dependencies]
 bbs-plugin-api = { workspace = true }
+bbs-serial-path = { workspace = true }
 async-trait    = { workspace = true }
 prost          = "0.13"
 serde          = { workspace = true }

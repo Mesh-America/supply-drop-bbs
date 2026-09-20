@@ -367,6 +367,14 @@ impl Plugin for MeshtasticTransport {
                 } else {
                     "via USB serial"
                 };
+                if let Some(alias) = bbs_serial_path::stable_alias_suggestion(&port) {
+                    warn!(
+                        port = %port,
+                        stable_alias = %alias,
+                        "meshtastic transport: {}",
+                        bbs_serial_path::NUMBERED_PATH_ADVICE
+                    );
+                }
                 info!(port = %port, baud = config.baud_rate, "meshtastic transport: connecting {conn_label}");
                 MeshtasticClient::connect_serial(SerialConfig {
                     port,

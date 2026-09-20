@@ -12,6 +12,7 @@ publish      = false
 [dependencies]
 bbs-core.workspace           = true
 bbs-plugin-api.workspace     = true
+bbs-serial-path.workspace    = true
 meshcore-companion.workspace = true
 async-trait.workspace = true
 serde.workspace       = true
