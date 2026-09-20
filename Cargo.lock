@@ -268,6 +268,7 @@ dependencies = [
  "fd-lock",
  "libc",
  "proptest",
+ "rustix",
  "serde",
  "serde_json",
  "sqlx",
