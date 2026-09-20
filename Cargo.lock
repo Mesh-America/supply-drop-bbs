@@ -368,6 +368,7 @@ dependencies = [
  "axum-extra",
  "bbs-core",
  "bbs-plugin-api",
+ "meshcore-companion",
  "mime_guess",
  "rust-embed",
  "serde",

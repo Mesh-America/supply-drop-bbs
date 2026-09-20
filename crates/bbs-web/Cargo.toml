@@ -12,6 +12,8 @@ publish      = false
 [dependencies]
 bbs-core.workspace       = true
 bbs-plugin-api.workspace = true
+# Region-name rules for the advert scope setting; one implementation, shared with bbs-mesh.
+meshcore-companion.workspace = true
 async-trait.workspace    = true
 serde.workspace          = true
 serde_json.workspace     = true
