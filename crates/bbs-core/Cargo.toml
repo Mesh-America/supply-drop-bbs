@@ -21,6 +21,7 @@ fd-lock.workspace     = true
 libc.workspace        = true
 serde.workspace       = true
 unicode-properties.workspace = true
+uuid.workspace        = true
 sqlx.workspace        = true
 thiserror.workspace   = true
 time.workspace        = true

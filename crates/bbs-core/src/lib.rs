@@ -36,6 +36,7 @@ pub mod ids;
 pub mod mesh_name;
 pub mod message;
 pub mod restore_apply;
+pub mod restore_stage;
 pub mod room;
 pub mod timestamp;
 pub mod toml_util;

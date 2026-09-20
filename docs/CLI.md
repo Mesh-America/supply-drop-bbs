@@ -328,8 +328,12 @@ starts.
 web UI produce, and runs the same validation the web upload endpoint does:
 a SQLite-format check, a check that the file has this application's own
 migration history, migrating it in place if it's an older schema, and a
-room-structure check. A file that fails any of these is rejected and
-nothing is staged.
+room-structure check, then SQLite's integrity check. A file that fails any
+of these is rejected and nothing is staged. Your file is copied into the data
+directory first and is never modified, so the disk needs room for a second
+copy; the copy becomes the staged file, or is removed if staging fails. Unlike the
+web UI, `stage` has no 2 GiB size limit (a database over 4 GiB, raw or in a
+zip, is still refused).
 
 ```sh
 supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/backup_20260511_142301.db
