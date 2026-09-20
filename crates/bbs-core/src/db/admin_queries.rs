@@ -13,7 +13,7 @@ use bbs_plugin_api::{
     AdminRoomSummary, AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminWeeklySignups,
 };
 use sqlx::Row;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing;
 
 // async_trait rewrites the callers in host.rs into closures that Clippy's
@@ -540,21 +540,44 @@ impl Database {
     /// a restore must keep working even when the live database is broken
     /// or missing, which is often exactly why an operator wants to restore.
     pub async fn stage_restore(uploaded_path: &Path, data_dir: &Path) -> Result<(), StoreError> {
-        let raw = tokio::fs::read(uploaded_path)
+        // The whole file is never read into memory: a database can be
+        // gigabytes, and this runs on small boards. Only the header is read
+        // here, and a zip is extracted to disk by streaming.
+        let uploaded_len = tokio::fs::metadata(uploaded_path)
             .await
-            .map_err(|e| StoreError::Decode(format!("read uploaded file: {e}")))?;
-        if raw.starts_with(b"PK\x03\x04") {
-            let extracted = tokio::task::spawn_blocking(move || extract_single_db_from_zip(&raw))
+            .map_err(|e| StoreError::Decode(format!("read uploaded file: {e}")))?
+            .len();
+        match classify_upload(uploaded_path).await? {
+            UploadKind::Zip => {
+                let extract_path = sibling_with_suffix(uploaded_path, ".extract.tmp");
+                let (src, dest) = (uploaded_path.to_path_buf(), extract_path.clone());
+                let extracted = tokio::task::spawn_blocking(move || {
+                    extract_single_db_from_zip(&src, &dest, MAX_RESTORE_DB_BYTES)
+                })
                 .await
                 .map_err(|e| StoreError::Decode(format!("extracting zip upload: {e}")))?
-                .map_err(StoreError::Decode)?;
-            tokio::fs::write(uploaded_path, &extracted)
-                .await
-                .map_err(|e| StoreError::Decode(format!("writing extracted upload: {e}")))?;
-        } else if !raw.starts_with(b"SQLite format 3\0") {
-            return Err(StoreError::Decode(
-                "not a SQLite database file or a recognized backup zip (bad header)".into(),
-            ));
+                .map_err(StoreError::Decode);
+                if let Err(e) = extracted {
+                    let _ = tokio::fs::remove_file(&extract_path).await;
+                    return Err(e);
+                }
+                // Same directory as the upload, so this replaces the zip with
+                // the database it held atomically.
+                if let Err(e) = tokio::fs::rename(&extract_path, uploaded_path).await {
+                    let _ = tokio::fs::remove_file(&extract_path).await;
+                    return Err(StoreError::Decode(format!(
+                        "replacing the upload with the extracted database: {e}"
+                    )));
+                }
+            }
+            UploadKind::Sqlite => {
+                if uploaded_len > MAX_RESTORE_DB_BYTES {
+                    return Err(StoreError::Decode(format!(
+                        "uploaded database is larger than the {} GiB restore limit",
+                        MAX_RESTORE_DB_BYTES / (1024 * 1024 * 1024)
+                    )));
+                }
+            }
         }
 
         let opts = sqlx::sqlite::SqliteConnectOptions::new()
@@ -632,9 +655,16 @@ impl Database {
             .await
             .is_err()
         {
-            tokio::fs::copy(uploaded_path, &staged_path)
+            let len = tokio::fs::metadata(uploaded_path)
                 .await
-                .map_err(|e| StoreError::Decode(format!("stage restore file: {e}")))?;
+                .map_err(|e| StoreError::Decode(format!("stage restore file: {e}")))?
+                .len();
+            crate::disk_space::ensure_free_space(data_dir, len).map_err(StoreError::Decode)?;
+            if let Err(e) = tokio::fs::copy(uploaded_path, &staged_path).await {
+                // Don't leave a torn file where a later confirm could pick it up.
+                let _ = tokio::fs::remove_file(&staged_path).await;
+                return Err(StoreError::Decode(format!("stage restore file: {e}")));
+            }
             let _ = tokio::fs::remove_file(uploaded_path).await;
         }
 
@@ -692,14 +722,94 @@ async fn sqlite_header_ok(path: &std::path::Path) -> bool {
     file.read_exact(&mut buf).await.is_ok() && buf.starts_with(b"SQLite format 3\0")
 }
 
-/// Extract the single `.db`-named entry from a zip archive's raw bytes, as
-/// produced by `admin_backup`'s zip-bundling caller. Rejects an archive
-/// with zero or more than one `.db` entry rather than guessing which one is
-/// the database. Runs synchronously — callers on an async runtime should
-/// wrap this in `spawn_blocking`, since decompression is CPU-bound.
-fn extract_single_db_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let cursor = std::io::Cursor::new(zip_bytes);
-    let mut archive = zip::ZipArchive::new(cursor).map_err(|e| format!("reading zip: {e}"))?;
+/// The largest database restore accepts, whether uploaded raw or extracted
+/// from a zip. The web upload caps the file itself at 2 GiB; this is the bound
+/// on what a zip may expand to, so a small crafted archive can't fill the disk.
+const MAX_RESTORE_DB_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+enum UploadKind {
+    Sqlite,
+    Zip,
+}
+
+/// Decide what an upload is from its first bytes alone.
+async fn classify_upload(path: &Path) -> Result<UploadKind, StoreError> {
+    use tokio::io::AsyncReadExt;
+    let mut head = Vec::with_capacity(16);
+    tokio::fs::File::open(path)
+        .await
+        .map_err(|e| StoreError::Decode(format!("read uploaded file: {e}")))?
+        .take(16)
+        .read_to_end(&mut head)
+        .await
+        .map_err(|e| StoreError::Decode(format!("read uploaded file: {e}")))?;
+    if head.starts_with(b"PK\x03\x04") {
+        Ok(UploadKind::Zip)
+    } else if head.starts_with(b"SQLite format 3\0") {
+        Ok(UploadKind::Sqlite)
+    } else {
+        Err(StoreError::Decode(
+            "not a SQLite database file or a recognized backup zip (bad header)".into(),
+        ))
+    }
+}
+
+/// `path` with `suffix` appended to its file name, in the same directory.
+fn sibling_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
+}
+
+/// How much of a zip entry is copied between free-space re-checks.
+const COPY_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Create (or truncate) `path` writable and, on Unix, owner-only (0600) from the
+/// moment it exists. The extracted file replaces the upload and becomes the
+/// live database, which holds password hashes; the upload itself is created
+/// 0600 by the callers, so the extracted copy must not be more permissive.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+}
+
+/// Stream the single `.db`-named entry of the zip at `zip_path` to `out_path`
+/// and return how many bytes were written. Rejects an archive with zero or more
+/// than one `.db` entry rather than guessing which one is the database.
+///
+/// Nothing is sized from the archive's own claims: the declared size is only
+/// used to refuse early and to check free space, and the copy is capped at
+/// `max_bytes` regardless of what the entry says, so a forged size header can
+/// neither trigger a huge allocation nor make the extraction outgrow the cap.
+/// On any error the partial output is removed. Runs synchronously; callers on
+/// an async runtime should wrap it in `spawn_blocking`.
+fn extract_single_db_from_zip(
+    zip_path: &Path,
+    out_path: &Path,
+    max_bytes: u64,
+) -> Result<u64, String> {
+    extract_single_db_with_chunk(zip_path, out_path, max_bytes, COPY_CHUNK_BYTES)
+}
+
+/// [`extract_single_db_from_zip`] with the free-space re-check interval as a
+/// parameter, so tests can cross chunk boundaries with small files.
+fn extract_single_db_with_chunk(
+    zip_path: &Path,
+    out_path: &Path,
+    max_bytes: u64,
+    chunk: u64,
+) -> Result<u64, String> {
+    use std::io::Read as _;
+
+    let file = std::fs::File::open(zip_path).map_err(|e| format!("reading zip: {e}"))?;
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
+        .map_err(|e| format!("reading zip: {e}"))?;
     let mut db_index = None;
     for i in 0..archive.len() {
         let entry = archive
@@ -716,15 +826,60 @@ fn extract_single_db_from_zip(zip_bytes: &[u8]) -> Result<Vec<u8>, String> {
     let mut entry = archive
         .by_index(idx)
         .map_err(|e| format!("reading zip entry: {e}"))?;
-    let mut out = Vec::with_capacity(entry.size() as usize);
-    std::io::Read::read_to_end(&mut entry, &mut out)
-        .map_err(|e| format!("extracting zip entry: {e}"))?;
-    Ok(out)
+
+    let declared = entry.size();
+    if declared > max_bytes {
+        return Err(format!(
+            "the database in the zip is larger than the {} GiB restore limit",
+            max_bytes / (1024 * 1024 * 1024)
+        ));
+    }
+    let out_dir = out_path.parent().unwrap_or_else(|| Path::new("."));
+    crate::disk_space::ensure_free_space(out_dir, declared)?;
+
+    let copied = (|| -> Result<u64, String> {
+        let mut out =
+            create_private(out_path).map_err(|e| format!("creating extracted database: {e}"))?;
+        let mut total: u64 = 0;
+        loop {
+            // Never ask for more than one chunk, nor for more than what is
+            // left before the cap plus one byte (so overshooting is detected).
+            let want = chunk.min(max_bytes.saturating_add(1) - total);
+            let n = std::io::copy(&mut (&mut entry).take(want), &mut out)
+                .map_err(|e| format!("extracting zip entry: {e}"))?;
+            total += n;
+            if total > max_bytes {
+                return Err(format!(
+                    "the database in the zip expands past the {} GiB restore limit",
+                    max_bytes / (1024 * 1024 * 1024)
+                ));
+            }
+            if n < want {
+                break;
+            }
+            // The declared size was only a hint. Re-check the disk as the
+            // real data arrives, so an entry that understates its size can't
+            // fill the volume the live database is on.
+            crate::disk_space::ensure_free_space(out_dir, 0)?;
+        }
+        out.sync_all()
+            .map_err(|e| format!("writing extracted database: {e}"))?;
+        Ok(total)
+    })();
+
+    if copied.is_err() {
+        let _ = std::fs::remove_file(out_path);
+    }
+    copied
 }
 
 #[cfg(test)]
 mod tests {
-    use super::extract_single_db_from_zip;
+    use super::{
+        classify_upload, extract_single_db_from_zip, extract_single_db_with_chunk,
+        sibling_with_suffix, StoreError, UploadKind,
+    };
+    use std::path::{Path, PathBuf};
 
     // Issue #195: `admin_backup`'s zip-bundling caller never offers a raw
     // `.db` for download, only the `.zip` bundle it always produces — so
@@ -746,25 +901,41 @@ mod tests {
         buf
     }
 
+    const NO_LIMIT: u64 = 1 << 30;
+
+    /// Write `bytes` as `in.zip` in a temp dir and extract to `out.db` there.
+    fn extract(bytes: &[u8], max: u64) -> (tempfile::TempDir, PathBuf, Result<u64, String>) {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("in.zip");
+        let out = dir.path().join("out.db");
+        std::fs::write(&zip_path, bytes).unwrap();
+        let r = extract_single_db_from_zip(&zip_path, &out, max);
+        (dir, out, r)
+    }
+
     #[test]
     fn extract_single_db_from_zip_finds_the_lone_db_entry() {
         let zip_bytes = build_test_zip(&[
             ("backup-2026-09-04.db", b"SQLite format 3\0fake db bytes"),
             ("config.toml", b"[bbs]\nname = \"Test\"\n"),
         ]);
-        let extracted =
-            extract_single_db_from_zip(&zip_bytes).expect("a single .db entry must extract");
-        assert_eq!(extracted, b"SQLite format 3\0fake db bytes");
+        let (_dir, out, r) = extract(&zip_bytes, NO_LIMIT);
+        assert_eq!(r.expect("a single .db entry must extract"), 29);
+        assert_eq!(
+            std::fs::read(out).unwrap(),
+            b"SQLite format 3\0fake db bytes"
+        );
     }
 
     #[test]
     fn extract_single_db_from_zip_rejects_no_db_entry() {
         let zip_bytes = build_test_zip(&[("config.toml", b"[bbs]\n")]);
-        let result = extract_single_db_from_zip(&zip_bytes);
+        let (_dir, out, r) = extract(&zip_bytes, NO_LIMIT);
         assert!(
-            result.is_err(),
+            r.is_err(),
             "a zip with no .db entry must be rejected, not silently accepted"
         );
+        assert!(!out.exists());
     }
 
     #[test]
@@ -773,17 +944,205 @@ mod tests {
             ("one.db", b"SQLite format 3\0aaa"),
             ("two.db", b"SQLite format 3\0bbb"),
         ]);
-        let result = extract_single_db_from_zip(&zip_bytes);
+        let (_dir, out, r) = extract(&zip_bytes, NO_LIMIT);
         assert!(
-            result.is_err(),
+            r.is_err(),
             "an ambiguous zip with two .db entries must be rejected rather \
              than silently picking one"
         );
+        assert!(!out.exists());
     }
 
     #[test]
-    fn extract_single_db_from_zip_rejects_a_non_zip_buffer() {
-        let result = extract_single_db_from_zip(b"not a zip at all");
-        assert!(result.is_err());
+    fn extract_single_db_from_zip_rejects_a_non_zip_file() {
+        let (_dir, out, r) = extract(b"not a zip at all", NO_LIMIT);
+        assert!(r.is_err());
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn extract_rejects_an_entry_whose_declared_size_is_over_the_limit() {
+        let zip_bytes = build_test_zip(&[("a.db", &[7u8; 4096])]);
+        let (_dir, out, r) = extract(&zip_bytes, 1024);
+        let err = r.unwrap_err();
+        assert!(err.contains("restore limit"), "{err}");
+        assert!(!out.exists());
+    }
+
+    // The declared size is attacker-controlled and must never size an
+    // allocation. With the production cap, a forged 32-bit size below the cap is
+    // harmless: only the bytes that are really there are read.
+    #[test]
+    fn a_forged_declared_size_below_the_cap_extracts_only_the_real_bytes() {
+        let mut zip_bytes = build_test_zip(&[("a.db", b"SQLite format 3\0abc")]);
+        // Central directory header: signature 0x02014b50, uncompressed size at +24.
+        let cd = zip_bytes
+            .windows(4)
+            .rposition(|w| w == b"PK\x01\x02")
+            .expect("central directory header");
+        zip_bytes[cd + 24..cd + 28].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        let (_dir, out, r) = extract(&zip_bytes, super::MAX_RESTORE_DB_BYTES);
+        // Either the zip crate notices the mismatch or it extracts the real
+        // content; what it must not do is allocate for the claim or write junk.
+        if r.is_ok() {
+            assert_eq!(std::fs::read(&out).unwrap(), b"SQLite format 3\0abc");
+        } else {
+            assert!(!out.exists(), "no partial output may be left behind");
+        }
+    }
+
+    // The shape that made `Vec::with_capacity(entry.size())` abort the process:
+    // a zip64 extra field declaring 2^46 bytes for a tiny entry. It is refused
+    // by the size cap before anything is allocated or written.
+    #[test]
+    fn a_forged_zip64_size_is_refused_by_the_cap_not_allocated() {
+        let mut buf = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default().large_file(true);
+            zip.start_file("a.db", opts).unwrap();
+            zip.write_all(b"SQLite format 3\0abc").unwrap();
+            zip.finish().unwrap();
+        }
+        // Walk the central directory entry's extra fields to the zip64 one
+        // (id 0x0001) and overwrite its first u64, the uncompressed size.
+        let cd = buf
+            .windows(4)
+            .rposition(|w| w == b"PK\x01\x02")
+            .expect("central directory header");
+        let name_len = u16::from_le_bytes([buf[cd + 28], buf[cd + 29]]) as usize;
+        let extra_len = u16::from_le_bytes([buf[cd + 30], buf[cd + 31]]) as usize;
+        let mut at = cd + 46 + name_len;
+        let end = at + extra_len;
+        let mut patched = false;
+        while at + 4 <= end {
+            let id = u16::from_le_bytes([buf[at], buf[at + 1]]);
+            let len = u16::from_le_bytes([buf[at + 2], buf[at + 3]]) as usize;
+            if id == 0x0001 && len >= 8 {
+                buf[at + 4..at + 12].copy_from_slice(&(1u64 << 46).to_le_bytes());
+                patched = true;
+                break;
+            }
+            at += 4 + len;
+        }
+        assert!(patched, "the test zip has no zip64 extra field to forge");
+
+        let (_dir, out, r) = extract(&buf, super::MAX_RESTORE_DB_BYTES);
+        let err = r.unwrap_err();
+        assert!(err.contains("restore limit"), "{err}");
+        assert!(!out.exists());
+    }
+
+    // A zip that claims to be small but inflates past the cap is stopped at
+    // the cap, and what was written is removed.
+    #[test]
+    fn an_entry_that_inflates_past_the_limit_is_cut_off_and_cleaned_up() {
+        let big = vec![0u8; 64 * 1024]; // deflates to almost nothing
+        let mut buf = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            zip.start_file("a.db", opts).unwrap();
+            zip.write_all(&big).unwrap();
+            zip.finish().unwrap();
+        }
+        // Understate the size to 100 bytes in the central directory (+24) and
+        // the local header (+22), so only the streaming cap can catch it.
+        for (sig, offset) in [(&b"PK\x01\x02"[..], 24), (&b"PK\x03\x04"[..], 22)] {
+            let at = buf.windows(4).position(|w| w == sig).unwrap();
+            buf[at + offset..at + offset + 4].copy_from_slice(&100u32.to_le_bytes());
+        }
+        let (_dir, out, r) = extract(&buf, 1024);
+        assert!(r.is_err(), "{r:?}");
+        assert!(!out.exists(), "the partial output must be removed");
+    }
+
+    #[test]
+    fn a_database_larger_than_a_chunk_extracts_intact() {
+        // 3 MiB payload in 64 KiB chunks: many chunk boundaries.
+        let payload: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let zip_bytes = build_test_zip(&[("big.db", &payload)]);
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("in.zip");
+        let out = dir.path().join("out.db");
+        std::fs::write(&zip_path, &zip_bytes).unwrap();
+        let n = extract_single_db_with_chunk(&zip_path, &out, NO_LIMIT, 64 * 1024).unwrap();
+        assert_eq!(n, payload.len() as u64);
+        assert_eq!(std::fs::read(out).unwrap(), payload);
+    }
+
+    // An entry exactly as long as a whole number of chunks ends on a chunk
+    // boundary: the loop must still terminate and report the right length.
+    #[test]
+    fn an_entry_that_is_an_exact_multiple_of_the_chunk_extracts_intact() {
+        let payload = vec![0x5Au8; 4096];
+        let zip_bytes = build_test_zip(&[("a.db", &payload)]);
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("in.zip");
+        let out = dir.path().join("out.db");
+        std::fs::write(&zip_path, &zip_bytes).unwrap();
+        let n = extract_single_db_with_chunk(&zip_path, &out, NO_LIMIT, 1024).unwrap();
+        assert_eq!(n, 4096);
+        assert_eq!(std::fs::read(out).unwrap(), payload);
+    }
+
+    // The extracted file becomes the live database, so it must not be readable
+    // by other users even though it is created fresh next to the upload.
+    #[cfg(unix)]
+    #[test]
+    fn the_extracted_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let zip_bytes = build_test_zip(&[("a.db", b"SQLite format 3\0abc")]);
+        let (_dir, out, r) = extract(&zip_bytes, NO_LIMIT);
+        r.unwrap();
+        let mode = std::fs::metadata(out).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+    }
+
+    #[tokio::test]
+    async fn classify_reads_only_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let sqlite = dir.path().join("a");
+        std::fs::write(&sqlite, b"SQLite format 3\0rest").unwrap();
+        assert!(matches!(
+            classify_upload(&sqlite).await,
+            Ok(UploadKind::Sqlite)
+        ));
+
+        let zip = dir.path().join("b");
+        std::fs::write(&zip, b"PK\x03\x04rest").unwrap();
+        assert!(matches!(classify_upload(&zip).await, Ok(UploadKind::Zip)));
+    }
+
+    #[tokio::test]
+    async fn classify_rejects_bad_short_empty_and_missing_files() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, bytes) in [
+            ("junk", &b"hello world, not a database"[..]),
+            ("short", &b"SQLite"[..]),
+            ("empty", &b""[..]),
+        ] {
+            let p = dir.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            assert!(
+                matches!(classify_upload(&p).await, Err(StoreError::Decode(_))),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            classify_upload(&dir.path().join("absent")).await,
+            Err(StoreError::Decode(_))
+        ));
+    }
+
+    #[test]
+    fn sibling_keeps_the_directory_and_appends_to_the_name() {
+        assert_eq!(
+            sibling_with_suffix(Path::new("/data/up.zip"), ".extract"),
+            Path::new("/data/up.zip.extract")
+        );
     }
 }

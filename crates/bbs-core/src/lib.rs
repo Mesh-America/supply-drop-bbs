@@ -30,6 +30,7 @@
 
 pub mod config_lock;
 pub mod db;
+pub mod disk_space;
 pub mod host;
 pub mod ids;
 pub mod mesh_name;

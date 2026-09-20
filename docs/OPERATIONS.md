@@ -605,6 +605,13 @@ needs a running BBS.
 A restore replaces the database only. The `config.toml` inside a `.zip` backup
 is not restored, and anything written since the backup was made is lost.
 
+Staging a restore checks the file without loading it into memory, and a `.zip` is
+streamed to disk while it is extracted. A database larger than 4 GiB, raw or
+inside a zip, is refused. Extracting a zip and copying a staged file between
+filesystems first check that the disk has room (and extraction re-checks as it
+goes), failing with a message instead of leaving a half-written file; the check
+is skipped if the free space can't be read.
+
 Before the swap, the current database is copied to
 `pre-restore-safety-<unix-seconds>.db` in the data directory. Only the most
 recent of these snapshots is kept, so a second restore replaces the first
