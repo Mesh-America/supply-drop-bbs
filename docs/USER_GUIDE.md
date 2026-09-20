@@ -493,10 +493,11 @@ The BBS echoes your draft and waits for confirmation:
 
 ```
 Has anyone tried the new firmware?
-Type . to send
+Type . to send, C to cancel
 ```
 
-Send a lone `.` to post it:
+Send a lone `.` to post it, or `C` to throw the draft away (nothing is sent and
+you are back at the normal prompt):
 
 ```
 .
@@ -515,6 +516,9 @@ E
 ```
 Enter your message for General:
 > Has anyone tried the new firmware?
+Has anyone tried the new firmware?
+Type . to send, C to cancel
+> .
 Message posted.
 ```
 
@@ -576,11 +580,13 @@ The BBS echoes the draft for confirmation:
 
 ```
 To bob: Hi Bob, did you get the antenna parts?
-Type . to send
+Type . to send, C to cancel
 ```
 
-Send `.` to post. If the confirmation prompt is lost in transit, sending `.`
-again is safe — the draft is preserved and will not be double-posted.
+Send `.` to post, or `C` to cancel. If the confirmation prompt is lost in
+transit, sending `.` again is safe — the draft is preserved and will not be
+double-posted. `C` only cancels at this prompt; `CANCEL` (or `STOP`) abandons
+whatever you are doing at any prompt.
 
 **Prompt flow (alternative):**
 
@@ -593,7 +599,10 @@ Enter recipient username:
 > bob
 Enter your message:
 > Hi Bob, did you get the antenna parts?
-Message posted.
+To bob: Hi Bob, did you get the antenna parts?
+Type . to send, C to cancel
+> .
+Mail sent to bob.
 ```
 
 **The recipient does not have to be online.** They'll see it the next time
@@ -1098,8 +1107,8 @@ account and you can re-register with the same username.
 | Command | Action |
 |---|---|
 | `E` | Write a message (prompt flow) |
-| `E <text>` | Stage inline message — send `.` to confirm |
-| `E <user> <text>` | Stage inline mail — send `.` to confirm (when in Mail) |
+| `E <text>` | Stage inline message — send `.` to confirm, `C` to cancel |
+| `E <user> <text>` | Stage inline mail — send `.` to confirm, `C` to cancel (when in Mail) |
 | `.` | Confirm and post a staged draft |
 | `D <id>` | Delete message #id |
 

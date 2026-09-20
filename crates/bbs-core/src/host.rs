@@ -506,7 +506,9 @@ impl Host for BbsHost {
         // Clear the post-confirm idempotency state for any command other than a
         // bare `.` (which the `Command::Unknown` arm handles as a re-confirm).
         // Once the user does anything else, a stray `.` is no longer a retry. (#107)
-        let is_repost_dot = matches!(&cmd, Command::Unknown { raw } if raw.trim() == ".");
+        // A bare `C` is the send prompt's cancel, so it counts as a retry too.
+        let is_repost_dot = matches!(&cmd, Command::Unknown { raw } if raw.trim() == ".")
+            || matches!(&cmd, Command::ChangeRoom { target } if target.trim().is_empty());
         if !is_repost_dot {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
@@ -2885,11 +2887,11 @@ impl BbsHost {
                         };
                     }
                 }
-                let preview = if let Some(ref rcpt) = recipient {
-                    format!("To {}: {}\nType . to send", rcpt.as_str(), body)
-                } else {
-                    format!("{body}\nType . to send")
-                };
+                let preview = draft_preview(
+                    recipient.as_ref(),
+                    &body,
+                    self.session_on_radio(session).await,
+                );
                 Ok(Response::Prompt {
                     text: preview,
                     hide_input: false,
@@ -2901,14 +2903,31 @@ impl BbsHost {
                 room_id,
                 stage: ComposeStage::AwaitingConfirmation { recipient, body },
             } => {
+                if reply.trim().eq_ignore_ascii_case("c") {
+                    // Abandon the draft: nothing is posted and the user is back at
+                    // the command prompt. (`CANCEL` also works, upstream of this.)
+                    // One edge: a step-by-step draft whose whole body is "c",
+                    // re-sent because the send prompt was lost, arrives here and
+                    // cancels. Accepted; the reply says nothing was sent.
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                        // Like a successful post, arm the retry slot: on a lossy
+                        // link the "Cancelled" reply can be lost, and a re-sent
+                        // `C` (or `.`) should hear the same answer rather than
+                        // "Usage" or "Unknown command".
+                        r.last_post_confirmation = Some(CANCELLED_DRAFT.to_owned());
+                    }
+                    return Ok(Response::Text(CANCELLED_DRAFT.into()));
+                }
                 if reply.trim() != "." {
                     // Re-show the staged draft — the confirmation prompt may have
                     // been lost on the first send.
-                    let preview = if let Some(ref rcpt) = recipient {
-                        format!("To {}: {}\nType . to send", rcpt.as_str(), body)
-                    } else {
-                        format!("{body}\nType . to send")
-                    };
+                    let preview = draft_preview(
+                        recipient.as_ref(),
+                        &body,
+                        self.session_on_radio(session).await,
+                    );
                     // Keep workflow state unchanged.
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
@@ -3725,6 +3744,17 @@ impl BbsHost {
         target: &str,
     ) -> Result<Response, HostError> {
         if target.trim().is_empty() {
+            // A bare `C` right after a draft was posted or cancelled is a retry
+            // of the send prompt's `C` (its reply was lost): repeat the outcome.
+            let outcome = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .get(&session)
+                    .and_then(|r| r.last_post_confirmation.clone())
+            };
+            if let Some(outcome) = outcome {
+                return Ok(Response::Text(outcome));
+            }
             return Ok(Response::Text("Usage: C <room name or number>".into()));
         }
 
@@ -4549,6 +4579,9 @@ impl BbsHost {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+        // Read before any sessions lock is taken below: the draft preview is
+        // clipped for radio sessions.
+        let on_radio = self.session_on_radio(session).await;
 
         let is_guest = level < PermissionLevel::User;
         let guest_rid = self.guest_room_id();
@@ -4632,7 +4665,7 @@ impl BbsHost {
                             };
                         }
                         return Ok(Response::Prompt {
-                            text: format!("To {}: {}\nType . to send", recipient.as_str(), body),
+                            text: draft_preview(Some(&recipient), &body, on_radio),
                             hide_input: false,
                         });
                     }
@@ -4657,7 +4690,7 @@ impl BbsHost {
                     };
                 }
                 return Ok(Response::Prompt {
-                    text: format!("{body}\nType . to send"),
+                    text: draft_preview(None, &body, on_radio),
                     hide_input: false,
                 });
             }
@@ -5796,6 +5829,48 @@ impl BbsHost {
 
 // ── Command label (for log events) ───────────────────────────────────────────
 
+/// Most bytes of draft preview sent to a radio session. MeshCore hard-truncates
+/// a reply at 156 bytes and Meshtastic at 220; staying under the smaller keeps
+/// the send/cancel instructions from being cut off after a long draft.
+const RADIO_DRAFT_PREVIEW_MAX_BYTES: usize = 150;
+
+/// The reply to cancelling a draft at the send prompt.
+const CANCELLED_DRAFT: &str = "Cancelled. Nothing was sent.";
+
+/// The staged-message preview shown before a post or mail is sent: the draft,
+/// then how to confirm or abandon it. `C` cancels only at this prompt; `CANCEL`
+/// works at every prompt. On a radio the echoed draft is clipped (with an
+/// ellipsis) so the instructions always fit in one frame.
+fn draft_preview(recipient: Option<&Username>, body: &str, on_radio: bool) -> String {
+    const SUFFIX: &str = "\nType . to send, C to cancel";
+    let prefix = recipient.map_or_else(String::new, |r| format!("To {}: ", r.as_str()));
+    let body = if on_radio {
+        let room = RADIO_DRAFT_PREVIEW_MAX_BYTES.saturating_sub(prefix.len() + SUFFIX.len());
+        clip_to_bytes(body, room)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+    format!("{prefix}{body}{SUFFIX}")
+}
+
+/// `s` cut to at most `max` bytes on a character boundary, ending in "…" when
+/// anything was removed.
+fn clip_to_bytes(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    const ELLIPSIS: &str = "…";
+    if s.len() <= max {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let keep = max.saturating_sub(ELLIPSIS.len());
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if i + c.len_utf8() > keep {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    std::borrow::Cow::Owned(format!("{}{ELLIPSIS}", &s[..end]))
+}
+
 fn cmd_label(cmd: &Command) -> &'static str {
     match cmd {
         Command::Help { .. } => "Help",
@@ -6104,8 +6179,8 @@ const HELP_POSTING: &str = "\
 Posting:\n\
  D <#>  delete\n\
  E      enter message (prompts)\n\
- E msg  post now, no prompt\n\
- E @user msg  send DM inline";
+ E msg  draft a post (. sends, C cancels)\n\
+ E @user msg  draft a DM inline";
 
 const HELP_NAVIGATION: &str = "\
 Navigation:\n\
@@ -9743,6 +9818,304 @@ mod tests {
             matches!(resp, Response::Text(_)),
             "dot after re-shown preview should post the message, got: {resp:?}"
         );
+    }
+
+    // ── Cancelling a drafted message (#312) ───────────────────────────────────
+
+    async fn reply(host: &BbsHost, sid: SessionId, text: &str) -> Response {
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: text.to_owned(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn room_message_count(host: &BbsHost, room: i64) -> usize {
+        crate::db::MessageStore::list_in_room(&host.db, RoomId::new(room), None, 100)
+            .await
+            .unwrap()
+            .messages
+            .len()
+    }
+
+    /// The prompt tells the user how to abandon the draft as well as how to send it.
+    #[tokio::test]
+    async fn the_draft_prompt_offers_cancel() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some("hello there".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let Response::Prompt { text, .. } = resp else {
+            panic!("expected the draft prompt, got {resp:?}");
+        };
+        assert!(
+            text.contains("Type . to send, C to cancel"),
+            "prompt should offer both, got {text:?}"
+        );
+    }
+
+    /// `C` (either case, with stray spaces) at the send prompt discards a room
+    /// post: nothing is posted, and the user is free to start another message.
+    #[tokio::test]
+    async fn c_cancels_a_drafted_room_post() {
+        for cancel in ["C", "c", " c "] {
+            let (host, _db) = make_host().await;
+            let sid = host.create_session("test").await.unwrap();
+            let uname = Username::new("alice").unwrap();
+            register_and_login(&host, sid, &uname, "pass1234").await;
+
+            host.process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some("never sent".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let resp = reply(&host, sid, cancel).await;
+            assert!(
+                matches!(&resp, Response::Text(t) if t.contains("Nothing was sent")),
+                "{cancel:?} should cancel, got {resp:?}"
+            );
+            assert_eq!(room_message_count(&host, 1).await, 0, "{cancel:?}");
+
+            // Back at the command prompt: a new message can be started, and it
+            // does not resurrect the cancelled draft.
+            host.process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some("second".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let resp = reply(&host, sid, ".").await;
+            assert!(matches!(&resp, Response::Text(t) if t.contains("Message posted")));
+            let page = crate::db::MessageStore::list_in_room(&host.db, RoomId::new(1), None, 10)
+                .await
+                .unwrap();
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.messages[0].content, "second");
+        }
+    }
+
+    /// The same for mail, whether the draft was made step by step or inline.
+    #[tokio::test]
+    async fn c_cancels_a_drafted_mail() {
+        let (host, _db) = make_host().await;
+        let s1 = host.create_session("test").await.unwrap();
+        register_and_login(&host, s1, &Username::new("alice").unwrap(), "pass1234").await;
+        let s2 = host.create_session("test").await.unwrap();
+        let carol = Username::new("carol").unwrap();
+        register_and_login(&host, s2, &carol, "pass5678").await;
+
+        host.process_command(s1, Command::GoMail).await.unwrap();
+        // Inline: "E carol hi".
+        host.process_command(
+            s1,
+            Command::EnterMessage {
+                body: Some("carol hi".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = reply(&host, s1, "C").await;
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Nothing was sent")),
+            "{resp:?}"
+        );
+
+        // Step by step: E, recipient, body, then C.
+        host.process_command(s1, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+        reply(&host, s1, "carol").await;
+        let resp = reply(&host, s1, "second try").await;
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.contains("C to cancel")),
+            "{resp:?}"
+        );
+        let resp = reply(&host, s1, "c").await;
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Nothing was sent")),
+            "{resp:?}"
+        );
+
+        let page = MessageStore::list_direct(&host.db, &carol, None, 10)
+            .await
+            .unwrap();
+        assert!(page.messages.is_empty(), "no mail may have been sent");
+    }
+
+    /// `C` cancels only at the send prompt. Earlier, it is just the text being
+    /// entered (a message can legitimately be "C"), and any other reply at the
+    /// send prompt still re-shows the draft rather than cancelling.
+    #[tokio::test]
+    async fn c_is_only_special_at_the_send_prompt() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+
+        host.process_command(sid, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+        // At the body prompt "C" is the message body.
+        let resp = reply(&host, sid, "C").await;
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.starts_with("C\n")),
+            "a body of C should be staged, got {resp:?}"
+        );
+        // Words that merely start with c are not a cancel.
+        for other in ["cancel it", "cc", "yes"] {
+            let resp = reply(&host, sid, other).await;
+            assert!(
+                matches!(&resp, Response::Prompt { text, .. } if text.contains("C to cancel")),
+                "{other:?} should re-show the draft, got {resp:?}"
+            );
+        }
+        let resp = reply(&host, sid, ".").await;
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Message posted")),
+            "{resp:?}"
+        );
+        assert_eq!(room_message_count(&host, 1).await, 1);
+    }
+
+    /// On a lossy link the reply to `C` (or to `.`) can be lost and the user
+    /// re-sends it: they must hear the same outcome again, not "Usage: C ..." or
+    /// "Unknown command.". A `C` sent after the post already went through is
+    /// answered with the true outcome, not silently treated as a room change.
+    #[tokio::test]
+    async fn a_retried_c_or_dot_repeats_the_outcome() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let text = |r: Response| match r {
+            Response::Text(t) => t,
+            other => panic!("expected Text, got {other:?}"),
+        };
+        let cmd = |raw: &str| Command::parse(raw, false);
+
+        // Cancelled, then `C` and `.` re-sent.
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("draft".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(text(reply(&host, sid, "C").await).contains("Nothing was sent"));
+        for again in ["C", "."] {
+            let r = host.process_command(sid, cmd(again)).await.unwrap();
+            assert!(text(r).contains("Nothing was sent"), "{again:?}");
+        }
+        assert_eq!(room_message_count(&host, 1).await, 0);
+
+        // Posted, then a stray `C` (the user thought the post had not happened).
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("real".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(text(reply(&host, sid, ".").await).contains("Message posted"));
+        let r = host.process_command(sid, cmd("C")).await.unwrap();
+        assert!(text(r).contains("Message posted"), "C after a post");
+        assert_eq!(
+            room_message_count(&host, 1).await,
+            1,
+            "nothing was re-posted"
+        );
+
+        // Once the user does something else the slot is gone and `C` is the
+        // room command again.
+        host.process_command(sid, Command::Whoami).await.unwrap();
+        let r = host.process_command(sid, cmd("C")).await.unwrap();
+        assert!(text(r).starts_with("Usage: C"));
+    }
+
+    /// `C` typed while a draft is pending reaches the workflow on every transport
+    /// (it is a reply, not a room command) and is a room command otherwise.
+    #[test]
+    fn bare_c_is_a_reply_only_while_awaiting_one() {
+        assert!(matches!(
+            Command::parse("C", true),
+            Command::WorkflowReply { .. }
+        ));
+        assert!(matches!(
+            Command::parse("C", false),
+            Command::ChangeRoom { .. }
+        ));
+    }
+
+    #[test]
+    fn a_draft_preview_is_clipped_for_radio_but_never_loses_its_instructions() {
+        const SUFFIX: &str = "\nType . to send, C to cancel";
+        let short = draft_preview(None, "hello", true);
+        assert_eq!(short, format!("hello{SUFFIX}"));
+
+        let bob = Username::new("bob").unwrap();
+        for body in ["x".repeat(400), "é".repeat(300), "日本語".repeat(80)] {
+            for rcpt in [None, Some(&bob)] {
+                let radio = draft_preview(rcpt, &body, true);
+                assert!(
+                    radio.len() <= RADIO_DRAFT_PREVIEW_MAX_BYTES,
+                    "{}",
+                    radio.len()
+                );
+                assert!(radio.ends_with(SUFFIX), "{radio:?}");
+                assert!(radio.contains('…'), "clipped drafts say so");
+                // Off radio nothing is clipped.
+                let full = draft_preview(rcpt, &body, false);
+                assert!(full.contains(body.as_str()) && !full.contains('…'));
+            }
+        }
+        // A draft that just fits is left alone.
+        let fits = "y".repeat(RADIO_DRAFT_PREVIEW_MAX_BYTES - SUFFIX.len());
+        assert_eq!(draft_preview(None, &fits, true), format!("{fits}{SUFFIX}"));
+        assert_eq!(clip_to_bytes("abc", 0), "…");
+    }
+
+    /// End to end on a radio session: a long draft still shows how to send or cancel.
+    #[tokio::test]
+    async fn a_long_draft_on_a_radio_session_keeps_the_send_and_cancel_hint() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("meshcore").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let resp = host
+            .process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some("word ".repeat(60)),
+                },
+            )
+            .await
+            .unwrap();
+        let Response::Prompt { text, .. } = resp else {
+            panic!("expected the draft prompt, got {resp:?}");
+        };
+        assert!(
+            text.len() <= RADIO_DRAFT_PREVIEW_MAX_BYTES,
+            "{}",
+            text.len()
+        );
+        assert!(text.ends_with("Type . to send, C to cancel"), "{text:?}");
     }
 
     /// Issue #107: after a post the workflow ends, but a re-sent bare `.`

@@ -141,7 +141,7 @@ Up to 3 failed attempts; after the third the workflow exits with an error.
 |---|---|---|
 | `AwaitingRecipient` | "Recipient username:" | Username string |
 | `AwaitingBody { recipient }` | "Enter message:" | Message body |
-| `AwaitingConfirmation { recipient, body }` | Draft preview + "Type . to send" | `.` to confirm, anything else re-prompts |
+| `AwaitingConfirmation { recipient, body }` | Draft preview + "Type . to send, C to cancel" | `.` to confirm, `C` (any case) to discard the draft, anything else re-shows the draft |
 
 For room posts the recipient is `None`; for Mail DMs it is `Some(username)`.
 

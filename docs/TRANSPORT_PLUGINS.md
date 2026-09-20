@@ -530,8 +530,9 @@ or design your own.
 
 **The inline message confirmation pattern:** `EnterMessage { body: Some(text) }`
 causes the host to stage the message as a draft and return `Response::Prompt`
-echoing the draft with "Type . to send". The user's next message (`.` or
-anything else) arrives as `WorkflowReply`. Sending `.` posts the message;
+echoing the draft with "Type . to send, C to cancel". The user's next message
+(`.`, `C` or anything else) arrives as `WorkflowReply`. Sending `.` posts the
+message; `C` discards the draft and returns the user to the command prompt;
 anything else re-displays the draft. This makes inline sends idempotent on
 lossy links — if "Message posted." is never received, retrying `.` is safe.
 
