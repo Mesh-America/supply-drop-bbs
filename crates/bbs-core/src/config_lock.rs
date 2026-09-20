@@ -185,6 +185,21 @@ where
 /// already exists and is a symlink — the normal case, where `.tmp` doesn't
 /// exist yet, is unaffected and still creates it.
 pub fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    atomic_write_file_as(path, contents, None)
+}
+
+/// [`atomic_write_file`], giving the new file the mode and owner recorded in
+/// `identity` (the metadata of the file being replaced) when there is one. The
+/// mode and owner are set on the temp file's descriptor before the rename, so
+/// there is no moment where the live file has the wrong ones, and a failure to
+/// set them leaves the old file in place. Changing the owner is best effort:
+/// a process that is not root cannot give a file away, and the file then keeps
+/// its own owner.
+pub fn atomic_write_file_as(
+    path: &Path,
+    contents: &[u8],
+    identity: Option<&std::fs::Metadata>,
+) -> io::Result<()> {
     use std::io::Write as _;
     let mut tmp_name = path.as_os_str().to_owned();
     tmp_name.push(".tmp");
@@ -195,7 +210,14 @@ pub fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         .truncate(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)?;
-    if let Err(e) = f.write_all(contents).and_then(|_| f.sync_all()) {
+    let written = f
+        .write_all(contents)
+        .and_then(|()| match identity {
+            Some(meta) => apply_identity(&f, meta),
+            None => Ok(()),
+        })
+        .and_then(|()| f.sync_all());
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
@@ -205,6 +227,23 @@ pub fn atomic_write_file(path: &Path, contents: &[u8]) -> io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// Give the open file the owner and mode in `meta`. The owner is only touched
+/// where it differs (some filesystems refuse `chown` outright) and a refusal is
+/// not an error; the mode is set afterwards, since a `chown` can clear the
+/// setuid and setgid bits.
+fn apply_identity(f: &std::fs::File, meta: &std::fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::{fchown, MetadataExt as _};
+    let now = f.metadata()?;
+    if now.uid() != meta.uid() || now.gid() != meta.gid() {
+        match fchown(f, Some(meta.uid()), Some(meta.gid())) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {}
+            Err(e) => return Err(e),
+        }
+    }
+    f.set_permissions(meta.permissions())
 }
 
 #[cfg(test)]

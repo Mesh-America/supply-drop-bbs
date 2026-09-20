@@ -632,8 +632,13 @@ values (or stay unset if this machine doesn't set them). They are:
 - how the BBS is reached: the whole `[plugins.web]` and `[plugins.cli]` tables;
 - what it executes: `[[plugins.process]]`;
 - the hardware and its cost settings: each radio's `connection_type`, `addr`,
-  `serial_port`, `baud_rate` and `hat`, and the whole `[security]` section
-  (password-hashing cost is tuned to the machine).
+  `serial_port` and `baud_rate`, its `[radio]` settings, whether it is
+  `enabled`, MeshCore's `app_target_version` and each radio's
+  `protected_contact_cap` (all describe the device on this machine), and the
+  whole `[security]` section (password-hashing cost is tuned to the machine).
+  A key this machine doesn't set stays unset, so a radio that isn't `enabled`
+  in this machine's config gets the built-in default (MeshCore on, Meshtastic
+  off), not the backup's value.
 
 A backup taken on another host, or a hostile one, would otherwise point the
 admin UI or a radio somewhere that doesn't exist here, or run a command. Everything
@@ -644,7 +649,7 @@ file, and the rest of the mesh and Meshtastic settings.
 The web UI has a checkbox, on by default, to restore the settings; clear it (or
 use `supply-drop-bbs restore apply --no-config`) to restore the database only.
 The settings are applied when the BBS starts, after the database swap. The
-config file it replaces is saved as `config.toml.pre-restore` next to it. If the
+config file it replaces is saved as `config.toml.pre-restore` next to it (next to the real file, if `config.toml` is a symlink). If the
 restored file doesn't load, or the service user can't write the config file,
 the previous settings stay, the database restore still stands, the log says why
 and the audit log entry `restore_completed` records it. The log level and log

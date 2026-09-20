@@ -238,7 +238,8 @@ enum RestoreAction {
         /// `config.toml` (the settings: BBS name, welcome message, and so on)
         /// is restored with it; the parts that belong to this machine (paths, the
         /// web and CLI plugins, the database, backup and security sections, the
-        /// radio connection) always keep this machine's values.
+        /// radios' connection, settings and on or off switch) always keep this
+        /// machine's values.
         #[arg(long)]
         no_config: bool,
     },
