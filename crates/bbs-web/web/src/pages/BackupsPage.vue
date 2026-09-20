@@ -177,7 +177,7 @@ function restoreLimits(hasSettings?: boolean): string {
     hasSettings === false
       ? 'This backup has no settings (config.toml), so only the database is restored. '
       : 'Its settings (config.toml, such as the BBS name) are restored too; paths, ' +
-        "the web and CLI plugins, the database, backup and security sections and the radio connection keep this machine's values. "
+        "the web and CLI plugins, the database, backup and security sections and the radios (connection, settings, on or off) keep this machine's values. "
   return (
     'This REPLACES the current database. ' + settings +
     'Anything written since the backup was made is lost. ' + snapshot
@@ -335,7 +335,7 @@ onMounted(load)
         <input type="checkbox" v-model="restoreSettings" :disabled="busy" />
         Also restore the backup's settings (<code>config.toml</code>: BBS name, welcome
         message, and so on). Settings that belong to this machine (paths, the web and CLI
-        plugins, the database, backup and security sections, the radio connection) are kept.
+        plugins, the database, backup and security sections, the radios' connection, settings and on or off switch) are kept.
       </label>
       <div class="restore-controls">
         <input

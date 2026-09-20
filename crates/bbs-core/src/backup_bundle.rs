@@ -26,7 +26,9 @@ pub struct BundleInfo {
 /// if it can be read, the config at `config_path`. The zip is written under a
 /// `.tmp` name and renamed only when complete, so a crash never leaves a
 /// half-written bundle that looks like a backup. It is created owner-only
-/// (0600): the database holds password hashes.
+/// (0600): the database holds password hashes. It is then handed to the owner
+/// of the backup directory where the process is allowed to do that (see
+/// `hand_to_dir_owner`).
 ///
 /// A missing or unreadable config is not an error (the bundle then holds the
 /// database alone, as the old bare backups did) but is logged, since a backup
@@ -69,6 +71,30 @@ pub fn bundle_and_drop_bare(
     Ok(info)
 }
 
+/// Give the open file to the owner (user and group) of the directory it is
+/// in, best effort. `supply-drop-bbs backup` run as root would otherwise leave
+/// a root-owned 0600 bundle that the service (which lists, deletes and stages
+/// backups) can't read. Going by the descriptor, not the path, keeps a swapped
+/// path from redirecting the chown. A process that isn't root can't give the
+/// file away but can usually still set the group, so that is tried next.
+///
+/// This assumes the backup directory belongs to the service user, as the
+/// packages set it up: a bundle is 0600 (it holds password hashes), so a
+/// directory owned by someone else with only group access to the service would
+/// still leave the service unable to read it.
+fn hand_to_dir_owner(file: &std::fs::File, path: &Path) {
+    use std::os::unix::fs::{fchown, MetadataExt as _};
+    let dir = match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    if let Ok(meta) = std::fs::metadata(dir) {
+        if fchown(file, Some(meta.uid()), Some(meta.gid())).is_err() {
+            let _ = fchown(file, None, Some(meta.gid()));
+        }
+    }
+}
+
 fn write_bundle_inner(
     db_path: &Path,
     db_entry: &str,
@@ -78,13 +104,24 @@ fn write_bundle_inner(
 ) -> std::io::Result<BundleInfo> {
     use zip::{write::SimpleFileOptions, CompressionMethod};
 
+    // A leftover temp file (a backup that died mid-write) is removed and made
+    // again, so the new one is created here with this mode and owner rather
+    // than inheriting whatever the old one had; `create_new` (O_EXCL) also
+    // refuses a symlink planted at the name, which matters when this runs as
+    // root under `supply-drop-bbs backup`.
+    match std::fs::remove_file(tmp) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.mode(0o600);
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let file = opts.open(tmp)?;
+    hand_to_dir_owner(&file, tmp);
     let mut zip = zip::ZipWriter::new(file);
     let zopts = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)

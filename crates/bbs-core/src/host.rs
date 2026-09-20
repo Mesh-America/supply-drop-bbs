@@ -10755,7 +10755,7 @@ mod tests {
 
     // The whole path: back up with settings, restore, and the BBS name (and the
     // other settings in the file) come back, while this machine's own paths and
-    // radio connection stay.
+    // radio connection and switch stay.
     #[tokio::test]
     async fn restoring_a_bundle_brings_back_the_settings_and_keeps_machine_specific_keys() {
         use crate::restore_apply::{apply_pending_restore, ApplyOutcome, ConfigOutcome};

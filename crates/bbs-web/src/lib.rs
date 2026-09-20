@@ -4294,7 +4294,7 @@ async fn api_stage_backup_restore(
 const RESTORE_UPLOAD_MAX_BYTES: usize = bbs_core::restore_stage::WEB_RESTORE_MAX_BYTES as usize;
 
 /// How much of an upload is written between free-space checks.
-const SPACE_RECHECK_BYTES: u64 = 64 * 1024 * 1024;
+const SPACE_RECHECK_BYTES: u64 = bbs_core::disk_space::RECHECK_INTERVAL_BYTES;
 
 /// `POST /api/v1/backups/restore` — accepts a multipart file upload,
 /// validates it as a restorable database WITHOUT touching the live one, and
@@ -4328,12 +4328,18 @@ async fn api_upload_restore(
                 .into_response()
         }
     };
-    // Held for the rest of this handler so a second concurrent upload (or a
-    // confirm) can't interleave with this one's validate-then-rename onto
-    // the shared pending_restore.staged.db path.
-    let _restore_guard = state.restore_lock.lock().await;
+    // A cheap early answer. The lock that keeps uploads and confirms from
+    // interleaving on the shared pending_restore.staged.db path is taken only
+    // once the body has arrived (below): holding it while a slow or stalled
+    // client trickles a multi-GiB body would block every other restore request
+    // for as long as that client cares to take.
     if state.restore_confirmed.load(Ordering::SeqCst) {
         return restore_already_confirmed();
+    }
+    // The size isn't known up front (multipart), so at least refuse to start
+    // on a disk that is already short of room.
+    if let Err(msg) = bbs_core::disk_space::ensure_free_space(std::path::Path::new(&data_dir), 0) {
+        return (StatusCode::INSUFFICIENT_STORAGE, Json(json_error(&msg))).into_response();
     }
 
     let field = match multipart.next_field().await {
@@ -4412,7 +4418,17 @@ async fn api_upload_restore(
     if let Err(e) = tokio::io::AsyncWriteExt::flush(&mut file).await {
         return server_error(&format!("saving upload: {e}"));
     }
+    // On disk before it is validated and renamed into place.
+    if let Err(e) = file.sync_all().await {
+        return server_error(&format!("saving upload: {e}"));
+    }
     drop(file);
+
+    // Now serialise with other uploads and confirms; see the note above.
+    let _restore_guard = state.restore_lock.lock().await;
+    if state.restore_confirmed.load(Ordering::SeqCst) {
+        return restore_already_confirmed();
+    }
 
     let result = state
         .host
@@ -6139,6 +6155,53 @@ mod tests {
             let f = fixture().await;
             let resp = upload(&f, sysop(), b"this is not a sqlite database").await;
             assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert!(data_dir_files(&f).is_empty(), "{:?}", data_dir_files(&f));
+        }
+
+        // A client that sends part of the body and then stalls must not hold the
+        // restore lock: that would block every other restore request (and the
+        // confirm) for as long as the client cares to sit there.
+        #[tokio::test]
+        async fn a_stalled_upload_does_not_hold_the_restore_lock() {
+            use axum::extract::FromRequest as _;
+            let f = fixture().await;
+            let (content_type, body) = multipart_body(b"SQLite format 3\0only the start");
+            // Drop the closing boundary so the field never ends.
+            let closing = "\r\n------restoretestboundary--\r\n".len();
+            let head = axum::body::Bytes::copy_from_slice(&body[..body.len() - closing]);
+            let stream = tokio_stream::iter([Ok::<_, std::convert::Infallible>(head)])
+                .chain(tokio_stream::pending());
+            let req = Request::builder()
+                .method("POST")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(axum::body::Body::from_stream(stream))
+                .unwrap();
+            let multipart = Multipart::from_request(req, &()).await.unwrap();
+
+            let state = Arc::clone(&f.state);
+            let task = tokio::spawn(async move {
+                api_upload_restore(State(state), Extension(sysop()), multipart).await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+            assert!(!task.is_finished(), "the upload is still waiting for data");
+            // The handler is past the multipart headers and streaming into its
+            // temp file, i.e. it is stalled where the lock would have been held.
+            assert!(
+                data_dir_files(&f)
+                    .iter()
+                    .any(|n| n.starts_with("restore_upload_")),
+                "{:?}",
+                data_dir_files(&f)
+            );
+            assert!(
+                f.state.restore_lock.try_lock().is_ok(),
+                "a stalled upload must not hold the restore lock"
+            );
+
+            task.abort();
+            let _ = task.await;
+            // The half-written temp file goes with the dropped request.
             assert!(data_dir_files(&f).is_empty(), "{:?}", data_dir_files(&f));
         }
 
