@@ -202,6 +202,16 @@ enum LoginSuspensionCheck {
     PermanentlyBanned,
 }
 
+/// Whole days left in a suspension ending at `until`, as seen at `now`, rounded
+/// up so a suspension ending in a few hours still reads as "1 more day": "0 more
+/// days" would be a confusing thing to tell someone who is still, in fact,
+/// blocked. `until` must be after `now`; the result is never below 1.
+fn suspension_days_remaining(until: Timestamp, now: Timestamp) -> i64 {
+    let remaining_secs = (until.as_offset_datetime() - now.as_offset_datetime()).whole_seconds();
+    // Manual ceiling division: `i64::div_ceil` isn't stable on this toolchain (1.96).
+    ((remaining_secs + 86_400 - 1) / 86_400).max(1)
+}
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug)]
 enum ComposeStage {
@@ -2154,7 +2164,10 @@ impl BbsHost {
         let Some(until) = user.suspended_until else {
             return Ok(LoginSuspensionCheck::PermanentlyBanned);
         };
-        if Timestamp::now() >= until {
+        // Read the clock once: the expiry check and the days remaining must
+        // agree on what "now" is, even if the wall clock steps between two reads.
+        let now = Timestamp::now();
+        if now >= until {
             UserStore::update(
                 &self.db,
                 user.id,
@@ -2173,16 +2186,9 @@ impl BbsHost {
             user.suspended_until = None;
             return Ok(LoginSuspensionCheck::Allowed(user));
         }
-        // Ceiling-divide the remaining whole seconds into days, so a
-        // suspension ending in a few hours still reads as "1 more day" —
-        // "0 more days" would be a confusing thing to tell someone who is
-        // still, in fact, blocked.
-        let remaining_secs =
-            (until.as_offset_datetime() - Timestamp::now().as_offset_datetime()).whole_seconds();
-        // Manual ceiling division — `i64::div_ceil` isn't stable on this
-        // toolchain (1.96) yet. `remaining_secs` is always positive here.
-        let days_remaining = ((remaining_secs + 86_400 - 1) / 86_400).max(1);
-        Ok(LoginSuspensionCheck::Suspended { days_remaining })
+        Ok(LoginSuspensionCheck::Suspended {
+            days_remaining: suspension_days_remaining(until, now),
+        })
     }
 
     /// Create `username` with `password`, attach the new account to `session`,
@@ -8386,6 +8392,56 @@ mod tests {
         assert!(stored.suspended_until.is_some());
     }
 
+    /// Days remaining round up, and a wall clock that reads a few seconds off
+    /// moves the answer only across a day boundary (#331): the integration tests
+    /// above keep clear of those boundaries, and this pins them down.
+    #[test]
+    fn suspension_days_remaining_rounds_up_at_the_day_boundaries() {
+        let now = Timestamp::from_utc(time::OffsetDateTime::UNIX_EPOCH);
+        let after = |secs: i64| {
+            Timestamp::from_utc(now.as_offset_datetime() + time::Duration::seconds(secs))
+        };
+        const DAY: i64 = 86_400;
+        assert_eq!(suspension_days_remaining(after(1), now), 1);
+        assert_eq!(suspension_days_remaining(after(3 * 3600), now), 1);
+        assert_eq!(suspension_days_remaining(after(DAY), now), 1);
+        assert_eq!(suspension_days_remaining(after(DAY + 1), now), 2);
+        assert_eq!(suspension_days_remaining(after(60 * 3600), now), 3);
+        assert_eq!(suspension_days_remaining(after(3 * DAY), now), 3);
+        assert_eq!(suspension_days_remaining(after(3 * DAY + 1), now), 4);
+        // Never below 1, even for an `until` that is not after `now`.
+        assert_eq!(suspension_days_remaining(now, now), 1);
+        assert_eq!(suspension_days_remaining(after(-5), now), 1);
+    }
+
+    /// `admin_suspend_user` stores `days` whole days from now. Checked with an
+    /// hour of slack each way rather than against a before/after bracket: the
+    /// wall clock can step by seconds (#331), and a day count is what matters.
+    #[tokio::test]
+    async fn admin_suspend_user_stores_whole_days_from_now() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "hunter99").await;
+
+        for days in [1u8, 3, 5] {
+            host.admin_suspend_user("alice", days).await.unwrap();
+            let until = UserStore::get_by_username(&host.db, &alice)
+                .await
+                .unwrap()
+                .unwrap()
+                .suspended_until
+                .expect("a timeout has an end");
+            let ahead = (until.as_offset_datetime() - Timestamp::now().as_offset_datetime())
+                .whole_seconds();
+            let want = i64::from(days) * 86_400;
+            assert!(
+                (want - 3600..=want + 3600).contains(&ahead),
+                "{days} day(s) should end about {want}s from now, got {ahead}s"
+            );
+        }
+    }
+
     /// The core UX #280 asks for: a login attempt during an active timeout
     /// is told how many days remain, not a generic "Login failed."
     #[tokio::test]
@@ -8396,7 +8452,18 @@ mod tests {
         register_and_login(&host, sid, &alice, "hunter99").await;
         host.process_command(sid, Command::Logout).await.unwrap();
 
-        host.admin_suspend_user("alice", 3).await.unwrap();
+        // Two and a half days out, set directly: it rounds up to 3 by 12 hours
+        // either way, so a wall clock that steps by a few seconds (see #331)
+        // can't tip it into "4". `admin_suspend_user("alice", 3)` would sit within
+        // a second of the 2 to 3 day boundary the moment the clock moved back.
+        let alice_id = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let until =
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() + time::Duration::hours(60));
+        UserStore::suspend(&host.db, alice_id, until).await.unwrap();
 
         let sid2 = host.create_session("test").await.unwrap();
         host.process_command(
@@ -8419,7 +8486,7 @@ mod tests {
         match r {
             Response::Error(msg) => {
                 assert!(
-                    msg.contains("suspended") && msg.contains("3"),
+                    msg.contains("suspended for 3 more day"),
                     "expected a message naming the days remaining, got: {msg:?}"
                 );
             }
@@ -8459,7 +8526,7 @@ mod tests {
             .unwrap();
         match r {
             Response::Error(msg) => assert!(
-                msg.contains("suspended"),
+                msg.contains("suspended for"),
                 "expected a suspension message, got: {msg:?}"
             ),
             other => panic!("expected Response::Error, got {other:?}"),
@@ -8521,9 +8588,12 @@ mod tests {
             .unwrap()
             .id;
         // Directly set an already-past suspended_until — admin_suspend_user
-        // itself only ever computes a future one.
+        // itself only ever computes a future one. An hour, not a second: this
+        // WSL2 VM's wall clock has been seen stepping back by more than two
+        // seconds under load (#331), and a margin that thin turned the test
+        // into a coin flip.
         let past =
-            Timestamp::from_utc(Timestamp::now().as_offset_datetime() - time::Duration::seconds(1));
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() - time::Duration::hours(1));
         UserStore::suspend(&host.db, alice_id, past).await.unwrap();
 
         let sid2 = host.create_session("test").await.unwrap();
