@@ -19,7 +19,9 @@
 //! * what it executes: `[[plugins.process]]`, which names commands to run;
 //! * the hardware: how each radio is connected, its `[radio]` settings, whether
 //!   it is `enabled`, and the security section, whose password-hashing cost is
-//!   tuned to this machine's speed.
+//!   tuned to this machine's speed;
+//! * the radio's name: Meshtastic's `short_name` and `long_name`, which are
+//!   reconciled with the radio on every connect.
 //!
 //! A bundle from another host would otherwise point the admin UI or a radio
 //! somewhere that doesn't exist here, or run a command that isn't installed
@@ -73,6 +75,8 @@ pub const MACHINE_SPECIFIC_KEYS: &[&[&str]] = &[
     &["plugins", "meshtastic", "radio"],
     &["plugins", "meshtastic", "enabled"],
     &["plugins", "meshtastic", "protected_contact_cap"],
+    &["plugins", "meshtastic", "short_name"],
+    &["plugins", "meshtastic", "long_name"],
 ];
 
 /// Check that `text` is a TOML document a restore can work with.
@@ -322,6 +326,63 @@ mod tests {
         assert_eq!(m["bbs"]["welcome_msg"].as_str(), Some("hi {name}"));
         assert_eq!(m["bbs"]["timezone"].as_str(), Some("UTC"));
         assert_eq!(m["location"]["latitude"].as_float(), Some(1.5));
+    }
+
+    // The sign-up policy, the guest room and the location describe the BBS, not
+    // the machine, so a backup from another instance brings them along.
+    #[test]
+    fn sign_up_policy_guest_room_and_location_come_from_the_backup() {
+        let current = "[bbs]\nrequire_verify = false\nguest_room = \"Lobby\"\n\
+                       [location]\nlatitude = 1.0\nlongitude = 2.0\n";
+        let restored = "[bbs]\nrequire_verify = true\nguest_room = \"Front Desk\"\n\
+                        [location]\nlatitude = 40.5\nlongitude = -105.25\n";
+        let m = merged(current, restored);
+        assert_eq!(m["bbs"]["require_verify"].as_bool(), Some(true));
+        assert_eq!(m["bbs"]["guest_room"].as_str(), Some("Front Desk"));
+        assert_eq!(m["location"]["latitude"].as_float(), Some(40.5));
+        assert_eq!(m["location"]["longitude"].as_float(), Some(-105.25));
+    }
+
+    #[test]
+    fn a_meshtastic_node_name_stays_with_this_machine() {
+        let m = merged(
+            "[plugins.meshtastic]\nshort_name = \"HERE\"\nlong_name = \"Here BBS\"\n",
+            "[plugins.meshtastic]\nshort_name = \"THEM\"\nlong_name = \"Their BBS\"\n",
+        );
+        assert_eq!(
+            m["plugins"]["meshtastic"]["short_name"].as_str(),
+            Some("HERE")
+        );
+        assert_eq!(
+            m["plugins"]["meshtastic"]["long_name"].as_str(),
+            Some("Here BBS")
+        );
+        // Unset here stays unset: the radio's own name is not managed.
+        let m = merged(
+            "[plugins.meshtastic]\nenabled = false\n",
+            "[plugins.meshtastic]\nshort_name = \"THEM\"\n",
+        );
+        assert!(m["plugins"]["meshtastic"].get("short_name").is_none());
+        // Only one name set here: that one is kept, the other is not taken.
+        let m = merged(
+            "[plugins.meshtastic]\nshort_name = \"HERE\"\n",
+            "[plugins.meshtastic]\nshort_name = \"THEM\"\nlong_name = \"Their BBS\"\n",
+        );
+        assert_eq!(
+            m["plugins"]["meshtastic"]["short_name"].as_str(),
+            Some("HERE")
+        );
+        assert!(m["plugins"]["meshtastic"].get("long_name").is_none());
+        // No Meshtastic section here at all.
+        let m = merged(
+            "[bbs]\nname = \"x\"\n",
+            "[plugins.meshtastic]\nlong_name = \"Their BBS\"\n",
+        );
+        assert!(m
+            .get("plugins")
+            .and_then(|p| p.get("meshtastic"))
+            .and_then(|t| t.get("long_name"))
+            .is_none());
     }
 
     #[test]

@@ -635,10 +635,14 @@ values (or stay unset if this machine doesn't set them). They are:
   `serial_port` and `baud_rate`, its `[radio]` settings, whether it is
   `enabled`, MeshCore's `app_target_version` and each radio's
   `protected_contact_cap` (all describe the device on this machine), and the
-  whole `[security]` section (password-hashing cost is tuned to the machine).
-  A key this machine doesn't set stays unset, so a radio that isn't `enabled`
-  in this machine's config gets the built-in default (MeshCore on, Meshtastic
-  off), not the backup's value.
+  whole `[security]` section (password-hashing cost is tuned to the machine);
+- the radio's name: Meshtastic's `short_name` and `long_name`, which the BBS
+  reconciles with the radio on every connect, so a backup from another node
+  would rename this one (and reboot it);
+
+A key this machine doesn't set stays unset, so a radio that isn't `enabled`
+in this machine's config gets the built-in default (MeshCore on, Meshtastic
+off), not the backup's value.
 
 A backup taken on another host, or a hostile one, would otherwise point the
 admin UI or a radio somewhere that doesn't exist here, or run a command. Everything

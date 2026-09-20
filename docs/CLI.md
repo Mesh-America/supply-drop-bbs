@@ -374,7 +374,7 @@ supply-drop-bbs restore apply
 
 By default a `.zip` backup's `config.toml` (the settings) is restored with the
 database, apart from the parts that belong to this machine (paths, the web and CLI
-plugins, the database, backup and security sections, the radios' connection, settings and on or off switch); see [Restoring from a
+plugins, the database, backup and security sections, the radios' connection, settings, on or off switch and node names); see [Restoring from a
 backup](OPERATIONS.md#restoring-from-a-backup). Pass `--no-config` to restore the
 database only.
 
