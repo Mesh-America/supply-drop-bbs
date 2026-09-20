@@ -30,6 +30,7 @@ transport-process     = ["dep:bbs-process-transport"]
 [dependencies]
 mimalloc.workspace        = true
 bbs-core.workspace        = true
+bbs-serial-path.workspace = true
 bbs-plugin-api.workspace  = true
 bbs-cli              = { workspace = true, optional = true }
 bbs-mesh             = { workspace = true, optional = true }
@@ -81,6 +82,7 @@ bbs-core              = { path = "crates/bbs-core",              version = "1.2.
 bbs-plugin-api        = { path = "crates/bbs-plugin-api",        version = "1.2.0" }
 bbs-cli               = { path = "crates/bbs-cli",               version = "1.2.0" }
 bbs-mesh              = { path = "crates/bbs-mesh",              version = "1.2.0" }
+bbs-serial-path       = { path = "crates/bbs-serial-path",       version = "1.2.0" }
 bbs-meshtastic        = { path = "crates/bbs-meshtastic",        version = "1.2.0" }
 bbs-web               = { path = "crates/bbs-web",              version = "1.2.0" }
 bbs-process-transport = { path = "crates/bbs-process-transport", version = "1.2.0" }

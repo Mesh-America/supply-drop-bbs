@@ -501,6 +501,14 @@ impl Plugin for MeshTransport {
                         "connection_type = 'serial' requires serial_port to be set".into(),
                     )
                 })?;
+                if let Some(alias) = bbs_serial_path::stable_alias_suggestion(&port) {
+                    warn!(
+                        port = %port,
+                        stable_alias = %alias,
+                        "mesh transport: {}",
+                        bbs_serial_path::NUMBERED_PATH_ADVICE
+                    );
+                }
                 let serial_config = SerialConfig {
                     port: port.clone(),
                     baud_rate: config.baud_rate,

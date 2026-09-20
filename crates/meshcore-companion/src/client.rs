@@ -376,7 +376,7 @@ fn serial_open_error(port: &str, e: tokio_serial::Error) -> io::Error {
             io::ErrorKind::PermissionDenied,
             format!(
                 "permission denied opening serial port {port}: the service user is not in the \
-                 group that owns the device. Run `ls -l {port}` to find the owning group \
+                 group that owns the device. Run `ls -lL {port}` to find the owning group \
                  (commonly `dialout` or `plugdev`), add the user to it \
                  (`sudo usermod -aG <group> supply-drop`), then restart the service. \
                  See docs/OPERATIONS.md — \"Serial port: Permission denied\"."
@@ -667,7 +667,7 @@ mod serial_open_error_tests {
         let mapped = serial_open_error("/dev/ttyACM0", e);
         assert_eq!(mapped.kind(), io::ErrorKind::PermissionDenied);
         assert!(mapped.to_string().contains("usermod"));
-        assert!(mapped.to_string().contains("ls -l"));
+        assert!(mapped.to_string().contains("ls -lL"));
     }
 
     #[test]

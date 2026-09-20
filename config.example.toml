@@ -179,8 +179,10 @@
 # connection_type = "tcp"
 
 # ── Serial mode (connection_type = "serial") ──────────────────────
-# Serial device. The setup wizard detects and sets this automatically.
-# serial_port = "/dev/ttyACM0"
+# Serial device. The setup wizard detects and sets this automatically, using the
+# stable /dev/serial/by-id/... name for a radio with its own USB serial number. Prefer that over
+# /dev/ttyACMn: those numbers change when a radio is re-attached.
+# serial_port = "/dev/serial/by-id/usb-Heltec_HT-n5262_D42292EF51268EE1-if00"
 # baud_rate = 115200
 
 # ── TCP / HAT mode (connection_type = "tcp" or "hat") ─────────────
@@ -249,7 +251,7 @@
 # connection_type = "serial"
 
 # ── Serial / HAT mode (connection_type = "serial" or "hat") ──────
-# serial_port = "/dev/ttyACM0"   # USB; use /dev/ttyAMA0 for HAT
+# serial_port = "/dev/serial/by-id/usb-..."   # USB (see /dev/serial/by-id/); use /dev/ttyAMA0 for HAT
 # baud_rate = 115200
 
 # ── TCP mode (connection_type = "tcp") ────────────────────────────

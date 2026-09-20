@@ -251,7 +251,7 @@ NodeSource) and re-run it.
 ### What the setup wizard asks
 
 1. **Radio connection type** - USB serial or Pi HAT
-2. **Serial port** *(USB only)* - detected automatically; you confirm or enter manually
+2. **Serial port** *(USB only)* - detected automatically; you confirm or enter manually. A radio that reports its own USB serial number is offered by its stable `/dev/serial/by-id/...` name (with the `/dev/ttyACMn` it currently is shown for reference), and that name is what is written to the config. Radios without a unique serial number are offered by their plain path and flagged, and if your current config names a port that is not plugged in, a "Keep current" row is offered first
 3. **BBS name** - displayed to users on connect
 4. **Data directory** - defaults to `/var/lib/supply-drop-bbs`
 5. **Web admin UI** - whether to enable it, and if so, the password and bind address
@@ -950,6 +950,23 @@ sudo journalctl -u supply-drop-bbs -f
 Common causes: wrong `serial_port` in config; **permission denied** on the port
 (see [Serial port: Permission denied](#serial-port-permission-denied) below);
 firmware crashed (unplug and replug).
+
+**Handshake timeouts after re-attaching a radio, or with two radios:**
+`/dev/ttyACM0`, `/dev/ttyACM1` and so on are numbered in the order the radios
+attach, so they can swap when a radio is unplugged and plugged back in (on WSL2,
+after a `usbipd attach`) or after a reboot. The BBS then speaks each protocol to
+the wrong radio and logs `AppStart handshake timeout` or
+`payload length ... exceeds MAX_PAYLOAD_SIZE`. Use the stable name instead:
+
+```sh
+ls -l /dev/serial/by-id/
+```
+
+Copy the entry for the radio into `serial_port`, for example
+`serial_port = "/dev/serial/by-id/usb-Heltec_HT-n5262_D42292EF51268EE1-if00"`.
+Two boards of the same model have different names, because the name includes the
+USB serial number (a board that reports none, or two that share one, cannot be told apart this way). The BBS logs a warning at connect when `serial_port` is a
+numbered `/dev/ttyACMn` or `/dev/ttyUSBn` name and a stable alias exists for it.
 
 **Pi HAT:**
 
