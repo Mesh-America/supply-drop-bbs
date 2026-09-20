@@ -223,13 +223,30 @@ sudo bash install.sh
 1. Installs minimal system packages (`curl`, `git`, `figlet`)
 2. Clones (or updates) the repository to `/opt/supply-drop-bbs`
 3. Downloads the pre-built binary for your architecture and verifies its SHA256 checksum
-4. Falls back to building from source if no pre-built binary is available (5–15 min on a Pi)
+4. Falls back to building from source if no pre-built binary is available (5–15 min on a Pi); see [Node.js for the source build](#nodejs-for-the-source-build)
 5. Installs the binary to `/usr/local/bin/supply-drop-bbs`
 6. Creates the `supply-drop` system user and the config/data directories
 7. Installs the `supply-drop-bbs.service` systemd unit
 8. Runs the **setup wizard**
 9. **Pi HAT only:** installs `openhop_core` in a Python venv, writes `pymc-companion.yaml`, and enables `pymc-companion.service`
 10. Enables and starts both services
+
+#### Node.js for the source build
+
+Building from source compiles the web admin UI, which needs npm and a Node.js
+the web build's dependencies accept: 18.17 or newer on the 18 line, 20.3 or
+newer on the 20 line, or 22 and later. The installer keeps an existing Node.js
+when `node` and `npm` both run as root, `node` is a Linux build in one of those
+ranges, and neither binary is the Windows copy that WSL adds to the `PATH` under
+`/mnt`. That includes a NodeSource install. Otherwise it installs `nodejs` (and
+`npm`, where the distribution ships it separately) from apt.
+
+A Node.js installed with nvm in your home directory is usually not visible to
+the installer: `sudo` resets `PATH`, so root doesn't see `~/.nvm`. The installer
+then installs its own from apt, which may be too old on some distributions
+(Ubuntu 22.04 ships 12). It warns when it ends up with a Node.js the web build
+can't use, and you can install a newer one system-wide (for example from
+NodeSource) and re-run it.
 
 ### What the setup wizard asks
 
@@ -327,7 +344,9 @@ sudo systemctl restart pymc-companion
 
 ### Building from source (manual)
 
-Required: Rust 1.88+ (`rustup install 1.88`).
+Required: Rust 1.88+ (`rustup install 1.88`), and npm with a supported Node.js
+(18.17+, 20.3+ or 22+; see [Node.js for the source build](#nodejs-for-the-source-build)),
+because the default build compiles the web admin UI.
 
 ```sh
 git clone https://github.com/Mesh-America/supply-drop-bbs
@@ -521,7 +540,9 @@ When asked **"Reconfigure now?"**, answer **N** to keep your existing config unc
 
 ### Source build update
 
-Use this path only if no pre-built binary is available for your architecture:
+Use this path only if no pre-built binary is available for your architecture.
+The build needs the same Node.js and npm as the installer's source build (see
+[Node.js for the source build](#nodejs-for-the-source-build)):
 
 ```sh
 sudo systemctl stop supply-drop-bbs

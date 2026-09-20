@@ -312,6 +312,42 @@ fi
 
 _installed_from_binary=false
 
+# True when `$1` resolves to an absolute path outside /mnt. WSL appends the
+# Windows PATH under /mnt (its default automount root), and the extensionless
+# npm shim there is found even when no Linux node is installed.
+linux_cmd() {
+    local _path
+    _path=$(command -v "$1") || return 1
+    [[ "$_path" == /* && "$_path" != /mnt/* ]]
+}
+
+# True when an existing Node.js can build the web UI: `node` and `npm` are both
+# Linux binaries that run, and node is in a version range the web build's
+# dependencies accept: 18.17+, 20.3+ or 22+ (see the `engines` fields in
+# crates/bbs-web/web/package-lock.json). Sets NODE_VER for the caller's
+# messages. Each call gets a timeout and no stdin so a wedged binary can't stall
+# the installer.
+NODE_VER=""
+node_usable() {
+    local _bin _maj _min
+    NODE_VER=""
+    for _bin in node npm; do
+        linux_cmd "$_bin" || return 1
+        timeout 15 "$_bin" --version </dev/null &>/dev/null || return 1
+    done
+    [[ $(timeout 15 node -p 'process.platform' </dev/null) == linux ]] || return 1
+    NODE_VER=$(timeout 15 node -p 'process.versions.node' </dev/null) || return 1
+    if [[ "$NODE_VER" =~ ^([0-9]{1,4})\.([0-9]{1,4})\.[0-9]+([-+][0-9A-Za-z.+-]+)?$ ]]; then
+        _maj=${BASH_REMATCH[1]}
+        _min=${BASH_REMATCH[2]}
+    else
+        NODE_VER=""
+        return 1
+    fi
+    # 10# so a leading zero isn't read as octal.
+    ((10#$_maj >= 22)) || ((10#$_maj == 20 && 10#$_min >= 3)) || ((10#$_maj == 18 && 10#$_min >= 17))
+}
+
 try_download_binary() {
     local arch
     arch=$(uname -m)
@@ -448,12 +484,35 @@ else
     echo "  This takes 5–15 minutes on a Pi — please wait."
     echo
 
-    # Build-only system packages.
+    # Build-only system packages. bbs-web's build.rs shells out to npm, so we
+    # need Node.js and npm. An existing usable Node.js (see node_usable) is
+    # kept. Otherwise ask apt for it. NodeSource's `nodejs` bundles its own
+    # npm and declares `Conflicts: npm`, so when NodeSource is apt's candidate
+    # a request for Ubuntu's `npm` alongside it makes apt abort with "held
+    # broken packages". Try the pair in a simulated install first and fall back
+    # to `nodejs` alone if that fails; the npm check below catches a fallback
+    # that left no npm. A Node.js that root can't see (typically nvm under plain
+    # `sudo`) counts as not installed.
     info "Installing build dependencies..."
-    apt-get install -y -qq \
-        build-essential pkg-config libssl-dev \
-        nodejs npm
+    _build_pkgs=(build-essential pkg-config libssl-dev)
+    if node_usable; then
+        info "Using existing Node.js v${NODE_VER} and npm $(npm --version)"
+    elif apt-get -s install nodejs npm &>/dev/null; then
+        _build_pkgs+=(nodejs npm)
+    else
+        _build_pkgs+=(nodejs)
+    fi
+    apt-get install -y -qq "${_build_pkgs[@]}"
     success "Build dependencies installed"
+    linux_cmd npm || \
+        die "No Linux npm found after installing build dependencies. Install Node.js and npm yourself (for example NodeSource's nodejs, which includes npm), then re-run."
+    if ! node_usable; then
+        if [[ -n "$NODE_VER" ]]; then
+            warn "Node.js v${NODE_VER} is outside the versions the web UI build supports (18.17+, 20.3+ or 22+); the build below may fail."
+        else
+            warn "No working Linux node and npm found for the web UI build (needs Node.js 18.17+, 20.3+ or 22+ and a working npm); the build below may fail."
+        fi
+    fi
 
     # Rust.
     if command -v cargo &>/dev/null; then
