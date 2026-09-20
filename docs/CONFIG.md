@@ -340,7 +340,7 @@ run companion-frame firmware. No `openhop_core` required.
 
 | Key           | Type    | Default          | Required | Description                              |
 |---------------|---------|------------------|----------|------------------------------------------|
-| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path. The setup wizard auto-detects this. |
+| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path. The setup wizard auto-detects this and writes the stable `/dev/serial/by-id/...` name for a radio that reports its own USB serial number. Prefer that: `/dev/ttyACMn` numbers change when a radio is re-attached, which can point the BBS at the wrong radio (the BBS warns at connect). See [OPERATIONS.md](OPERATIONS.md#radio-bridge-disconnected). |
 | `baud_rate`   | integer | `115200`         | no       | Serial baud rate                         |
 
 ### TCP / HAT mode (`connection_type = "tcp"` or `"hat"`)
@@ -555,7 +555,7 @@ No daemon required.
 
 | Key           | Type    | Default          | Required | Description           |
 |---------------|---------|------------------|----------|-----------------------|
-| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path    |
+| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path. Prefer the stable `/dev/serial/by-id/...` name for USB radios (see the `[plugins.mesh]` table above); the BBS warns at connect when a numbered `/dev/ttyACMn` name is used |
 | `baud_rate`   | integer | `115200`         | no       | Serial baud rate      |
 
 ### TCP mode (`connection_type = "tcp"`)
