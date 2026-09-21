@@ -1729,10 +1729,10 @@ warn!("meshtastic: frame too long ({} bytes) — truncating", n);
 
 ### Before opening a PR
 
-- [ ] `rustup run 1.88 cargo fmt --all --check` passes
-- [ ] `rustup run 1.88 cargo test --workspace` passes
-- [ ] `rustup run 1.88 cargo clippy --workspace -- -D warnings` passes
-- [ ] `rustup run 1.88 cargo doc --workspace --no-deps --all-features` passes
+- [ ] `rustup run 1.96 cargo fmt --all --check` passes
+- [ ] `rustup run 1.96 cargo test --workspace` passes
+- [ ] `rustup run 1.96 cargo clippy --workspace -- -D warnings` passes
+- [ ] `rustup run 1.96 cargo doc --workspace --no-deps --all-features` passes
 - [ ] Payload size test added for every canned string
 - [ ] Config documented in `docs/CONFIG.md`
 - [ ] Feature flag documented in root `Cargo.toml` comment

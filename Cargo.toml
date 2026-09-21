@@ -74,7 +74,7 @@ version = "1.2.0"
 edition      = "2021"
 authors      = ["Mesh-America"]
 repository   = "https://github.com/Mesh-America/supply-drop-bbs"
-rust-version = "1.88"
+rust-version = "1.96"
 
 # Shared dependencies. As we add real deps (sqlx, axum, etc.) they
 # go here so every workspace member uses the same version.

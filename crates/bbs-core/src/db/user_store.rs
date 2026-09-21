@@ -110,9 +110,9 @@ pub trait UserStore: Send + Sync {
     /// (supply-drop-bbs-ax3 / #280). Distinct from [`update`](Self::update)
     /// with `status = Some(Banned)`, which is a *permanent* ban and leaves
     /// `suspended_until` untouched (callers going through `update` for a
-    /// permanent ban should pair it with [`clear_suspension`]
-    /// (Self::clear_suspension) to avoid leaving a stale expiry from an
-    /// earlier suspension).
+    /// permanent ban should pair it with
+    /// [`clear_suspension`](Self::clear_suspension) to avoid leaving a stale
+    /// expiry from an earlier suspension).
     async fn suspend(&self, id: UserId, until: Timestamp) -> Result<(), StoreError>;
 
     /// Clear `suspended_until` back to `NULL`, without touching `status`.
