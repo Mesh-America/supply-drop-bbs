@@ -481,7 +481,7 @@ pub enum Command {
 
     // Message reading
     ReadNew,
-    ReadForward  { after: Option<i64> },
+    ReadForward  { after: Option<i64> },   // F <id>: start AT that id (or the first message after it)
     ReadReverse,
     ScanMessages,
     FastForward,
