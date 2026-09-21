@@ -184,6 +184,7 @@ Up to 3 failed attempts on `VerifyOld` before the workflow is cancelled.
 | `F` | Fetch next message, advance cursor, stay in workflow |
 | `R` | Fetch previous message, move cursor back, stay in workflow |
 | `E` | Start `Workflow::Compose` replying to current message sender (Mail) or posting to current room |
+| `F <id>` | Jump to message `<id>` (or the next one after it if it is gone), stay in workflow |
 | `H` / `?` | Show contextual reading-mode help, stay in workflow |
 | Anything else | Reset cursor and workflow, return to normal mode |
 
