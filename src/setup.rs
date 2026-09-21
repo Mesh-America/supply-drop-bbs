@@ -1404,9 +1404,11 @@ fn prompt_advert_scope(theme: &ColorfulTheme, existing: Option<&str>) -> Option<
     println!("A MeshCore region name keeps the BBS's adverts inside that region, which");
     println!("cuts noise on a large mesh. Leave it unset to change nothing.");
     println!();
-    println!("It applies to everything the radio floods, replies to users included, and");
-    println!("a scoped flood is only passed on by repeaters that know the region. Check");
-    println!("your repeaters before setting one.");
+    println!("It also scopes the floods the radio starts when it has no path to someone");
+    println!("(the first reply to a new user, logins). A repeater passes a scoped flood on");
+    println!("only if it carries that exact region, so pick one every repeater between the");
+    println!("BBS and your users carries: a region your communities share, not the");
+    println!("narrowest one.");
     println!();
 
     let prompt = match existing {

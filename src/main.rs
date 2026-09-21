@@ -477,10 +477,11 @@ enum ConfigAction {
     /// With no argument, prints the current setting. With a region name
     /// (`usa`, or `#usa`), writes `advert_scope` to the `[plugins.mesh]`
     /// section: at connect the BBS sets the radio's default flood scope to it,
-    /// before the on-connect advert. That scope applies to everything the radio
-    /// floods, replies to users included, and a scoped flood is only passed on
-    /// by repeaters that know the region. `off` removes the setting, which does
-    /// NOT clear a scope already on the radio (use the MeshCore app for that).
+    /// before the on-connect advert. The scope also applies to the floods the
+    /// radio starts when it has no path to someone (the first reply to a new
+    /// user, logins), and a scoped flood is only passed on by repeaters that
+    /// carry that exact region. `off` removes the setting, which does NOT clear
+    /// a scope already on the radio (use the MeshCore app for that).
     /// Changes take effect on the next BBS restart.
     #[cfg(feature = "transport-mesh")]
     AdvertScope {
@@ -1852,7 +1853,7 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                     let key: String = scope.key.iter().map(|b| format!("{b:02x}")).collect();
                     println!("advert_scope = \"{}\"", scope.name);
                     println!("  region key: {key}");
-                    println!("  (set on the radio at connect; scopes everything the radio floods)");
+                    println!("  (set on the radio at connect; scopes its adverts and its floods to new contacts)");
                 }
                 None => println!(
                     "advert_scope is not set: the BBS leaves the radio's flood scope alone."
@@ -1876,8 +1877,10 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                 config_edit_mesh_string(config_path, "advert_scope", &name);
                 println!(
                     "advert_scope = \"{name}\". Restart the BBS for the change to take effect. \
-                     Every flood the radio starts is scoped to it, not only adverts: make sure \
-                     the repeaters between the BBS and your users know this region."
+                     Floods the radio starts to reach someone it has no path to are scoped to it \
+                     too, not only adverts, and a repeater passes a scoped flood on only if it \
+                     carries this exact region: pick one that every repeater between the BBS \
+                     and your users carries."
                 );
             }
         },
