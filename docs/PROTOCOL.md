@@ -291,6 +291,44 @@ mid-session (so none is a safe eviction candidate), the new contact is
 simply not protected and the BBS logs a distinct warning; nothing crashes
 or silently loses state either way.
 
+### MeshCore: contact auto-add
+
+A MeshCore radio can only DM a node it holds as a contact, and the firmware
+drops DMs from senders that aren't contacts. Whether a newly heard node is
+stored is controlled by the radio's auto-add settings. The radio has an
+"add all" mode and a "selected types" mode (`manual_add_contacts` on the
+device). In "selected types" mode a node is only stored if its type is
+enabled, so a radio with Chat off never stores new users and nobody new can
+reach the BBS.
+
+On every connect the transport reads the radio's `autoadd_config` and, if
+either of these bits is clear, sets it (a single write, skipped when both are
+already set):
+
+| Mask | Meaning |
+|------|---------|
+| `0x01` | Overwrite the oldest non-favourite contact when the table is full |
+| `0x02` | Auto-add Chat nodes (the type real users advertise as) |
+
+All other bits are left as the operator set them. No config key controls
+this. The BBS supports MeshCore firmware 1.14.0 or newer.
+
+The radio's `autoadd_max_hops` setting is not changed. When it is non-zero
+the radio does not store nodes heard across that many hops or more (a value
+of 1 means direct only), so a new user further away than that still can't
+reach the BBS. The BBS logs a warning at connect naming the setting. If
+far-away users can't get through, raise or remove the limit in the MeshCore
+app.
+
+A user also has to be heard before their first DM works, so a brand-new user
+should send an advert first. MeshCore clients only advertise when the user
+asks them to (for example "Send Advert").
+
+Forcing overwrite-oldest means the radio may evict a contact on its own when
+the table is full, without knowing which users have an active BBS session;
+see [saturated contact table](#meshcore-saturated-contact-table) below for how
+the BBS handles a full table.
+
 ### MeshCore: saturated contact table
 
 If MeshCore's own contact table is completely full — no further contact,

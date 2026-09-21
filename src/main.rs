@@ -22,7 +22,10 @@ mod setup;
 
 use std::{path::PathBuf, sync::Arc};
 
-use bbs_core::{BbsHost, Database};
+use bbs_core::{
+    restore_apply::{ApplyOutcome, ConfigOutcome},
+    BbsHost, Database,
+};
 use clap::{Parser, Subcommand};
 use tracing::{error, info, warn};
 use tracing_subscriber::{layer::SubscriberExt, reload, util::SubscriberInitExt, EnvFilter};
@@ -92,8 +95,15 @@ enum Commands {
     /// Apply any pending database migrations.
     Migrate,
 
-    /// Trigger an immediate database backup.
-    Backup,
+    /// Create, list or delete backups. With no subcommand, creates a backup.
+    ///
+    /// A backup is a `.zip` holding the database and the `config.toml` the BBS
+    /// runs with. Listing and deleting only read the backup directory, so they
+    /// work even when the database is broken.
+    Backup {
+        #[command(subcommand)]
+        action: Option<BackupAction>,
+    },
 
     /// Validate and apply a database restore from a backup file.
     ///
@@ -179,6 +189,23 @@ enum Commands {
     },
 }
 
+/// What `backup` does. Bare `backup` is `backup create`.
+#[derive(Subcommand)]
+enum BackupAction {
+    /// Take a backup now (the default when no subcommand is given).
+    Create,
+    /// List the backups in the backup directory, newest first.
+    List,
+    /// Delete a backup from the backup directory.
+    Delete {
+        /// The backup's file name, as `backup list` shows it.
+        name: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[derive(Subcommand)]
 enum RestoreAction {
     /// Validate a backup file and stage it for restore, without touching
@@ -191,7 +218,8 @@ enum RestoreAction {
     /// place, and a room-structure check. Staging never applies anything;
     /// run `apply` afterward to confirm it.
     Stage {
-        /// Path to a `.db` or `.zip` backup file.
+        /// Path to a `.db` or `.zip` backup file, or just the name of one in
+        /// the backup directory (as `backup list` shows it).
         path: PathBuf,
     },
 
@@ -206,6 +234,14 @@ enum RestoreAction {
         /// prompt — for scripted/non-interactive use.
         #[arg(long)]
         yes: bool,
+        /// Restore the database only. By default a backup bundle's
+        /// `config.toml` (the settings: BBS name, welcome message, and so on)
+        /// is restored with it; the parts that belong to this machine (paths, the
+        /// web and CLI plugins, the database, backup and security sections, the
+        /// radios' connection, settings, on or off switch and node names) always keep this
+        /// machine's values.
+        #[arg(long)]
+        no_config: bool,
     },
 }
 
@@ -614,7 +650,11 @@ async fn main() {
         Some(Commands::Setup) => cmd_setup(config_path.as_deref()),
         Some(Commands::Config { action }) => cmd_config(config_path.as_deref(), action),
         Some(Commands::Migrate) => cmd_migrate(&cli).await,
-        Some(Commands::Backup) => cmd_backup(&cli).await,
+        Some(Commands::Backup { ref action }) => match action {
+            None | Some(BackupAction::Create) => cmd_backup(&cli).await,
+            Some(BackupAction::List) => cmd_backup_list(&cli).await,
+            Some(BackupAction::Delete { name, yes }) => cmd_backup_delete(&cli, name, *yes).await,
+        },
         Some(Commands::Restore { ref action }) => cmd_restore(&cli, action).await,
         Some(Commands::User { ref action }) => cmd_user(&cli, action).await,
         Some(Commands::Room { ref action }) => cmd_room(&cli, action).await,
@@ -691,30 +731,170 @@ async fn open_database(path: &std::path::Path) -> Database {
     }
 }
 
-/// Delete every `pre-restore-safety-*.db` file in `data_dir` except `keep`,
-/// so repeated restores don't accumulate an unbounded number of
-/// full-database-sized snapshots on disk — a real concern on the
-/// SD-card-class storage this project targets.
-fn prune_old_restore_safety_snapshots(data_dir: &std::path::Path, keep: &std::path::Path) {
+/// How long ago `meta`'s file was last written *or* renamed, whichever is more
+/// recent. A rename keeps the modification time but updates the change time, so
+/// a sidecar that sat idle for hours and was only just moved aside for a restore
+/// does not look old. `None` if the clock can't say (a timestamp in the future).
+fn time_since_last_touched(meta: &std::fs::Metadata) -> Option<std::time::Duration> {
+    use std::os::unix::fs::MetadataExt as _;
+    let changed = u64::try_from(meta.ctime())
+        .ok()
+        .map(|s| std::time::UNIX_EPOCH + std::time::Duration::from_secs(s));
+    let last = match (meta.modified().ok(), changed) {
+        (Some(m), Some(c)) => m.max(c),
+        (Some(t), None) | (None, Some(t)) => t,
+        (None, None) => return None,
+    };
+    last.elapsed().ok()
+}
+
+/// Delete the temporary copies the web admin's restore endpoints leave in
+/// `data_dir` when a request is cut off before it finishes
+/// (`restore_upload_<uuid>.tmp` and `restore_backup_<uuid>.tmp`). Each is a
+/// full database-sized file, and a name is never reused, so nothing else
+/// would ever remove them. A zip being extracted sits beside its upload as
+/// `<name>.extract.tmp`, which the same rule catches. The CLI's
+/// `restore_cli_<uuid>.tmp` copies are only removed once they are over an hour
+/// old: the CLI can be running while this process starts, but a copy that old
+/// belongs to a `restore stage` that was killed.
+fn sweep_stale_restore_temp_files(data_dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(data_dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path == keep {
-            continue;
-        }
-        let is_old_snapshot = path
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| time_since_last_touched(&m));
+        let is_stale_copy = path
             .file_name()
             .and_then(|n| n.to_str())
-            .map(|n| n.starts_with("pre-restore-safety-") && n.ends_with(".db"))
-            .unwrap_or(false);
-        if is_old_snapshot {
-            if let Err(e) = std::fs::remove_file(&path) {
-                warn!(path = %path.display(), "could not prune old restore safety snapshot: {e}");
+            .is_some_and(|n| is_stale_restore_temp(n, age));
+        if is_stale_copy {
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(path = %path.display(), "removed stale restore temp file"),
+                Err(e) => {
+                    warn!(path = %path.display(), "could not remove stale restore temp file: {e}")
+                }
             }
         }
     }
+}
+
+/// Remove what a restore that died mid-swap left beside the database at
+/// `db_path` (a sidecar moved aside, the copy-fallback temp file), once it has
+/// gone over an hour untouched. Only those exact names, wherever the database
+/// is, so nothing else in a directory it shares is touched.
+fn sweep_stale_swap_leftovers(db_path: &std::path::Path) {
+    sweep_swap_leftovers_older_than(db_path, std::time::Duration::from_secs(60 * 60));
+}
+
+fn sweep_swap_leftovers_older_than(db_path: &std::path::Path, min_age: std::time::Duration) {
+    for path in bbs_core::restore_apply::swap_leftover_paths(db_path) {
+        let old = std::fs::symlink_metadata(&path)
+            .ok()
+            .and_then(|m| time_since_last_touched(&m))
+            .is_some_and(|age| age >= min_age);
+        if old {
+            match std::fs::remove_file(&path) {
+                Ok(()) => info!(path = %path.display(), "removed stale restore leftover"),
+                Err(e) => {
+                    warn!(path = %path.display(), "could not remove stale restore leftover: {e}")
+                }
+            }
+        }
+    }
+}
+
+/// Delete `backup_*.zip.tmp` files in the backup directory that are over an hour
+/// old: a bundle being written when the process died. Each holds a full copy of
+/// the database and, being a `.tmp`, is never listed or pruned. A bundle still
+/// being written (a backup running as this starts) is younger and left alone.
+fn sweep_stale_bundle_temp_files(backup_dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(backup_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let age = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok());
+        let stale = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| is_stale_bundle_temp(n, age));
+        if stale {
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => info!(path = %entry.path().display(), "removed stale backup temp file"),
+                Err(e) => {
+                    warn!(path = %entry.path().display(), "could not remove stale backup temp file: {e}")
+                }
+            }
+        }
+    }
+}
+
+fn is_stale_bundle_temp(name: &str, age: Option<std::time::Duration>) -> bool {
+    name.starts_with("backup_")
+        && name.ends_with(".zip.tmp")
+        && age.is_some_and(|a| a > std::time::Duration::from_secs(60 * 60))
+}
+
+/// Whether `name` is a restore temp copy that is safe to delete at startup, given
+/// how long ago it was last written (`None` if unknown).
+fn is_stale_restore_temp(name: &str, age: Option<std::time::Duration>) -> bool {
+    let over_an_hour = age.is_some_and(|a| a > std::time::Duration::from_secs(60 * 60));
+    // A snapshot the restore apply step was copying into the data directory.
+    // Left by a process that died mid-restore it can be a whole database; the
+    // age gate keeps a restore that is running right now safe. (The files it
+    // leaves beside the database itself are swept by name: see
+    // sweep_stale_swap_leftovers.)
+    if name.starts_with("pre-restore-safety-") && name.ends_with(".partial") {
+        return over_an_hour;
+    }
+    if !name.ends_with(".tmp") {
+        return false;
+    }
+    if name.starts_with("restore_upload_") || name.starts_with("restore_backup_") {
+        return true;
+    }
+    name.starts_with("restore_cli_") && over_an_hour
+}
+
+/// The config file to put in a backup bundle: the one this process loaded, as an
+/// absolute path (the service starts from `/`, so a relative one would not
+/// resolve later). `None` if the config came from defaults alone.
+fn bundled_config_path(cli: &Cli) -> Option<String> {
+    config::resolve_config_path(cli.config.as_deref())
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Apply the `--data-dir` and `--log-level` command-line overrides to a loaded
+/// config.
+///
+/// `--data-dir` clears the derived paths (DB, log file, backup dir, CLI socket)
+/// so that `resolve()` re-derives them under the new data dir. Callers who want
+/// to keep an explicit `database.path` can set it in the TOML.
+fn apply_cli_overrides(mut cfg: config::Config, cli: &Cli) -> Result<config::Config, String> {
+    if let Some(ref dd) = cli.data_dir {
+        cfg.bbs.data_dir = Some(dd.clone());
+        cfg.database.path = None;
+        cfg.logging.file = None;
+        cfg.backup.directory = None;
+        #[cfg(feature = "transport-cli")]
+        {
+            cfg.plugins.cli.socket = None;
+        }
+        cfg = cfg.resolve();
+    }
+    if let Some(ref level_str) = cli.log_level {
+        use std::str::FromStr;
+        cfg.logging.level = config::LogLevel::from_str(level_str).map_err(|e| e.to_string())?;
+    }
+    Ok(cfg)
 }
 
 /// Host supervisor — the real `run` path.
@@ -737,35 +917,17 @@ async fn cmd_run(cli: &Cli) {
         }
     };
 
-    // Apply --data-dir override.  When this flag is set we clear the
-    // derived paths (DB, log file, backup dir, CLI socket) so that
-    // resolve() re-derives them under the new data_dir.  Callers who
-    // want to keep an explicit database.path can set it in the TOML.
-    if let Some(ref dd) = cli.data_dir {
-        cfg.bbs.data_dir = Some(dd.clone());
-        cfg.database.path = None;
-        cfg.logging.file = None;
-        cfg.backup.directory = None;
-        #[cfg(feature = "transport-cli")]
-        {
-            cfg.plugins.cli.socket = None;
-        }
-        cfg = cfg.resolve();
-    }
-
-    // Apply --log-level override; parsed before tracing init so we can
-    // announce the stomp (ADR-0009) in the first log line.
+    // Apply the --data-dir and --log-level overrides. The log level is parsed
+    // before tracing init so we can announce the stomp (ADR-0009) in the first
+    // log line.
     let cli_level_str = cli.log_level.clone();
-    if let Some(ref level_str) = cli_level_str {
-        use std::str::FromStr;
-        match config::LogLevel::from_str(level_str) {
-            Ok(l) => cfg.logging.level = l,
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(1);
-            }
+    cfg = match apply_cli_overrides(cfg, cli) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(1);
         }
-    }
+    };
 
     // ── 2. Tracing ────────────────────────────────────────────────────────────
 
@@ -849,15 +1011,23 @@ async fn cmd_run(cli: &Cli) {
     }
 
     // ── 3. Data directory ─────────────────────────────────────────────────────
-    let data_dir = cfg
-        .bbs
-        .data_dir
-        .as_ref()
-        .expect("data_dir set by resolve()");
+    // Owned, because a restore can replace `cfg` below (the data directory
+    // itself is a machine-specific key a restore keeps).
+    let data_dir_owned = cfg.bbs.data_dir.clone().expect("data_dir set by resolve()");
+    let data_dir = &data_dir_owned;
 
     if let Err(e) = std::fs::create_dir_all(data_dir) {
         error!(path = %data_dir.display(), "could not create data directory: {e}");
         std::process::exit(1);
+    }
+
+    // ── 3a. Remove restore temp copies orphaned by an interrupted request ───────
+    sweep_stale_restore_temp_files(data_dir);
+    if let Some(db_path) = cfg.database.path.as_deref() {
+        sweep_stale_swap_leftovers(db_path);
+    }
+    if let Some(dir) = cfg.backup.directory.as_deref() {
+        sweep_stale_bundle_temp_files(dir);
     }
 
     // ── 3b. Apply a staged database restore, if one is pending ─────────────────
@@ -865,12 +1035,14 @@ async fn cmd_run(cli: &Cli) {
     // connections to the database file yet, so swapping it is safe.
     //
     // `pending_restore.db`'s mere presence here is deliberately the ONLY
-    // signal for "the sysop confirmed this restore" — api_upload_restore
-    // (crates/bbs-web/src/lib.rs, issue #195) validates an uploaded file and
-    // stages it under a separate, inert name (`pending_restore.staged.db`)
-    // that this check never looks at; only api_apply_restore promotes it to
-    // this name, then exits so systemd's `Restart=always` brings this
-    // instance back up to perform the swap below. Do not stage directly
+    // signal for "the sysop confirmed this restore" — api_upload_restore and
+    // api_stage_backup_restore (crates/bbs-web/src/lib.rs, issues #195 and
+    // #309) and the CLI's `restore stage` validate a file and stage it under
+    // a separate, inert name (`pending_restore.staged.db`) that this check
+    // never looks at; only a confirm (api_apply_restore, or `restore apply`)
+    // promotes it to this name. Under systemd the web confirm then exits so
+    // `Restart=always` brings this instance back up to perform the swap
+    // below; otherwise the operator restarts the BBS. Do not stage directly
     // under this name from anywhere: doing so would mean ANY unrelated
     // restart between upload and confirmation (a crash, an operator
     // restarting the service for an unrelated reason, systemd firing
@@ -879,74 +1051,105 @@ async fn cmd_run(cli: &Cli) {
     let db_path_for_restore = cfg
         .database
         .path
-        .as_ref()
+        .clone()
         .expect("database.path set by resolve()");
-    let pending_restore = data_dir.join("pending_restore.db");
-    if pending_restore.exists() {
-        info!(path = %pending_restore.display(), "applying staged database restore");
-
-        // Safety net: snapshot the current live database before overwriting
-        // it, so a bad or wrong-system upload doesn't destroy data with no
-        // way back. No live connection exists yet in THIS process, but that
-        // doesn't mean the file is checkpoint-clean: every restart path in
-        // this binary (this restore flow and the pre-existing api_restart
-        // alike) exits via std::process::exit, which skips the checkpoint a
-        // clean connection close would otherwise run, and this project
-        // raises wal_autocheckpoint to 10000 pages — so a live,
-        // un-checkpointed WAL sidecar next to db_path is the normal case
-        // here, not a rare one. Checkpoint it into the main file first, or
-        // a plain file copy could silently miss recently committed messages.
-        if db_path_for_restore.exists() {
-            if let Err(e) = Database::checkpoint_wal(&db_path_for_restore.to_string_lossy()).await {
+    // A restore that can't be applied never stops startup (a crash loop under
+    // `Restart=always` would take the web admin, the place to sort it out,
+    // down with it): the live database is left as it was and the outcome is
+    // logged here, and recorded in the audit log below once the database is
+    // open (the sysop's only in-app trace of a restore that did not go as the
+    // UI promised).
+    let mut restore_audit: Option<(&str, String)> = None;
+    let config_path = config::resolve_config_path(cli.config.as_deref());
+    match bbs_core::restore_apply::apply_pending_restore(
+        data_dir,
+        &db_path_for_restore,
+        config_path.as_deref(),
+    )
+    .await
+    {
+        ApplyOutcome::NothingPending => {}
+        ApplyOutcome::Applied {
+            snapshot,
+            snapshot_has_wal_copy,
+            config,
+        } => {
+            let mut detail = snapshot.as_ref().map_or_else(
+                || "no previous database to snapshot".to_owned(),
+                |s| format!("previous database saved as {}", s.display()),
+            );
+            match config {
+                ConfigOutcome::NotIncluded => {}
+                ConfigOutcome::Failed(why) => {
+                    warn!(
+                        "the database was restored but its settings (config.toml) were NOT: {why}"
+                    );
+                    detail.push_str(&format!("; settings NOT restored: {why}"));
+                }
+                ConfigOutcome::Applied(applied) => {
+                    // Keep the new config only if it loads: one that does not
+                    // would stop every later start, so put the old one back.
+                    let path = config_path
+                        .as_deref()
+                        .expect("a config was applied, so its path is known");
+                    let reloaded = bbs_core::restore_config::settle_applied(path, &applied, || {
+                        config::load(cli.config.as_deref())
+                            .map_err(|e| e.to_string())
+                            .and_then(|c| apply_cli_overrides(c, cli))
+                    });
+                    match reloaded {
+                        Ok(new_cfg) => {
+                            cfg = new_cfg;
+                            info!(
+                                "settings restored from the backup (config.toml); the log level \
+                                 and format take effect at the next restart"
+                            );
+                            detail.push_str("; settings restored from the backup");
+                        }
+                        Err(why) => {
+                            error!(
+                                "the config.toml from the backup does not load ({why}); the \
+                                 previous one was kept"
+                            );
+                            detail.push_str(&format!(
+                                "; settings NOT restored: the config.toml in the backup does \
+                                 not load ({why})"
+                            ));
+                        }
+                    }
+                }
+            }
+            restore_audit = Some(("restore_completed", detail));
+            match &snapshot {
+                Some(s) => info!(
+                    snapshot = %s.display(),
+                    "database restore applied; the previous database is saved as the snapshot"
+                ),
+                None => info!("database restore applied"),
+            }
+            if snapshot_has_wal_copy {
                 warn!(
-                    "could not checkpoint the live database's WAL before \
-                     snapshotting it — proceeding with a plain file copy \
-                     anyway, which may miss very recent messages: {e}"
+                    "the previous database had commits that could not be checkpointed; \
+                     a copy of its -wal file sits next to the snapshot and must stay with it"
                 );
             }
-
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            let safety_path = data_dir.join(format!("pre-restore-safety-{stamp}.db"));
-            if let Err(e) = std::fs::copy(db_path_for_restore, &safety_path) {
-                let _ = std::fs::remove_file(&safety_path);
-                error!("could not snapshot the live database before restoring — aborting restore, database left untouched: {e}");
-                std::process::exit(1);
+        }
+        ApplyOutcome::Rejected { reason, set_aside } => {
+            restore_audit = Some(("restore_failed", reason.clone()));
+            error!(
+                "database restore NOT applied, continuing with the existing database \
+                 unchanged: {reason}"
+            );
+            match set_aside {
+                Some(p) => warn!(
+                    path = %p.display(),
+                    "the restore file was set aside so it is not retried on every start"
+                ),
+                None => warn!(
+                    "the restore file could not be set aside and will be retried on the next start"
+                ),
             }
-            info!(path = %safety_path.display(), "pre-restore safety snapshot saved");
-
-            // Keep only the snapshot just taken — an unbounded number of
-            // full-database-sized files would otherwise accumulate across
-            // repeated restores.
-            prune_old_restore_safety_snapshots(data_dir, &safety_path);
         }
-
-        if let Err(e) = std::fs::rename(&pending_restore, db_path_for_restore) {
-            // `rename` can fail across filesystems (EXDEV) — data_dir and
-            // database.path are configured independently and aren't
-            // guaranteed to share one. Fall back to copy+delete, matching
-            // the identical fallback `stage_restore`'s own rename already
-            // has for the same reason.
-            if let Err(copy_err) = std::fs::copy(&pending_restore, db_path_for_restore) {
-                error!(
-                    "could not apply staged restore (rename failed: {e}; \
-                     copy fallback also failed: {copy_err})"
-                );
-                std::process::exit(1);
-            }
-            let _ = std::fs::remove_file(&pending_restore);
-        }
-        // The old live database's WAL/SHM sidecars (if any) now refer to
-        // data that no longer exists at this path — remove them so the
-        // restored file starts clean rather than SQLite trying to replay a
-        // stale WAL against it.
-        for ext in ["-wal", "-shm"] {
-            let sidecar = PathBuf::from(format!("{}{ext}", db_path_for_restore.display()));
-            let _ = std::fs::remove_file(sidecar);
-        }
-        info!("database restore applied — continuing startup with the restored database");
     }
 
     // ── 4. Database ───────────────────────────────────────────────────────────
@@ -1008,6 +1211,16 @@ async fn cmd_run(cli: &Cli) {
     // configured name if sharing is later turned off. bbs-mesh::transport
     // re-truncates to the correct, current-state-aware budget at the actual
     // point each advert is sent (see bbs_core::mesh_name).
+    if let Some((action, detail)) = restore_audit {
+        use bbs_plugin_api::Host as _;
+        if let Err(e) = bbs
+            .admin_write_audit("system", action, None, Some(&detail))
+            .await
+        {
+            warn!("could not record the restore outcome in the audit log: {e}");
+        }
+    }
+
     bbs.set_node_name(Some(bbs_core::mesh_name::truncate_mesh_node_name(
         &cfg.bbs.name,
         false,
@@ -1028,6 +1241,7 @@ async fn cmd_run(cli: &Cli) {
             let keep_weekly = cfg.backup.keep_weekly;
             let interval_hours = cfg.backup.interval_hours;
             let host_backup = Arc::clone(&host);
+            let backup_config_path = bundled_config_path(cli);
             info!(
                 dir = %backup_dir.display(),
                 interval_hours,
@@ -1044,9 +1258,16 @@ async fn cmd_run(cli: &Cli) {
                         continue;
                     }
                     let dir_str = backup_dir.to_string_lossy();
-                    match host_backup.admin_trigger_backup(&dir_str).await {
+                    match host_backup
+                        .admin_trigger_backup_bundle(&dir_str, backup_config_path.as_deref())
+                        .await
+                    {
                         Ok(rec) => {
-                            info!(filename = %rec.filename, "automatic backup completed");
+                            info!(
+                                filename = %rec.filename,
+                                settings_included = rec.config_filename.is_some(),
+                                "automatic backup completed"
+                            );
                             prune_backups(&host_backup, &dir_str, keep_daily, keep_weekly).await;
                         }
                         Err(e) => warn!("automatic backup failed: {e}"),
@@ -1122,22 +1343,9 @@ async fn cmd_run(cli: &Cli) {
         // Resolve the config file to an absolute path so the web plugin can
         // bundle the correct config.toml into backup zips regardless of the
         // process working directory (e.g. systemd starts from /).
-        let cfg_abs: Option<String> = if let Some(ref p) = cli.config {
-            p.canonicalize()
-                .ok()
-                .map(|abs| abs.to_string_lossy().into_owned())
-        } else {
-            // No --config flag: try the same search order as config::load so
-            // we can still find the file that was actually loaded.
-            [
-                std::path::PathBuf::from("config.toml"),
-                std::path::PathBuf::from("/etc/supply-drop-bbs/config.toml"),
-            ]
-            .iter()
-            .find(|p| p.exists())
-            .and_then(|p| p.canonicalize().ok())
-            .map(|abs| abs.to_string_lossy().into_owned())
-        };
+        // The same file the config loader and the backups use, so the settings page
+        // and every backup bundle agree on which config this is.
+        let cfg_abs: Option<String> = bundled_config_path(cli);
         let wp = init_web_plugin(
             &cfg.plugins.web,
             Arc::clone(&host),
@@ -2102,14 +2310,175 @@ async fn cmd_backup(cli: &Cli) {
     }
 
     let dir_str = backup_dir.to_string_lossy();
-    match host.admin_trigger_backup(&dir_str).await {
+    match host
+        .admin_trigger_backup_bundle(&dir_str, bundled_config_path(cli).as_deref())
+        .await
+    {
         Ok(rec) => {
             println!("Backup created: {}", rec.filename);
             println!("  size:     {} bytes", rec.size_bytes);
+            if rec.config_filename.is_some() {
+                println!("  settings: config.toml included");
+            } else {
+                println!(
+                    "  settings: NOT included (no readable config.toml was found; \
+                     pass --config to include one)"
+                );
+            }
             println!("  location: {}", backup_dir.display());
         }
         Err(e) => {
             eprintln!("error creating backup: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// The file `restore stage` should read for the argument the operator typed. A
+/// bare file name (no directory part) is the backup of that name in the backup
+/// directory, so a name copied from `backup list` works even if an older copy
+/// of the same name sits in the current directory; a name with a directory part
+/// is a path and is used as it is. Anything that is not a file is returned
+/// unchanged, for the caller to report.
+fn resolve_stage_source(arg: &std::path::Path, backup_dir: &std::path::Path) -> PathBuf {
+    let bare_name = arg
+        .to_str()
+        .filter(|_| arg.file_name().is_some_and(|f| f == arg.as_os_str()))
+        .filter(|n| bbs_core::restore_stage::backup_filename_is_safe(n))
+        .filter(|n| !bbs_core::restore_stage::is_restore_working_file(n));
+    if let Some(name) = bare_name {
+        let candidate = backup_dir.join(name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+    arg.to_path_buf()
+}
+
+/// A file name made safe to print in a terminal: control characters (an escape
+/// sequence in a name would otherwise be run by the operator's terminal) show
+/// as `?`.
+fn printable_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// The `backup list` table.
+fn format_backup_list(records: &[bbs_plugin_api::AdminBackupRecord]) -> String {
+    let names: Vec<String> = records
+        .iter()
+        .map(|r| printable_name(&r.filename))
+        .collect();
+    // Widths in characters, which is what `{:<width$}` pads to (not bytes).
+    let width = names
+        .iter()
+        .map(|n| n.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max("name".len());
+    let mut out = format!(
+        "{:<width$}  {:>10}  {:<19}  settings\n",
+        "name", "size", "created (UTC)"
+    );
+    for (r, name) in records.iter().zip(&names) {
+        let created = printable_name(
+            &r.created_at
+                .get(..19)
+                .unwrap_or(&r.created_at)
+                .replace('T', " "),
+        );
+        let settings = if r.config_filename.is_some() {
+            "yes"
+        } else {
+            "no"
+        };
+        out.push_str(&format!(
+            "{name:<width$}  {:>10}  {created:<19}  {settings}\n",
+            fmt_bytes(r.size_bytes),
+        ));
+    }
+    out
+}
+
+/// List the backups in the backup directory. Reads the directory only, so it
+/// works when the database is broken.
+async fn cmd_backup_list(cli: &Cli) {
+    let cfg = load_config(cli);
+    let backup_dir = cfg
+        .backup
+        .directory
+        .as_ref()
+        .expect("backup.directory set by resolve()");
+    // The listing treats an unreadable directory as empty, which is right for
+    // the web UI but would tell an operator running as the wrong user that their
+    // backups are gone: report anything but "not created yet".
+    if let Err(e) = std::fs::read_dir(backup_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            eprintln!("error: cannot read {}: {e}", backup_dir.display());
+            std::process::exit(1);
+        }
+    }
+    match Database::admin_list_backups(&backup_dir.to_string_lossy()).await {
+        Ok(records) if records.is_empty() => {
+            println!("No backups in {}.", backup_dir.display());
+        }
+        Ok(records) => {
+            print!("{}", format_backup_list(&records));
+            println!("{} backup(s) in {}", records.len(), backup_dir.display());
+        }
+        Err(e) => {
+            eprintln!("error listing backups: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Delete one backup from the backup directory, after confirmation.
+async fn cmd_backup_delete(cli: &Cli, name: &str, yes: bool) {
+    let cfg = load_config(cli);
+    let backup_dir = cfg
+        .backup
+        .directory
+        .as_ref()
+        .expect("backup.directory set by resolve()");
+
+    if !bbs_core::restore_stage::backup_filename_is_safe(name)
+        || !bbs_core::restore_stage::is_backup_file_name(name)
+    {
+        eprintln!("error: '{name}' is not a backup file name (see `supply-drop-bbs backup list`)");
+        std::process::exit(1);
+    }
+    if !backup_dir.join(name).is_file() {
+        eprintln!(
+            "error: no backup named '{name}' in {} (see `supply-drop-bbs backup list`)",
+            backup_dir.display()
+        );
+        std::process::exit(1);
+    }
+    if !yes {
+        let confirmed = match dialoguer::Confirm::new()
+            .with_prompt(format!("Delete backup {name}? This cannot be undone."))
+            .default(false)
+            .interact()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                // No terminal to ask on (cron, a pipe): fail rather than report
+                // success for a delete that did not happen.
+                eprintln!("error: cannot ask for confirmation ({e}); pass --yes to delete");
+                std::process::exit(1);
+            }
+        };
+        if !confirmed {
+            println!("Aborted — nothing was deleted.");
+            return;
+        }
+    }
+    match Database::admin_delete_backup(&backup_dir.to_string_lossy(), name).await {
+        Ok(()) => println!("Deleted {name}."),
+        Err(e) => {
+            eprintln!("error deleting backup: {e}");
             std::process::exit(1);
         }
     }
@@ -2130,25 +2499,36 @@ async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
 
     match action {
         RestoreAction::Stage { path } => {
+            let backup_dir = cfg
+                .backup
+                .directory
+                .as_ref()
+                .expect("backup.directory set by resolve()");
+            let resolved = resolve_stage_source(path, backup_dir);
+            let path = &resolved;
             if !path.is_file() {
-                eprintln!("error: {} is not a file", path.display());
+                eprintln!(
+                    "error: {} is not a file (a bare backup name is looked up in {})",
+                    path.display(),
+                    backup_dir.display()
+                );
                 std::process::exit(1);
             }
 
-            // Copy into data_dir itself rather than pointing stage_restore
-            // at the operator's own file directly — stage_restore may
-            // overwrite its input in place (e.g. extracting a zip), and
-            // the operator's source file must never be touched.
-            let tmp_path = data_dir.join("restore_cli_upload.tmp");
-            if let Err(e) = tokio::fs::copy(path, &tmp_path).await {
-                eprintln!("error copying {}: {e}", path.display());
-                std::process::exit(1);
-            }
-
-            let result = Database::stage_restore(&tmp_path, data_dir).await;
-            if result.is_err() {
-                let _ = tokio::fs::remove_file(&tmp_path).await;
-            }
+            // Copies the operator's file into data_dir first (staging consumes
+            // its input, and their file must never be touched), the same way
+            // the web UI does. No size limit here, and a symlink is followed:
+            // the operator named this path themselves.
+            let result = bbs_core::restore_stage::stage_copy(
+                path,
+                data_dir,
+                "restore_cli_",
+                bbs_core::restore_stage::SourceRules {
+                    max_bytes: None,
+                    follow_symlinks: true,
+                },
+            )
+            .await;
 
             match result {
                 Ok(()) => {
@@ -2164,24 +2544,35 @@ async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
                 }
             }
         }
-        RestoreAction::Apply { yes } => {
+        RestoreAction::Apply { yes, no_config } => {
             if !*yes {
                 let confirmed = dialoguer::Confirm::new()
                     .with_prompt(
-                        "This will replace the live database the next time the BBS starts. \
-                         A safety snapshot of the current database is taken first, but this \
-                         is still a destructive operation. Continue?",
+                        "This will replace the live database (and, if the backup has them, \
+                         its settings) the next time the BBS starts. A safety snapshot of \
+                         the current database is taken first, but this is still a \
+                         destructive operation. Continue?",
                     )
                     .default(false)
-                    .interact()
-                    .unwrap_or(false);
+                    .interact();
+                let confirmed = match confirmed {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // No terminal to ask on (cron, a pipe): fail rather than
+                        // exit 0 for a restore that was not confirmed.
+                        eprintln!(
+                            "error: cannot ask for confirmation ({e}); pass --yes to confirm"
+                        );
+                        std::process::exit(1);
+                    }
+                };
                 if !confirmed {
                     println!("Aborted — nothing was confirmed.");
                     return;
                 }
             }
 
-            match Database::admin_apply_staged_restore(data_dir).await {
+            match Database::admin_apply_staged_restore_with(data_dir, !*no_config).await {
                 Ok(()) => {
                     println!("Restore confirmed.");
                     println!(
@@ -3674,5 +4065,326 @@ mod contacts_tests {
             .find(|a| a.get_id() == "username")
             .expect("username arg exists");
         assert!(username_arg.is_required_set());
+    }
+}
+
+#[cfg(test)]
+mod restore_temp_sweep_tests {
+    use super::{is_stale_restore_temp, sweep_stale_restore_temp_files, time_since_last_touched};
+    use std::time::Duration;
+
+    #[test]
+    fn a_file_moved_aside_just_now_is_not_old_even_if_it_was_last_written_long_ago() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("bbs.sqlite-shm");
+        let aside = dir.path().join("bbs.sqlite-shm.restore-aside");
+        let f = std::fs::File::create(&live).unwrap();
+        f.set_modified(std::time::SystemTime::now() - Duration::from_secs(3 * 60 * 60))
+            .unwrap();
+        drop(f);
+        std::fs::rename(&live, &aside).unwrap();
+
+        // The modification time is three hours old; the rename is not.
+        let age = time_since_last_touched(&std::fs::metadata(&aside).unwrap()).unwrap();
+        assert!(age < Duration::from_secs(60), "{age:?}");
+    }
+
+    #[test]
+    fn sweep_removes_only_the_web_restore_temp_copies() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let stale = [
+            "restore_backup_5f6c1a5e-0000-0000-0000-000000000000.tmp",
+            "restore_upload_5f6c1a5e-0000-0000-0000-000000000000.tmp",
+            "restore_upload_5f6c1a5e-0000-0000-0000-000000000000.tmp.extract.tmp",
+        ];
+        let keep = [
+            "pending_restore.db",
+            "pending_restore.staged.db",
+            "restore_cli_5f6c1a5e-0000-0000-0000-000000000000.tmp",
+            "pre-restore-safety-1789869375.db",
+            "restore_backup_notes.txt",
+            "bbs.sqlite",
+        ];
+        for name in stale.iter().chain(keep.iter()) {
+            std::fs::write(p.join(name), b"x").unwrap();
+        }
+
+        sweep_stale_restore_temp_files(p);
+
+        for name in stale {
+            assert!(!p.join(name).exists(), "{name} should be removed");
+        }
+        for name in keep {
+            assert!(p.join(name).exists(), "{name} must be left alone");
+        }
+    }
+
+    // A killed `restore stage` leaves a database-sized copy that only the
+    // next service start can collect, but a running one must not lose its file.
+    #[test]
+    fn leftovers_from_an_interrupted_restore_apply_are_swept_once_old() {
+        use super::is_stale_restore_temp;
+        let old = Some(Duration::from_secs(3601));
+        let fresh = Some(Duration::from_secs(60));
+        for name in [
+            "pre-restore-safety-1789869375.db.partial",
+            "pre-restore-safety-1789869375.db-wal.partial",
+        ] {
+            assert!(is_stale_restore_temp(name, old), "{name} when old");
+            assert!(!is_stale_restore_temp(name, fresh), "{name} may be in use");
+            assert!(!is_stale_restore_temp(name, None), "{name} of unknown age");
+        }
+        // Finished snapshots and the live files are never touched.
+        for name in [
+            "pre-restore-safety-1789869375.db",
+            "pre-restore-safety-1789869375.db-wal",
+            "bbs.sqlite",
+            "bbs.sqlite-wal",
+            "pending_restore.db",
+            // Not by suffix alone: an operator's own file that happens to end
+            // this way is not ours to delete.
+            "notes.restore-aside",
+            "other.sqlite.restore.tmp",
+        ] {
+            assert!(!is_stale_restore_temp(name, old), "{name}");
+        }
+    }
+
+    // The files a died-mid-swap restore leaves beside the database are removed
+    // by exact name, in whatever directory the database is in, and nothing else
+    // there is.
+    #[test]
+    fn swap_leftovers_are_swept_by_exact_name_beside_the_database() {
+        use super::sweep_swap_leftovers_older_than;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        let db = p.join("bbs.sqlite");
+        let leftovers = [
+            "bbs.sqlite-wal.restore-aside",
+            "bbs.sqlite-shm.restore-aside",
+            "bbs.sqlite.restore.tmp",
+        ];
+        let keep = [
+            "bbs.sqlite",
+            "bbs.sqlite-wal",
+            "other.sqlite-wal.restore-aside",
+            "notes.restore.tmp",
+        ];
+        for name in leftovers.iter().chain(keep.iter()) {
+            std::fs::write(p.join(name), b"x").unwrap();
+        }
+
+        // Fresh ones are left: a restore may be running right now.
+        sweep_swap_leftovers_older_than(&db, Duration::from_secs(3600));
+        for name in leftovers.iter().chain(keep.iter()) {
+            assert!(p.join(name).exists(), "{name} is too new to remove");
+        }
+
+        sweep_swap_leftovers_older_than(&db, Duration::ZERO);
+        for name in leftovers {
+            assert!(!p.join(name).exists(), "{name} should be removed");
+        }
+        for name in keep {
+            assert!(p.join(name).exists(), "{name} must be left alone");
+        }
+    }
+
+    #[test]
+    fn only_old_backup_bundle_temp_files_are_swept() {
+        use super::is_stale_bundle_temp;
+        let old = Some(Duration::from_secs(3601));
+        assert!(is_stale_bundle_temp("backup_20260101_000000.zip.tmp", old));
+        assert!(!is_stale_bundle_temp(
+            "backup_20260101_000000.zip.tmp",
+            Some(Duration::from_secs(60))
+        ));
+        assert!(!is_stale_bundle_temp(
+            "backup_20260101_000000.zip.tmp",
+            None
+        ));
+        // Real backups and anything else are never touched.
+        assert!(!is_stale_bundle_temp("backup_20260101_000000.zip", old));
+        assert!(!is_stale_bundle_temp("backup_20260101_000000.db", old));
+        assert!(!is_stale_bundle_temp("notes.zip.tmp", old));
+    }
+
+    #[test]
+    fn cli_temp_copies_are_swept_only_once_they_are_old() {
+        let cli = "restore_cli_5f6c1a5e-0000-0000-0000-000000000000.tmp";
+        assert!(!is_stale_restore_temp(cli, Some(Duration::from_secs(60))));
+        assert!(!is_stale_restore_temp(cli, Some(Duration::from_secs(3600))));
+        assert!(is_stale_restore_temp(cli, Some(Duration::from_secs(3601))));
+        assert!(!is_stale_restore_temp(cli, None), "unknown age is not old");
+        // The web copies never wait: nothing else is writing them at startup.
+        assert!(is_stale_restore_temp(
+            "restore_upload_x.tmp",
+            Some(Duration::ZERO)
+        ));
+        assert!(is_stale_restore_temp("restore_backup_x.tmp", None));
+        // Only .tmp names, whatever the prefix.
+        assert!(!is_stale_restore_temp(
+            "restore_cli_x.txt",
+            Some(Duration::from_secs(99999))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod backup_cli_tests {
+    use super::{format_backup_list, resolve_stage_source};
+    use bbs_plugin_api::AdminBackupRecord;
+    use std::path::Path;
+
+    fn record(name: &str, size: u64, at: &str, config: bool) -> AdminBackupRecord {
+        AdminBackupRecord {
+            filename: name.into(),
+            size_bytes: size,
+            created_at: at.into(),
+            config_filename: config.then(|| "config.toml".into()),
+            config_size_bytes: config.then_some(10),
+        }
+    }
+
+    #[test]
+    fn the_list_shows_name_size_date_and_whether_settings_are_included() {
+        let text = format_backup_list(&[
+            record(
+                "backup_20260920_101500.zip",
+                2_097_152,
+                "2026-09-20T10:15:00Z",
+                true,
+            ),
+            record(
+                "backup_20260101_000000.db",
+                512,
+                "2026-01-01T00:00:00Z",
+                false,
+            ),
+        ]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert!(
+            lines[0].starts_with("name") && lines[0].ends_with("settings"),
+            "{text}"
+        );
+        assert!(lines[1].contains("backup_20260920_101500.zip"), "{text}");
+        assert!(lines[1].contains("2026-09-20 10:15:00"), "{text}");
+        assert!(lines[1].ends_with("yes"), "{text}");
+        assert!(
+            lines[2].contains("backup_20260101_000000.db") && lines[2].ends_with("no"),
+            "{text}"
+        );
+        // The columns line up: each one starts at the same offset on every row.
+        let col = |l: &str, needle: &str| l.find(needle).unwrap();
+        assert_eq!(
+            col(lines[0], "created"),
+            col(lines[1], "2026-09-20"),
+            "{text}"
+        );
+        assert_eq!(
+            col(lines[0], "created"),
+            col(lines[2], "2026-01-01"),
+            "{text}"
+        );
+        assert_eq!(col(lines[0], "settings"), col(lines[1], "yes"), "{text}");
+        assert_eq!(col(lines[0], "settings"), col(lines[2], "no"), "{text}");
+    }
+
+    #[test]
+    fn names_with_control_characters_or_multibyte_letters_stay_aligned() {
+        let text = format_backup_list(&[
+            record("backup_\u{1b}[31mred.zip", 1, "2026-09-20T10:15:00Z", true),
+            record("sauvegarde_é_日本.zip", 1, "2026-09-20T10:15:00Z", false),
+            record("b.zip", 1, "2026-09-20T10:15:00Z", false),
+        ]);
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("backup_?[31mred.zip"), "{text}");
+        // Every row's date starts at the same character column.
+        let col = |l: &str| l.chars().take_while(|c| *c != '2').count();
+        let lines: Vec<&str> = text.lines().skip(1).collect();
+        assert_eq!(col(lines[0]), col(lines[1]), "{text}");
+        assert_eq!(col(lines[0]), col(lines[2]), "{text}");
+    }
+
+    #[test]
+    fn an_empty_list_is_just_the_header() {
+        assert_eq!(format_backup_list(&[]).lines().count(), 1);
+    }
+
+    #[test]
+    fn a_path_that_is_a_file_is_used_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = tempfile::tempdir().unwrap();
+        let file = dir.path().join("mine.zip");
+        std::fs::write(&file, b"x").unwrap();
+        // Even if the backup directory has a file of the same bare name.
+        std::fs::write(backups.path().join("mine.zip"), b"y").unwrap();
+        assert_eq!(resolve_stage_source(&file, backups.path()), file);
+    }
+
+    #[test]
+    fn bare_backup_is_create_and_the_subcommands_parse() {
+        use super::{BackupAction, Cli, Commands};
+        use clap::Parser as _;
+        let bare = Cli::try_parse_from(["x", "backup"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Some(Commands::Backup { action: None })
+        ));
+        let create = Cli::try_parse_from(["x", "backup", "create"]).unwrap();
+        assert!(matches!(
+            create.command,
+            Some(Commands::Backup {
+                action: Some(BackupAction::Create)
+            })
+        ));
+        let list = Cli::try_parse_from(["x", "--config", "c.toml", "backup", "list"]).unwrap();
+        assert!(matches!(
+            list.command,
+            Some(Commands::Backup {
+                action: Some(BackupAction::List)
+            })
+        ));
+        let del = Cli::try_parse_from(["x", "backup", "delete", "a.zip", "--yes"]).unwrap();
+        match del.command {
+            Some(Commands::Backup {
+                action: Some(BackupAction::Delete { name, yes }),
+            }) => {
+                assert_eq!(name, "a.zip");
+                assert!(yes);
+            }
+            _ => panic!("delete did not parse"),
+        }
+        assert!(Cli::try_parse_from(["x", "backup", "delete"]).is_err());
+    }
+
+    #[test]
+    fn a_bare_name_is_looked_up_in_the_backup_directory() {
+        let backups = tempfile::tempdir().unwrap();
+        std::fs::write(backups.path().join("backup_1.zip"), b"x").unwrap();
+        assert_eq!(
+            resolve_stage_source(Path::new("backup_1.zip"), backups.path()),
+            backups.path().join("backup_1.zip")
+        );
+    }
+
+    #[test]
+    fn anything_else_is_returned_unchanged_for_the_caller_to_report() {
+        let backups = tempfile::tempdir().unwrap();
+        std::fs::write(backups.path().join("backup_1.zip"), b"x").unwrap();
+        for arg in [
+            "absent.zip",
+            "sub/backup_1.zip",
+            "../backup_1.zip",
+            "..",
+            "",
+        ] {
+            assert_eq!(
+                resolve_stage_source(Path::new(arg), backups.path()),
+                Path::new(arg),
+                "{arg:?}"
+            );
+        }
     }
 }

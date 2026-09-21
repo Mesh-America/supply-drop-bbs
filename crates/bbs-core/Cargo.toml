@@ -21,6 +21,7 @@ fd-lock.workspace     = true
 libc.workspace        = true
 serde.workspace       = true
 unicode-properties.workspace = true
+uuid.workspace        = true
 sqlx.workspace        = true
 thiserror.workspace   = true
 time.workspace        = true
@@ -28,6 +29,12 @@ tokio.workspace       = true
 toml_edit.workspace   = true
 tracing.workspace     = true
 zip.workspace         = true
+
+# Free-space pre-flight (disk_space.rs). rustix is a safe wrapper, so the
+# `unsafe_code = "forbid"` lint stays intact; it is already in the tree via
+# tempfile.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [dev-dependencies]
 proptest    = { workspace = true }

@@ -108,10 +108,11 @@ impl Bridge {
         self.send(&self_info_frame(name)).await;
         self.read_until_sync().await;
         self.send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES])).await;
-        // GET_CONTACTS, then GET_AUTOADD_CONFIG (reply: already enabled).
+        // GET_CONTACTS, then GET_AUTOADD_CONFIG (reply: 0x03, Chat auto-add and
+        // overwrite-oldest already on, so the transport sends nothing back).
         let _get_contacts = self.read_command().await;
         let _get_autoadd = self.read_command().await;
-        self.send(&radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 1]))
+        self.send(&radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 0x03, 0]))
             .await;
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

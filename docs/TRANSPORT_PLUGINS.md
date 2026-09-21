@@ -530,8 +530,9 @@ or design your own.
 
 **The inline message confirmation pattern:** `EnterMessage { body: Some(text) }`
 causes the host to stage the message as a draft and return `Response::Prompt`
-echoing the draft with "Type . to send". The user's next message (`.` or
-anything else) arrives as `WorkflowReply`. Sending `.` posts the message;
+echoing the draft with "Type . to send, C to cancel". The user's next message
+(`.`, `C` or anything else) arrives as `WorkflowReply`. Sending `.` posts the
+message; `C` discards the draft and returns the user to the command prompt;
 anything else re-displays the draft. This makes inline sends idempotent on
 lossy links — if "Message posted." is never received, retrying `.` is safe.
 
@@ -1728,10 +1729,10 @@ warn!("meshtastic: frame too long ({} bytes) — truncating", n);
 
 ### Before opening a PR
 
-- [ ] `rustup run 1.88 cargo fmt --all --check` passes
-- [ ] `rustup run 1.88 cargo test --workspace` passes
-- [ ] `rustup run 1.88 cargo clippy --workspace -- -D warnings` passes
-- [ ] `rustup run 1.88 cargo doc --workspace --no-deps --all-features` passes
+- [ ] `rustup run 1.96 cargo fmt --all --check` passes
+- [ ] `rustup run 1.96 cargo test --workspace` passes
+- [ ] `rustup run 1.96 cargo clippy --workspace -- -D warnings` passes
+- [ ] `rustup run 1.96 cargo doc --workspace --no-deps --all-features` passes
 - [ ] Payload size test added for every canned string
 - [ ] Config documented in `docs/CONFIG.md`
 - [ ] Feature flag documented in root `Cargo.toml` comment

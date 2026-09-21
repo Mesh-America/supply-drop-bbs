@@ -1,0 +1,19 @@
+[package]
+name        = "bbs-serial-path"
+description = "Stable /dev/serial/by-id names for USB serial devices"
+version.workspace      = true
+edition.workspace      = true
+authors.workspace      = true
+repository.workspace   = true
+rust-version.workspace = true
+license-file = "../../LICENSE"
+publish      = false
+
+# No dependencies on purpose: the setup wizard and both radio transports use
+# this, and none of them should pick up the database stack for a path helper.
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

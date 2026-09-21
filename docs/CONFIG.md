@@ -340,7 +340,7 @@ run companion-frame firmware. No `openhop_core` required.
 
 | Key           | Type    | Default          | Required | Description                              |
 |---------------|---------|------------------|----------|------------------------------------------|
-| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path. The setup wizard auto-detects this. |
+| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path. The setup wizard auto-detects this and writes the stable `/dev/serial/by-id/...` name for a radio that reports its own USB serial number. Prefer that: `/dev/ttyACMn` numbers change when a radio is re-attached, which can point the BBS at the wrong radio (the BBS warns at connect). See [OPERATIONS.md](OPERATIONS.md#radio-bridge-disconnected). |
 | `baud_rate`   | integer | `115200`         | no       | Serial baud rate                         |
 
 ### TCP / HAT mode (`connection_type = "tcp"` or `"hat"`)
@@ -471,6 +471,15 @@ is a no-op on the wire. This applies *before* any other radio operation (the
 message-queue drain, contact fetch, autoadd query), the same way `path_bytes`
 and the advert name/GPS are synced on every startup.
 
+Separately from `[plugins.mesh.radio]`, and regardless of whether that section
+exists, the BBS also turns on the radio's Chat auto-add and overwrite-oldest
+settings on every connect if they are off. This runs after the message-queue
+drain and contact fetch, and is what lets new users reach the BBS without
+changing the radio's settings in the MeshCore app. A radio's hop limit for
+auto-add can still keep far-away users out. See
+[PROTOCOL.md](PROTOCOL.md#meshcore-contact-auto-add). There is no config key
+for this.
+
 The CLI is for applying (or previewing) a change **without** starting the BBS —
 useful before the service is installed, for a one-off preset test, or to
 resolve a preset into concrete values and `--save` them back into
@@ -546,7 +555,7 @@ No daemon required.
 
 | Key           | Type    | Default          | Required | Description           |
 |---------------|---------|------------------|----------|-----------------------|
-| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path    |
+| `serial_port` | string  | `"/dev/ttyACM0"` | no       | Serial device path. Prefer the stable `/dev/serial/by-id/...` name for USB radios (see the `[plugins.mesh]` table above); the BBS warns at connect when a numbered `/dev/ttyACMn` name is used |
 | `baud_rate`   | integer | `115200`         | no       | Serial baud rate      |
 
 ### TCP mode (`connection_type = "tcp"`)

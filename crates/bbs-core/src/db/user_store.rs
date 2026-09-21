@@ -110,9 +110,9 @@ pub trait UserStore: Send + Sync {
     /// (supply-drop-bbs-ax3 / #280). Distinct from [`update`](Self::update)
     /// with `status = Some(Banned)`, which is a *permanent* ban and leaves
     /// `suspended_until` untouched (callers going through `update` for a
-    /// permanent ban should pair it with [`clear_suspension`]
-    /// (Self::clear_suspension) to avoid leaving a stale expiry from an
-    /// earlier suspension).
+    /// permanent ban should pair it with
+    /// [`clear_suspension`](Self::clear_suspension) to avoid leaving a stale
+    /// expiry from an earlier suspension).
     async fn suspend(&self, id: UserId, until: Timestamp) -> Result<(), StoreError>;
 
     /// Clear `suspended_until` back to `NULL`, without touching `status`.
@@ -120,6 +120,14 @@ pub trait UserStore: Send + Sync {
     /// expiry that might still be set — reactivating (unban), a fresh
     /// permanent ban, or deletion.
     async fn clear_suspension(&self, id: UserId) -> Result<(), StoreError>;
+
+    /// End a timeout that has run out: set `status = Active` and clear
+    /// `suspended_until`, in one statement, and only if the row is still
+    /// `Banned` with a `suspended_until` at or before `now`. Returns whether it
+    /// did. A `false` means the row changed since the caller read it (a sysop
+    /// unbanned, re-suspended or deleted the account), and the caller should
+    /// read it again rather than act on its stale copy.
+    async fn end_expired_suspension(&self, id: UserId, now: Timestamp) -> Result<bool, StoreError>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────
@@ -397,6 +405,24 @@ impl UserStore for Database {
             return Err(StoreError::NotFound);
         }
         Ok(())
+    }
+
+    async fn end_expired_suspension(&self, id: UserId, now: Timestamp) -> Result<bool, StoreError> {
+        // `julianday` compares the stored text as a time, not as a string, so
+        // it does not depend on the offset or fractional-second format.
+        let rows = sqlx::query(
+            "UPDATE users SET status = ?, suspended_until = NULL \
+             WHERE id = ? AND status = ? AND suspended_until IS NOT NULL \
+             AND julianday(suspended_until) <= julianday(?)",
+        )
+        .bind(UserStatus::Active as i64)
+        .bind(id.as_i64())
+        .bind(UserStatus::Banned as i64)
+        .bind(now.to_rfc3339())
+        .execute(&self.write_pool)
+        .await?
+        .rows_affected();
+        Ok(rows > 0)
     }
 
     async fn hard_delete(&self, id: UserId) -> Result<(), StoreError> {

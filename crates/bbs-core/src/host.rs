@@ -202,6 +202,16 @@ enum LoginSuspensionCheck {
     PermanentlyBanned,
 }
 
+/// Whole days left in a suspension ending at `until`, as seen at `now`, rounded
+/// up so a suspension ending in a few hours still reads as "1 more day": "0 more
+/// days" would be a confusing thing to tell someone who is still, in fact,
+/// blocked. `until` must be after `now`; the result is never below 1.
+fn suspension_days_remaining(until: Timestamp, now: Timestamp) -> i64 {
+    let remaining_secs = (until.as_offset_datetime() - now.as_offset_datetime()).whole_seconds();
+    // Manual ceiling division: `i64::div_ceil` isn't stable on this toolchain (1.96).
+    ((remaining_secs + 86_400 - 1) / 86_400).max(1)
+}
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Debug)]
 enum ComposeStage {
@@ -236,10 +246,11 @@ struct SessionRecord {
     /// `None` means "not yet started"; F starts at the first message, R at the last.
     /// Reset to `None` when the room changes.
     current_message_id: Option<MessageId>,
-    /// The confirmation shown for the most recent post, kept until the next
-    /// command. Lets a re-sent bare `.` (e.g. when the confirmation was lost on
-    /// a lossy radio link) re-emit the *same* confirmation idempotently instead
-    /// of returning "Unknown command." See issues #107 and #121.
+    /// The outcome shown for the most recent post or cancelled draft, kept
+    /// until the next command. Lets a re-sent bare `.` (e.g. when the reply was
+    /// lost on a lossy radio link) re-emit the *same* confirmation idempotently
+    /// instead of returning "Unknown command.", and, on a radio, a re-sent bare
+    /// `C` repeat the cancel. See issues #107, #121 and #312.
     last_post_confirmation: Option<String>,
 }
 
@@ -496,7 +507,11 @@ impl Host for BbsHost {
         // Clear the post-confirm idempotency state for any command other than a
         // bare `.` (which the `Command::Unknown` arm handles as a re-confirm).
         // Once the user does anything else, a stray `.` is no longer a retry. (#107)
-        let is_repost_dot = matches!(&cmd, Command::Unknown { raw } if raw.trim() == ".");
+        // A bare `C` is the send prompt's cancel, so on a radio it counts as a
+        // retry too (elsewhere it is just the room command asking for its argument).
+        let is_bare_c = matches!(&cmd, Command::ChangeRoom { target } if target.trim().is_empty());
+        let is_repost_dot = matches!(&cmd, Command::Unknown { raw } if raw.trim() == ".")
+            || (is_bare_c && self.session_on_radio(session).await);
         if !is_repost_dot {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
@@ -1604,17 +1619,18 @@ impl Host for BbsHost {
         &self,
         backup_dir: &str,
     ) -> Result<Vec<AdminBackupRecord>, HostError> {
-        self.db
-            .admin_list_backups(backup_dir)
+        crate::db::Database::admin_list_backups(backup_dir)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
-        self.db
-            .admin_delete_backup(backup_dir, filename)
+        crate::db::Database::admin_delete_backup(backup_dir, filename)
             .await
-            .map_err(|e| HostError::Storage(format!("{e}")))
+            .map_err(|e| match e {
+                crate::db::StoreError::NotFound => HostError::NotFound(filename.to_owned()),
+                e => HostError::Storage(format!("{e}")),
+            })
     }
 
     async fn admin_stage_restore(
@@ -1630,10 +1646,96 @@ impl Host for BbsHost {
         .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
+    async fn admin_stage_backup_restore(
+        &self,
+        source_path: &str,
+        data_dir: &str,
+    ) -> Result<(), HostError> {
+        use crate::restore_stage::{stage_copy, SourceRules, StageError, WEB_RESTORE_MAX_BYTES};
+        stage_copy(
+            std::path::Path::new(source_path),
+            std::path::Path::new(data_dir),
+            "restore_backup_",
+            SourceRules {
+                max_bytes: Some(WEB_RESTORE_MAX_BYTES),
+                follow_symlinks: false,
+            },
+        )
+        .await
+        .map_err(|e| match e {
+            StageError::NotFound => HostError::NotFound("backup not found".into()),
+            StageError::NotRegularFile => HostError::PreconditionFailed(e.to_string()),
+            StageError::TooLarge(m) | StageError::NoSpace(m) | StageError::Rejected(m) => {
+                HostError::Storage(m)
+            }
+            StageError::Io(m) => HostError::Internal(m),
+        })
+    }
+
+    async fn admin_trigger_backup_bundle(
+        &self,
+        backup_dir: &str,
+        config_path: Option<&str>,
+    ) -> Result<AdminBackupRecord, HostError> {
+        let record = self.admin_trigger_backup(backup_dir).await?;
+        let db_path = std::path::Path::new(backup_dir).join(&record.filename);
+        let zip_name = record.filename.trim_end_matches(".db").to_owned() + ".zip";
+        let zip_path = std::path::Path::new(backup_dir).join(&zip_name);
+        let config_path = config_path
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from);
+
+        let (db, entry, zip) = (db_path.clone(), record.filename.clone(), zip_path.clone());
+        let bundled = tokio::task::spawn_blocking(move || {
+            let db_len = std::fs::metadata(&db)?.len();
+            if let Some(dir) = zip.parent() {
+                crate::disk_space::ensure_free_space(dir, db_len).map_err(std::io::Error::other)?;
+            }
+            crate::backup_bundle::bundle_and_drop_bare(&db, &entry, config_path.as_deref(), &zip)
+        })
+        .await
+        .map_err(|e| HostError::Storage(format!("bundling the backup: {e}")))?;
+
+        match bundled {
+            Ok(info) => Ok(AdminBackupRecord {
+                filename: zip_name,
+                size_bytes: info.zip_bytes,
+                created_at: record.created_at,
+                config_filename: info
+                    .config_bytes
+                    .map(|_| crate::backup_bundle::CONFIG_ENTRY.to_owned()),
+                config_size_bytes: info.config_bytes,
+            }),
+            Err(e) => {
+                // Never lose the backup that was just taken: the database-only
+                // copy stays, and the caller is told it has no settings.
+                tracing::warn!(
+                    "backup: could not bundle the database with the config ({e}); keeping \
+                     the database-only backup {}",
+                    record.filename
+                );
+                Ok(record)
+            }
+        }
+    }
+
     async fn admin_apply_staged_restore(&self, data_dir: &str) -> Result<(), HostError> {
         crate::db::Database::admin_apply_staged_restore(std::path::Path::new(data_dir))
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_apply_staged_restore_with(
+        &self,
+        data_dir: &str,
+        include_config: bool,
+    ) -> Result<(), HostError> {
+        crate::db::Database::admin_apply_staged_restore_with(
+            std::path::Path::new(data_dir),
+            include_config,
+        )
+        .await
+        .map_err(|e| HostError::Storage(format!("{e}")))
     }
 
     async fn admin_write_audit(
@@ -2070,35 +2172,42 @@ impl BbsHost {
         let Some(until) = user.suspended_until else {
             return Ok(LoginSuspensionCheck::PermanentlyBanned);
         };
-        if Timestamp::now() >= until {
-            UserStore::update(
-                &self.db,
-                user.id,
-                None,
-                Some(UserStatus::Active),
-                None,
-                None,
-            )
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-            UserStore::clear_suspension(&self.db, user.id)
+        // Read the clock once: the expiry check and the days remaining must
+        // agree on what "now" is, even if the wall clock steps between two reads.
+        let now = Timestamp::now();
+        if now >= until {
+            // One conditional statement: the account is reactivated only if it
+            // is still in this expired timeout. Two separate writes could
+            // reactivate an account a sysop had re-suspended or banned since
+            // it was read, or leave it Active with the expiry still set.
+            let ended = UserStore::end_expired_suspension(&self.db, user.id, now)
                 .await
                 .map_err(|e| HostError::Storage(format!("{e}")))?;
-            let mut user = user;
-            user.status = UserStatus::Active;
-            user.suspended_until = None;
-            return Ok(LoginSuspensionCheck::Allowed(user));
+            if ended {
+                let mut user = user;
+                user.status = UserStatus::Active;
+                user.suspended_until = None;
+                return Ok(LoginSuspensionCheck::Allowed(user));
+            }
+            // The row changed since it was read. Go by what it is now, and
+            // refuse if it can't be read.
+            let fresh = UserStore::get_by_id(&self.db, user.id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+            return Ok(match fresh {
+                Some(u) if u.status == UserStatus::Active => LoginSuspensionCheck::Allowed(u),
+                Some(u) if u.status == UserStatus::Banned => match u.suspended_until {
+                    Some(until) => LoginSuspensionCheck::Suspended {
+                        days_remaining: suspension_days_remaining(until, now),
+                    },
+                    None => LoginSuspensionCheck::PermanentlyBanned,
+                },
+                _ => LoginSuspensionCheck::PermanentlyBanned,
+            });
         }
-        // Ceiling-divide the remaining whole seconds into days, so a
-        // suspension ending in a few hours still reads as "1 more day" —
-        // "0 more days" would be a confusing thing to tell someone who is
-        // still, in fact, blocked.
-        let remaining_secs =
-            (until.as_offset_datetime() - Timestamp::now().as_offset_datetime()).whole_seconds();
-        // Manual ceiling division — `i64::div_ceil` isn't stable on this
-        // toolchain (1.96) yet. `remaining_secs` is always positive here.
-        let days_remaining = ((remaining_secs + 86_400 - 1) / 86_400).max(1);
-        Ok(LoginSuspensionCheck::Suspended { days_remaining })
+        Ok(LoginSuspensionCheck::Suspended {
+            days_remaining: suspension_days_remaining(until, now),
+        })
     }
 
     /// Create `username` with `password`, attach the new account to `session`,
@@ -2795,11 +2904,11 @@ impl BbsHost {
                         };
                     }
                 }
-                let preview = if let Some(ref rcpt) = recipient {
-                    format!("To {}: {}\nType . to send", rcpt.as_str(), body)
-                } else {
-                    format!("{body}\nType . to send")
-                };
+                let preview = draft_preview(
+                    recipient.as_ref(),
+                    &body,
+                    self.session_on_radio(session).await,
+                );
                 Ok(Response::Prompt {
                     text: preview,
                     hide_input: false,
@@ -2811,14 +2920,31 @@ impl BbsHost {
                 room_id,
                 stage: ComposeStage::AwaitingConfirmation { recipient, body },
             } => {
+                if reply.trim().eq_ignore_ascii_case("c") {
+                    // Abandon the draft: nothing is posted and the user is back at
+                    // the command prompt. (`CANCEL` also works, upstream of this.)
+                    // One edge: a step-by-step draft whose whole body is "c",
+                    // re-sent because the send prompt was lost, arrives here and
+                    // cancels. Accepted; the reply says nothing was sent.
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                        // Like a successful post, arm the retry slot: on a lossy
+                        // link the "Cancelled" reply can be lost, and a re-sent
+                        // `C` (or `.`) should hear the same answer rather than
+                        // "Usage" or "Unknown command".
+                        r.last_post_confirmation = Some(CANCELLED_DRAFT.to_owned());
+                    }
+                    return Ok(Response::Text(CANCELLED_DRAFT.into()));
+                }
                 if reply.trim() != "." {
                     // Re-show the staged draft — the confirmation prompt may have
                     // been lost on the first send.
-                    let preview = if let Some(ref rcpt) = recipient {
-                        format!("To {}: {}\nType . to send", rcpt.as_str(), body)
-                    } else {
-                        format!("{body}\nType . to send")
-                    };
+                    let preview = draft_preview(
+                        recipient.as_ref(),
+                        &body,
+                        self.session_on_radio(session).await,
+                    );
                     // Keep workflow state unchanged.
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
@@ -3635,6 +3761,20 @@ impl BbsHost {
         target: &str,
     ) -> Result<Response, HostError> {
         if target.trim().is_empty() {
+            // A bare `C` right after a draft was posted or cancelled is a retry
+            // of the send prompt's `C` (its reply was lost): repeat the outcome.
+            // Only on a radio, where replies get lost; on the CLI or web a bare
+            // `C` is someone asking how to change room, not a retry.
+            let outcome = {
+                let sessions = self.sessions.read().await;
+                sessions
+                    .get(&session)
+                    .filter(|r| matches!(r.transport.as_str(), "meshcore" | "meshtastic"))
+                    .and_then(|r| r.last_post_confirmation.clone())
+            };
+            if let Some(outcome) = outcome {
+                return Ok(Response::Text(outcome));
+            }
             return Ok(Response::Text("Usage: C <room name or number>".into()));
         }
 
@@ -4459,6 +4599,9 @@ impl BbsHost {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
+        // Read before any sessions lock is taken below: the draft preview is
+        // clipped for radio sessions.
+        let on_radio = self.session_on_radio(session).await;
 
         let is_guest = level < PermissionLevel::User;
         let guest_rid = self.guest_room_id();
@@ -4542,7 +4685,7 @@ impl BbsHost {
                             };
                         }
                         return Ok(Response::Prompt {
-                            text: format!("To {}: {}\nType . to send", recipient.as_str(), body),
+                            text: draft_preview(Some(&recipient), &body, on_radio),
                             hide_input: false,
                         });
                     }
@@ -4567,7 +4710,7 @@ impl BbsHost {
                     };
                 }
                 return Ok(Response::Prompt {
-                    text: format!("{body}\nType . to send"),
+                    text: draft_preview(None, &body, on_radio),
                     hide_input: false,
                 });
             }
@@ -5706,6 +5849,51 @@ impl BbsHost {
 
 // ── Command label (for log events) ───────────────────────────────────────────
 
+/// Most bytes of draft preview sent to a radio session. MeshCore hard-truncates
+/// a reply at 156 bytes and Meshtastic at 220; staying under the smaller keeps
+/// the send/cancel instructions from being cut off after a long draft.
+const RADIO_DRAFT_PREVIEW_MAX_BYTES: usize = 150;
+
+/// The reply to cancelling a draft at the send prompt.
+const CANCELLED_DRAFT: &str = "Cancelled. Nothing was sent.";
+
+/// The staged-message preview shown before a post or mail is sent: the draft,
+/// then how to confirm or abandon it. `C` cancels only at this prompt; `CANCEL`
+/// works at every prompt. On a radio the echoed draft is clipped (with an
+/// ellipsis) so the instructions always fit in one frame.
+fn draft_preview(recipient: Option<&Username>, body: &str, on_radio: bool) -> String {
+    const SUFFIX: &str = "\nType . to send, C to cancel";
+    let prefix = recipient.map_or_else(String::new, |r| format!("To {}: ", r.as_str()));
+    let body = if on_radio {
+        let room = RADIO_DRAFT_PREVIEW_MAX_BYTES.saturating_sub(prefix.len() + SUFFIX.len());
+        clip_to_bytes(body, room)
+    } else {
+        std::borrow::Cow::Borrowed(body)
+    };
+    format!("{prefix}{body}{SUFFIX}")
+}
+
+/// `s` cut to at most `max` bytes on a character boundary, ending in "…" when
+/// anything was removed. When `max` is too small to hold the ellipsis the result
+/// is empty, so the limit holds either way.
+fn clip_to_bytes(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    const ELLIPSIS: &str = "…";
+    if s.len() <= max {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let Some(keep) = max.checked_sub(ELLIPSIS.len()) else {
+        return std::borrow::Cow::Borrowed("");
+    };
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if i + c.len_utf8() > keep {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    std::borrow::Cow::Owned(format!("{}{ELLIPSIS}", &s[..end]))
+}
+
 fn cmd_label(cmd: &Command) -> &'static str {
     match cmd {
         Command::Help { .. } => "Help",
@@ -6014,8 +6202,8 @@ const HELP_POSTING: &str = "\
 Posting:\n\
  D <#>  delete\n\
  E      enter message (prompts)\n\
- E msg  post now, no prompt\n\
- E @user msg  send DM inline";
+ E msg  draft a post (. sends, C cancels)\n\
+ E @user msg  draft a DM inline";
 
 const HELP_NAVIGATION: &str = "\
 Navigation:\n\
@@ -8302,6 +8490,56 @@ mod tests {
         assert!(stored.suspended_until.is_some());
     }
 
+    /// Days remaining round up, and a wall clock that reads a few seconds off
+    /// moves the answer only across a day boundary (#331): the integration tests
+    /// above keep clear of those boundaries, and this pins them down.
+    #[test]
+    fn suspension_days_remaining_rounds_up_at_the_day_boundaries() {
+        let now = Timestamp::from_utc(time::OffsetDateTime::UNIX_EPOCH);
+        let after = |secs: i64| {
+            Timestamp::from_utc(now.as_offset_datetime() + time::Duration::seconds(secs))
+        };
+        const DAY: i64 = 86_400;
+        assert_eq!(suspension_days_remaining(after(1), now), 1);
+        assert_eq!(suspension_days_remaining(after(3 * 3600), now), 1);
+        assert_eq!(suspension_days_remaining(after(DAY), now), 1);
+        assert_eq!(suspension_days_remaining(after(DAY + 1), now), 2);
+        assert_eq!(suspension_days_remaining(after(60 * 3600), now), 3);
+        assert_eq!(suspension_days_remaining(after(3 * DAY), now), 3);
+        assert_eq!(suspension_days_remaining(after(3 * DAY + 1), now), 4);
+        // Never below 1, even for an `until` that is not after `now`.
+        assert_eq!(suspension_days_remaining(now, now), 1);
+        assert_eq!(suspension_days_remaining(after(-5), now), 1);
+    }
+
+    /// `admin_suspend_user` stores `days` whole days from now. Checked with an
+    /// hour of slack each way rather than against a before/after bracket: the
+    /// wall clock can step by seconds (#331), and a day count is what matters.
+    #[tokio::test]
+    async fn admin_suspend_user_stores_whole_days_from_now() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "hunter99").await;
+
+        for days in [1u8, 3, 5] {
+            host.admin_suspend_user("alice", days).await.unwrap();
+            let until = UserStore::get_by_username(&host.db, &alice)
+                .await
+                .unwrap()
+                .unwrap()
+                .suspended_until
+                .expect("a timeout has an end");
+            let ahead = (until.as_offset_datetime() - Timestamp::now().as_offset_datetime())
+                .whole_seconds();
+            let want = i64::from(days) * 86_400;
+            assert!(
+                (want - 3600..=want + 3600).contains(&ahead),
+                "{days} day(s) should end about {want}s from now, got {ahead}s"
+            );
+        }
+    }
+
     /// The core UX #280 asks for: a login attempt during an active timeout
     /// is told how many days remain, not a generic "Login failed."
     #[tokio::test]
@@ -8312,7 +8550,18 @@ mod tests {
         register_and_login(&host, sid, &alice, "hunter99").await;
         host.process_command(sid, Command::Logout).await.unwrap();
 
-        host.admin_suspend_user("alice", 3).await.unwrap();
+        // Two and a half days out, set directly: it rounds up to 3 by 12 hours
+        // either way, so a wall clock that steps by a few seconds (see #331)
+        // can't tip it into "4". `admin_suspend_user("alice", 3)` would sit within
+        // a second of the 2 to 3 day boundary the moment the clock moved back.
+        let alice_id = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let until =
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() + time::Duration::hours(60));
+        UserStore::suspend(&host.db, alice_id, until).await.unwrap();
 
         let sid2 = host.create_session("test").await.unwrap();
         host.process_command(
@@ -8335,7 +8584,7 @@ mod tests {
         match r {
             Response::Error(msg) => {
                 assert!(
-                    msg.contains("suspended") && msg.contains("3"),
+                    msg.contains("suspended for 3 more day"),
                     "expected a message naming the days remaining, got: {msg:?}"
                 );
             }
@@ -8375,7 +8624,7 @@ mod tests {
             .unwrap();
         match r {
             Response::Error(msg) => assert!(
-                msg.contains("suspended"),
+                msg.contains("suspended for"),
                 "expected a suspension message, got: {msg:?}"
             ),
             other => panic!("expected Response::Error, got {other:?}"),
@@ -8437,9 +8686,12 @@ mod tests {
             .unwrap()
             .id;
         // Directly set an already-past suspended_until — admin_suspend_user
-        // itself only ever computes a future one.
+        // itself only ever computes a future one. An hour, not a second: this
+        // WSL2 VM's wall clock has been seen stepping back by more than two
+        // seconds under load (#331), and a margin that thin turned the test
+        // into a coin flip.
         let past =
-            Timestamp::from_utc(Timestamp::now().as_offset_datetime() - time::Duration::seconds(1));
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() - time::Duration::hours(1));
         UserStore::suspend(&host.db, alice_id, past).await.unwrap();
 
         let sid2 = host.create_session("test").await.unwrap();
@@ -9591,6 +9843,346 @@ mod tests {
         );
     }
 
+    // ── Cancelling a drafted message (#312) ───────────────────────────────────
+
+    async fn reply(host: &BbsHost, sid: SessionId, text: &str) -> Response {
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: text.to_owned(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn room_message_count(host: &BbsHost, room: i64) -> usize {
+        crate::db::MessageStore::list_in_room(&host.db, RoomId::new(room), None, 100)
+            .await
+            .unwrap()
+            .messages
+            .len()
+    }
+
+    /// The prompt tells the user how to abandon the draft as well as how to send it.
+    #[tokio::test]
+    async fn the_draft_prompt_offers_cancel() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &uname, "pass1234").await;
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some("hello there".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let Response::Prompt { text, .. } = resp else {
+            panic!("expected the draft prompt, got {resp:?}");
+        };
+        assert!(
+            text.contains("Type . to send, C to cancel"),
+            "prompt should offer both, got {text:?}"
+        );
+    }
+
+    /// `C` (either case, with stray spaces) at the send prompt discards a room
+    /// post: nothing is posted, and the user is free to start another message.
+    #[tokio::test]
+    async fn c_cancels_a_drafted_room_post() {
+        for cancel in ["C", "c", " c "] {
+            let (host, _db) = make_host().await;
+            let sid = host.create_session("test").await.unwrap();
+            let uname = Username::new("alice").unwrap();
+            register_and_login(&host, sid, &uname, "pass1234").await;
+
+            host.process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some("never sent".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let resp = reply(&host, sid, cancel).await;
+            assert!(
+                matches!(&resp, Response::Text(t) if t.contains("Nothing was sent")),
+                "{cancel:?} should cancel, got {resp:?}"
+            );
+            assert_eq!(room_message_count(&host, 1).await, 0, "{cancel:?}");
+
+            // Back at the command prompt: a new message can be started, and it
+            // does not resurrect the cancelled draft.
+            host.process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some("second".into()),
+                },
+            )
+            .await
+            .unwrap();
+            let resp = reply(&host, sid, ".").await;
+            assert!(matches!(&resp, Response::Text(t) if t.contains("Message posted")));
+            let page = crate::db::MessageStore::list_in_room(&host.db, RoomId::new(1), None, 10)
+                .await
+                .unwrap();
+            assert_eq!(page.messages.len(), 1);
+            assert_eq!(page.messages[0].content, "second");
+        }
+    }
+
+    /// The same for mail, whether the draft was made step by step or inline.
+    #[tokio::test]
+    async fn c_cancels_a_drafted_mail() {
+        let (host, _db) = make_host().await;
+        let s1 = host.create_session("test").await.unwrap();
+        register_and_login(&host, s1, &Username::new("alice").unwrap(), "pass1234").await;
+        let s2 = host.create_session("test").await.unwrap();
+        let carol = Username::new("carol").unwrap();
+        register_and_login(&host, s2, &carol, "pass5678").await;
+
+        host.process_command(s1, Command::GoMail).await.unwrap();
+        // Inline: "E carol hi".
+        host.process_command(
+            s1,
+            Command::EnterMessage {
+                body: Some("carol hi".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let resp = reply(&host, s1, "C").await;
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Nothing was sent")),
+            "{resp:?}"
+        );
+
+        // Step by step: E, recipient, body, then C.
+        host.process_command(s1, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+        reply(&host, s1, "carol").await;
+        let resp = reply(&host, s1, "second try").await;
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.contains("C to cancel")),
+            "{resp:?}"
+        );
+        let resp = reply(&host, s1, "c").await;
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Nothing was sent")),
+            "{resp:?}"
+        );
+
+        let page = MessageStore::list_direct(&host.db, &carol, None, 10)
+            .await
+            .unwrap();
+        assert!(page.messages.is_empty(), "no mail may have been sent");
+    }
+
+    /// `C` cancels only at the send prompt. Earlier, it is just the text being
+    /// entered (a message can legitimately be "C"), and any other reply at the
+    /// send prompt still re-shows the draft rather than cancelling.
+    #[tokio::test]
+    async fn c_is_only_special_at_the_send_prompt() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+
+        host.process_command(sid, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+        // At the body prompt "C" is the message body.
+        let resp = reply(&host, sid, "C").await;
+        assert!(
+            matches!(&resp, Response::Prompt { text, .. } if text.starts_with("C\n")),
+            "a body of C should be staged, got {resp:?}"
+        );
+        // Words that merely start with c are not a cancel.
+        for other in ["cancel it", "cc", "yes"] {
+            let resp = reply(&host, sid, other).await;
+            assert!(
+                matches!(&resp, Response::Prompt { text, .. } if text.contains("C to cancel")),
+                "{other:?} should re-show the draft, got {resp:?}"
+            );
+        }
+        let resp = reply(&host, sid, ".").await;
+        assert!(
+            matches!(&resp, Response::Text(t) if t.contains("Message posted")),
+            "{resp:?}"
+        );
+        assert_eq!(room_message_count(&host, 1).await, 1);
+    }
+
+    /// On a lossy link the reply to `C` (or to `.`) can be lost and the user
+    /// re-sends it: they must hear the same outcome again, not "Usage: C ..." or
+    /// "Unknown command.". A `C` sent after the post already went through is
+    /// answered with the true outcome, not silently treated as a room change.
+    #[tokio::test]
+    async fn a_retried_c_or_dot_repeats_the_outcome() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("meshcore").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let text = |r: Response| match r {
+            Response::Text(t) => t,
+            other => panic!("expected Text, got {other:?}"),
+        };
+        let cmd = |raw: &str| Command::parse(raw, false);
+
+        // Cancelled, then `C` and `.` re-sent.
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("draft".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(text(reply(&host, sid, "C").await).contains("Nothing was sent"));
+        for again in ["C", "."] {
+            let r = host.process_command(sid, cmd(again)).await.unwrap();
+            assert!(text(r).contains("Nothing was sent"), "{again:?}");
+        }
+        assert_eq!(room_message_count(&host, 1).await, 0);
+
+        // Posted, then a stray `C` (the user thought the post had not happened).
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("real".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(text(reply(&host, sid, ".").await).contains("Message posted"));
+        let r = host.process_command(sid, cmd("C")).await.unwrap();
+        assert!(text(r).contains("Message posted"), "C after a post");
+        assert_eq!(
+            room_message_count(&host, 1).await,
+            1,
+            "nothing was re-posted"
+        );
+
+        // Once the user does something else the slot is gone and `C` is the
+        // room command again.
+        host.process_command(sid, Command::Whoami).await.unwrap();
+        let r = host.process_command(sid, cmd("C")).await.unwrap();
+        assert!(text(r).starts_with("Usage: C"));
+    }
+
+    /// Off a radio there is no lost reply to repeat: a bare `C` after a post is
+    /// the room command asking for its argument, not a replay of the post.
+    #[tokio::test]
+    async fn a_bare_c_after_a_post_is_the_room_command_off_radio() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("cli").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        host.process_command(
+            sid,
+            Command::EnterMessage {
+                body: Some("real".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&reply(&host, sid, ".").await, Response::Text(t) if t.contains("Message posted"))
+        );
+        let r = host
+            .process_command(sid, Command::parse("C", false))
+            .await
+            .unwrap();
+        assert!(
+            matches!(&r, Response::Text(t) if t.starts_with("Usage: C")),
+            "{r:?}"
+        );
+        // That `C` was a command of its own, so the post's slot is gone and a
+        // later `.` is not a replay of "Message posted.".
+        let r = host
+            .process_command(sid, Command::parse(".", false))
+            .await
+            .unwrap();
+        assert!(
+            !matches!(&r, Response::Text(t) if t.contains("Message posted")),
+            "{r:?}"
+        );
+    }
+
+    /// `C` typed while a draft is pending reaches the workflow on every transport
+    /// (it is a reply, not a room command) and is a room command otherwise.
+    #[test]
+    fn bare_c_is_a_reply_only_while_awaiting_one() {
+        assert!(matches!(
+            Command::parse("C", true),
+            Command::WorkflowReply { .. }
+        ));
+        assert!(matches!(
+            Command::parse("C", false),
+            Command::ChangeRoom { .. }
+        ));
+    }
+
+    #[test]
+    fn a_draft_preview_is_clipped_for_radio_but_never_loses_its_instructions() {
+        const SUFFIX: &str = "\nType . to send, C to cancel";
+        let short = draft_preview(None, "hello", true);
+        assert_eq!(short, format!("hello{SUFFIX}"));
+
+        let bob = Username::new("bob").unwrap();
+        for body in ["x".repeat(400), "é".repeat(300), "日本語".repeat(80)] {
+            for rcpt in [None, Some(&bob)] {
+                let radio = draft_preview(rcpt, &body, true);
+                assert!(
+                    radio.len() <= RADIO_DRAFT_PREVIEW_MAX_BYTES,
+                    "{}",
+                    radio.len()
+                );
+                assert!(radio.ends_with(SUFFIX), "{radio:?}");
+                assert!(radio.contains('…'), "clipped drafts say so");
+                // Off radio nothing is clipped.
+                let full = draft_preview(rcpt, &body, false);
+                assert!(full.contains(body.as_str()) && !full.contains('…'));
+            }
+        }
+        // A draft that just fits is left alone.
+        let fits = "y".repeat(RADIO_DRAFT_PREVIEW_MAX_BYTES - SUFFIX.len());
+        assert_eq!(draft_preview(None, &fits, true), format!("{fits}{SUFFIX}"));
+        // Too small for the ellipsis: empty, never over the limit.
+        for max in 0.."…".len() {
+            assert_eq!(clip_to_bytes("abcdef", max), "", "{max}");
+        }
+        assert_eq!(clip_to_bytes("abcdef", "…".len()), "…");
+    }
+
+    /// End to end on a radio session: a long draft still shows how to send or cancel.
+    #[tokio::test]
+    async fn a_long_draft_on_a_radio_session_keeps_the_send_and_cancel_hint() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("meshcore").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let resp = host
+            .process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some("word ".repeat(60)),
+                },
+            )
+            .await
+            .unwrap();
+        let Response::Prompt { text, .. } = resp else {
+            panic!("expected the draft prompt, got {resp:?}");
+        };
+        assert!(
+            text.len() <= RADIO_DRAFT_PREVIEW_MAX_BYTES,
+            "{}",
+            text.len()
+        );
+        assert!(text.ends_with("Type . to send, C to cancel"), "{text:?}");
+    }
+
     /// Issue #107: after a post the workflow ends, but a re-sent bare `.`
     /// (the "Message posted." ack lost on a lossy link) must re-emit the
     /// confirmation idempotently — not "Unknown command" — and must not
@@ -10008,6 +10600,372 @@ mod tests {
         let staged = data_dir.path().join("pending_restore.staged.db");
         assert!(
             !staged.exists(),
+            "a rejected upload must not be staged for restore"
+        );
+    }
+
+    /// `admin_stage_backup_restore` copies a backup from a directory into the
+    /// data directory, stages the copy and leaves the original alone, and its
+    /// errors carry the variants the web layer turns into status codes.
+    #[tokio::test]
+    async fn stage_backup_restore_stages_a_copy_and_maps_its_errors() {
+        let (host, _live_db_file) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_string_lossy().into_owned();
+
+        let rec = host
+            .admin_trigger_backup(&backups.path().to_string_lossy())
+            .await
+            .unwrap();
+        let src = backups.path().join(&rec.filename);
+        let before = std::fs::read(&src).unwrap();
+
+        host.admin_stage_backup_restore(&src.to_string_lossy(), &data)
+            .await
+            .expect("a genuine backup stages");
+        let left: Vec<String> = std::fs::read_dir(data_dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["pending_restore.staged.db"]);
+        assert_eq!(
+            std::fs::read(&src).unwrap(),
+            before,
+            "the source is untouched"
+        );
+
+        let missing = backups.path().join("absent.db");
+        assert!(matches!(
+            host.admin_stage_backup_restore(&missing.to_string_lossy(), &data)
+                .await,
+            Err(HostError::NotFound(_))
+        ));
+        let dir = backups.path().join("looks_like.db");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(matches!(
+            host.admin_stage_backup_restore(&dir.to_string_lossy(), &data)
+                .await,
+            Err(HostError::PreconditionFailed(_))
+        ));
+        let bogus = backups.path().join("bogus.db");
+        std::fs::write(&bogus, b"not a database").unwrap();
+        assert!(matches!(
+            host.admin_stage_backup_restore(&bogus.to_string_lossy(), &data)
+                .await,
+            Err(HostError::Storage(_))
+        ));
+
+        // A symlink is refused, not followed.
+        #[cfg(unix)]
+        {
+            let link = backups.path().join("link.db");
+            std::os::unix::fs::symlink(&src, &link).unwrap();
+            assert!(matches!(
+                host.admin_stage_backup_restore(&link.to_string_lossy(), &data)
+                    .await,
+                Err(HostError::PreconditionFailed(_))
+            ));
+        }
+        // Over the web UI's limit: refused before any copy, as a storage error.
+        let huge = backups.path().join("huge.db");
+        std::fs::File::create(&huge)
+            .unwrap()
+            .set_len(crate::restore_stage::WEB_RESTORE_MAX_BYTES + 1)
+            .unwrap();
+        let err = host
+            .admin_stage_backup_restore(&huge.to_string_lossy(), &data)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, HostError::Storage(ref m) if m.contains("limit")),
+            "{err:?}"
+        );
+        let left: Vec<String> = std::fs::read_dir(data_dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            left,
+            ["pending_restore.staged.db"],
+            "no temp copy may remain"
+        );
+    }
+
+    // ── backup bundles carry the settings, and a restore brings them back ────
+
+    /// A bundle of the live database with `config_text` as its config.toml.
+    async fn make_bundle(
+        host: &BbsHost,
+        backups: &std::path::Path,
+        config_text: &str,
+    ) -> (String, std::path::PathBuf) {
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path().join("config.toml");
+        std::fs::write(&cfg, config_text).unwrap();
+        let rec = host
+            .admin_trigger_backup_bundle(&backups.to_string_lossy(), Some(&cfg.to_string_lossy()))
+            .await
+            .unwrap();
+        assert!(rec.filename.ends_with(".zip"), "{rec:?}");
+        assert_eq!(rec.config_filename.as_deref(), Some("config.toml"));
+        (rec.filename.clone(), backups.join(&rec.filename))
+    }
+
+    #[tokio::test]
+    async fn a_backup_bundle_is_listed_with_its_settings_and_holds_no_stray_db() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (name, _path) = make_bundle(&host, backups.path(), "[bbs]\nname = \"Mine\"\n").await;
+
+        let listed = host
+            .admin_list_backups(&backups.path().to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].filename, name);
+        assert_eq!(listed[0].config_filename.as_deref(), Some("config.toml"));
+        assert_eq!(listed[0].config_size_bytes, Some(20));
+        let files: Vec<String> = std::fs::read_dir(backups.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(files, [name], "only the zip may be left");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_without_a_known_config_is_a_database_only_zip() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let rec = host
+            .admin_trigger_backup_bundle(&backups.path().to_string_lossy(), None)
+            .await
+            .unwrap();
+        assert!(rec.filename.ends_with(".zip"));
+        assert_eq!(rec.config_filename, None);
+        let listed = host
+            .admin_list_backups(&backups.path().to_string_lossy())
+            .await
+            .unwrap();
+        assert_eq!(listed[0].config_filename, None);
+    }
+
+    // The whole path: back up with settings, restore, and the BBS name (and the
+    // other settings in the file) come back, while this machine's own paths and
+    // radio connection and switch stay.
+    #[tokio::test]
+    async fn restoring_a_bundle_brings_back_the_settings_and_keeps_machine_specific_keys() {
+        use crate::restore_apply::{apply_pending_restore, ApplyOutcome, ConfigOutcome};
+
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (_name, zip) = make_bundle(
+            &host,
+            backups.path(),
+            "[bbs]\nname = \"The Old Name\"\nwelcome_msg = \"Welcome back\"\ndata_dir = \"/old/box\"\n\
+             [plugins.web]\nbind = \"0.0.0.0:9\"\n",
+        )
+        .await;
+
+        // The "current" machine: a different name and paths.
+        let data_dir = tempfile::tempdir().unwrap();
+        let cfg_dir = tempfile::tempdir().unwrap();
+        let cfg = cfg_dir.path().join("config.toml");
+        std::fs::write(
+            &cfg,
+            "[bbs]\nname = \"The New Name\"\ndata_dir = \"/this/box\"\n\
+             [plugins.web]\nbind = \"127.0.0.1:8080\"\n",
+        )
+        .unwrap();
+
+        let data = data_dir.path().to_string_lossy().into_owned();
+        host.admin_stage_backup_restore(&zip.to_string_lossy(), &data)
+            .await
+            .expect("the bundle stages");
+        assert!(
+            data_dir
+                .path()
+                .join(crate::restore_config::STAGED_CONFIG_NAME)
+                .exists(),
+            "the settings are staged with the database"
+        );
+        host.admin_apply_staged_restore_with(&data, true)
+            .await
+            .unwrap();
+        assert!(data_dir
+            .path()
+            .join(crate::restore_config::PENDING_CONFIG_NAME)
+            .exists());
+
+        // "Next start": the live database is a different file.
+        let live_db = data_dir.path().join("bbs.sqlite");
+        let out = apply_pending_restore(data_dir.path(), &live_db, Some(&cfg)).await;
+        let ApplyOutcome::Applied {
+            config: ConfigOutcome::Applied(_),
+            ..
+        } = out
+        else {
+            panic!("{out:?}");
+        };
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("name = \"The Old Name\""), "{text}");
+        assert!(text.contains("welcome_msg = \"Welcome back\""), "{text}");
+        assert!(text.contains("data_dir = \"/this/box\""), "{text}");
+        assert!(text.contains("bind = \"127.0.0.1:8080\""), "{text}");
+        assert!(!text.contains("0.0.0.0"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn choosing_database_only_discards_the_settings() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (_n, zip) = make_bundle(&host, backups.path(), "[bbs]\nname = \"X\"\n").await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_string_lossy().into_owned();
+
+        host.admin_stage_backup_restore(&zip.to_string_lossy(), &data)
+            .await
+            .unwrap();
+        host.admin_apply_staged_restore_with(&data, false)
+            .await
+            .unwrap();
+
+        assert!(data_dir.path().join("pending_restore.db").exists());
+        for name in [
+            crate::restore_config::STAGED_CONFIG_NAME,
+            crate::restore_config::PENDING_CONFIG_NAME,
+        ] {
+            assert!(!data_dir.path().join(name).exists(), "{name}");
+        }
+    }
+
+    // A staged config always belongs to the staged database: staging a bare
+    // database afterwards must not leave the earlier bundle's settings to be
+    // confirmed with it.
+    #[tokio::test]
+    async fn staging_a_database_without_settings_clears_earlier_staged_settings() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (_n, zip) = make_bundle(&host, backups.path(), "[bbs]\nname = \"X\"\n").await;
+        let bare = host
+            .admin_trigger_backup(&backups.path().to_string_lossy())
+            .await
+            .unwrap();
+        let data_dir = tempfile::tempdir().unwrap();
+        let data = data_dir.path().to_string_lossy().into_owned();
+        let staged_cfg = data_dir
+            .path()
+            .join(crate::restore_config::STAGED_CONFIG_NAME);
+
+        host.admin_stage_backup_restore(&zip.to_string_lossy(), &data)
+            .await
+            .unwrap();
+        assert!(staged_cfg.exists());
+        host.admin_stage_backup_restore(
+            &backups.path().join(&bare.filename).to_string_lossy(),
+            &data,
+        )
+        .await
+        .unwrap();
+        assert!(!staged_cfg.exists(), "the bare database has no settings");
+    }
+
+    #[tokio::test]
+    async fn a_bundle_with_an_unparseable_config_is_refused_at_staging() {
+        let (host, _live) = make_host().await;
+        let backups = tempfile::tempdir().unwrap();
+        let (_n, zip) = make_bundle(&host, backups.path(), "[bbs\nname = ").await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let err = host
+            .admin_stage_backup_restore(&zip.to_string_lossy(), &data_dir.path().to_string_lossy())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not valid TOML"), "{err}");
+        assert!(
+            std::fs::read_dir(data_dir.path()).unwrap().next().is_none(),
+            "nothing may be staged or left behind"
+        );
+    }
+
+    /// A backup that migrates cleanly and has a healthy `rooms` table, but with
+    /// damage in a different table. The migration and room checks never read
+    /// that table, so only SQLite's own integrity check can refuse it.
+    async fn backup_with_a_second_table(
+        host: &BbsHost,
+        dir: &std::path::Path,
+        corrupt_its_root_page: bool,
+    ) -> std::path::PathBuf {
+        use sqlx::sqlite::SqliteConnectOptions;
+        let path = dir.join("source_backup.db");
+        host.db.admin_backup(&path.to_string_lossy()).await.unwrap();
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false);
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+        sqlx::query("CREATE TABLE extra_data (id INTEGER PRIMARY KEY, blob BLOB)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for _ in 0..64 {
+            sqlx::query("INSERT INTO extra_data (blob) VALUES (randomblob(900))")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let root: i64 =
+            sqlx::query_scalar("SELECT rootpage FROM sqlite_master WHERE name = 'extra_data'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        if corrupt_its_root_page {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start(((root - 1) * page_size) as u64))
+                .unwrap();
+            f.write_all(&vec![0xFFu8; page_size as usize]).unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn stage_restore_rejects_page_damage_outside_the_tables_the_other_checks_read() {
+        let (host, _live_db_file) = make_host().await;
+
+        // Control: the same extra table, undamaged, stages fine, so the
+        // rejection below is down to the damage and not to the extra table.
+        let ok_dir = tempfile::tempdir().unwrap();
+        let ok_backup = backup_with_a_second_table(&host, ok_dir.path(), false).await;
+        host.admin_stage_restore(
+            &ok_backup.to_string_lossy(),
+            &ok_dir.path().to_string_lossy(),
+        )
+        .await
+        .expect("an undamaged backup with an extra table must stage");
+
+        let bad_dir = tempfile::tempdir().unwrap();
+        let bad_backup = backup_with_a_second_table(&host, bad_dir.path(), true).await;
+        let err = host
+            .admin_stage_restore(
+                &bad_backup.to_string_lossy(),
+                &bad_dir.path().to_string_lossy(),
+            )
+            .await
+            .expect_err("a damaged backup must be rejected");
+        assert!(err.to_string().contains("integrity check"), "{err}");
+        assert!(
+            !bad_dir.path().join("pending_restore.staged.db").exists(),
             "a rejected upload must not be staged for restore"
         );
     }

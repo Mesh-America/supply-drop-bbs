@@ -69,6 +69,11 @@ pub enum InboundFrame {
     ChannelInfo(ChannelInfo),
     AutoaddConfig {
         config: u8,
+        /// `autoadd_max_hops`: 0 means no limit, otherwise the radio stores
+        /// only nodes heard across fewer than this many hops (1 = direct
+        /// only). `None` when the reply has no second byte (firmware older
+        /// than 1.14.0). Bytes after the second are ignored.
+        max_hops: Option<u8>,
     },
     // Raw body for less-common resp codes we parse on demand:
     Stats {
@@ -246,6 +251,10 @@ pub enum OutboundFrame {
         advert_loc_policy: u8,
         multi_acks: u8,
     },
+    /// Set the `autoadd_config` byte. Encoded as `[CMD][config]`; the firmware
+    /// only touches `autoadd_max_hops` when a third byte is present, so this
+    /// deliberately leaves the operator's hop limit alone. Do not add a hop
+    /// field here without deciding that the BBS should own that policy.
     SetAutoaddConfig {
         config: u8,
     },
@@ -460,7 +469,11 @@ pub fn decode_inbound(payload: &[u8]) -> Result<InboundFrame, FrameDecodeError> 
         }
         RESP_CODE_AUTOADD_CONFIG => {
             need!(1);
-            Ok(InboundFrame::AutoaddConfig { config: body[0] })
+            // [autoadd_config][autoadd_max_hops]
+            Ok(InboundFrame::AutoaddConfig {
+                config: body[0],
+                max_hops: body.get(1).copied(),
+            })
         }
         RESP_CODE_STATS => {
             need!(1);

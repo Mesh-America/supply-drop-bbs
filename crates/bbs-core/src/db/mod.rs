@@ -90,7 +90,14 @@ impl Database {
 
     /// Force a WAL checkpoint on the database at `path`, folding any
     /// committed-but-not-yet-checkpointed transactions from its `-wal`
-    /// sidecar into the main file. A no-op if `path` doesn't exist yet.
+    /// sidecar into the main file. A no-op (returning `true`) if `path`
+    /// doesn't exist yet.
+    ///
+    /// Returns whether the checkpoint completed. `false` means another
+    /// connection kept a read open, so the WAL could not be folded in and
+    /// truncated (SQLite reports that as a "busy" row, not an error): the main
+    /// file alone may be missing recent commits, and a plain copy of it must
+    /// not be treated as complete. Waits at most a second for readers.
     ///
     /// Call this before taking a plain-file copy of a database that might
     /// still be running (e.g. a pre-restore safety snapshot in `main.rs`):
@@ -101,20 +108,23 @@ impl Database {
     /// `std::process::exit`, which (per its own contract) runs no
     /// destructors and therefore skips the checkpoint a clean connection
     /// close would otherwise perform.
-    pub async fn checkpoint_wal(path: &str) -> Result<(), DbOpenError> {
+    pub async fn checkpoint_wal(path: &str) -> Result<bool, DbOpenError> {
         if !std::path::Path::new(path).exists() {
-            return Ok(());
+            return Ok(true);
         }
-        let opts = base_opts(path).create_if_missing(false);
+        let opts = base_opts(path)
+            .create_if_missing(false)
+            .busy_timeout(std::time::Duration::from_secs(1));
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
             .await?;
-        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-            .execute(&pool)
+        // The pragma answers with one row: (busy, WAL frames, frames checkpointed).
+        let busy: i64 = sqlx::query_scalar("PRAGMA wal_checkpoint(TRUNCATE)")
+            .fetch_one(&pool)
             .await?;
         pool.close().await;
-        Ok(())
+        Ok(busy == 0)
     }
 
     /// Borrow the internal credential store.

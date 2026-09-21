@@ -223,7 +223,7 @@ sudo bash install.sh
 1. Installs minimal system packages (`curl`, `git`, `figlet`)
 2. Clones (or updates) the repository to `/opt/supply-drop-bbs`
 3. Downloads the pre-built binary for your architecture and verifies its SHA256 checksum
-4. Falls back to building from source if no pre-built binary is available (5–15 min on a Pi)
+4. Falls back to building from source if no pre-built binary is available (5–15 min on a Pi); see [Node.js for the source build](#nodejs-for-the-source-build)
 5. Installs the binary to `/usr/local/bin/supply-drop-bbs`
 6. Creates the `supply-drop` system user and the config/data directories
 7. Installs the `supply-drop-bbs.service` systemd unit
@@ -231,10 +231,27 @@ sudo bash install.sh
 9. **Pi HAT only:** installs `openhop_core` in a Python venv, writes `pymc-companion.yaml`, and enables `pymc-companion.service`
 10. Enables and starts both services
 
+#### Node.js for the source build
+
+Building from source compiles the web admin UI, which needs npm and a Node.js
+the web build's dependencies accept: 18.17 or newer on the 18 line, 20.3 or
+newer on the 20 line, or 22 and later. The installer keeps an existing Node.js
+when `node` and `npm` both run as root, `node` is a Linux build in one of those
+ranges, and neither binary is the Windows copy that WSL adds to the `PATH` under
+`/mnt`. That includes a NodeSource install. Otherwise it installs `nodejs` (and
+`npm`, where the distribution ships it separately) from apt.
+
+A Node.js installed with nvm in your home directory is usually not visible to
+the installer: `sudo` resets `PATH`, so root doesn't see `~/.nvm`. The installer
+then installs its own from apt, which may be too old on some distributions
+(Ubuntu 22.04 ships 12). It warns when it ends up with a Node.js the web build
+can't use, and you can install a newer one system-wide (for example from
+NodeSource) and re-run it.
+
 ### What the setup wizard asks
 
 1. **Radio connection type** - USB serial or Pi HAT
-2. **Serial port** *(USB only)* - detected automatically; you confirm or enter manually
+2. **Serial port** *(USB only)* - detected automatically; you confirm or enter manually. A radio that reports its own USB serial number is offered by its stable `/dev/serial/by-id/...` name (with the `/dev/ttyACMn` it currently is shown for reference), and that name is what is written to the config. Radios without a unique serial number are offered by their plain path and flagged, and if your current config names a port that is not plugged in, a "Keep current" row is offered first
 3. **BBS name** - displayed to users on connect
 4. **Data directory** - defaults to `/var/lib/supply-drop-bbs`
 5. **Web admin UI** - whether to enable it, and if so, the password and bind address
@@ -327,7 +344,9 @@ sudo systemctl restart pymc-companion
 
 ### Building from source (manual)
 
-Required: Rust 1.88+ (`rustup install 1.88`).
+Required: Rust 1.96 (the version pinned in `rust-toolchain.toml`; rustup installs it on the first build), and npm with a supported Node.js
+(18.17+, 20.3+ or 22+; see [Node.js for the source build](#nodejs-for-the-source-build)),
+because the default build compiles the web admin UI.
 
 ```sh
 git clone https://github.com/Mesh-America/supply-drop-bbs
@@ -521,7 +540,9 @@ When asked **"Reconfigure now?"**, answer **N** to keep your existing config unc
 
 ### Source build update
 
-Use this path only if no pre-built binary is available for your architecture:
+Use this path only if no pre-built binary is available for your architecture.
+The build needs the same Node.js and npm as the installer's source build (see
+[Node.js for the source build](#nodejs-for-the-source-build)):
 
 ```sh
 sudo systemctl stop supply-drop-bbs
@@ -536,9 +557,14 @@ sudo systemctl start supply-drop-bbs
 
 ### Automatic backups
 
-If `[backup] enabled = true` (default), the BBS runs
-`VACUUM INTO 'backup-YYYY-MM-DD-HHMMSS.sqlite'` on the configured interval.
-Backups land in `<data_dir>/backups`. `VACUUM INTO` is non-blocking.
+If `[backup] enabled = true` (default), the BBS takes a backup on the configured
+interval. Each backup is one `backup_YYYYMMDD_HHMMSS.zip` in `<data_dir>/backups`
+holding the database (made with `VACUUM INTO`, which is non-blocking) and the
+`config.toml` the BBS is running with, so the settings (the BBS name, welcome
+message, timezone, location and so on) are backed up with the data. The bundle
+is readable only by the service user, since the database holds password hashes.
+If the config file can't be found or read, the BBS logs a warning and the backup
+holds the database alone; the Backups page marks the ones that include settings.
 
 Retention defaults: 7 daily + 4 weekly. Configurable.
 
@@ -548,7 +574,14 @@ Retention defaults: 7 daily + 4 weekly. Configurable.
 supply-drop-bbs backup
 ```
 
-Or use the **Trigger backup** button in the web admin UI.
+Or use the **create backup** button on the **Backups** page of the web admin UI.
+Both make the same `.zip` bundle as the automatic backups. `supply-drop-bbs
+backup` includes the config file it loaded, so pass `--config` if it is not in
+one of the default places.
+
+To see and remove backups from the command line, use `supply-drop-bbs backup
+list` and `supply-drop-bbs backup delete <name>`; they work even when the
+database is broken. See [the CLI reference](CLI.md).
 
 ### Off-host backups
 
@@ -566,16 +599,121 @@ supply-drop-bbs restore apply
 sudo systemctl restart supply-drop-bbs
 ```
 
-Or use the **Backups** page in the web admin UI: upload the backup file
-(a raw `.db` or the `.zip` the web UI's own "create backup" button
-produces), then confirm the restore once it validates. Either way,
-staging and confirming are deliberately separate steps — nothing changes
-until you confirm, and the database is only actually swapped the next
-time the BBS process starts. A safety snapshot of the current database is
-taken automatically before the swap; see [Disaster recovery](#disaster-recovery)
-if you need to roll back to it. This works even when the live database is
-broken (see [Corrupted database](#corrupted-database)) — staging and
-confirming never require the live database to open successfully.
+Or use the **Backups** page in the web admin UI. To restore a backup listed
+there, click its **restore** button and confirm. The backup is validated,
+staged and confirmed in one step, and the service then restarts on the
+restored database. That restart needs the BBS running under systemd;
+otherwise the restore is confirmed and the page tells you to restart the BBS
+yourself, which applies it. While the restore applies, the page shows a
+full-screen notice and blocks everything else, then reloads by itself once the
+restarted service answers (to the login screen, since sessions don't survive a
+restart). If it hasn't seen the restart after two minutes it offers a reload
+button. To restore a backup from another system, upload
+the file instead (a `.zip` bundle from a backup, or a raw `.db`), then confirm the restore once it validates. From the
+command line, or with an upload, staging and confirming are separate steps:
+nothing changes until you confirm, and the database is only swapped the next
+time the BBS process starts. The command line works even when the live database
+is broken (see [Corrupted database](#corrupted-database)) — staging and
+confirming never require the live database to open successfully; the web UI
+needs a running BBS.
+
+A restore brings back the database and, from a `.zip` bundle that has one, the
+settings in its `config.toml`. Anything written since the backup was made is
+lost. Backups made before bundles carried the settings (bare `.db` files, or
+older zips without a config) restore the database only.
+
+Some settings belong to this machine, or decide what it runs and who can reach
+it, so they are not taken from the backup: they keep this machine's current
+values (or stay unset if this machine doesn't set them). They are:
+
+- where things live: `bbs.data_dir`, `logging.file`, and the whole `[database]`
+  and `[backup]` sections (which also keeps this machine's backup schedule and
+  retention);
+- how the BBS is reached: the whole `[plugins.web]` and `[plugins.cli]` tables;
+- what it executes: `[[plugins.process]]`;
+- the hardware and its cost settings: each radio's `connection_type`, `addr`,
+  `serial_port` and `baud_rate`, its `[radio]` settings, whether it is
+  `enabled`, MeshCore's `app_target_version` and each radio's
+  `protected_contact_cap` (all describe the device on this machine), and the
+  whole `[security]` section (password-hashing cost is tuned to the machine);
+- the radio's name: Meshtastic's `short_name` and `long_name`, which the BBS
+  reconciles with the radio on every connect, so a backup from another node
+  would rename this one (and reboot it);
+
+A key this machine doesn't set stays unset, so a radio that isn't `enabled`
+in this machine's config gets the built-in default (MeshCore on, Meshtastic
+off), not the backup's value.
+
+A backup taken on another host, or a hostile one, would otherwise point the
+admin UI or a radio somewhere that doesn't exist here, or run a command. Everything
+else comes from the backup: the other `[bbs]` settings (name, welcome message,
+starting room, timezone and so on), `[location]`, `[logging]` apart from the
+file, and the rest of the mesh and Meshtastic settings.
+
+The web UI has a checkbox, on by default, to restore the settings; clear it (or
+use `supply-drop-bbs restore apply --no-config`) to restore the database only.
+The settings are applied when the BBS starts, after the database swap. The
+config file it replaces is saved as `config.toml.pre-restore` next to it (next to the real file, if `config.toml` is a symlink). If the
+restored file doesn't load, or the service user can't write the config file,
+the previous settings stay, the database restore still stands, the log says why
+and the audit log entry `restore_completed` records it. The log level and log
+format from the backup take effect at the restart after that.
+
+Staging a restore checks the file without loading it into memory, and a `.zip` is
+streamed to disk while it is extracted. The web UI restores files up to 2 GiB,
+whether uploaded or already in the backup directory; `restore stage` on the CLI
+has no limit on the file. Everywhere, a database larger than 4 GiB, raw or
+inside a zip, is refused. Extracting a zip and copying a staged file between
+filesystems first check that the disk has room (and extraction re-checks as it
+goes), failing with a message instead of leaving a half-written file; the check
+is skipped if the free space can't be read.
+
+The web upload makes the same check before it starts writing and again as it
+goes, and keeps 16 MiB free for the rest of the system. Copies left behind by a
+restore that was cut off are removed when the BBS starts: the web upload and
+backup copies (`restore_upload_*.tmp`, `restore_backup_*.tmp`) at once, and the
+CLI's (`restore_cli_*.tmp`), the apply step's `pre-restore-safety-*.partial`
+snapshot copy and the files it leaves beside the database (`<db>-wal.restore-aside`,
+`<db>-shm.restore-aside` and `<db>.restore.tmp`, by those exact names) once they
+have gone an hour untouched.
+
+Before the swap, the current database is copied to
+`pre-restore-safety-<unix-seconds>.db` in the data directory. The three most
+recent snapshots are kept and older ones are deleted after each restore, so the
+snapshot of your original data survives a second restore. The snapshots and
+`pending_restore*` files are not backups: if the backup directory is the data
+directory they are not listed, downloaded, deleted or staged by name, so stage a
+snapshot by its path, as below. To roll back to a snapshot, restore it like any
+other backup:
+
+```sh
+supply-drop-bbs restore stage /var/lib/supply-drop-bbs/pre-restore-safety-<unix-seconds>.db
+supply-drop-bbs restore apply
+sudo systemctl restart supply-drop-bbs
+```
+
+If a `pre-restore-safety-<unix-seconds>.db-wal` file sits beside the snapshot, the
+database it was taken from could not be opened (it was probably damaged), so its
+`-wal` file was kept as it was rather than lost. Keep the two together. That file
+holds commits the `.db` alone does not, and staging the `.db` by itself, as the
+commands above do, leaves them out. To get at them, open the pair together with
+the `sqlite3` tool (for a damaged one, its `.recover` command) before staging.
+
+A restore that cannot be applied never stops the BBS from starting. If there is
+no room for the snapshot, the live database is open in another process, or the
+snapshot or the swap fails, the live database is left as it was, the log says
+`database restore NOT applied` with the reason, an audit log entry
+`restore_failed` records it, and the confirmed file is renamed to
+`pending_restore.failed.db` so it is not retried on every start. The web page
+that confirmed the restore cannot see this, so check the audit log or the logs
+if the data did not change. Fix the cause and stage the restore again, or delete
+`pending_restore.failed.db`. A successful restore is recorded as
+`restore_completed`. Staging also runs SQLite's integrity check on the file and
+refuses one with damaged pages, which takes time proportional to its size.
+
+A restore that is confirmed but not yet applied (the BBS wasn't restarted)
+is a file named `pending_restore.db` in the data directory. Delete it before
+the next start to cancel the restore.
 
 ## Rooms and access control
 
@@ -712,7 +850,7 @@ snapshot of whatever's currently at the live path is taken automatically
 before the swap.
 
 ```sh
-sudo -u supply-drop supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/<file>.db
+sudo -u supply-drop supply-drop-bbs restore stage /var/lib/supply-drop-bbs/backups/<file>.zip
 sudo -u supply-drop supply-drop-bbs restore apply --yes
 sudo systemctl restart supply-drop-bbs
 ```
@@ -725,10 +863,13 @@ sudo systemctl stop supply-drop-bbs
 sudo mv /var/lib/supply-drop-bbs/bbs.sqlite /var/lib/supply-drop-bbs/bbs.sqlite.corrupt
 sudo mv /var/lib/supply-drop-bbs/bbs.sqlite-wal /var/lib/supply-drop-bbs/bbs.sqlite-wal.corrupt 2>/dev/null || true
 ls -lt /var/lib/supply-drop-bbs/backups/
-sudo cp /var/lib/supply-drop-bbs/backups/<latest>.sqlite /var/lib/supply-drop-bbs/bbs.sqlite
+sudo unzip -p /var/lib/supply-drop-bbs/backups/<latest>.zip '*.db' > /var/lib/supply-drop-bbs/bbs.sqlite
 sudo chown supply-drop:supply-drop /var/lib/supply-drop-bbs/bbs.sqlite
 sudo systemctl start supply-drop-bbs
 ```
+
+To read the settings a backup carries without restoring it, run
+`unzip -p <backup>.zip config.toml`.
 
 The fallback skips all of `restore`'s validation (SQLite-format check,
 migration-history check, room-structure check) — only use it when the CLI
@@ -771,21 +912,18 @@ See [CLI.md](CLI.md) for the full `user` subcommand reference.
 
 ### Health endpoint
 
-If the web admin plugin is enabled, `GET /health` returns:
+If the web admin plugin is enabled, `GET /api/v1/health` answers without a
+login:
 
 ```json
-{
-  "status": "healthy",
-  "uptime_seconds": 1234567,
-  "version": "0.1.0",
-  "bridge_connected": true,
-  "transports": { "mesh": "running", "web": "running" },
-  "db": { "size_bytes": 12345678, "last_backup": "2026-05-08T03:00:00Z" }
-}
+{ "status": "ok", "boot_id": "5f6c1a5e-8d2b-4c0e-9a1f-3b7e2d4c6a10" }
 ```
 
-`status` is `"healthy"` only if every transport reports running and the bridge
-is connected; otherwise `"degraded"`.
+`status` is `"ok"` whenever the web server is answering. `boot_id` is a random
+id created when the BBS process starts, so it changes on every restart; the
+Backups page uses it to tell that the restart after a restore has finished.
+It also lets anyone who can reach the web port see when the BBS restarts. For
+uptime, use the authenticated `GET /api/v1/status`.
 
 ### Mesh link health
 
@@ -906,6 +1044,23 @@ sudo journalctl -u supply-drop-bbs -f
 Common causes: wrong `serial_port` in config; **permission denied** on the port
 (see [Serial port: Permission denied](#serial-port-permission-denied) below);
 firmware crashed (unplug and replug).
+
+**Handshake timeouts after re-attaching a radio, or with two radios:**
+`/dev/ttyACM0`, `/dev/ttyACM1` and so on are numbered in the order the radios
+attach, so they can swap when a radio is unplugged and plugged back in (on WSL2,
+after a `usbipd attach`) or after a reboot. The BBS then speaks each protocol to
+the wrong radio and logs `AppStart handshake timeout` or
+`payload length ... exceeds MAX_PAYLOAD_SIZE`. Use the stable name instead:
+
+```sh
+ls -l /dev/serial/by-id/
+```
+
+Copy the entry for the radio into `serial_port`, for example
+`serial_port = "/dev/serial/by-id/usb-Heltec_HT-n5262_D42292EF51268EE1-if00"`.
+Two boards of the same model have different names, because the name includes the
+USB serial number (a board that reports none, or two that share one, cannot be told apart this way). The BBS logs a warning at connect when `serial_port` is a
+numbered `/dev/ttyACMn` or `/dev/ttyUSBn` name and a stable alias exists for it.
 
 **Pi HAT:**
 

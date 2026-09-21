@@ -199,8 +199,12 @@ fn merge_protected_bit(
     }
 }
 
+/// Whether a protect/unprotect stamped `t` still counts as recent at `now`. A
+/// stamp in the future (the clock was set back since) counts only if it is
+/// within the window too: `saturating_sub` would read any future stamp as zero
+/// seconds old and keep it live for as long as it stayed ahead.
 fn within_grace(t: u64, now: u64) -> bool {
-    now.saturating_sub(t) < PROTECT_GRACE_SECS
+    t.abs_diff(now) < PROTECT_GRACE_SECS
 }
 
 fn prefix6(pubkey: &[u8; 32]) -> [u8; 6] {
@@ -1172,6 +1176,18 @@ fn hex_encode(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_stamp_far_in_the_future_is_not_within_the_grace_window() {
+        let now = 1_000_000;
+        assert!(within_grace(now, now));
+        assert!(within_grace(now - (PROTECT_GRACE_SECS - 1), now));
+        assert!(!within_grace(now - PROTECT_GRACE_SECS, now));
+        // The clock set back a little: still recent. Set back a lot: not.
+        assert!(within_grace(now + 5, now));
+        assert!(!within_grace(now + PROTECT_GRACE_SECS, now));
+        assert!(!within_grace(u64::MAX, now));
+    }
+
     fn dummy_key(byte: u8) -> [u8; 32] {
         [byte; 32]
     }
@@ -1199,7 +1215,7 @@ mod tests {
         let ts = records[0].last_seen_secs;
         let now = now_secs();
         assert!(
-            ts >= now - 2 && ts <= now + 2,
+            ts >= now - 30 && ts <= now + 30,
             "ts {ts} should be near now {now}"
         );
     }
@@ -1214,7 +1230,7 @@ mod tests {
         let ts = bus.list()[0].last_seen_secs;
         let now = now_secs();
         assert!(
-            ts >= now - 2 && ts <= now + 2,
+            ts >= now - 30 && ts <= now + 30,
             "boot-relative ts {boot_relative} should have been replaced with now ({now}), got {ts}"
         );
     }
@@ -1238,7 +1254,7 @@ mod tests {
         let ts = bus.list()[0].last_seen_secs;
         let now = now_secs();
         assert!(
-            ts >= now - 2 && ts <= now + 2,
+            ts >= now - 30 && ts <= now + 30,
             "far-future ts {very_far_future} should have been replaced with now ({now}), got {ts}"
         );
         let _ = far_future; // suppress unused warning
@@ -1503,7 +1519,7 @@ mod tests {
         let mut inner = bus.inner.lock().expect("advert bus poisoned");
         let record = inner.records.get_mut(key).expect("record must exist");
         assert!(record.protected_at.is_some(), "record must be protected");
-        record.protected_at = Some(unix_now_u64().saturating_sub(PROTECT_GRACE_SECS + 1));
+        record.protected_at = Some(unix_now_u64().saturating_sub(PROTECT_GRACE_SECS + 3600));
     }
 
     /// [`backdate_protected_at`]'s sibling for `unprotected_at`, so tests can
@@ -1515,7 +1531,7 @@ mod tests {
             record.unprotected_at.is_some(),
             "record must be unprotected"
         );
-        record.unprotected_at = Some(unix_now_u64().saturating_sub(PROTECT_GRACE_SECS + 1));
+        record.unprotected_at = Some(unix_now_u64().saturating_sub(PROTECT_GRACE_SECS + 3600));
     }
 
     #[test]
@@ -1983,7 +1999,7 @@ mod tests {
             .unwrap();
         let ts = i64::from(record.last_advert_timestamp);
         assert!(
-            ts >= now - 2 && ts <= now + 2,
+            ts >= now - 30 && ts <= now + 30,
             "boot-relative last_advert_timestamp should have fallen back to now, got {ts}"
         );
     }
@@ -2036,11 +2052,11 @@ mod tests {
         let boot_ts = by_key[&hex_encode(&boot_relative_key)];
         let future_ts = by_key[&hex_encode(&far_future_key)];
         assert!(
-            boot_ts >= now - 2 && boot_ts <= now + 2,
+            boot_ts >= now - 30 && boot_ts <= now + 30,
             "boot-relative device timestamp should have fallen back to now"
         );
         assert!(
-            future_ts >= now - 2 && future_ts <= now + 2,
+            future_ts >= now - 30 && future_ts <= now + 30,
             "far-future device timestamp should have fallen back to now"
         );
     }

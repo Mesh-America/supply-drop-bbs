@@ -28,12 +28,17 @@
 //! Domain types + persistence layer. Command processing and the
 //! concrete `Host` implementation come in subsequent commits.
 
+pub mod backup_bundle;
 pub mod config_lock;
 pub mod db;
+pub mod disk_space;
 pub mod host;
 pub mod ids;
 pub mod mesh_name;
 pub mod message;
+pub mod restore_apply;
+pub mod restore_config;
+pub mod restore_stage;
 pub mod room;
 pub mod timestamp;
 pub mod toml_util;

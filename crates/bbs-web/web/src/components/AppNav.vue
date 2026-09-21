@@ -214,7 +214,7 @@ const groups = computed<NavGroup[]>(() => {
     <div class="sidebar-footer muted">
       <span>supply drop bbs<span v-if="appVersion" class="version-tag">v{{ appVersion }}</span></span>
       <p>open source project by <a href="http://meshamerica.com" target="_blank">Mesh America</a></p>
-      <p>please consider <a href="https://meshamerica.com/pitch-in/" target="_blank">supporting our mission</a></p>
+      <p>please consider <a href="https://meshamerica.com/membership/" target="_blank">supporting our mission</a></p>
     </div>
   </aside>
 

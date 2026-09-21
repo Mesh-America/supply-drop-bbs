@@ -591,8 +591,13 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
         let (ct, sp, br, ma) = match conn_choice {
             0 => {
-                let (ct, sp, br) =
-                    configure_serial(&theme, ex.mesh_serial_port.as_deref(), ex.mesh_baud_rate);
+                // Only a port that was itself a USB serial port is a "current" one;
+                // a HAT UART left in the config is not.
+                let current = ex
+                    .mesh_serial_port
+                    .as_deref()
+                    .filter(|_| ex.mesh_connection_type == "serial");
+                let (ct, sp, br) = configure_serial(&theme, current, ex.mesh_baud_rate);
                 (ct, sp, br, None)
             }
             1 => ("hat", None, None, None),
@@ -835,11 +840,11 @@ pub fn run_wizard(config_out: Option<&Path>) {
 
         match conn_choice {
             0 => {
-                let (ct, sp, br) = configure_serial(
-                    &theme,
-                    ex.meshtastic_serial_port.as_deref(),
-                    ex.meshtastic_baud_rate,
-                );
+                let current = ex
+                    .meshtastic_serial_port
+                    .as_deref()
+                    .filter(|_| ex.meshtastic_connection_type == "serial");
+                let (ct, sp, br) = configure_serial(&theme, current, ex.meshtastic_baud_rate);
                 meshtastic_conn_type = ct;
                 meshtastic_serial_port = sp;
                 meshtastic_baud_rate = br;
@@ -1386,32 +1391,29 @@ fn configure_serial(
         }
         prompt.interact_text().unwrap_or_else(|_| cancelled())
     } else {
-        let mut items: Vec<String> = ports
-            .iter()
-            .map(|p| {
-                if let Some(ref info) = p.description {
-                    format!("{}  ({})", p.name, info)
-                } else {
-                    p.name.clone()
-                }
-            })
-            .collect();
+        let choices = port_choices(&ports, existing_port);
+        if choices.iter().any(|c| c.stable) {
+            println!(
+                "\nPorts are listed by their stable /dev/serial/by-id name where there is one. \
+                 /dev/ttyACMn numbers change when a radio is re-attached, which can point the \
+                 BBS at the wrong radio.\n"
+            );
+        }
+        let mut items: Vec<String> = choices.iter().map(|c| c.label.clone()).collect();
         items.push("Enter path manually…".into());
 
-        let port_default = existing_port
-            .and_then(|ep| ports.iter().position(|p| p.name == ep))
-            .unwrap_or(0);
+        let port_default = default_port_choice(&choices, existing_port);
 
         let choice = prompt_select(theme, "Select serial port", &items, port_default);
 
-        if choice == ports.len() {
+        if choice == choices.len() {
             let mut prompt = Input::with_theme(theme).with_prompt("Serial port path");
             if let Some(p) = existing_port {
                 prompt = prompt.default(p.to_owned());
             }
             prompt.interact_text().unwrap_or_else(|_| cancelled())
         } else {
-            ports[choice].name.clone()
+            choices[choice].value.clone()
         }
     };
 
@@ -2217,8 +2219,192 @@ fn toml_str(s: &str) -> String {
 // ── Serial port listing ───────────────────────────────────────────────────────
 
 struct PortInfo {
+    /// The device name the OS reports, e.g. `/dev/ttyACM0`.
     name: String,
     description: Option<String>,
+    /// The stable `/dev/serial/by-id/...` alias of this device, set only when
+    /// udev has one and the device has a USB serial number no other listed
+    /// port shares (see [`trusted_aliases`]).
+    by_id: Option<String>,
+}
+
+/// One row of the serial port menu.
+struct PortChoice {
+    /// What is written to the config: the stable alias when there is one,
+    /// otherwise the device name.
+    value: String,
+    /// The device name (`/dev/ttyACM0`), to recognise an existing config entry.
+    device: String,
+    label: String,
+    /// `value` is a stable `/dev/serial/by-id` alias.
+    stable: bool,
+}
+
+/// The menu rows for `ports`, in the same order. Each row writes the stable
+/// `/dev/serial/by-id` alias when the port has one, so the BBS keeps talking to
+/// the same radio when the `ttyACMn` numbers change; two boards of the same
+/// model have different aliases (they differ by USB serial number). A numbered
+/// USB port with no alias is flagged, since its name can change.
+///
+/// If `existing` (the port in the current config) matches no detected port, for
+/// example because the radio is unplugged, a "keep current" row comes first so
+/// re-running the wizard doesn't silently replace it. An alias the wizard does
+/// not trust (see [`trusted_aliases`]) matches no port by name either, so the
+/// row also says when it resolves to a device that is present.
+fn port_choices(ports: &[PortInfo], existing: Option<&str>) -> Vec<PortChoice> {
+    port_choices_with(ports, existing, |path| {
+        std::fs::canonicalize(path)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+    })
+}
+
+/// [`port_choices`] with the way a configured path is resolved to the device it
+/// points at supplied by the caller (the filesystem, in the wizard).
+fn port_choices_with(
+    ports: &[PortInfo],
+    existing: Option<&str>,
+    resolve: impl Fn(&str) -> Option<String>,
+) -> Vec<PortChoice> {
+    let mut choices: Vec<PortChoice> = Vec::new();
+    if let Some(e) = existing.filter(|e| !e.is_empty()) {
+        let detected = ports
+            .iter()
+            .any(|p| p.name == e || p.by_id.as_deref() == Some(e));
+        if !detected {
+            // Only a by-id alias is called "not reliable": another name (a
+            // sysop's own udev symlink, a by-path name) is theirs to judge.
+            let present_as = Some(e)
+                .filter(|e| e.starts_with("/dev/serial/by-id/"))
+                .and_then(&resolve)
+                .filter(|t| ports.iter().any(|p| p.name == *t));
+            let note = match present_as {
+                Some(device) => {
+                    format!("present as {device}, but this name is not a reliable one")
+                }
+                None => "not in the detected list".to_owned(),
+            };
+            choices.push(PortChoice {
+                value: e.to_owned(),
+                device: e.to_owned(),
+                label: format!("Keep current: {e}  ({note})"),
+                stable: false,
+            });
+        }
+    }
+    choices.extend(ports.iter().map(|p| {
+        let desc = p
+            .description
+            .as_deref()
+            .map(|d| format!("  ({d})"))
+            .unwrap_or_default();
+        match &p.by_id {
+            Some(alias) => {
+                let short = alias.rsplit('/').next().unwrap_or(alias);
+                PortChoice {
+                    value: alias.clone(),
+                    device: p.name.clone(),
+                    label: format!("{}{desc}  [stable name: {short}]", p.name),
+                    stable: true,
+                }
+            }
+            None => {
+                let flag = if bbs_serial_path::is_numbered_usb_tty(&p.name) {
+                    "  — no stable /dev/serial/by-id name; this number can change"
+                } else {
+                    ""
+                };
+                PortChoice {
+                    value: p.name.clone(),
+                    device: p.name.clone(),
+                    label: format!("{}{desc}{flag}", p.name),
+                    stable: false,
+                }
+            }
+        }
+    }));
+    choices
+}
+
+/// The menu row to pre-select: the one matching the port already in the
+/// config, whether it was written as the alias or as the numbered name (so
+/// re-running the wizard offers the alias for a config that has `/dev/ttyACM0`),
+/// otherwise the first.
+fn default_port_choice(choices: &[PortChoice], existing: Option<&str>) -> usize {
+    existing
+        .and_then(|e| choices.iter().position(|c| c.value == e || c.device == e))
+        .unwrap_or(0)
+}
+
+/// What identifies a USB serial port to udev's `by-id` naming.
+#[derive(PartialEq)]
+struct UsbIdentity {
+    vid: u16,
+    pid: u16,
+    serial: Option<String>,
+}
+
+/// Whether a USB serial number is a factory placeholder that many units of the
+/// same board share (`0001` on many CP210x boards, all zeros, `12345678`). An
+/// alias built from one is not tied to a single device: a second board of that
+/// model would get the same name, even though none is attached now.
+fn is_placeholder_serial(serial: &str) -> bool {
+    let s = serial.trim();
+    let mut chars = s.chars();
+    let repeated = chars.next().is_some_and(|first| chars.all(|c| c == first));
+    // Four digits or fewer is a counter, not a per-unit serial.
+    let short_number = s.len() <= 4 && s.chars().all(|c| c.is_ascii_digit());
+    let known = [
+        "0123456789",
+        "1234567890",
+        "12345678",
+        "123456789",
+        "0123456789ABCDEF",
+    ]
+    .iter()
+    .any(|k| s.eq_ignore_ascii_case(k));
+    repeated || short_number || known
+}
+
+/// Keeps the alias of each port only where it can be trusted to name that one
+/// device. `ids[i]` and `aliases[i]` describe port `i`; `None` in `ids` means
+/// not a USB port.
+///
+/// The alias is built from the USB vendor, product and serial number (plus an
+/// interface suffix), so a device with no serial number, or two boards sharing
+/// one, get the same name and udev leaves which of them owns the link
+/// undefined: writing it could pin the BBS to the wrong radio. So an alias is
+/// kept only if the device has a serial number and every port with the same
+/// vendor, product and serial has its own, different alias. A multi-port chip
+/// (`-if00`, `-if01`) passes; two look-alike boards fail, because only one link
+/// exists between them.
+fn trusted_aliases(ids: &[Option<UsbIdentity>], aliases: &[Option<String>]) -> Vec<Option<String>> {
+    (0..ids.len())
+        .map(|i| {
+            let id = ids[i].as_ref()?;
+            let alias = aliases.get(i)?.as_ref()?;
+            if id
+                .serial
+                .as_deref()
+                .is_none_or(|s| s.is_empty() || is_placeholder_serial(s))
+            {
+                return None;
+            }
+            let group: Vec<usize> = (0..ids.len())
+                .filter(|&j| ids[j].as_ref() == Some(id))
+                .collect();
+            let all_distinct = group.iter().all(|&j| {
+                aliases.get(j).and_then(Option::as_ref).is_some_and(|a| {
+                    group
+                        .iter()
+                        .filter(|&&k| aliases.get(k).and_then(Option::as_ref) == Some(a))
+                        .count()
+                        == 1
+                })
+            });
+            all_distinct.then(|| alias.clone())
+        })
+        .collect()
 }
 
 fn usb_port_hint(vid: u16, pid: u16) -> Option<&'static str> {
@@ -2240,40 +2426,59 @@ fn usb_port_hint(vid: u16, pid: u16) -> Option<&'static str> {
 fn list_serial_ports() -> Vec<PortInfo> {
     match tokio_serial::available_ports() {
         Err(_) => vec![],
-        Ok(ports) => ports
-            .into_iter()
-            .map(|p| {
-                let description = match &p.port_type {
-                    tokio_serial::SerialPortType::UsbPort(info) => {
-                        let hint = usb_port_hint(info.vid, info.pid);
-                        let mut parts: Vec<&str> = Vec::new();
-                        if let Some(ref mfr) = info.manufacturer {
-                            parts.push(mfr);
+        Ok(ports) => {
+            let identities: Vec<Option<UsbIdentity>> = ports
+                .iter()
+                .map(|p| match &p.port_type {
+                    tokio_serial::SerialPortType::UsbPort(info) => Some(UsbIdentity {
+                        vid: info.vid,
+                        pid: info.pid,
+                        serial: info.serial_number.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            let aliases: Vec<Option<String>> = ports
+                .iter()
+                .map(|p| bbs_serial_path::by_id_alias(&p.port_name))
+                .collect();
+            ports
+                .into_iter()
+                .zip(trusted_aliases(&identities, &aliases))
+                .map(|(p, by_id)| {
+                    let description = match &p.port_type {
+                        tokio_serial::SerialPortType::UsbPort(info) => {
+                            let hint = usb_port_hint(info.vid, info.pid);
+                            let mut parts: Vec<&str> = Vec::new();
+                            if let Some(ref mfr) = info.manufacturer {
+                                parts.push(mfr);
+                            }
+                            if let Some(ref prod) = info.product {
+                                parts.push(prod);
+                            }
+                            let base = if parts.is_empty() {
+                                "USB".to_owned()
+                            } else {
+                                parts.join(" ")
+                            };
+                            if let Some(h) = hint {
+                                Some(format!("{base} — {h}"))
+                            } else {
+                                Some(base)
+                            }
                         }
-                        if let Some(ref prod) = info.product {
-                            parts.push(prod);
-                        }
-                        let base = if parts.is_empty() {
-                            "USB".to_owned()
-                        } else {
-                            parts.join(" ")
-                        };
-                        if let Some(h) = hint {
-                            Some(format!("{base} — {h}"))
-                        } else {
-                            Some(base)
-                        }
+                        tokio_serial::SerialPortType::PciPort => Some("PCI".into()),
+                        tokio_serial::SerialPortType::BluetoothPort => Some("Bluetooth".into()),
+                        tokio_serial::SerialPortType::Unknown => None,
+                    };
+                    PortInfo {
+                        name: p.port_name,
+                        description,
+                        by_id,
                     }
-                    tokio_serial::SerialPortType::PciPort => Some("PCI".into()),
-                    tokio_serial::SerialPortType::BluetoothPort => Some("Bluetooth".into()),
-                    tokio_serial::SerialPortType::Unknown => None,
-                };
-                PortInfo {
-                    name: p.port_name,
-                    description,
-                }
-            })
-            .collect(),
+                })
+                .collect()
+        }
     }
 }
 
@@ -2312,13 +2517,14 @@ fn print_next_steps(
         println!("the port, add the service user to the group that owns the device");
         println!("(it varies by distro — 'dialout' or 'plugdev'):");
         println!();
-        println!("  ls -l <port>                          # shows the owning group");
+        println!("  ls -lL <port>                         # shows the owning group");
         println!("  sudo usermod -aG <group> supply-drop  # then restart the service");
         println!();
         if use_mesh && mesh_conn_type == "serial" {
             if let Some(port) = mesh_serial_port {
                 println!("Verify MeshCore port access with:");
-                println!("  ls -l {port}");
+                // -L: a by-id path is a symlink; without it ls shows the link, not the device.
+                println!("  ls -lL {port}");
                 println!();
             }
         }
@@ -2416,7 +2622,7 @@ fn print_next_steps(
     println!("  If this software is useful to you, please");
     println!("  consider supporting our mission:");
     println!();
-    println!("    https://meshamerica.com/pitch-in/");
+    println!("    https://meshamerica.com/membership/");
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!();
 }
@@ -2657,5 +2863,280 @@ mod migrate_adv_type_tests {
             std::fs::read_to_string(&path).unwrap(),
             "companion:\n  adv_type: 1"
         );
+    }
+}
+
+#[cfg(test)]
+mod serial_port_menu_tests {
+    use super::*;
+
+    fn port(name: &str, desc: Option<&str>, by_id: Option<&str>) -> PortInfo {
+        PortInfo {
+            name: name.into(),
+            description: desc.map(Into::into),
+            by_id: by_id.map(Into::into),
+        }
+    }
+
+    fn usb(vid: u16, pid: u16, serial: Option<&str>) -> Option<UsbIdentity> {
+        Some(UsbIdentity {
+            vid,
+            pid,
+            serial: serial.map(Into::into),
+        })
+    }
+
+    const ALIAS_A: &str = "/dev/serial/by-id/usb-Heltec_HT-n5262_D42292EF51268EE1-if00";
+    const ALIAS_B: &str = "/dev/serial/by-id/usb-Heltec_HT-n5262_01E66D357489801B-if00";
+
+    // The case that motivated this: two identical boards, one MeshCore and one
+    // Meshtastic. Each menu row must write its own stable alias, not the
+    // attach-order number.
+    #[test]
+    fn two_identical_boards_write_two_different_stable_paths() {
+        let ports = [
+            port("/dev/ttyACM0", Some("Heltec HT-n5262"), Some(ALIAS_A)),
+            port("/dev/ttyACM1", Some("Heltec HT-n5262"), Some(ALIAS_B)),
+        ];
+        let choices = port_choices(&ports, None);
+        assert_eq!(choices[0].value, ALIAS_A);
+        assert_eq!(choices[1].value, ALIAS_B);
+        assert!(choices.iter().all(|c| c.stable));
+    }
+
+    #[test]
+    fn a_row_shows_the_numbered_name_description_and_short_alias() {
+        let choices = port_choices(
+            &[port("/dev/ttyACM0", Some("Heltec HT-n5262"), Some(ALIAS_A))],
+            None,
+        );
+        let label = &choices[0].label;
+        assert!(label.starts_with("/dev/ttyACM0"), "{label}");
+        assert!(label.contains("Heltec HT-n5262"), "{label}");
+        assert!(
+            label.contains("usb-Heltec_HT-n5262_D42292EF51268EE1-if00"),
+            "{label}"
+        );
+        // The directory is left out of the row to keep it on one line.
+        assert!(!label.contains("/dev/serial/by-id"), "{label}");
+    }
+
+    #[test]
+    fn without_an_alias_the_plain_path_is_written_and_a_numbered_port_is_flagged() {
+        let choices = port_choices(
+            &[
+                port("/dev/ttyACM0", Some("USB"), None),
+                port("/dev/ttyUSB1", None, None),
+            ],
+            None,
+        );
+        assert_eq!(choices[0].value, "/dev/ttyACM0");
+        assert_eq!(choices[1].value, "/dev/ttyUSB1");
+        for c in &choices {
+            assert!(!c.stable);
+            assert!(
+                c.label.contains("no stable /dev/serial/by-id name"),
+                "{}",
+                c.label
+            );
+        }
+    }
+
+    #[test]
+    fn a_port_that_isnt_a_numbered_usb_tty_is_not_flagged() {
+        let choices = port_choices(&[port("/dev/ttyS0", Some("PCI"), None)], None);
+        assert_eq!(choices[0].value, "/dev/ttyS0");
+        assert!(
+            !choices[0].label.contains("can change"),
+            "{}",
+            choices[0].label
+        );
+    }
+
+    #[test]
+    fn rows_keep_the_order_of_the_ports() {
+        let ports = [
+            port("/dev/ttyACM1", None, Some(ALIAS_B)),
+            port("/dev/ttyACM0", None, Some(ALIAS_A)),
+        ];
+        let devices: Vec<_> = port_choices(&ports, None)
+            .into_iter()
+            .map(|c| c.device)
+            .collect();
+        assert_eq!(devices, ["/dev/ttyACM1", "/dev/ttyACM0"]);
+    }
+
+    fn two_boards() -> Vec<PortInfo> {
+        vec![
+            port("/dev/ttyACM0", None, Some(ALIAS_A)),
+            port("/dev/ttyACM1", None, Some(ALIAS_B)),
+        ]
+    }
+
+    #[test]
+    fn default_selects_the_existing_alias() {
+        let choices = port_choices(&two_boards(), Some(ALIAS_B));
+        assert_eq!(choices.len(), 2);
+        assert_eq!(default_port_choice(&choices, Some(ALIAS_B)), 1);
+    }
+
+    // Re-running the wizard on a config that still has the numbered name must
+    // land on that device's row, so accepting the default upgrades it to the
+    // alias.
+    #[test]
+    fn default_selects_the_row_of_an_existing_numbered_name() {
+        let choices = port_choices(&two_boards(), Some("/dev/ttyACM1"));
+        assert_eq!(choices.len(), 2);
+        assert_eq!(default_port_choice(&choices, Some("/dev/ttyACM1")), 1);
+    }
+
+    #[test]
+    fn default_is_the_first_row_when_nothing_is_configured() {
+        let choices = port_choices(&two_boards(), None);
+        assert_eq!(default_port_choice(&choices, None), 0);
+        assert_eq!(default_port_choice(&[], Some(ALIAS_A)), 0);
+    }
+
+    // A configured port that isn't among the detected ones (radio unplugged, a
+    // path on a different bus) must not be silently replaced by the first
+    // detected radio when the operator presses Enter.
+    #[test]
+    fn an_undetected_configured_port_gets_a_keep_current_row_and_is_the_default() {
+        for existing in ["/dev/ttyACM9", "COM3", ALIAS_A] {
+            let choices =
+                port_choices(&[port("/dev/ttyACM1", None, Some(ALIAS_B))], Some(existing));
+            assert_eq!(choices.len(), 2, "{existing}");
+            assert_eq!(choices[0].value, existing);
+            assert!(choices[0].label.starts_with("Keep current"), "{existing}");
+            assert_eq!(default_port_choice(&choices, Some(existing)), 0);
+        }
+    }
+
+    #[test]
+    fn a_detected_or_absent_configured_port_adds_no_keep_current_row() {
+        let ports = two_boards();
+        assert_eq!(port_choices(&ports, Some("/dev/ttyACM0")).len(), 2);
+        assert_eq!(port_choices(&ports, Some(ALIAS_A)).len(), 2);
+        assert_eq!(port_choices(&ports, None).len(), 2);
+        assert_eq!(port_choices(&ports, Some("")).len(), 2);
+    }
+
+    fn some(s: &str) -> Option<String> {
+        Some(s.to_owned())
+    }
+
+    #[test]
+    fn a_unique_usb_serial_keeps_its_alias() {
+        let ids = [
+            usb(0x303A, 0x1001, Some("D42292EF51268EE1")),
+            usb(0x303A, 0x1001, Some("01E66D357489801B")),
+        ];
+        let aliases = [some(ALIAS_A), some(ALIAS_B)];
+        assert_eq!(trusted_aliases(&ids, &aliases), aliases);
+    }
+
+    // Two look-alike boards reporting the same serial number share one by-id
+    // name, so only one of them has a link at all and udev decides which: never
+    // trust it.
+    #[test]
+    fn two_boards_sharing_a_serial_lose_their_alias() {
+        let ids = [
+            usb(0x10C4, 0xEA60, Some("SN-7431")),
+            usb(0x10C4, 0xEA60, Some("SN-7431")),
+        ];
+        let one_link = [
+            some("/dev/serial/by-id/usb-Silicon_Labs_CP2102_SN-7431-if00"),
+            None,
+        ];
+        assert_eq!(trusted_aliases(&ids, &one_link), [None, None]);
+    }
+
+    // Many CP210x boards ship with the serial "0001". One such board on its own
+    // has no duplicate to expose it, but the alias would name whichever board
+    // is attached next.
+    #[test]
+    fn a_factory_placeholder_serial_loses_its_alias_even_when_alone() {
+        for placeholder in ["0001", "0000", "00000000", "12345678", "0123456789", "A"] {
+            let ids = [usb(0x10C4, 0xEA60, Some(placeholder))];
+            let aliases = [some(ALIAS_A)];
+            assert_eq!(trusted_aliases(&ids, &aliases), [None], "{placeholder}");
+        }
+        for real in ["D42292EF51268EE1", "01E66D357489801B", "FT123", "SN-7431"] {
+            assert!(!is_placeholder_serial(real), "{real}");
+        }
+    }
+
+    // An untrusted alias in the config matches no detected port by name, but
+    // the device is there: the row must not claim otherwise.
+    #[test]
+    fn keep_current_says_when_the_configured_name_points_at_a_present_device() {
+        let ports = [port("/dev/ttyACM0", Some("CP2102"), None)];
+        let existing = "/dev/serial/by-id/usb-Silicon_Labs_CP2102_0001-if00";
+        let present = port_choices_with(&ports, Some(existing), |p| {
+            (p == existing).then(|| "/dev/ttyACM0".to_owned())
+        });
+        assert!(
+            present[0].label.contains("present as /dev/ttyACM0"),
+            "{}",
+            present[0].label
+        );
+        assert!(!present[0].label.contains("not in the detected list"));
+
+        let unplugged = port_choices_with(&ports, Some(existing), |_| None);
+        assert!(
+            unplugged[0].label.contains("not in the detected list"),
+            "{}",
+            unplugged[0].label
+        );
+    }
+
+    #[test]
+    fn a_missing_or_empty_serial_loses_its_alias() {
+        let ids = [
+            usb(0x1A86, 0x7523, None),
+            usb(0x1A86, 0x55D4, Some("")),
+            usb(0x303A, 0x1001, Some("UNIQUE")),
+        ];
+        let aliases = [
+            some("/dev/serial/by-id/a"),
+            some("/dev/serial/by-id/b"),
+            some(ALIAS_A),
+        ];
+        assert_eq!(trusted_aliases(&ids, &aliases), [None, None, some(ALIAS_A)]);
+    }
+
+    // A multi-port chip is one vid/pid/serial with one alias per interface.
+    #[test]
+    fn a_multi_port_chip_with_distinct_interface_aliases_keeps_them() {
+        let ids = [
+            usb(0x0403, 0x6010, Some("FT123")),
+            usb(0x0403, 0x6010, Some("FT123")),
+        ];
+        let aliases = [
+            some("/dev/serial/by-id/usb-FTDI_FT2232H_FT123-if00-port0"),
+            some("/dev/serial/by-id/usb-FTDI_FT2232H_FT123-if01-port0"),
+        ];
+        assert_eq!(trusted_aliases(&ids, &aliases), aliases);
+    }
+
+    #[test]
+    fn the_same_serial_on_different_products_is_independent() {
+        let ids = [
+            usb(0x10C4, 0xEA60, Some("SN-7431")),
+            usb(0x303A, 0x1001, Some("SN-7431")),
+        ];
+        let aliases = [some(ALIAS_A), some(ALIAS_B)];
+        assert_eq!(trusted_aliases(&ids, &aliases), aliases);
+    }
+
+    #[test]
+    fn a_non_usb_port_or_a_port_without_a_link_has_no_alias() {
+        let ids = [
+            None,
+            usb(0x303A, 0x1001, Some("SERIAL-A")),
+            usb(0x303A, 0x1001, Some("SERIAL-B")),
+        ];
+        let aliases = [some(ALIAS_A), None, some(ALIAS_B)];
+        assert_eq!(trusted_aliases(&ids, &aliases), [None, None, some(ALIAS_B)]);
     }
 }

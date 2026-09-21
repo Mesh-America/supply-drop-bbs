@@ -614,7 +614,6 @@ pub fn plugins_d_dir(config_path: &std::path::Path) -> PathBuf {
 /// Return the config file path that would be used by `load()`.
 ///
 /// Returns `None` when no config file can be located.
-#[cfg(feature = "transport-process")]
 pub fn resolve_config_path(explicit_path: Option<&std::path::Path>) -> Option<PathBuf> {
     resolve_file(explicit_path).0
 }
@@ -693,4 +692,39 @@ pub fn load(explicit_path: Option<&std::path::Path>) -> Result<Config, ConfigErr
     figment = figment.merge(Env::prefixed("SUPPLY_DROP__").split("__"));
 
     Ok(figment.extract::<Config>()?.resolve())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Config;
+    use bbs_core::restore_config::MACHINE_SPECIFIC_KEYS;
+
+    /// A key in the restore's keep-list that no config field carries protects
+    /// nothing: the restore would quietly take that setting from the backup.
+    /// (`plugins.mesh.hat` sat in the list for that reason.) Options
+    /// serialize as `null`, so an unset optional field still counts.
+    #[test]
+    fn every_machine_specific_restore_key_names_a_real_config_field() {
+        let cfg = serde_json::to_value(Config::default()).expect("config serializes");
+        for path in MACHINE_SPECIFIC_KEYS {
+            // A plugin that isn't compiled into this build has no field. Only
+            // the plugin names that can be feature-gated are skipped, so a
+            // misspelt one still fails.
+            if let ["plugins", plugin, ..] = path {
+                assert!(
+                    ["cli", "mesh", "meshtastic", "web", "process"].contains(plugin),
+                    "{path:?} names an unknown plugin `{plugin}`"
+                );
+                if cfg["plugins"].get(plugin).is_none() {
+                    continue;
+                }
+            }
+            let mut node = &cfg;
+            for key in *path {
+                node = node
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{path:?} is not a config field (no `{key}`)"));
+            }
+        }
+    }
 }
