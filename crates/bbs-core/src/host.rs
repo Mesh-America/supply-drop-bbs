@@ -3263,6 +3263,17 @@ impl BbsHost {
                     // than bouncing the user out (issue #109).
                     "H" | "?" => Ok(Response::Text(HELP_READING_MODE.into())),
                     _ => {
+                        // F <id> jumps to a message without leaving reading
+                        // mode. Without this it fell through to the catch-all
+                        // below and exited, so the messages a scan listed could
+                        // not be read one after another by number.
+                        if let Some(id) = upper
+                            .strip_prefix("F ")
+                            .and_then(|rest| rest.trim().parse::<i64>().ok())
+                        {
+                            return self.handle_read_forward(session, Some(id)).await;
+                        }
+
                         // D [<id>] deletes without leaving reading mode (issue
                         // #184) -- previously any input other than F/R/E/H
                         // fell straight to the catch-all below, so "D <id>"
@@ -4307,7 +4318,8 @@ impl BbsHost {
         if let Some(cursor) = page.next_cursor {
             parts.push(format!(
                 "(more — type N again or F {} to continue)",
-                cursor.as_i64()
+                // F starts AT an id, so the next message is the id after the last shown.
+                cursor.as_i64().saturating_add(1)
             ));
         }
         Ok(Response::MultiText(parts))
@@ -4336,12 +4348,15 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
-        // Explicit cursor from "F <id>" overrides session state.
+        // Explicit "F <id>" overrides session state and starts AT that message.
+        // The cursor is "show what comes after this id", so an explicit id is
+        // stepped back by one; if the id is gone (deleted, or in another room)
+        // the first message after it is shown.
         let (cursor, already_reading) = {
             let sessions = self.sessions.read().await;
             let r = sessions.get(&session);
             let cursor = after
-                .map(MessageId::new)
+                .map(|id| MessageId::new(id.saturating_sub(1)))
                 .or_else(|| r.and_then(|r| r.current_message_id));
             let already_reading = r.is_some_and(|r| matches!(r.workflow, Workflow::Reading));
             (cursor, already_reading)
@@ -4381,13 +4396,23 @@ impl BbsHost {
 
         let msg = match msg {
             None => {
+                // The prompt offers R / H / X, so the session is in reading
+                // mode. `F <id>` past the last message from the command prompt
+                // used to leave the workflow unset, and the very next `R` was
+                // answered "No active workflow".
+                {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::Reading;
+                    }
+                }
                 return Ok(Response::Prompt {
                     text: format!(
                         "No more messages in {}.\nR - Backward  H - Help  X - Exit",
                         room.name
                     ),
                     hide_input: false,
-                })
+                });
             }
             Some(m) => m,
         };
@@ -9100,6 +9125,261 @@ mod tests {
                 "H should keep the user in reading mode"
             );
         }
+    }
+
+    /// Post `bodies` to the lobby as `sid`; returns the ids the room assigned.
+    async fn post_all(host: &BbsHost, sid: SessionId, bodies: &[&str]) -> Vec<i64> {
+        for body in bodies {
+            host.process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some((*body).into()),
+                },
+            )
+            .await
+            .unwrap();
+            host.process_command(sid, Command::WorkflowReply { reply: ".".into() })
+                .await
+                .unwrap();
+        }
+        crate::db::MessageStore::list_in_room(&host.db, RoomId::new(1), None, 100)
+            .await
+            .unwrap()
+            .messages
+            .iter()
+            .map(|m| m.id.as_i64())
+            .collect()
+    }
+
+    async fn say(host: &BbsHost, sid: SessionId, text: &str) -> Response {
+        host.process_command(
+            sid,
+            Command::WorkflowReply {
+                reply: text.to_owned(),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    fn shown(resp: Response) -> String {
+        match resp {
+            Response::Prompt { text, .. } | Response::Text(text) => text,
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// `F <id>` starts AT that message (the help says "start from a specific
+    /// message"); it used to show the one after it, so `F 3` after a scan that
+    /// listed #3 showed the next message instead.
+    #[tokio::test]
+    async fn f_with_an_id_starts_at_that_message() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+
+        let resp = host
+            .process_command(
+                sid,
+                Command::ReadForward {
+                    after: Some(ids[1]),
+                },
+            )
+            .await
+            .unwrap();
+        let text = shown(resp);
+        assert!(
+            text.contains("second") && !text.contains("third"),
+            "F {} should show that message, got: {text:?}",
+            ids[1]
+        );
+
+        // The first message can be read directly too (nothing before it).
+        let text = shown(
+            host.process_command(
+                sid,
+                Command::ReadForward {
+                    after: Some(ids[0]),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(text.contains("first"), "{text:?}");
+    }
+
+    /// An id that no longer exists starts at the next message after it (the
+    /// documented fallback; the test above pins the exact-id behaviour).
+    #[tokio::test]
+    async fn f_with_a_missing_id_starts_at_the_next_message() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+        host.admin_delete_message(ids[1]).await.unwrap();
+
+        let text = shown(
+            host.process_command(
+                sid,
+                Command::ReadForward {
+                    after: Some(ids[1]),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(text.contains("third"), "{text:?}");
+    }
+
+    /// `F <id>` while already reading used to fall into "any other input exits
+    /// reading mode", so a scan's messages could not be read by number one
+    /// after another. It shows the message and stays in reading mode, including
+    /// for the last message in the room.
+    #[tokio::test]
+    async fn f_with_an_id_inside_reading_mode_stays_in_reading_mode() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+
+        // Into reading mode by reading the first message by number.
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[0]),
+            },
+        )
+        .await
+        .unwrap();
+        {
+            let sessions = host.sessions.read().await;
+            assert!(matches!(sessions[&sid].workflow, Workflow::Reading));
+        }
+
+        for (id, body) in [(ids[2], "third"), (ids[1], "second"), (ids[2], "third")] {
+            let text = shown(say(&host, sid, &format!("F {id}")).await);
+            assert!(
+                text.contains(body) && !text.to_lowercase().contains("exited"),
+                "F {id} should show {body:?}, got: {text:?}"
+            );
+            let sessions = host.sessions.read().await;
+            assert!(
+                matches!(sessions[&sid].workflow, Workflow::Reading),
+                "F {id} must leave the user in reading mode"
+            );
+        }
+
+        // The last message was read by number: a bare F now says there is no
+        // more, still in reading mode.
+        let text = shown(say(&host, sid, "F").await);
+        assert!(text.contains("No more messages"), "{text:?}");
+        let sessions = host.sessions.read().await;
+        assert!(matches!(sessions[&sid].workflow, Workflow::Reading));
+    }
+
+    /// The `N` paging hint names the id to continue from. `F` starts AT an id,
+    /// so the hint must name the one after the last message shown, not that
+    /// message (which it would repeat).
+    #[tokio::test]
+    async fn the_n_paging_hint_continues_after_the_last_message_shown() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["m1", "m2", "m3", "m4", "m5", "m6", "m7"]).await;
+
+        let parts = match host.process_command(sid, Command::ReadNew).await.unwrap() {
+            Response::MultiText(p) => p,
+            other => panic!("expected MultiText, got {other:?}"),
+        };
+        let hint = parts.last().unwrap();
+        let continue_at = ids[5];
+        assert!(
+            hint.contains(&format!("F {continue_at} "))
+                || hint.contains(&format!("F {continue_at})")),
+            "hint should name {continue_at} (the first message not shown), got: {hint:?}"
+        );
+
+        // And following the hint shows exactly that message.
+        let text = shown(
+            host.process_command(
+                sid,
+                Command::ReadForward {
+                    after: Some(continue_at),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(text.contains("m6"), "{text:?}");
+    }
+
+    /// Ids at or below zero start from the first message rather than
+    /// panicking or reporting nothing.
+    #[tokio::test]
+    async fn f_with_zero_or_a_negative_id_starts_from_the_first_message() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        post_all(&host, sid, &["first", "second"]).await;
+
+        for id in [0, -3, i64::MIN] {
+            let text = shown(
+                host.process_command(sid, Command::ReadForward { after: Some(id) })
+                    .await
+                    .unwrap(),
+            );
+            assert!(text.contains("first"), "F {id}: {text:?}");
+        }
+    }
+
+    /// Only a number after `F` is a jump; anything else still exits reading
+    /// mode as it always did.
+    #[tokio::test]
+    async fn f_with_something_other_than_a_number_still_exits_reading_mode() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        post_all(&host, sid, &["first"]).await;
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+
+        let text = shown(say(&host, sid, "F x").await);
+        assert!(text.to_lowercase().contains("exited"), "{text:?}");
+        let sessions = host.sessions.read().await;
+        assert!(!matches!(sessions[&sid].workflow, Workflow::Reading));
+    }
+
+    /// `F <id>` past the last message from the command prompt says there is no
+    /// more and offers R, so the session must be in reading mode for `R` to work.
+    #[tokio::test]
+    async fn f_past_the_last_message_leaves_reading_mode_on_so_r_works() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "last"]).await;
+
+        let text = shown(
+            host.process_command(
+                sid,
+                Command::ReadForward {
+                    after: Some(ids[1] + 1),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(text.contains("No more messages"), "{text:?}");
+        {
+            let sessions = host.sessions.read().await;
+            assert!(matches!(sessions[&sid].workflow, Workflow::Reading));
+        }
+        let text = shown(say(&host, sid, "R").await);
+        assert!(
+            !text.contains("No active workflow") && text.contains("last"),
+            "{text:?}"
+        );
     }
 
     /// Issue #184: `D <#>` inside reading mode previously fell through to the

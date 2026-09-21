@@ -399,7 +399,7 @@ Type `N` again to continue to the next batch.
 #12 alice: Has anyone tried the new firmware?
 #13 bob: Yes! Much better range on the 915 MHz band.
 #14 carol: Same here, went from 2 km to almost 4 km.
-(more — type N again or F 14 to continue)
+(more — type N again or F 15 to continue)
 ```
 
 ### Read forward (oldest first)
@@ -414,7 +414,7 @@ Reads from the very beginning of the room. To start from a specific message:
 F 42
 ```
 
-Reads messages with IDs higher than 42.
+Starts at message #42 (or at the next one, if #42 no longer exists) and reads forward. It works while you are already reading, too.
 
 ### Read newest first
 
@@ -461,7 +461,7 @@ Shows a one-line summary for each recent message — ID, sender, and the first
 (more — type F <id> to read from a message)
 ```
 
-Use `F <id>` to jump to a specific message after scanning.
+Use `F <id>` to jump to a specific message after scanning: `F 13` shows message #13. It works while you are reading too, so you can read the messages you scanned one after another by number.
 
 ### Message format
 
@@ -1103,7 +1103,7 @@ account and you can re-register with the same username.
 |---|---|
 | `N` | Read new messages (5 at a time) |
 | `F` | Forward read from the beginning |
-| `F <id>` | Forward read starting after message #id |
+| `F <id>` | Forward read starting at message #id (the next one if #id is gone); works inside reading mode too |
 | `R` | Reverse read (newest first) |
 | `S` | Scan message headers |
 | `.FF` | Fast-forward past unread (mark all read) |
