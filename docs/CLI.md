@@ -273,7 +273,7 @@ supply-drop-bbs config advert-scope [VALUE] [OPTIONS]
 
 Show, set or clear the MeshCore region the BBS's adverts are scoped to (`[plugins.mesh].advert_scope`; see [Advert scope](CONFIG.md#advert-scope-region)). With no argument it prints the current setting and the region key. With a region name (`usa`, or `'#usa'`, which a shell needs quoted) it writes the setting; the name is checked the same way as when the config loads, and an invalid one is refused. `off` removes the setting. **Takes effect on the next BBS restart.** Like the other `config` commands it needs a config file that loads, so a value that was hand-edited to something invalid has to be fixed in the file.
 
-At connect the BBS sets the radio's default flood scope to the region, before the on-connect advert. That scope applies to everything the radio floods, replies to users included, and a scoped flood is only passed on by repeaters that know the region. `off` does not clear a scope already on the radio; use the MeshCore app for that.
+At connect the BBS sets the radio's default flood scope to the region, before the on-connect advert. The scope also applies to the floods the radio starts when it has no path to someone (the first reply to a new user, logins), and a repeater passes a scoped flood on only if it carries that exact region, so pick one that every repeater between the BBS and your users carries (see [Choosing a region](CONFIG.md#choosing-a-region)). `off` does not clear a scope already on the radio; use the MeshCore app for that.
 
 | Argument | Meaning |
 |----------|---------|

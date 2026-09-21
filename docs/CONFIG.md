@@ -306,7 +306,7 @@ arrive.
 | `workflow_timeout_secs`| integer | `300` | no       | Seconds a node may sit awaiting a workflow reply before the transport cancels the stale workflow and treats the node's next message as a fresh command. On a lossy multi-hop link a prompt reply (e.g. "Choose a password:") can be lost, stranding the node — every message it then sends is consumed as workflow input whose "try again" response is *also* lost, and only `cancel` breaks the loop. The timer is reset per workflow *stage* (a changed prompt), so a legitimately-progressing multi-step flow is not cut short. `0` disables the timeout. |
 | `path_bytes`        | integer | `3`     | no       | Bytes each hop adds to a flooded packet's routing path (MeshCore's path-hash width): `2` or `3`. More bytes make path-hash collisions — and the mis-routes they cause — less likely on a dense mesh, at the cost of a little more airtime per packet and a lower maximum hop count. Pushed to the radio on every connect. Values other than `2` or `3` are clamped into range. Also settable via the setup wizard ("MeshCore routing"), the web admin **Settings → MeshCore radio** page, or per-device with `supply-drop-bbs node set-path-bytes <2\|3>` (add `--save` to also write it here). |
 | `advert_on_connect` | bool    | `true`  | no       | Broadcast a self-advert each time the radio (re)connects. An advert is how other nodes and repeaters discover the BBS and learn (or refresh) a route back to it, so advertising on connect means the mesh relearns the BBS promptly after a restart or link blip rather than waiting for the radio firmware's own advert schedule (which a companion device may run rarely). Adverts are flooded so they propagate mesh-wide. **In addition, the BBS broadcasts a periodic flood advert once every 24 hours on a fixed schedule — this is not configurable.** |
-| `advert_scope`      | string  | unset   | no       | A MeshCore flood scope (region) to set on the radio, such as `"usa"` or `"#usa"`, so adverts stay inside that region. Set on the radio at connect, before the on-connect advert. It also applies to everything else the BBS floods. See [Advert scope](#advert-scope-region). Unset or empty leaves the radio's scope alone. |
+| `advert_scope`      | string  | unset   | no       | A MeshCore flood scope (region) to set on the radio, such as `"usa"` or `"#usa"`, so adverts stay inside that region. Set on the radio at connect, before the on-connect advert. It also scopes the floods the radio starts to reach someone it has no path to. See [Advert scope](#advert-scope-region). Unset or empty leaves the radio's scope alone. |
 
 > **Check the confirm rate before enabling retransmission.** Retransmission
 > relies on the radio returning an end-to-end delivery confirmation
@@ -340,15 +340,49 @@ it sends the on-connect advert; the radio keeps it, so the advert every 24 hours
 is scoped too. The BBS sends it once per radio for as long as it runs and logs
 what the radio reports back (the region and its key).
 
-**This scopes everything the radio floods, not only adverts.** The radio holds
-one default scope, and its replies to users and channel messages use it as well.
-A scoped flood is passed on only by repeaters set up for that region, so check
-that the repeaters between the BBS and your users know it before turning this
-on. Leave it unset to change nothing, including a scope you set in the MeshCore
-app. An invalid name (empty after the `#`, over 30 bytes, or containing a control
+Needs MeshCore firmware 1.15.0 or newer, the release that added the default
+scope. Leave `advert_scope` unset to change nothing, including a scope you set in
+the MeshCore app.
+
+**It scopes more than adverts.** The radio holds one default scope. Its
+self-advert uses it, and so do the floods the radio starts when it has no path to
+someone: the first reply to a new user, logins and requests. Once the radio has a
+path, replies go direct and are not flooded.
+
+#### Choosing a region
+
+MeshCore matches the region tag exactly. The parent and child links a mesh sets
+up with `region put` are for organising the list; they do not make a repeater
+that carries `wa` pass on a flood scoped to `sea`, or the reverse. A repeater
+passes a scoped flood on only if it carries the tag the flood is scoped to. Each
+repeater carries the tags along its own chain, so a Seattle repeater in the
+Cascadia scheme carries `west`, `pnw`, `wa`, `w-wa` and `sea`.
+
+The BBS holds one region, so pick the narrowest tag that **every repeater
+between the BBS and your users carries**:
+
+- Users all in one metro: that metro's tag (`sea`).
+- Users in several metros in one state: the tag they share, such as `wa` (or a
+  regional tag like `w-wa` if all of them are in it).
+- Users across a border, such as Portland and Vancouver, WA: a wider tag both
+  communities' repeaters carry, such as `pnw`, not either metro.
+- Anything you are unsure about: a wider tag reaches more repeaters, and the
+  worst case is a little more advert traffic than you wanted. A tag too narrow
+  makes the BBS invisible to the users outside it.
+
+There is no way to give the BBS two unrelated tags. If your users are covered by
+no single tag short of the top of your mesh, use the top tag (`west`).
+
+Ask the operators of the repeaters near you which tags they carry. Check that
+they carry the one you choose before turning this on, and if repeaters in your
+area deny unscoped floods, remember that the BBS's own floods are scoped to this
+region too.
+
+An invalid name (empty after the `#`, over 30 bytes, or containing a control
 character) fails `config check`. Which other characters MeshCore accepts in a
 region name is not checked here, so a name the repeaters don't know is only
-noticed when adverts stop crossing them.
+noticed when adverts stop crossing them. Names are hashed as written, so match
+the case your mesh uses (Cascadia's are lowercase).
 
 It can be set in `config.toml`, by `supply-drop-bbs config advert-scope` (see the [CLI reference](CLI.md#config-advert-scope)), in the setup wizard, or on the web admin Settings page under MeshCore radio.
 

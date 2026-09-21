@@ -1356,10 +1356,12 @@ chmod g+w {{ configFile }}</pre>
             A MeshCore region name that keeps the BBS's adverts inside that region.
             Leave blank to change nothing (a scope set in the MeshCore app stays as it
             is). Set on the radio at the next connect, so restart the BBS after
-            changing it. It applies to everything the radio floods, replies to users
-            included, and a scoped flood is only passed on by repeaters that know the
-            region, so check your repeaters first. Clearing it here does not clear a
-            scope already on the radio; use the MeshCore app for that.
+            changing it. It also scopes the floods the radio starts when it has no
+            path to someone (the first reply to a new user, logins). A repeater passes
+            a scoped flood on only if it carries that exact region, so pick one every
+            repeater between the BBS and your users carries: a region your
+            communities share, not the narrowest one. Clearing it here does not clear
+            a scope already on the radio; use the MeshCore app for that.
           </p>
         </div>
 

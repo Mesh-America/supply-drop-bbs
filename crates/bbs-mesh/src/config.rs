@@ -283,14 +283,16 @@ pub struct MeshConfig {
     pub advert_on_connect: bool,
 
     /// MeshCore flood scope (a "region") to set on the radio, so the BBS's
-    /// adverts (on connect and every 24 hours) and everything else it floods
-    /// reach only repeaters that know the region.
+    /// adverts (on connect and every 24 hours) reach only repeaters that carry
+    /// the region.
     ///
-    /// The radio holds one default scope, and its self-advert and every flood
-    /// it starts use it, so this covers DM replies and channel messages as
-    /// well as adverts. A scoped flood is passed on only by repeaters set up for
-    /// that region: check the repeaters between the BBS and your users before
-    /// turning this on.
+    /// The radio holds one default scope. Its self-advert uses it, and so do the
+    /// floods it starts to reach a contact it has no path to (the first reply to
+    /// a new user, logins). A repeater passes a scoped flood on only if it
+    /// carries that exact region: MeshCore matches the tag, not the hierarchy
+    /// around it. Pick a region every repeater between the BBS and your users
+    /// carries, which for users in several communities is one they share, not
+    /// the narrowest.
     ///
     /// Written as the region's name, with or without a leading `#`, at most 30
     /// bytes (`"usa"`, `"#usa"`). Case matters: the name is hashed as written.

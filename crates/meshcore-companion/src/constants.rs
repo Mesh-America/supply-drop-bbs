@@ -79,7 +79,8 @@ pub const CMD_FACTORY_RESET: u8 = 51;
 pub const CMD_SEND_PATH_DISCOVERY_REQ: u8 = 52;
 pub const CMD_SET_FLOOD_SCOPE: u8 = 54;
 /// Sets the radio's persistent default flood scope (name and key). The
-/// self-advert and every flood the radio originates use it.
+/// self-advert uses it, and so do the floods the radio starts to reach a
+/// contact it has no path to (a channel with its own scope overrides it).
 pub const CMD_SET_DEFAULT_FLOOD_SCOPE: u8 = 63;
 pub const CMD_GET_DEFAULT_FLOOD_SCOPE: u8 = 64;
 pub const CMD_SEND_CONTROL_DATA: u8 = 55;
