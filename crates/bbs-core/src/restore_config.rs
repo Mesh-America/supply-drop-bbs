@@ -17,8 +17,7 @@
 //! * how it is reached: the whole `[plugins.web]` and `[plugins.cli]` tables
 //!   (bind address, origin, cookies, CSP, socket and its permissions);
 //! * what it executes: `[[plugins.process]]`, which names commands to run;
-//! * the hardware: how each radio is connected, its `[radio]` settings and MeshCore
-//!   `advert_scope` (the region its floods are scoped to), whether
+//! * the hardware: how each radio is connected, its `[radio]` settings, whether
 //!   it is `enabled`, and the security section, whose password-hashing cost is
 //!   tuned to this machine's speed;
 //! * the radio's name: Meshtastic's `short_name` and `long_name`, which are
@@ -68,7 +67,6 @@ pub const MACHINE_SPECIFIC_KEYS: &[&[&str]] = &[
     &["plugins", "mesh", "radio"],
     &["plugins", "mesh", "enabled"],
     &["plugins", "mesh", "app_target_version"],
-    &["plugins", "mesh", "advert_scope"],
     &["plugins", "mesh", "protected_contact_cap"],
     &["plugins", "meshtastic", "connection_type"],
     &["plugins", "meshtastic", "addr"],

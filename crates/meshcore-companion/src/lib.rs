@@ -33,13 +33,11 @@ pub mod client;
 pub mod constants;
 pub mod error;
 pub mod frame;
-pub mod scope;
 pub mod types;
 
 pub use client::{ClientConfig, ClientEvent, CompanionClient, SendError, SerialConfig};
 pub use error::FrameDecodeError;
 pub use frame::{decode_inbound, encode_outbound, strip_frame_header, InboundFrame, OutboundFrame};
-pub use scope::{normalize_region_name, region_key, FloodScope, RegionNameError};
 pub use types::{
     BattAndStorage, ChannelInfo, ChannelMsg, Contact, ContactMsg, DeviceInfo, ExportedContact,
     LoginSuccess, SelfInfo, SentResult,

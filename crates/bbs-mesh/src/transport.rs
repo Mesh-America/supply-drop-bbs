@@ -486,7 +486,6 @@ impl Plugin for MeshTransport {
                     app_target_version: config.app_target_version,
                     reconnect_delay_initial: config.reconnect_delay_initial(),
                     reconnect_delay_max: config.reconnect_delay_max(),
-                    default_flood_scope: config.flood_scope(),
                 };
                 info!(
                     addr = %config.addr,
@@ -516,7 +515,6 @@ impl Plugin for MeshTransport {
                     app_target_version: config.app_target_version,
                     reconnect_delay_initial: config.reconnect_delay_initial(),
                     reconnect_delay_max: config.reconnect_delay_max(),
-                    default_flood_scope: config.flood_scope(),
                 };
                 info!(
                     port = %port,

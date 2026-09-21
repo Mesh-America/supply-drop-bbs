@@ -2063,9 +2063,6 @@ struct RadioConfigResponse {
     /// `None` means "not set in file" (the transport still applies its own
     /// default of 3).
     path_bytes: Option<u8>,
-    /// MeshCore region the BBS's adverts (and other floods) are scoped to, at
-    /// `[plugins.mesh].advert_scope`. `None` when unset.
-    advert_scope: Option<String>,
     /// Full preset details for populating the UI dropdown and auto-filling fields.
     presets: Vec<RadioPresetDetail>,
 }
@@ -2099,10 +2096,6 @@ struct RadioConfigPatch {
     /// back to the transport's default of 3).
     #[serde(default, deserialize_with = "deserialize_some")]
     path_bytes: Option<Option<i64>>,
-    /// MeshCore region name (`usa` or `#usa`). `null` or an empty string clears
-    /// it; an invalid name is a 400.
-    #[serde(default, deserialize_with = "deserialize_some")]
-    advert_scope: Option<Option<String>>,
 }
 
 /// Editable subset of the BBS configuration, returned by GET /api/v1/config.
@@ -2497,10 +2490,6 @@ fn doc_set_mesh_field(
     val: toml_edit::Value,
 ) -> Result<(), String> {
     let plugins = bbs_core::toml_util::ensure_table(doc, "plugins")?;
-    // A table that only exists to hold `[plugins.mesh]` needs no header of its own.
-    if plugins.is_empty() {
-        plugins.set_implicit(true);
-    }
     let mesh = bbs_core::toml_util::ensure_subtable(plugins, "mesh")?;
     mesh.insert(key, toml_edit::Item::Value(val));
     Ok(())
@@ -2598,19 +2587,6 @@ fn toml_plugin_str(val: &toml::Value, plugin: &str, key: &str) -> Option<String>
         .get(key)?
         .as_str()
         .map(str::to_owned)
-}
-
-/// Read `[plugins.<plugin>].<key>` as text whether it is written as a string, an
-/// integer or a boolean. The config loader accepts a region named `2024` written
-/// as a bare number, so a reader that only takes strings would show it as unset
-/// and a save would then delete it.
-fn toml_plugin_text(val: &toml::Value, plugin: &str, key: &str) -> Option<String> {
-    match val.get("plugins")?.get(plugin)?.get(key)? {
-        toml::Value::String(s) => Some(s.clone()),
-        toml::Value::Integer(i) => Some(i.to_string()),
-        toml::Value::Boolean(b) => Some(b.to_string()),
-        _ => None,
-    }
 }
 
 /// Read a small integer from `[plugins.<plugin>].<key>`.
@@ -3108,7 +3084,6 @@ async fn api_get_radio_config(
         connection_type,
         serial_port,
         path_bytes: toml_plugin_u8(&val, "mesh", "path_bytes"),
-        advert_scope: toml_plugin_text(&val, "mesh", "advert_scope"),
         presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
@@ -3134,24 +3109,6 @@ async fn api_patch_radio_config(
             )
                 .into_response()
         }
-    };
-
-    // Checked before anything is written: a name the radio cannot hold would
-    // make the config fail to load at the next start.
-    let advert_scope_edit: Option<Option<String>> = match &patch.advert_scope {
-        None => None,
-        Some(None) => Some(None),
-        Some(Some(s)) if s.trim().is_empty() => Some(None),
-        Some(Some(s)) => match meshcore_companion::normalize_region_name(s) {
-            Ok(name) => Some(Some(name)),
-            Err(e) => {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json_error(&format!("advert_scope: {e}"))),
-                )
-                    .into_response()
-            }
-        },
     };
 
     // Read through write is one locked critical section — see
@@ -3234,34 +3191,6 @@ async fn api_patch_radio_config(
                 Some(_) => {} // out-of-range value: silently ignored, same as before
             }
         }
-        if let Some(v) = &advert_scope_edit {
-            match v {
-                None => doc_remove_mesh_field(&mut doc, "advert_scope"),
-                Some(name) => {
-                    let plugins = bbs_core::toml_util::ensure_table(&mut doc, "plugins")
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                    if plugins.is_empty() {
-                        plugins.set_implicit(true);
-                    }
-                    let mesh = bbs_core::toml_util::ensure_subtable(plugins, "mesh")
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-                    // Untouched when the file already holds this region (a hand
-                    // written `#usa` and its comments are left as they are).
-                    let already = mesh
-                        .get("advert_scope")
-                        .and_then(toml_edit::Item::as_str)
-                        .and_then(|s| meshcore_companion::normalize_region_name(s).ok())
-                        .is_some_and(|s| s == *name);
-                    if !already {
-                        bbs_core::toml_util::set_string_keeping_comments(
-                            mesh,
-                            "advert_scope",
-                            name,
-                        );
-                    }
-                }
-            }
-        }
 
         let serialized = doc.to_string();
         bbs_core::config_lock::atomic_write_file(
@@ -3312,7 +3241,6 @@ async fn api_patch_radio_config(
         connection_type: toml_plugin_str(&val, "mesh", "connection_type"),
         serial_port: toml_plugin_str(&val, "mesh", "serial_port"),
         path_bytes: toml_plugin_u8(&val, "mesh", "path_bytes"),
-        advert_scope: toml_plugin_text(&val, "mesh", "advert_scope"),
         presets: RADIO_PRESETS.to_vec(),
     })
     .into_response()
@@ -5185,129 +5113,6 @@ mod tests {
         assert_eq!(set.coding_rate, Some(Some(5)));
         assert_eq!(set.tx_power_dbm, Some(Some(20)));
         assert_eq!(set.path_bytes, Some(Some(2)));
-    }
-
-    async fn radio_patch(config_text: &str, body: &str) -> (StatusCode, serde_json::Value, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let config_path = dir.path().join("config.toml");
-        std::fs::write(&config_path, config_text).unwrap();
-        let host: Arc<dyn Host> = Arc::new(MockHost::new());
-        let config = WebConfig {
-            config_path: Some(config_path.to_str().unwrap().to_owned()),
-            ..WebConfig::default()
-        };
-        let state = Arc::new(AppState::new(host, config));
-        let patch: RadioConfigPatch = serde_json::from_str(body).unwrap();
-        let resp = api_patch_radio_config(State(state), Extension(sysop()), Json(patch))
-            .await
-            .into_response();
-        let status = resp.status();
-        let json = body_json(resp).await;
-        (status, json, std::fs::read_to_string(&config_path).unwrap())
-    }
-
-    #[tokio::test]
-    async fn the_advert_scope_can_be_set_changed_and_cleared_from_the_web() {
-        // Set: a leading `#` is dropped, the value is stored as the radio holds it.
-        let (status, json, file) =
-            radio_patch("[bbs]\nname = \"x\"\n", r##"{"advert_scope":"#usa"}"##).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["advert_scope"], "usa");
-        assert!(file.contains("advert_scope = \"usa\""), "{file}");
-
-        // Changed, with the response reflecting the file.
-        let (_, json, file) = radio_patch(
-            "[plugins.mesh]\nadvert_scope = \"usa\"\n",
-            r#"{"advert_scope":"west"}"#,
-        )
-        .await;
-        assert_eq!(json["advert_scope"], "west");
-        assert!(file.contains("advert_scope = \"west\""), "{file}");
-
-        // Cleared by null or an empty string.
-        for body in [r#"{"advert_scope":null}"#, r#"{"advert_scope":"  "}"#] {
-            let (status, json, file) =
-                radio_patch("[plugins.mesh]\nadvert_scope = \"usa\"\n", body).await;
-            assert_eq!(status, StatusCode::OK, "{body}");
-            assert!(json["advert_scope"].is_null(), "{body}");
-            assert!(!file.contains("advert_scope"), "{body}: {file}");
-        }
-
-        // Omitted: left alone.
-        let (_, json, file) = radio_patch(
-            "[plugins.mesh]\nadvert_scope = \"usa\"\n",
-            r#"{"path_bytes":2}"#,
-        )
-        .await;
-        assert_eq!(json["advert_scope"], "usa");
-        assert!(file.contains("advert_scope = \"usa\""), "{file}");
-    }
-
-    #[tokio::test]
-    async fn saving_leaves_the_layout_and_comments_around_advert_scope_alone() {
-        // No empty `[plugins]` header is written for a table that only holds
-        // `[plugins.mesh]`.
-        let (_, _, file) = radio_patch("[bbs]\nname = \"x\"\n", r#"{"advert_scope":"usa"}"#).await;
-        assert!(!file.contains("[plugins]\n"), "{file}");
-        assert!(
-            file.contains("[plugins.mesh]\nadvert_scope = \"usa\""),
-            "{file}"
-        );
-
-        // A hand-written comment survives a change of value...
-        let original = "[plugins.mesh]\n# region for adverts\nadvert_scope = \"usa\" # by hand\n";
-        let (_, _, file) = radio_patch(original, r#"{"advert_scope":"west"}"#).await;
-        assert_eq!(
-            file,
-            "[plugins.mesh]\n# region for adverts\nadvert_scope = \"west\" # by hand\n"
-        );
-        // ...and a save of the same region (however written) touches nothing.
-        let original = "[plugins.mesh]\nadvert_scope = \"#usa\" # keep\n";
-        let (_, _, file) = radio_patch(original, r#"{"advert_scope":"usa"}"#).await;
-        assert_eq!(file, original);
-    }
-
-    #[tokio::test]
-    async fn a_region_written_as_a_bare_number_is_shown_and_survives_a_save() {
-        let (status, json, file) = radio_patch(
-            "[plugins.mesh]\nadvert_scope = 2024\n",
-            r#"{"path_bytes":2}"#,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(json["advert_scope"], "2024", "shown, not reported as unset");
-        assert!(file.contains("advert_scope = 2024"), "{file}");
-
-        // The form sends back what it was shown; that is kept as the same region.
-        let (_, json, _) = radio_patch(
-            "[plugins.mesh]\nadvert_scope = 2024\n",
-            r#"{"advert_scope":"2024"}"#,
-        )
-        .await;
-        assert_eq!(json["advert_scope"], "2024");
-    }
-
-    #[tokio::test]
-    async fn a_region_name_the_radio_cannot_hold_is_a_400_and_writes_nothing() {
-        let original = "[bbs]\nname = \"x\"\n";
-        let too_long = format!(r#"{{"advert_scope":"{}"}}"#, "x".repeat(31));
-        let with_control = serde_json::json!({ "advert_scope": "a\u{1}b" }).to_string();
-        for body in [
-            too_long.as_str(),
-            r##"{"advert_scope":"#"}"##,
-            with_control.as_str(),
-        ] {
-            let (status, json, file) = radio_patch(original, body).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-            assert!(
-                json["error"]["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("advert_scope"),
-                "{json}"
-            );
-            assert_eq!(file, original, "{body}");
-        }
     }
 
     // The frontend looks up a preset by name (Vec::find) and uses name as a

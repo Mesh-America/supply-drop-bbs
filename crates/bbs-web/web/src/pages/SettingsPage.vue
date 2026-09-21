@@ -416,7 +416,6 @@ interface RadioConfigData {
   connection_type: string | null
   serial_port: string | null
   path_bytes: number | null
-  advert_scope: string | null
   presets: RadioPresetDetail[]
 }
 
@@ -441,9 +440,6 @@ const radioTxPowerDbm = ref<string | number>('')
 // Routing path-hash width (companion-protocol setting, not a physical radio
 // param; applies to every connection type). Always 2 or 3; default 3.
 const radioPathBytes = ref<number>(3)
-// MeshCore region the BBS's adverts are scoped to; blank means not set (the BBS
-// leaves the radio's own scope alone).
-const radioAdvertScope = ref<string>('')
 
 // A blank <input type="number"> stays the empty string (never NaN or 0) per
 // Vue's numeric cast, so this correctly distinguishes "not entered" from a
@@ -482,7 +478,6 @@ async function loadRadioConfig() {
     radioPresets.value = r.presets
     radioPreset.value = r.preset ?? ''
     radioPathBytes.value = r.path_bytes ?? 3
-    radioAdvertScope.value = r.advert_scope ?? ''
     // Prefer stored individual values; if none, fall back to preset values
     if (r.frequency_hz != null || r.bandwidth_hz != null || r.spreading_factor != null ||
         r.coding_rate != null || r.tx_power_dbm != null) {
@@ -514,12 +509,9 @@ async function saveRadioConfig() {
       coding_rate:      !isBlank(radioCodingRate.value)      ? parseInt(String(radioCodingRate.value), 10)      : null,
       tx_power_dbm:     !isBlank(radioTxPowerDbm.value)      ? parseInt(String(radioTxPowerDbm.value), 10)      : null,
       path_bytes:       radioPathBytes.value,
-      advert_scope:     radioAdvertScope.value.trim() || null,
     }
     const updated = await api.patch<RadioConfigData>('/api/v1/radio-config', patch)
     radioConfig.value = updated
-    // Show the stored form (a leading # is dropped when saving).
-    radioAdvertScope.value = updated.advert_scope ?? ''
     radioSaveOk.value = 'Radio config saved to config.toml.'
   } catch (e: any) {
     radioSaveError.value = e?.message ?? 'failed to save radio config'
@@ -1339,29 +1331,6 @@ chmod g+w {{ configFile }}</pre>
             more airtime per packet. Applied to the device on every connect,
             regardless of connection type. Has no effect on firmware too old to report
             SelfInfo on connect; the device keeps its own default in that case.
-          </p>
-        </div>
-
-        <div class="field">
-          <label>Advert region (optional)</label>
-          <input
-            v-model="radioAdvertScope"
-            type="text"
-            maxlength="31"
-            placeholder="e.g. usa"
-            :disabled="radioLoading"
-            style="max-width: 320px"
-          />
-          <p class="hint">
-            A MeshCore region name that keeps the BBS's adverts inside that region.
-            Leave blank to change nothing (a scope set in the MeshCore app stays as it
-            is). Set on the radio at the next connect, so restart the BBS after
-            changing it. It also scopes the floods the radio starts when it has no
-            path to someone (the first reply to a new user, logins). A repeater passes
-            a scoped flood on only if it carries that exact region, so pick one every
-            repeater between the BBS and your users carries: a region your
-            communities share, not the narrowest one. Clearing it here does not clear
-            a scope already on the radio; use the MeshCore app for that.
           </p>
         </div>
 
