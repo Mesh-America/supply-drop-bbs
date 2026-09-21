@@ -230,13 +230,6 @@
 # firmware's own advert schedule. Default true. (A periodic flood advert also
 # goes out once every 24h on a fixed schedule — not configurable.)
 # advert_on_connect = true
-# Keep the BBS's adverts (and everything else the radio floods, replies to users
-# included) inside a MeshCore region. The name is hashed as written, with or
-# without a leading '#'. Set on the radio at connect, before the on-connect
-# advert. Repeaters between the BBS and your users must know the region, or
-# scoped floods stop at the first one that doesn't. Unset leaves the radio's
-# scope alone. See docs/CONFIG.md, "Advert scope".
-# advert_scope = "usa"
 
 
 # ─── Plugin: Meshtastic transport ─────────────────────────────────

@@ -106,7 +106,6 @@ async fn loopback() -> (CompanionClient, TcpBridge) {
         app_target_version: APP_TARGET_VER_V3,
         reconnect_delay_initial: Duration::from_millis(20),
         reconnect_delay_max: Duration::from_millis(100),
-        default_flood_scope: None,
     };
     let client = CompanionClient::connect(config);
     let (stream, _) = listener.accept().await.unwrap();
@@ -292,7 +291,6 @@ async fn reconnects_after_disconnect() {
         app_target_version: APP_TARGET_VER_V3,
         reconnect_delay_initial: Duration::from_millis(20),
         reconnect_delay_max: Duration::from_millis(50),
-        default_flood_scope: None,
     };
     let mut client = CompanionClient::connect(config);
 
@@ -351,7 +349,6 @@ async fn drop_client_closes_connection() {
         app_target_version: APP_TARGET_VER_V3,
         reconnect_delay_initial: Duration::from_millis(10),
         reconnect_delay_max: Duration::from_millis(10),
-        default_flood_scope: None,
     };
 
     let mut client = CompanionClient::connect(config);
@@ -393,7 +390,6 @@ async fn send_after_worker_exit_returns_error() {
         app_target_version: APP_TARGET_VER_V3,
         reconnect_delay_initial: Duration::from_millis(5),
         reconnect_delay_max: Duration::from_millis(5),
-        default_flood_scope: None,
     };
     // Hold only the Sender half; receive side is unused.
     let client = CompanionClient::connect(config);
@@ -406,264 +402,4 @@ async fn send_after_worker_exit_returns_error() {
     // panic — the Rust channel type guarantees `send` returns Err once
     // the worker has exited and cmd_rx is dropped.
     drop(client);
-}
-
-// ── Default flood scope during the handshake ─────────────────────────────────
-
-fn scope_reply(scope: &meshcore_companion::FloodScope) -> Vec<u8> {
-    let mut payload = vec![RESP_CODE_DEFAULT_FLOOD_SCOPE];
-    payload.extend_from_slice(scope.name.as_bytes());
-    payload.resize(1 + 31, 0);
-    payload.extend_from_slice(&scope.key);
-    radio_frame(&payload)
-}
-
-fn err_reply(code: u8) -> Vec<u8> {
-    radio_frame(&[RESP_CODE_ERR, code])
-}
-
-async fn scoped_loopback(
-    scope: &meshcore_companion::FloodScope,
-) -> (CompanionClient, tokio::net::TcpListener, TcpBridge) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut config = ClientConfig::new(listener.local_addr().unwrap());
-    config.reconnect_delay_initial = Duration::from_millis(20);
-    config.reconnect_delay_max = Duration::from_millis(50);
-    config.default_flood_scope = Some(scope.clone());
-    let client = CompanionClient::connect(config);
-    let (stream, _) = listener.accept().await.unwrap();
-    (client, listener, TcpBridge { stream })
-}
-
-async fn next_event(client: &mut CompanionClient) -> ClientEvent {
-    tokio::time::timeout(Duration::from_secs(2), client.recv())
-        .await
-        .expect("timed out waiting for an event")
-        .expect("client channel closed")
-}
-
-/// The scope is set and read back before `Connected` is emitted, so an
-/// application that sends its first command on `Connected` (an advert) is
-/// already scoped.
-#[tokio::test]
-async fn the_default_flood_scope_is_set_and_read_back_before_connected() {
-    let scope = meshcore_companion::FloodScope::for_region("usa").unwrap();
-    let (mut client, _listener, mut bridge) = scoped_loopback(&scope).await;
-
-    bridge.recv_n(11).await; // AppStart
-    bridge.send(&self_info_frame("Node")).await;
-
-    // The Set: [prefix][len=48][63][name×31][key×16].
-    let set = bridge.recv_n(3 + 48).await;
-    assert_eq!(set[3], CMD_SET_DEFAULT_FLOOD_SCOPE);
-    assert_eq!(&set[4..7], b"usa");
-    assert_eq!(&set[35..51], &scope.key);
-    // No Connected yet: the exchange is still open.
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), client.recv())
-            .await
-            .is_err(),
-        "Connected must wait for the scope exchange"
-    );
-    bridge.send(&ok_frame()).await;
-
-    // The Get.
-    let get = bridge.recv_n(4).await;
-    assert_eq!(get[3], CMD_GET_DEFAULT_FLOOD_SCOPE);
-    bridge.send(&scope_reply(&scope)).await;
-
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-}
-
-/// Firmware without the command answers with an error: the connection still
-/// comes up, and the Get is not sent.
-#[tokio::test]
-async fn a_radio_that_rejects_the_scope_still_connects() {
-    let scope = meshcore_companion::FloodScope::for_region("usa").unwrap();
-    let (mut client, _listener, mut bridge) = scoped_loopback(&scope).await;
-
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    bridge.recv_n(3 + 48).await; // the Set
-    bridge.send(&err_reply(ERR_CODE_UNSUPPORTED_CMD)).await;
-
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-    // Nothing else was written for it.
-    let mut probe = [0u8; 1];
-    let read = tokio::time::timeout(
-        Duration::from_millis(100),
-        tokio::io::AsyncReadExt::read(&mut bridge.stream, &mut probe),
-    )
-    .await;
-    assert!(read.is_err(), "no Get after a rejected Set");
-}
-
-/// A reconnect to the same radio does not write the scope again (each write is
-/// a flash write on the radio).
-#[tokio::test]
-async fn a_reconnect_to_the_same_radio_does_not_resend_the_scope() {
-    let scope = meshcore_companion::FloodScope::for_region("usa").unwrap();
-    let (mut client, listener, mut bridge) = scoped_loopback(&scope).await;
-
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    bridge.recv_n(3 + 48).await;
-    bridge.send(&ok_frame()).await;
-    bridge.recv_n(4).await;
-    bridge.send(&scope_reply(&scope)).await;
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-
-    // Link drops; the client reconnects.
-    drop(bridge);
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Disconnected { will_retry: true }
-    ));
-    let (stream, _) = listener.accept().await.unwrap();
-    let mut bridge = TcpBridge { stream };
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-
-    // Connected arrives straight away: there is no scope exchange to wait for.
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-}
-
-/// A link that drops mid-exchange has not settled it, so the next connection
-/// sends the scope again.
-#[tokio::test]
-async fn a_link_that_drops_mid_exchange_sends_the_scope_again() {
-    let scope = meshcore_companion::FloodScope::for_region("usa").unwrap();
-    let (mut client, listener, mut bridge) = scoped_loopback(&scope).await;
-
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    bridge.recv_n(3 + 48).await; // the Set, never answered
-    drop(bridge);
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Disconnected { will_retry: true }
-    ));
-
-    let (stream, _) = listener.accept().await.unwrap();
-    let mut bridge = TcpBridge { stream };
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    let set = bridge.recv_n(3 + 48).await;
-    assert_eq!(set[3], CMD_SET_DEFAULT_FLOOD_SCOPE);
-}
-
-/// A read-back that cannot be decoded (or a Get that errors) must not stop the
-/// connection coming up or make the client redo the exchange on every retry.
-#[tokio::test]
-async fn an_undecodable_read_back_still_connects_and_is_not_retried() {
-    let scope = meshcore_companion::FloodScope::for_region("usa").unwrap();
-    let (mut client, listener, mut bridge) = scoped_loopback(&scope).await;
-
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    bridge.recv_n(3 + 48).await;
-    bridge.send(&ok_frame()).await;
-    bridge.recv_n(4).await;
-    // A scope reply cut short: a name and no key.
-    let mut short = vec![RESP_CODE_DEFAULT_FLOOD_SCOPE];
-    short.extend_from_slice(b"usa");
-    bridge.send(&radio_frame(&short)).await;
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-
-    // A reconnect does not start the exchange over.
-    drop(bridge);
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Disconnected { will_retry: true }
-    ));
-    let (stream, _) = listener.accept().await.unwrap();
-    let mut bridge = TcpBridge { stream };
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-}
-
-#[tokio::test]
-async fn a_get_that_errors_after_an_accepted_set_still_connects() {
-    let scope = meshcore_companion::FloodScope::for_region("usa").unwrap();
-    let (mut client, _listener, mut bridge) = scoped_loopback(&scope).await;
-
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    bridge.recv_n(3 + 48).await;
-    bridge.send(&ok_frame()).await;
-    bridge.recv_n(4).await;
-    bridge.send(&err_reply(ERR_CODE_UNSUPPORTED_CMD)).await;
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-}
-
-/// A radio that keeps a different scope than the one sent is reported, and the
-/// connection still comes up.
-#[tokio::test]
-async fn a_read_back_that_differs_still_connects() {
-    let scope = meshcore_companion::FloodScope::for_region("usa").unwrap();
-    let other = meshcore_companion::FloodScope::for_region("eu").unwrap();
-    let (mut client, _listener, mut bridge) = scoped_loopback(&scope).await;
-
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    bridge.recv_n(3 + 48).await;
-    bridge.send(&ok_frame()).await;
-    bridge.recv_n(4).await;
-    bridge.send(&scope_reply(&other)).await;
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-}
-
-/// Commands queued before the connection is up are written after the scope
-/// exchange, never ahead of the Set.
-#[tokio::test]
-async fn a_command_queued_before_connecting_goes_out_after_the_scope_exchange() {
-    let scope = meshcore_companion::FloodScope::for_region("usa").unwrap();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let mut config = ClientConfig::new(listener.local_addr().unwrap());
-    config.default_flood_scope = Some(scope.clone());
-    let client = CompanionClient::connect(config);
-    client.send(OutboundFrame::SyncNextMessage).await.unwrap();
-    let (stream, _) = listener.accept().await.unwrap();
-    let mut bridge = TcpBridge { stream };
-    let mut client = client;
-
-    bridge.recv_n(11).await;
-    bridge.send(&self_info_frame("Node")).await;
-    let set = bridge.recv_n(3 + 48).await;
-    assert_eq!(set[3], CMD_SET_DEFAULT_FLOOD_SCOPE, "the Set is first");
-    bridge.send(&ok_frame()).await;
-    let get = bridge.recv_n(4).await;
-    assert_eq!(get[3], CMD_GET_DEFAULT_FLOOD_SCOPE);
-    bridge.send(&scope_reply(&scope)).await;
-    assert!(matches!(
-        next_event(&mut client).await,
-        ClientEvent::Connected { .. }
-    ));
-    let queued = bridge.recv_n(4).await;
-    assert_eq!(queued[3], CMD_SYNC_NEXT_MESSAGE);
 }
