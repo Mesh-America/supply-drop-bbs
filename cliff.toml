@@ -45,6 +45,14 @@ commit_preprocessors = [
 ]
 
 commit_parsers = [
+  # The advert region work was reverted out of `next` (#348) while it is tested.
+  # It comes back as different commits (a cherry-pick has a new id), so these four
+  # ids, the original three and their revert, are skipped and the changelog shows
+  # the feature once, under the commits that finally ship it.
+  { sha = "15042b846fea5e35be69de96a8b49e482c7b78c3", skip = true },
+  { sha = "61a61109d376ffbc12b3a41d7c8324cefbb8ccb1", skip = true },
+  { sha = "730b484061f216f663b623435c401ffa44eaef8d", skip = true },
+  { sha = "de6602b1dcc740d67e38ad28b12959f9e23af57e", skip = true },
   # Map conventional-commit types → changelog section groups.
   { message = "^feat", group = "Features" },
   { message = "^fix",  group = "Bug Fixes" },

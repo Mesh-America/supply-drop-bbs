@@ -344,7 +344,7 @@ sudo systemctl restart pymc-companion
 
 ### Building from source (manual)
 
-Required: Rust 1.88+ (`rustup install 1.88`), and npm with a supported Node.js
+Required: Rust 1.96 (the version pinned in `rust-toolchain.toml`; rustup installs it on the first build), and npm with a supported Node.js
 (18.17+, 20.3+ or 22+; see [Node.js for the source build](#nodejs-for-the-source-build)),
 because the default build compiles the web admin UI.
 
@@ -661,7 +661,9 @@ and the audit log entry `restore_completed` records it. The log level and log
 format from the backup take effect at the restart after that.
 
 Staging a restore checks the file without loading it into memory, and a `.zip` is
-streamed to disk while it is extracted. A database larger than 4 GiB, raw or
+streamed to disk while it is extracted. The web UI restores files up to 2 GiB,
+whether uploaded or already in the backup directory; `restore stage` on the CLI
+has no limit on the file. Everywhere, a database larger than 4 GiB, raw or
 inside a zip, is refused. Extracting a zip and copying a staged file between
 filesystems first check that the disk has room (and extraction re-checks as it
 goes), failing with a message instead of leaving a half-written file; the check

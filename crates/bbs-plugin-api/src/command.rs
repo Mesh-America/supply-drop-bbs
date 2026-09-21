@@ -173,10 +173,12 @@ pub enum Command {
     /// pointer). (N)
     ReadNew,
 
-    /// Browse messages oldest-first, optionally starting after a
-    /// given message ID. (F)
+    /// Browse messages oldest-first, optionally starting at a given message
+    /// ID (`F <id>`). (F)
     ReadForward {
-        /// Start cursor; `None` means from the beginning.
+        /// Message ID to start at: the message with that ID, or the first one
+        /// after it if it is gone. `None` means continue from the session
+        /// cursor, or from the beginning.
         after: Option<i64>,
     },
 
