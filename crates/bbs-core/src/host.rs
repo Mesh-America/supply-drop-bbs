@@ -48,6 +48,20 @@ const MAIL_ROOM_ID: RoomId = RoomId::new(2);
 
 /// Messages shown per page for mesh radio (keep short for LoRa).
 const MESH_PAGE: u32 = 5;
+/// Most consecutive blocked messages one `F` or `R` step will skip over.
+const MAX_BLOCKED_SKIP: usize = 200;
+
+/// What one `F` or `R` step found (see `neighbour_step`).
+enum ReadStep {
+    /// The next message the reader has not blocked.
+    Found(Message),
+    /// Nothing more in that direction; `last_skipped` is the last blocked
+    /// message stepped over on the way, if any.
+    End { last_skipped: Option<MessageId> },
+    /// A run of blocked messages longer than one step skips; the reader is now
+    /// at this id and the next keypress carries on.
+    Skipped(MessageId),
+}
 
 // ── Workflow state ────────────────────────────────────────────────────────────
 
@@ -4325,6 +4339,88 @@ impl BbsHost {
         Ok(Response::MultiText(parts))
     }
 
+    /// Step from `cursor` (forward, or back) to the neighbouring message the
+    /// reader has not blocked, in the room or in their mail. `N` and scan hide
+    /// blocked senders; `F` and `R` step over them the same way. One step skips
+    /// at most [`MAX_BLOCKED_SKIP`] blocked messages, so a long unbroken run
+    /// from one blocked sender cannot turn a keypress into an unbounded number
+    /// of queries; past that it reports [`ReadStep::Skipped`] and the reader
+    /// carries on from there with the next keypress.
+    async fn neighbour_step(
+        &self,
+        room_id: RoomId,
+        username: &Username,
+        cursor: Option<MessageId>,
+        forward: bool,
+        blocked: &std::collections::HashSet<String>,
+    ) -> Result<ReadStep, HostError> {
+        let storage = |e: crate::db::StoreError| HostError::Storage(format!("{e}"));
+        let mut at = cursor;
+        let mut last_skipped = None;
+        for _ in 0..MAX_BLOCKED_SKIP {
+            let found = match (room_id == MAIL_ROOM_ID, forward) {
+                (true, true) => self.db.next_direct(username, at).await,
+                (true, false) => self.db.prev_direct(username, at).await,
+                (false, true) => self.db.next_in_room(room_id, at).await,
+                (false, false) => self.db.prev_in_room(room_id, at).await,
+            }
+            .map_err(storage)?;
+            match found {
+                Some(m) if blocked.contains(m.sender.as_str()) => {
+                    at = Some(m.id);
+                    last_skipped = Some(m.id);
+                }
+                Some(m) => return Ok(ReadStep::Found(m)),
+                None => return Ok(ReadStep::End { last_skipped }),
+            }
+        }
+        Ok(match at {
+            Some(id) => ReadStep::Skipped(id),
+            None => ReadStep::End { last_skipped },
+        })
+    }
+
+    /// The reply when a step ended part-way through a long run of blocked
+    /// messages: move the reading position to where it stopped and say to
+    /// press the same key again. `key` is `F` or `R`.
+    async fn stopped_in_blocked_run(
+        &self,
+        session: SessionId,
+        at: MessageId,
+        key: &str,
+    ) -> Response {
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.current_message_id = Some(at);
+                r.workflow = Workflow::Reading;
+            }
+        }
+        Response::Prompt {
+            text: format!(
+                "Skipped a long run of blocked messages.\n{key} - Keep going  H - Help  X - Exit"
+            ),
+            hide_input: false,
+        }
+    }
+
+    /// Whether there is anything to read next to `msg_id` in that direction.
+    /// A capped walk counts as "yes": more may follow the blocked run.
+    async fn has_neighbour(
+        &self,
+        room_id: RoomId,
+        username: &Username,
+        msg_id: MessageId,
+        forward: bool,
+        blocked: &std::collections::HashSet<String>,
+    ) -> Result<bool, HostError> {
+        Ok(!matches!(
+            self.neighbour_step(room_id, username, Some(msg_id), forward, blocked)
+                .await?,
+            ReadStep::End { .. }
+        ))
+    }
+
     async fn handle_read_forward(
         &self,
         session: SessionId,
@@ -4387,15 +4483,25 @@ impl BbsHost {
             });
         }
 
-        let msg = if room_id == MAIL_ROOM_ID {
-            self.db.next_direct(&username, cursor).await
-        } else {
-            self.db.next_in_room(room_id, cursor).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?;
-
-        let msg = match msg {
-            None => {
+        let blocked = self
+            .db
+            .blocks_by(username.as_str())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let msg = match self
+            .neighbour_step(room_id, &username, cursor, true, &blocked)
+            .await?
+        {
+            ReadStep::Found(m) => m,
+            ReadStep::Skipped(at) => {
+                return Ok(self.stopped_in_blocked_run(session, at, "F").await);
+            }
+            ReadStep::End { last_skipped } => {
+                // Only blocked messages were left: mark them read so they do
+                // not keep the room showing as unread (`N` does the same).
+                if let Some(last) = last_skipped {
+                    let _ = self.db.mark_read(user_id, room_id, last).await;
+                }
                 // The prompt offers R / H / X, so the session is in reading
                 // mode. `F <id>` past the last message from the command prompt
                 // used to leave the workflow unset, and the very next `R` was
@@ -4414,7 +4520,6 @@ impl BbsHost {
                     hide_input: false,
                 });
             }
-            Some(m) => m,
         };
 
         // Advance read pointer and update session cursor.
@@ -4428,21 +4533,12 @@ impl BbsHost {
         }
 
         // Check neighbours for conditional nav hints.
-        let has_prev = if room_id == MAIL_ROOM_ID {
-            self.db.prev_direct(&username, Some(msg.id)).await
-        } else {
-            self.db.prev_in_room(room_id, Some(msg.id)).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?
-        .is_some();
-
-        let has_next = if room_id == MAIL_ROOM_ID {
-            self.db.next_direct(&username, Some(msg.id)).await
-        } else {
-            self.db.next_in_room(room_id, Some(msg.id)).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?
-        .is_some();
+        let has_prev = self
+            .has_neighbour(room_id, &username, msg.id, false, &blocked)
+            .await?;
+        let has_next = self
+            .has_neighbour(room_id, &username, msg.id, true, &blocked)
+            .await?;
 
         Ok(Response::Prompt {
             text: build_message_with_nav(&msg, has_prev, has_next),
@@ -4503,15 +4599,20 @@ impl BbsHost {
             });
         }
 
-        let msg = if room_id == MAIL_ROOM_ID {
-            self.db.prev_direct(&username, cursor).await
-        } else {
-            self.db.prev_in_room(room_id, cursor).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?;
-
-        let msg = match msg {
-            None => {
+        let blocked = self
+            .db
+            .blocks_by(username.as_str())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let msg = match self
+            .neighbour_step(room_id, &username, cursor, false, &blocked)
+            .await?
+        {
+            ReadStep::Found(m) => m,
+            ReadStep::Skipped(at) => {
+                return Ok(self.stopped_in_blocked_run(session, at, "R").await);
+            }
+            ReadStep::End { .. } => {
                 return Ok(Response::Prompt {
                     text: format!(
                         "No previous messages in {}.\nF - Forward  H - Help  X - Exit",
@@ -4520,7 +4621,6 @@ impl BbsHost {
                     hide_input: false,
                 })
             }
-            Some(m) => m,
         };
 
         // Advance read pointer and update session cursor.
@@ -4534,21 +4634,12 @@ impl BbsHost {
         }
 
         // Check neighbours for conditional nav hints.
-        let has_prev = if room_id == MAIL_ROOM_ID {
-            self.db.prev_direct(&username, Some(msg.id)).await
-        } else {
-            self.db.prev_in_room(room_id, Some(msg.id)).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?
-        .is_some();
-
-        let has_next = if room_id == MAIL_ROOM_ID {
-            self.db.next_direct(&username, Some(msg.id)).await
-        } else {
-            self.db.next_in_room(room_id, Some(msg.id)).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?
-        .is_some();
+        let has_prev = self
+            .has_neighbour(room_id, &username, msg.id, false, &blocked)
+            .await?;
+        let has_next = self
+            .has_neighbour(room_id, &username, msg.id, true, &blocked)
+            .await?;
 
         Ok(Response::Prompt {
             text: build_message_with_nav(&msg, has_prev, has_next),
@@ -9380,6 +9471,137 @@ mod tests {
             !text.contains("No active workflow") && text.contains("last"),
             "{text:?}"
         );
+    }
+
+    /// alice (logged in), plus a registered bob whose messages alice has
+    /// blocked. Posts to the lobby in `order`, each entry `"a:text"` (alice) or
+    /// `"b:text"` (bob), and returns `(host, tempfile, alice_session, ids)`.
+    async fn room_with_a_blocked_sender(
+        order: &[&str],
+    ) -> (Arc<BbsHost>, NamedTempFile, SessionId, Vec<i64>) {
+        use crate::db::MessageStore as _;
+        let (host, tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "pass1234").await;
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob, "pass1234").await;
+
+        let mut ids = Vec::new();
+        for entry in order {
+            let (who, text) = entry.split_once(':').unwrap();
+            let sender = if who == "a" { &alice } else { &bob };
+            let id = host
+                .db
+                .post_to_room(RoomId::new(1), sender, text, Timestamp::now())
+                .await
+                .unwrap();
+            ids.push(id.as_i64());
+        }
+        host.db.block_user("alice", "bob").await.unwrap();
+        (host, tmp, sid, ids)
+    }
+
+    async fn read_from(host: &BbsHost, sid: SessionId, id: i64) -> String {
+        shown(
+            host.process_command(sid, Command::ReadForward { after: Some(id) })
+                .await
+                .unwrap(),
+        )
+    }
+
+    /// `N` and scan hide a blocked sender; `F` and `R` used to show them anyway.
+    #[tokio::test]
+    async fn f_and_r_step_over_a_blocked_sender() {
+        let (host, _tmp, sid, ids) = room_with_a_blocked_sender(&["a:m1", "b:b1", "a:m2"]).await;
+
+        // From m1, F goes to m2 (b1 is hidden), and R comes back to m1.
+        assert!(read_from(&host, sid, ids[0]).await.contains("m1"));
+        let text = shown(say(&host, sid, "F").await);
+        assert!(
+            text.contains("m2") && !text.contains("b1"),
+            "F should skip the blocked sender, got: {text:?}"
+        );
+        let text = shown(say(&host, sid, "R").await);
+        assert!(
+            text.contains("m1") && !text.contains("b1"),
+            "R should skip the blocked sender, got: {text:?}"
+        );
+
+        // Jumping straight to a blocked sender's id lands on the next message
+        // that is shown, not on theirs.
+        let text = shown(say(&host, sid, &format!("F {}", ids[1])).await);
+        assert!(text.contains("m2") && !text.contains("b1"), "{text:?}");
+    }
+
+    /// Nav hints look past blocked messages: after the last visible message
+    /// there is no "F - Next" even though a blocked message follows it, and
+    /// before the first one there is no "R - Previous".
+    #[tokio::test]
+    async fn nav_hints_ignore_blocked_messages() {
+        let (host, _tmp, sid, ids) =
+            room_with_a_blocked_sender(&["b:b0", "a:m1", "b:b1", "a:m2", "b:b2"]).await;
+
+        let text = read_from(&host, sid, ids[3]).await;
+        assert!(text.contains("m2"), "{text:?}");
+        assert!(
+            !text.contains("F - Next"),
+            "only a blocked message follows, so there is no next: {text:?}"
+        );
+        assert!(text.contains("R - Previous"), "{text:?}");
+
+        let text = shown(say(&host, sid, "F").await);
+        assert!(text.contains("No more messages"), "{text:?}");
+
+        // m1 has only a blocked message before it.
+        let text = read_from(&host, sid, ids[1]).await;
+        assert!(text.contains("m1"), "{text:?}");
+        assert!(!text.contains("R - Previous"), "{text:?}");
+        assert!(text.contains("F - Next"), "{text:?}");
+    }
+
+    /// Blocked messages read past at the end of the room are marked read, so
+    /// they do not leave the room showing unread (as `N` already ensures).
+    #[tokio::test]
+    async fn reading_past_trailing_blocked_messages_leaves_nothing_unread() {
+        use crate::db::MessageStore as _;
+        let (host, _tmp, sid, ids) = room_with_a_blocked_sender(&["a:m1", "b:b1"]).await;
+        let alice = UserStore::get_by_username(&host.db, &Username::new("alice").unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        read_from(&host, sid, ids[0]).await;
+        let text = shown(say(&host, sid, "F").await);
+        assert!(text.contains("No more messages"), "{text:?}");
+        assert_eq!(
+            host.db
+                .unread_count(alice.id, RoomId::new(1))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// A run of blocked messages longer than one step skips does not read as
+    /// the end of the room: the reader is told, and the next `F` carries on.
+    #[tokio::test]
+    async fn a_long_run_of_blocked_messages_is_crossed_over_two_keypresses() {
+        let mut order = vec!["a:m1"];
+        let blocked: Vec<String> = (0..=MAX_BLOCKED_SKIP).map(|i| format!("b:x{i}")).collect();
+        order.extend(blocked.iter().map(String::as_str));
+        order.push("a:m2");
+        let (host, _tmp, sid, ids) = room_with_a_blocked_sender(&order).await;
+
+        let text = read_from(&host, sid, ids[0]).await;
+        assert!(
+            text.contains("m1") && text.contains("F - Next"),
+            "more follows the blocked run: {text:?}"
+        );
+        let text = shown(say(&host, sid, "F").await);
+        assert!(text.contains("Skipped a long run"), "{text:?}");
+        let text = shown(say(&host, sid, "F").await);
+        assert!(text.contains("m2"), "{text:?}");
     }
 
     /// Issue #184: `D <#>` inside reading mode previously fell through to the
