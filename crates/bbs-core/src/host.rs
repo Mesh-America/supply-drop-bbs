@@ -3653,14 +3653,7 @@ impl BbsHost {
 
         let mut lines = Vec::new();
         for room in &rooms {
-            let unread = if room.id == MAIL_ROOM_ID {
-                self.db
-                    .unread_direct_count(&username, user_id, room.id)
-                    .await
-            } else {
-                self.db.unread_count(user_id, room.id).await
-            }
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let unread = self.unread_in(&username, user_id, room.id).await?;
             let marker = if unread > 0 { "*" } else { " " };
             let here = if room.id == current_room {
                 " [here]"
@@ -3726,6 +3719,24 @@ impl BbsHost {
         })
     }
 
+    /// How many messages in `room_id` this reader hasn't read yet. Mail counts
+    /// only the DMs involving them, every other room counts the whole room.
+    async fn unread_in(
+        &self,
+        username: &Username,
+        user_id: UserId,
+        room_id: RoomId,
+    ) -> Result<u64, HostError> {
+        if room_id == MAIL_ROOM_ID {
+            self.db
+                .unread_direct_count(username, user_id, room_id)
+                .await
+        } else {
+            self.db.unread_count(user_id, room_id).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
     async fn handle_go_next_unread(&self, session: SessionId) -> Result<Response, HostError> {
         let (username, user_id, level, current_room) =
             match self.session_auth_or_guest(session).await {
@@ -3751,8 +3762,31 @@ impl BbsHost {
             }
         };
 
+        // If the room the reader is already in has unread messages, read
+        // those first — a companion session can easily be sitting in the
+        // very room a new message just landed in, and "no unread anywhere"
+        // would be a confusing answer when N, run in place, finds it right
+        // away. Only once the current room is caught up does G move on to
+        // hunt through the rest of the list.
+        //
+        // The room has to still be one this reader may read: raising a room's
+        // permission level doesn't evict whoever is sitting in it, and G
+        // shouldn't start delivering posts the reader has since lost access to.
+        if rooms.iter().any(|r| r.id == current_room)
+            && self.unread_in(&username, user_id, current_room).await? > 0
+        {
+            // `handle_read_new` returns MultiText only when it actually has
+            // something to show. Anything else means the current room has
+            // nothing readable after all — every unread message is from a
+            // blocked sender, say — so fall through and search the rest.
+            let resp = self.handle_read_new(session).await?;
+            if matches!(resp, Response::MultiText(_)) {
+                return Ok(resp);
+            }
+        }
+
         // Walk the room list starting just after the current room,
-        // wrapping around. Skip the current room if encountered during wrap.
+        // wrapping around. Skip the current room — already checked above.
         let start = rooms
             .iter()
             .position(|r| r.id == current_room)
@@ -3763,15 +3797,7 @@ impl BbsHost {
             if room.id == current_room {
                 continue;
             }
-            let unread = if room.id == MAIL_ROOM_ID {
-                self.db
-                    .unread_direct_count(&username, user_id, room.id)
-                    .await
-            } else {
-                self.db.unread_count(user_id, room.id).await
-            }
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-            if unread > 0 {
+            if self.unread_in(&username, user_id, room.id).await? > 0 {
                 self.set_current_room(session, room.id).await;
                 return self.handle_read_new(session).await;
             }
@@ -3843,14 +3869,7 @@ impl BbsHost {
         }
 
         self.set_current_room(session, room.id).await;
-        let unread = if room.id == MAIL_ROOM_ID {
-            self.db
-                .unread_direct_count(&username, user_id, room.id)
-                .await
-        } else {
-            self.db.unread_count(user_id, room.id).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let unread = self.unread_in(&username, user_id, room.id).await?;
 
         let msg = if unread > 0 {
             format!("Now in: {} ({unread} new). Type N to read.", room.name)
@@ -3883,14 +3902,7 @@ impl BbsHost {
         }
 
         self.set_current_room(session, room.id).await;
-        let unread = if room.id == MAIL_ROOM_ID {
-            self.db
-                .unread_direct_count(&username, user_id, room.id)
-                .await
-        } else {
-            self.db.unread_count(user_id, room.id).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let unread = self.unread_in(&username, user_id, room.id).await?;
 
         let msg = if unread > 0 {
             format!("Now in: {} ({unread} new). Type N to read.", room.name)
@@ -6181,7 +6193,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".ff" if logged_in => ".FF — fast-forward past unread\nResets your last-read pointer to the latest message.",
         "e" if logged_in => "E — enter a message\nE <text> to post without a prompt\nIn Mail: E @user message",
         "d" if logged_in => "D <id> — delete a message\nAides and sysops can delete any message.",
-        "g" if logged_in => "G — go to next room with unread messages",
+        "g" if logged_in => "G — read unread here, else go to the next room with unread",
         "c" if logged_in => "C <name> — change room by name or number",
         "k" if logged_in => "K — list known rooms",
         "m" if logged_in => {
@@ -6324,7 +6336,7 @@ Posting:\n\
 const HELP_NAVIGATION: &str = "\
 Navigation:\n\
  C    change room\n\
- G    next unread room\n\
+ G    unread here, else next room\n\
  K    list known rooms\n\
  M    go to Mail";
 
@@ -9998,6 +10010,448 @@ mod tests {
                 "current room must be BAYCO ARES, not whatever sat at position 3"
             );
         }
+    }
+
+    /// Reported bug: G ("next room with unread") returned "No unread messages
+    /// in any room." while N, run right after, found a new message straight
+    /// away. Root cause was that G skipped the reader's own current room
+    /// while hunting for unread — exactly the case where a companion
+    /// session's current room is the one that just got a new message. G now
+    /// checks the current room first, matching what N would show there,
+    /// before moving on to the rest of the room list.
+    #[tokio::test]
+    async fn go_next_unread_reads_the_current_room_first_if_it_has_unread() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        // Bob registers now (not later), so his "new user registered" notice
+        // to the sysop's Mail can be drained before the room under test gets
+        // its own message — otherwise this G would land on Mail instead of
+        // Custom Room, for reasons unrelated to what this test checks.
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+
+        // Sysop switches into the custom room and stays there.
+        host.process_command(
+            sysop_sid,
+            Command::ChangeRoom {
+                target: "Custom Room".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        host.db
+            .post_to_room(custom_id, &bob_name, "hi from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        // G should read the current room's new message directly, the same
+        // as N would, instead of hunting past it and finding nothing.
+        let g_resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let g_text = match g_resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            g_text.contains("hi from bob"),
+            "G should read the current room's own unread message, got: {g_text:?}"
+        );
+    }
+
+    /// With the current room caught up, G still falls through to search the
+    /// rest of the room list — the pre-existing "go find unread elsewhere"
+    /// behavior is unchanged.
+    #[tokio::test]
+    async fn go_next_unread_still_searches_other_rooms_once_current_is_caught_up() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // Drain the registration notice. That first G moves the sysop into
+        // Mail and reads it, so Mail — the room they're now sitting in — is
+        // the caught-up "current room" for the G under test.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+
+        host.db
+            .post_to_room(custom_id, &bob_name, "hi from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        let g_resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let g_text = match g_resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            g_text.contains("hi from bob"),
+            "G should still find unread in another room when the current one is caught up, got: {g_text:?}"
+        );
+    }
+
+    /// The current-room-first path counts Mail by the reader's own DMs, not
+    /// by the whole room — G run while sitting in Mail reads a new DM in
+    /// place rather than hunting past it.
+    #[tokio::test]
+    async fn go_next_unread_reads_mail_in_place_when_that_is_the_current_room() {
+        let (host, _db) = make_host().await;
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // First G moves the sysop into Mail and clears the registration notice.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+
+        // Bob DMs the sysop, landing a new message in the room they're in.
+        host.db
+            .post_direct(
+                &bob_name,
+                &sysop_name,
+                "psst, a direct message",
+                Timestamp::now(),
+            )
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("psst, a direct message"),
+            "G should read the new DM in Mail without moving, got: {text:?}"
+        );
+    }
+
+    /// If everything unread in the current room is from a blocked sender,
+    /// the room has nothing to show — G must not stop there. It carries on
+    /// and finds the room that does have something readable.
+    #[tokio::test]
+    async fn go_next_unread_passes_over_a_current_room_of_only_blocked_messages() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // Drain the registration notice, then park the sysop in the Lobby.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            sysop_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Sysop blocks bob, then bob posts in the Lobby (the current room,
+        // now all-blocked) and in the custom room.
+        host.process_command(
+            sysop_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        host.db
+            .post_to_room(lobby_id, &bob_name, "blocked chatter", Timestamp::now())
+            .await
+            .unwrap();
+        host.db
+            .post_to_room(custom_id, &bob_name, "also blocked", Timestamp::now())
+            .await
+            .unwrap();
+
+        // The Lobby's only unread message is from a blocked sender, so it has
+        // nothing to show: G must carry on past it to the custom room rather
+        // than stopping in the Lobby and calling it a day.
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            !text.contains("blocked chatter") && !text.contains("also blocked"),
+            "G must not surface a blocked sender's messages, got: {text:?}"
+        );
+        assert!(
+            text.contains("Custom Room"),
+            "G should have moved past the all-blocked Lobby to the custom room, got: {text:?}"
+        );
+    }
+
+    /// Neither the current room nor any other room has unread: G reports
+    /// there's nothing, same as before this fix.
+    #[tokio::test]
+    async fn go_next_unread_reports_none_when_fully_caught_up() {
+        let (host, _db) = make_host().await;
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(text, "No unread messages in any room.");
+    }
+
+    /// Reported: G ("next unread room") says "No unread messages in any room"
+    /// for a Sysop account even though N finds new messages once the user
+    /// manually switches to the room. Reproduces with a Sysop who is the
+    /// first registrant (auto-promoted), a custom (non-system) room, and
+    /// another user's message in it — as close to the report as a unit test
+    /// can get without a real mesh session.
+    #[tokio::test]
+    async fn go_next_unread_finds_a_custom_room_for_a_sysop() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // First registrant — auto-promoted to Sysop, same as any real deployment.
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        // A second, validated user registers (this drops a "new user registered"
+        // notice into the sysop's Mail) and posts to the custom room.
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        let bob_id = UserStore::get_by_username(&host.db, &bob_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            bob_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Drain the registration notice out of Mail before the room under test
+        // gets its message, so this doesn't depend on which of the two rooms
+        // the room list happens to yield first.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+
+        host.db
+            .post_to_room(custom_id, &bob_name, "hi from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("hi from bob"),
+            "G should land on the custom room and show bob's message, got: {text:?}"
+        );
+    }
+
+    /// Same setup, but the reader is a plain User (not the first registrant /
+    /// Sysop), to check whether the permission level actually matters.
+    #[tokio::test]
+    async fn go_next_unread_finds_a_custom_room_for_a_regular_user() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // First registrant is auto-promoted to Sysop; make and validate a
+        // second, ordinary User to do the reading.
+        let sysop_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sysop_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let reader_sid = host.create_session("test").await.unwrap();
+        let reader_name = Username::new("carol").unwrap();
+        register_and_login(&host, reader_sid, &reader_name, "pass1234").await;
+        let reader_id = UserStore::get_by_username(&host.db, &reader_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            reader_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        let bob_id = UserStore::get_by_username(&host.db, &bob_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            bob_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+        host.db
+            .post_to_room(custom_id, &bob_name, "hi from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(reader_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("hi from bob"),
+            "G should land on the custom room and show bob's message, got: {text:?}"
+        );
     }
 
     // ── Issue #193: K pages a long room list instead of overflowing a frame ──

@@ -156,7 +156,8 @@ pub enum Command {
     /// List all accessible rooms with unread-message markers. (K)
     ListRooms,
 
-    /// Jump to the next room that has unread messages. (G)
+    /// Read unread messages in the current room, or if it has none, jump to
+    /// the next room that does. (G)
     GoNextUnread,
 
     /// Change to a room by name or numeric ID. (C)
