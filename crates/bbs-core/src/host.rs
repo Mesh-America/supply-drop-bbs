@@ -216,6 +216,25 @@ enum LoginSuspensionCheck {
     PermanentlyBanned,
 }
 
+/// The tail of every forced-logout message.
+const LOGGED_OUT: &str = "You have been logged out.";
+
+/// An account that may not hold a session: the reason recorded on the
+/// [`DomainEvent::SessionEnded`] and the text shown to the user.
+struct Barred {
+    reason: &'static str,
+    text: String,
+}
+
+impl Barred {
+    fn gone() -> Self {
+        Barred {
+            reason: "user deleted",
+            text: format!("Your account no longer exists. {LOGGED_OUT}"),
+        }
+    }
+}
+
 /// Whole days left in a suspension ending at `until`, as seen at `now`, rounded
 /// up so a suspension ending in a few hours still reads as "1 more day": "0 more
 /// days" would be a confusing thing to tell someone who is still, in fact,
@@ -501,6 +520,13 @@ impl Host for BbsHost {
         cmd: Command,
     ) -> Result<Response, HostError> {
         debug!(%session, ?cmd, "processing command");
+
+        // A ban, suspension or deletion made outside this process can't reach
+        // into the session map, so the account is checked before every command
+        // rather than trusting that it was fine when the user logged in.
+        if let Some(response) = self.log_out_if_account_barred(session).await? {
+            return Ok(response);
+        }
 
         // Emit a CommandExecuted event for every non-WorkflowReply command so
         // the web admin log view shows live BBS activity.
@@ -3766,6 +3792,138 @@ impl BbsHost {
 // ── Room navigation helpers ───────────────────────────────────────────────────
 
 impl BbsHost {
+    /// Check whether the account behind `session` may still be logged in, and
+    /// if not, log the account out everywhere and return what to tell the
+    /// user. Returns `None` for a session that isn't logged in or whose
+    /// account is in good standing.
+    ///
+    /// The in-process `BAN`, `TIMEOUT` and `.DU` commands and the web admin
+    /// end a user's sessions when they act (#127). `supply-drop-bbs user ban`,
+    /// `user timeout` and a direct edit of the database run in another process
+    /// and can't, so without this a banned user carried on until they logged
+    /// out (#377, #381). This catches up on the account's next command.
+    ///
+    /// Banning keeps the account's permission level (see [`crate::user`]), so
+    /// the level re-read in [`Self::session_auth_user`] can't notice a ban;
+    /// this reads the status. It is a second read of the same row per command;
+    /// the two are kept apart because this one runs before any command and
+    /// the other only for commands that need a validated user.
+    ///
+    /// The session that sent the command is logged out in place rather than
+    /// removed: transports map a node to a session id and only drop that
+    /// mapping on [`Response::LoggedOut`], so a removed session would leave the
+    /// node sending commands into a dead id until it typed `LOGIN`. Keeping
+    /// the id and clearing the login gives the user the same footing as a
+    /// fresh, unauthenticated session. The account's other sessions, which
+    /// aren't mid-command, are removed exactly as the in-process commands do.
+    ///
+    /// A suspension that has run out is lifted here exactly as it is at login,
+    /// so a user whose timeout expires mid-session is not thrown out for it.
+    ///
+    /// Only a command triggers this. A session of a barred account that never
+    /// sends one keeps receiving whatever a transport pushes to it (new-user
+    /// notices for aides) until any session of that account sends a command,
+    /// which logs them all out. `permission_ctx`, which transports call on
+    /// every message, stays a plain map lookup for that reason.
+    ///
+    /// If the account can't be read, the session carries on: a storage error
+    /// is not a reason to lock every user out of the BBS.
+    async fn log_out_if_account_barred(
+        &self,
+        session: SessionId,
+    ) -> Result<Option<Response>, HostError> {
+        let user_id = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&session).and_then(|r| r.user_id) {
+                Some(id) => id,
+                None => return Ok(None),
+            }
+        };
+        let Some(barred) = self.account_barred(session, user_id).await? else {
+            return Ok(None);
+        };
+        self.log_out_account(user_id, Some(session), barred.reason)
+            .await;
+        Ok(Some(Response::Error(barred.text)))
+    }
+
+    /// Why an account may not hold a session, and what to tell it.
+    async fn account_barred(
+        &self,
+        session: SessionId,
+        user_id: UserId,
+    ) -> Result<Option<Barred>, HostError> {
+        let user = match UserStore::get_by_id(&self.db, user_id).await {
+            Ok(user) => user,
+            Err(e) => {
+                warn!(%session, "could not read the account behind a session, letting it carry on: {e}");
+                return Ok(None);
+            }
+        };
+        Ok(match user {
+            None => Some(Barred::gone()),
+            Some(u) => match u.status {
+                UserStatus::Active => None,
+                UserStatus::Banned => match self.resolve_suspension(u).await? {
+                    LoginSuspensionCheck::Allowed(_) => None,
+                    LoginSuspensionCheck::Suspended { days_remaining } => Some(Barred {
+                        reason: "user suspended",
+                        text: format!(
+                            "Your account has been suspended for {days_remaining} more day(s). {LOGGED_OUT}"
+                        ),
+                    }),
+                    LoginSuspensionCheck::PermanentlyBanned => Some(Barred {
+                        reason: "user banned",
+                        text: format!("Your account has been banned. {LOGGED_OUT}"),
+                    }),
+                },
+                // Deleted, and any status added later: refuse unless the
+                // account is known to be allowed in.
+                _ => Some(Barred::gone()),
+            },
+        })
+    }
+
+    /// Log `user_id` out of every session it holds. `keep` is logged out in
+    /// place (see [`Self::log_out_if_account_barred`] for why); every other
+    /// session of the account is removed and reported as ended for `reason`,
+    /// the same as the in-process ban.
+    async fn log_out_account(&self, user_id: UserId, keep: Option<SessionId>, reason: &str) {
+        let removed: Vec<SessionId> = {
+            let mut sessions = self.sessions.write().await;
+            let ids: Vec<SessionId> = sessions
+                .iter()
+                .filter(|(id, r)| r.user_id == Some(user_id) && Some(**id) != keep)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &ids {
+                sessions.remove(id);
+            }
+            if let Some(r) = keep.and_then(|k| sessions.get_mut(&k)) {
+                // Only if it still belongs to this account: an in-process
+                // eviction may have removed it meanwhile, and a removed id
+                // is never reused.
+                if r.user_id == Some(user_id) {
+                    r.username = None;
+                    r.user_id = None;
+                    r.level = PermissionLevel::Unvalidated;
+                    r.workflow = Workflow::None;
+                    r.current_room = LOBBY_ROOM_ID;
+                    r.current_message_id = None;
+                    r.last_post_confirmation = None;
+                }
+            }
+            ids
+        };
+        for id in removed {
+            let _ = self.events_tx.send(DomainEvent::SessionEnded {
+                session: id,
+                reason: reason.into(),
+            });
+        }
+        info!(%user_id, reason, "logged an account out of its sessions");
+    }
+
     /// Extract (username, user_id, level, current_room) from a live session,
     /// returning an auth error response if the session isn't logged in.
     async fn session_auth(
@@ -3794,12 +3952,10 @@ impl BbsHost {
     /// direction, without the user logging out and back in. The level on the
     /// session is a cache, corrected here when it disagrees.
     ///
-    /// This does **not** consult the account's `status`, so a ban, suspension
-    /// or deletion applied outside this process still does not reach a live
-    /// session — banning deliberately preserves `permission_level` (see
-    /// [`crate::user`]), so there is nothing here for it to notice. Nor does
-    /// it reach the web admin API, which keeps its own session cache. Both
-    /// are tracked separately.
+    /// This does not consult the account's `status`. A ban, suspension or
+    /// deletion is handled before any command runs, by
+    /// [`Self::log_out_if_account_barred`]. Neither reaches the web admin API,
+    /// which keeps its own session cache (#380).
     ///
     /// When `access_policy.require_verify` is `false`, Unvalidated sessions
     /// are promoted to `User` in-memory so they pass this check without a
@@ -3823,12 +3979,13 @@ impl BbsHost {
         // (#127), but a separate process has no way to do that. (#373)
         //
         // It costs one lookup by primary key per command, against commands
-        // that arrive at radio speed.
+        // that arrive at radio speed. `log_out_if_account_barred` reads the
+        // same row just before, for the status; see its doc comment.
         let level = match UserStore::get_by_id(&self.db, user_id).await {
             Ok(Some(u)) => u.permission_level,
-            // The row is gone. Serving its session is a separate gap with its
-            // own decision to make (see the ban/deletion issue), so this keeps
-            // the previous behaviour rather than quietly changing it here.
+            // The row is gone. `log_out_if_account_barred` logs such a session
+            // out before the command gets here, so this is only reachable if
+            // the row vanished in between; the next command catches it.
             Ok(None) => cached,
             // A storage error is not a reason to lock every session out of the
             // BBS, so carry on with the cached level and say why in the log.
@@ -8090,6 +8247,269 @@ mod tests {
             PermissionLevel::User,
             "the session should hold the level the account now has"
         );
+    }
+
+    /// Log in `name` as the second registrant (a User; the first registrant,
+    /// who becomes Sysop, stays logged in on its own session) and return the
+    /// session, the account id, and an event receiver past the logins.
+    async fn second_user_logged_in(
+        host: &BbsHost,
+        name: &str,
+    ) -> (SessionId, UserId, broadcast::Receiver<DomainEvent>) {
+        let sysop_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            host,
+            sysop_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new(name).unwrap();
+        register_and_login(host, sid, &uname, "pass1234").await;
+        let id = UserStore::get_by_username(&host.db, &uname)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let rx = host.events_tx.subscribe();
+        (sid, id, rx)
+    }
+
+    /// The session still exists, so the transport's id stays good, but nobody
+    /// is logged in on it any more.
+    async fn logged_out_in_place(host: &BbsHost, sid: SessionId) -> bool {
+        let sessions = host.sessions.read().await;
+        match sessions.get(&sid) {
+            Some(r) => r.username.is_none() && r.user_id.is_none(),
+            None => false,
+        }
+    }
+
+    fn expect_session_ended(
+        rx: &mut broadcast::Receiver<DomainEvent>,
+        sid: SessionId,
+        reason: &str,
+    ) {
+        loop {
+            match rx.try_recv() {
+                Ok(DomainEvent::SessionEnded { session, reason: r }) => {
+                    assert_eq!(session, sid);
+                    assert_eq!(r, reason);
+                    return;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("expected SessionEnded({reason}), got {e:?}"),
+            }
+        }
+    }
+
+    const BANNED: &str = "Your account has been banned. You have been logged out.";
+    const GONE: &str = "Your account no longer exists. You have been logged out.";
+    const SUSPENDED_3: &str =
+        "Your account has been suspended for 3 more day(s). You have been logged out.";
+
+    /// A ban made outside this process ends the live session on its next
+    /// command, and the command does not run.
+    ///
+    /// Banning keeps the permission level, so the per-command level re-read
+    /// sees nothing to change; the status has to be read. The CLI used to
+    /// print "session ended" here while the session went on. (#377, #381)
+    #[tokio::test]
+    async fn a_ban_from_outside_the_process_ends_the_session() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "mallory").await;
+        let before = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert!(!matches!(before, Response::Error(_)), "got: {before:?}");
+
+        UserStore::update(&host.db, id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+
+        let resp = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert_eq!(resp, Response::Error(BANNED.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+
+        // The id is still good: the next command is refused as not logged in,
+        // not as an unknown session, and a login is refused as a ban.
+        let next = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert!(
+            matches!(&next, Response::Error(e) if e.starts_with("Not logged in")),
+            "got: {next:?}"
+        );
+    }
+
+    /// The same for a sysop, whose preserved level would otherwise keep every
+    /// sysop command open to them. This is the compromised-account case the
+    /// CLI ban exists for. (#381)
+    #[tokio::test]
+    async fn a_banned_sysop_loses_sysop_commands_at_once() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let name = Username::new("root").unwrap();
+        register_and_login(&host, sid, &name, "pass1234").await;
+        let id = UserStore::get_by_username(&host.db, &name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let allowed = host
+            .process_command(sid, Command::ListPending)
+            .await
+            .unwrap();
+        assert!(!matches!(allowed, Response::Error(_)), "got: {allowed:?}");
+
+        UserStore::update(&host.db, id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(sid, Command::ListPending)
+            .await
+            .unwrap();
+        assert_eq!(resp, Response::Error(BANNED.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// A suspension made outside this process ends the session and says how
+    /// long is left.
+    #[tokio::test]
+    async fn a_suspension_from_outside_the_process_ends_the_session() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "mallory").await;
+
+        let until =
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() + time::Duration::hours(60));
+        UserStore::suspend(&host.db, id, until).await.unwrap();
+
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert_eq!(resp, Response::Error(SUSPENDED_3.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// A suspension that runs out while the user is logged in is lifted, as at
+    /// login, rather than throwing them out.
+    #[tokio::test]
+    async fn an_expired_suspension_is_lifted_not_enforced() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "carol").await;
+
+        let until =
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() - time::Duration::hours(1));
+        UserStore::suspend(&host.db, id, until).await.unwrap();
+
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            !matches!(resp, Response::Error(_)),
+            "an expired suspension should not refuse the command, got: {resp:?}"
+        );
+        assert!(!logged_out_in_place(&host, sid).await);
+        let user = UserStore::get_by_id(&host.db, id).await.unwrap().unwrap();
+        assert_eq!(
+            user.status,
+            UserStatus::Active,
+            "the suspension should be lifted"
+        );
+        assert_eq!(user.suspended_until, None);
+    }
+
+    /// A soft-deleted account ends the session.
+    #[tokio::test]
+    async fn a_deleted_account_ends_the_session() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "dave").await;
+        UserStore::update(&host.db, id, None, Some(UserStatus::Deleted), None, None)
+            .await
+            .unwrap();
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert_eq!(resp, Response::Error(GONE.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// An account row removed outright ends the session too, where the level
+    /// re-read used to carry on with the cached level.
+    #[tokio::test]
+    async fn a_removed_account_row_ends_the_session() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "erin").await;
+        UserStore::hard_delete(&host.db, id).await.unwrap();
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert_eq!(resp, Response::Error(GONE.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// The account's other sessions go too, the way the in-process ban sweeps
+    /// them, not just the one that sent the command.
+    #[tokio::test]
+    async fn a_ban_logs_the_account_out_of_its_other_sessions_too() {
+        let (host, _db) = make_host().await;
+        let (sid, id, mut rx) = second_user_logged_in(&host, "mallory").await;
+        let second = host.create_session("test").await.unwrap();
+        let ok = host
+            .process_command(
+                second,
+                Command::LoginOneShot {
+                    username: Username::new("mallory").unwrap(),
+                    password: "pass1234".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ok, Response::LoggedIn { .. }), "got: {ok:?}");
+        while rx.try_recv().is_ok() {}
+
+        UserStore::update(&host.db, id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+        let resp = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert_eq!(resp, Response::Error(BANNED.into()));
+
+        assert!(logged_out_in_place(&host, sid).await);
+        assert!(
+            !host.sessions.read().await.contains_key(&second),
+            "the account's other session should be removed"
+        );
+        expect_session_ended(&mut rx, second, "user banned");
+    }
+
+    /// Only the barred account's sessions end. Another user's session, and a
+    /// session nobody has logged into, carry on.
+    #[tokio::test]
+    async fn barring_one_account_leaves_other_sessions_alone() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "mallory").await;
+        let other = host.create_session("test").await.unwrap();
+        register_and_login(&host, other, &Username::new("frank").unwrap(), "pass1234").await;
+        let anon = host.create_session("test").await.unwrap();
+
+        UserStore::update(&host.db, id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(other, Command::ListRooms)
+            .await
+            .unwrap();
+        assert!(!matches!(resp, Response::Error(_)), "got: {resp:?}");
+        let resp = host
+            .process_command(anon, Command::Help { topic: None })
+            .await
+            .unwrap();
+        assert!(!matches!(resp, Response::Error(_)), "got: {resp:?}");
+        {
+            let sessions = host.sessions.read().await;
+            assert!(sessions.contains_key(&other));
+            assert!(sessions.contains_key(&anon));
+            assert!(
+                sessions.get(&sid).and_then(|r| r.user_id).is_some(),
+                "a barred session is logged out on its own next command, not someone else's"
+            );
+        }
+
+        // The barred session itself is refused on its own next command.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert_eq!(resp, Response::Error(BANNED.into()));
+        assert!(logged_out_in_place(&host, sid).await);
     }
 
     /// The same read that catches a demotion still catches a promotion, which

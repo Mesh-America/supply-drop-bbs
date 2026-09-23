@@ -920,6 +920,22 @@ Use `UNBAN` to lift a timeout early. The same rules as `BAN` apply (an
 Aide cannot suspend another Aide or a Sysop), and it's logged in the
 audit trail.
 
+A ban, timeout or deletion made from outside the BBS, with
+`supply-drop-bbs user ban` or `user timeout` or by editing the database,
+can't disconnect anyone directly. It takes effect on the user's next
+command instead: the command doesn't run, and the user is logged out with
+one of these:
+
+```
+Your account has been banned. You have been logged out.
+Your account has been suspended for 2 more day(s). You have been logged out.
+Your account no longer exists. You have been logged out.
+```
+
+The user's other sessions, if any, end at the same time. A timeout that
+runs out while the user is logged in is lifted, not enforced, the same as
+at login.
+
 ### Unbanning a user (Sysop only)
 
 ```

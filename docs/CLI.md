@@ -615,7 +615,7 @@ supply-drop-bbs user ban <USERNAME> [OPTIONS]
 supply-drop-bbs user unban <USERNAME> [OPTIONS]
 ```
 
-Disable (`ban`) or re-enable (`unban`) a user account. A disabled account can't log in and any live session is ended immediately — but the account and its authored messages are preserved. This is a softer action than deletion: deleting additionally reserves the username so no-one else can register it, and isn't currently exposed as a CLI command.
+Disable (`ban`) or re-enable (`unban`) a user account. A disabled account can't log in, and a session it already has open ends the next time it sends a command, with a message saying the account was banned. The account and its authored messages are preserved. This is a softer action than deletion: deleting additionally reserves the username so no-one else can register it, and isn't currently exposed as a CLI command.
 
 | Argument | Description |
 |----------|-------------|
@@ -623,7 +623,7 @@ Disable (`ban`) or re-enable (`unban`) a user account. A disabled account can't 
 
 ```sh
 supply-drop-bbs user ban alice
-# disabled: alice (login rejected, session ended)
+# disabled: alice (login rejected; a live session ends on its next command)
 
 supply-drop-bbs user unban alice
 # re-enabled: alice
@@ -631,7 +631,7 @@ supply-drop-bbs user unban alice
 
 **Exit codes:** `0` on success; `1` if the user is not found or the database cannot be opened.
 
-Equivalent to the in-BBS `BAN <username>` (Aide+) / `UNBAN <username>` (Sysop) commands, and to the **ban**/**unban** buttons on the web admin's Users page.
+Equivalent to the in-BBS `BAN <username>` (Aide+) / `UNBAN <username>` (Sysop) commands, and to the **ban**/**unban** buttons on the web admin's Users page. Those run inside the server and end a live session at once; the CLI runs as a separate process, which is why its ban lands on the session's next command instead.
 
 ---
 
@@ -641,12 +641,14 @@ Equivalent to the in-BBS `BAN <username>` (Aide+) / `UNBAN <username>` (Sysop) c
 supply-drop-bbs user timeout <USERNAME> <DAYS> [OPTIONS]
 ```
 
-Suspend a user account for a fixed number of days, distinct from a permanent `ban`: login is rejected and any live session is ended immediately, same as `ban`, but the account reactivates automatically once the timeout elapses rather than staying disabled until an explicit `unban`. A login attempt during the timeout is told how many days remain. `unban` lifts a timeout early.
+Suspend a user account for a fixed number of days, distinct from a permanent `ban`: login is rejected and a live session ends on its next command, same as `ban`, but the account reactivates automatically once the timeout elapses rather than staying disabled until an explicit `unban`. A login attempt during the timeout is told how many days remain. `unban` lifts a timeout early.
 
 | Argument | Description |
 |----------|-------------|
 | `<USERNAME>` | BBS username to suspend (case-sensitive) |
 | `<DAYS>` | Suspension length, `1`-`5` |
+
+As with `user ban`, the CLI runs as a separate process and can't reach the server's sessions, so the suspension lands on a live session's next command.
 
 ```sh
 supply-drop-bbs user timeout alice 3

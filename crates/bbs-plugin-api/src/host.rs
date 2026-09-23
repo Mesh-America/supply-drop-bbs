@@ -269,6 +269,10 @@ pub trait Host: Send + Sync {
     /// Update a user's status and/or permission level.
     ///
     /// Pass `None` for either field to leave it unchanged.
+    ///
+    /// A ban or deletion ends the user's live sessions in this process. A
+    /// caller in another process (the CLI) has no sessions to end; the
+    /// running server catches up on the user's next command.
     async fn admin_update_user(
         &self,
         username: &str,
@@ -281,7 +285,8 @@ pub trait Host: Send + Sync {
 
     /// Put a user into a time-limited suspension ("timeout"): rejects login
     /// with a message stating how many days remain, and terminates any
-    /// existing sessions immediately, the same as a permanent ban — but
+    /// existing sessions in this process, the same as a permanent ban (from
+    /// another process, the server catches up on the user's next command) — but
     /// automatically lifts once `days` have elapsed rather than staying in
     /// effect until an explicit unban (supply-drop-bbs-ax3 / #280).
     ///

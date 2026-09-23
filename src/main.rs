@@ -311,8 +311,8 @@ enum UserAction {
         /// BBS username whose password will be reset.
         username: String,
     },
-    /// Disable a user account: login is rejected and any live session is
-    /// ended immediately, but the account and its authored messages are
+    /// Disable a user account: login is rejected and a live session ends on
+    /// its next command, but the account and its authored messages are
     /// preserved (this is a softer action than deletion — deleting a user
     /// additionally reserves the username so no-one else can register it,
     /// and is not currently exposed as a CLI command).
@@ -332,8 +332,8 @@ enum UserAction {
         username: String,
     },
     /// Suspend a user account for a fixed number of days, distinct from a
-    /// permanent `ban`: login is rejected and any live session is ended
-    /// immediately, same as `ban`, but the account reactivates
+    /// permanent `ban`: login is rejected and a live session ends on its
+    /// next command, same as `ban`, but the account reactivates
     /// automatically once the timeout elapses rather than staying disabled
     /// until an explicit `unban`.
     ///
@@ -2733,7 +2733,9 @@ async fn cmd_user(cli: &Cli, action: &UserAction) {
 
         UserAction::Ban { username } => {
             match host.admin_update_user(username, Some(1), None).await {
-                Ok(()) => println!("disabled: {username} (login rejected, session ended)"),
+                Ok(()) => println!(
+                    "disabled: {username} (login rejected; a live session ends on its next command)"
+                ),
                 Err(bbs_plugin_api::HostError::NotFound(_)) => {
                     eprintln!("error: user '{username}' not found");
                     std::process::exit(1);
