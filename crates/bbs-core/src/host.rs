@@ -5285,7 +5285,7 @@ impl BbsHost {
         target: Username,
         force: Option<bool>,
     ) -> Result<Response, HostError> {
-        let (caller, _, _, _) = match self.session_auth_user(session).await {
+        let (caller, caller_id, _, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -5329,19 +5329,11 @@ impl BbsHost {
                         "'{blocked}' is not currently blocked."
                     )));
                 }
-                self.db
-                    .unblock_user(blocker, blocked)
-                    .await
-                    .map_err(|e| HostError::Storage(format!("{e}")))?;
-                Ok(Response::Text(format!("'{blocked}' is no longer blocked.")))
+                self.unblock_and_report(caller_id, blocker, blocked).await
             }
             None => {
                 if currently {
-                    self.db
-                        .unblock_user(blocker, blocked)
-                        .await
-                        .map_err(|e| HostError::Storage(format!("{e}")))?;
-                    Ok(Response::Text(format!("'{blocked}' is no longer blocked.")))
+                    self.unblock_and_report(caller_id, blocker, blocked).await
                 } else {
                     self.db
                         .block_user(blocker, blocked)
@@ -5351,6 +5343,44 @@ impl BbsHost {
                 }
             }
         }
+    }
+
+    /// Lift a block and say what it hid.
+    ///
+    /// Messages sent while the block was up that reading has already carried
+    /// the read pointer past won't come back in `N` — the pointer moved over
+    /// them unseen so `N` wouldn't re-fetch the same hidden page forever.
+    /// Rather than resurface them (which would mean rewinding the pointer and
+    /// re-delivering everyone else's messages from that stretch too), say how
+    /// many there were and where to start reading. (#367)
+    async fn unblock_and_report(
+        &self,
+        blocker_id: UserId,
+        blocker: &str,
+        blocked: &str,
+    ) -> Result<Response, HostError> {
+        // Read before the block row goes away — it holds the start point.
+        let hidden = self
+            .db
+            .hidden_while_blocked(blocker_id.as_i64(), blocker, blocked)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        self.db
+            .unblock_user(blocker, blocked)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let mut msg = format!("'{blocked}' is no longer blocked.");
+        if let Some(h) = hidden {
+            let plural = if h.count == 1 { "message" } else { "messages" };
+            msg.push_str(&format!(
+                " {} earlier {plural} of theirs stayed hidden — F {} to read from the oldest.",
+                h.count,
+                h.oldest.as_i64()
+            ));
+        }
+        Ok(Response::Text(msg))
     }
 
     async fn handle_ban_user(
@@ -10433,6 +10463,222 @@ mod tests {
         assert!(
             text.contains("hi from carol"),
             "G should have looked past the blocked-only room to the readable one, got: {text:?}"
+        );
+    }
+
+    /// Reading past a blocked sender moves the read pointer over their
+    /// messages without showing them, so unblocking can't bring them back in
+    /// N. Unblocking now says how many there were and where to start. (#367)
+    #[tokio::test]
+    async fn unblocking_reports_what_the_block_hid() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice_name = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // Park alice in the Lobby with nothing new, and block bob there.
+        host.process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let first = host
+            .db
+            .post_to_room(lobby_id, &bob_name, "hidden one", Timestamp::now())
+            .await
+            .unwrap();
+        host.db
+            .post_to_room(lobby_id, &bob_name, "hidden two", Timestamp::now())
+            .await
+            .unwrap();
+
+        // N shows nothing (both are blocked) but carries the pointer past them.
+        let read = host
+            .process_command(alice_sid, Command::ReadNew)
+            .await
+            .unwrap();
+        assert!(
+            matches!(read, Response::Text(ref t) if t.contains("No new messages")),
+            "both messages are blocked, so N should show nothing: {read:?}"
+        );
+
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("no longer blocked"),
+            "should confirm the unblock, got: {text:?}"
+        );
+        assert!(
+            text.contains("2 earlier messages"),
+            "should report both hidden messages, got: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("F {}", first.as_i64())),
+            "should point at the oldest hidden message ({}), got: {text:?}",
+            first.as_i64()
+        );
+    }
+
+    /// Nothing was hidden, so the unblock says only that.
+    #[tokio::test]
+    async fn unblocking_stays_quiet_when_nothing_was_hidden() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            alice_sid,
+            &Username::new("alice").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Bob says nothing at all while blocked.
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp,
+            Response::Text("'bob' is no longer blocked.".into()),
+            "with nothing hidden the unblock should say nothing more"
+        );
+    }
+
+    /// A message sent before the block went up isn't something the block hid,
+    /// so it mustn't be counted — that's why the block records where it
+    /// started rather than just counting everything behind the pointer.
+    #[tokio::test]
+    async fn unblocking_ignores_messages_from_before_the_block() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice_name = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        host.process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        // Bob posts and alice reads it normally, before any block exists.
+        host.db
+            .post_to_room(lobby_id, &bob_name, "seen normally", Timestamp::now())
+            .await
+            .unwrap();
+        let read = host
+            .process_command(alice_sid, Command::ReadNew)
+            .await
+            .unwrap();
+        let read_text = match read {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            read_text.contains("seen normally"),
+            "alice should read bob's message before blocking him: {read_text:?}"
+        );
+
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp,
+            Response::Text("'bob' is no longer blocked.".into()),
+            "a message read before the block isn't something the block hid"
         );
     }
 
