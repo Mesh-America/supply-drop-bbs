@@ -3788,9 +3788,18 @@ impl BbsHost {
     /// Like `session_auth` but also requires `PermissionLevel::User` or above.
     /// Unvalidated accounts get a pending-validation message.
     ///
-    /// When the cached level is Unvalidated, the DB is re-read once to catch
-    /// out-of-process promotions (e.g. `supply-drop-bbs user promote`) without
-    /// requiring the user to log out and back in.
+    /// The account's level is re-read on every call, so a change made outside
+    /// this process — `supply-drop-bbs user promote` or `demote`, a direct
+    /// edit of the database — takes effect on the next command in either
+    /// direction, without the user logging out and back in. The level on the
+    /// session is a cache, corrected here when it disagrees.
+    ///
+    /// This does **not** consult the account's `status`, so a ban, suspension
+    /// or deletion applied outside this process still does not reach a live
+    /// session — banning deliberately preserves `permission_level` (see
+    /// [`crate::user`]), so there is nothing here for it to notice. Nor does
+    /// it reach the web admin API, which keeps its own session cache. Both
+    /// are tracked separately.
     ///
     /// When `access_policy.require_verify` is `false`, Unvalidated sessions
     /// are promoted to `User` in-memory so they pass this check without a
@@ -3799,28 +3808,48 @@ impl BbsHost {
         &self,
         session: SessionId,
     ) -> Result<(Username, UserId, PermissionLevel, RoomId), Response> {
-        let (username, user_id, level, room_id) = self.session_auth(session).await?;
+        let (username, user_id, cached, room_id) = self.session_auth(session).await?;
+
+        // The level held on the session is a cache of the account's. A change
+        // made outside this process — `supply-drop-bbs user demote`, a direct
+        // edit of the database — cannot reach into this process's session map,
+        // so the account is read back on every command.
+        //
+        // This used to happen only when the cached level was Unvalidated,
+        // which caught promotions and nothing else: a demoted user kept the
+        // level they logged in with, and with it access to rooms and commands
+        // they had just lost, until they happened to log out. The in-BBS
+        // `.USER`/`.AIDE` path is fine because it evicts the user's sessions
+        // (#127), but a separate process has no way to do that. (#373)
+        //
+        // It costs one lookup by primary key per command, against commands
+        // that arrive at radio speed.
+        let level = match UserStore::get_by_id(&self.db, user_id).await {
+            Ok(Some(u)) => u.permission_level,
+            // The row is gone. Serving its session is a separate gap with its
+            // own decision to make (see the ban/deletion issue), so this keeps
+            // the previous behaviour rather than quietly changing it here.
+            Ok(None) => cached,
+            // A storage error is not a reason to lock every session out of the
+            // BBS, so carry on with the cached level and say why in the log.
+            Err(e) => {
+                tracing::warn!(
+                    "could not re-read the account behind a session, \
+                     continuing on its cached permission level: {e}"
+                );
+                cached
+            }
+        };
+
+        if level != cached {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.level = level;
+            }
+        }
 
         if level >= PermissionLevel::User {
             return Ok((username, user_id, level, room_id));
-        }
-
-        // Level is Unvalidated — re-read from DB in case an out-of-process
-        // tool (CLI, direct DB edit) promoted this user since they logged in.
-        let fresh_level = UserStore::get_by_id(&self.db, user_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.permission_level)
-            .unwrap_or(level);
-
-        if fresh_level >= PermissionLevel::User {
-            // Refresh the in-memory session so subsequent commands don't DB-check again.
-            let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.level = fresh_level;
-            }
-            return Ok((username, user_id, fresh_level, room_id));
         }
 
         // If require_verify is disabled, treat Unvalidated as User-level.
@@ -7979,6 +8008,129 @@ mod tests {
         assert!(
             matches!(&ok, Response::Prompt { text, .. } if text.to_lowercase().contains("password")),
             "valid username should start registration, got: {ok:?}"
+        );
+    }
+
+    /// A demotion made outside this process has to reach a live session.
+    ///
+    /// `supply-drop-bbs user demote` writes to the database from another
+    /// process and cannot evict sessions the way the in-BBS `.USER` command
+    /// does, so the level is read back per command. Before that, the session
+    /// kept the level it logged in with and the aide-only commands that came
+    /// with it. (#373)
+    #[tokio::test]
+    async fn a_demotion_from_outside_the_process_takes_effect_at_once() {
+        let (host, _db) = make_host().await;
+
+        // First registrant is Sysop and stays logged in throughout.
+        let sysop_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sysop_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let aide_sid = host.create_session("test").await.unwrap();
+        let aide_name = Username::new("bob").unwrap();
+        register_and_login(&host, aide_sid, &aide_name, "pass1234").await;
+        let aide_id = UserStore::get_by_username(&host.db, &aide_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            aide_id,
+            None,
+            None,
+            Some(PermissionLevel::Aide),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An aide can see the pending-user queue.
+        let allowed = host
+            .process_command(aide_sid, Command::ListPending)
+            .await
+            .unwrap();
+        assert!(
+            !matches!(allowed, Response::Error(_)),
+            "an aide should be allowed PENDING, got: {allowed:?}"
+        );
+
+        // Demote straight in the database, as a separate process would. The
+        // session map still says Aide.
+        UserStore::update(
+            &host.db,
+            aide_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let refused = host
+            .process_command(aide_sid, Command::ListPending)
+            .await
+            .unwrap();
+        assert!(
+            matches!(refused, Response::Error(ref e) if e.contains("Aide access required")),
+            "the demotion should take effect on the next command, got: {refused:?}"
+        );
+
+        // And the session's cached level was corrected, not just the answer.
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&aide_sid].level,
+            PermissionLevel::User,
+            "the session should hold the level the account now has"
+        );
+    }
+
+    /// The same read that catches a demotion still catches a promotion, which
+    /// is what it was originally there for.
+    #[tokio::test]
+    async fn a_promotion_from_outside_the_process_still_takes_effect() {
+        let (host, _db) = make_host().await;
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sysop_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        // A second account stays Unvalidated, so rooms are closed to it.
+        let sid = host.create_session("test").await.unwrap();
+        let name = Username::new("bob").unwrap();
+        register_and_login(&host, sid, &name, "pass1234").await;
+        let id = UserStore::get_by_username(&host.db, &name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let before = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(before, Response::Text(ref t) if t.contains("pending validation")),
+            "an unvalidated account should be held back, got: {before:?}"
+        );
+
+        UserStore::update(&host.db, id, None, None, Some(PermissionLevel::User), None)
+            .await
+            .unwrap();
+
+        let after = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(after, Response::Prompt { .. }),
+            "the promotion should take effect on the next command, got: {after:?}"
         );
     }
 
