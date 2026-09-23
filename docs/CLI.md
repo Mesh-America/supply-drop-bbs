@@ -265,6 +265,39 @@ sudo supply-drop-bbs config share-position on \
 
 ---
 
+### `config advert-scope`
+
+```
+supply-drop-bbs config advert-scope [VALUE] [OPTIONS]
+```
+
+Show, set or clear the MeshCore region the BBS's adverts are scoped to (`[plugins.mesh].advert_scope`; see [Advert scope](CONFIG.md#advert-scope-region)). With no argument it prints the current setting and the region key. With a region name (`usa`, or `'#usa'`, which a shell needs quoted) it writes the setting; the name is checked the same way as when the config loads, and an invalid one is refused. `off` removes the setting. **Takes effect on the next BBS restart.** Like the other `config` commands it needs a config file that loads, so a value that was hand-edited to something invalid has to be fixed in the file.
+
+At connect the BBS sets the radio's default flood scope to the region, before the on-connect advert. The scope also applies to the floods the radio starts when it has no path to someone (the first reply to a new user, logins), and a repeater passes a scoped flood on only if it carries that exact region, so pick one that every repeater between the BBS and your users carries (see [Choosing a region](CONFIG.md#choosing-a-region)). `off` does not clear a scope already on the radio; use the MeshCore app for that.
+
+| Argument | Meaning |
+|----------|---------|
+| *(none)* | Print the current setting |
+| `<region>` | Set the region, with or without a leading `#` (at most 30 bytes; case matters) |
+| `off` | Stop managing the scope (a region actually called `off` can be set as `'#off'`) |
+
+```sh
+# Show what is set
+supply-drop-bbs config advert-scope --config /etc/supply-drop-bbs/config.toml
+
+# Scope adverts to the "usa" region
+sudo supply-drop-bbs config advert-scope usa \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Stop managing it
+sudo supply-drop-bbs config advert-scope off \
+  --config /etc/supply-drop-bbs/config.toml
+```
+
+> **Tip:** The setup wizard and the web admin's **Settings** page (MeshCore radio) can set the same value.
+
+---
+
 ### `migrate`
 
 ```

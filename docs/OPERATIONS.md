@@ -633,7 +633,8 @@ values (or stay unset if this machine doesn't set them). They are:
 - what it executes: `[[plugins.process]]`;
 - the hardware and its cost settings: each radio's `connection_type`, `addr`,
   `serial_port` and `baud_rate`, its `[radio]` settings, whether it is
-  `enabled`, MeshCore's `app_target_version` and each radio's
+  `enabled`, MeshCore's `app_target_version` and `advert_scope` (the region its
+  floods are scoped to), and each radio's
   `protected_contact_cap` (all describe the device on this machine), and the
   whole `[security]` section (password-hashing cost is tuned to the machine);
 - the radio's name: Meshtastic's `short_name` and `long_name`, which the BBS

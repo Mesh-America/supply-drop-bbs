@@ -471,6 +471,23 @@ enum ConfigAction {
         /// aware of its own location without publishing it.
         enabled: String,
     },
+
+    /// Show, set or clear the MeshCore region the BBS's adverts are scoped to.
+    ///
+    /// With no argument, prints the current setting. With a region name
+    /// (`usa`, or `#usa`), writes `advert_scope` to the `[plugins.mesh]`
+    /// section: at connect the BBS sets the radio's default flood scope to it,
+    /// before the on-connect advert. The scope also applies to the floods the
+    /// radio starts when it has no path to someone (the first reply to a new
+    /// user, logins), and a scoped flood is only passed on by repeaters that
+    /// carry that exact region. `off` removes the setting, which does NOT clear
+    /// a scope already on the radio (use the MeshCore app for that).
+    /// Changes take effect on the next BBS restart.
+    #[cfg(feature = "transport-mesh")]
+    AdvertScope {
+        /// Region name, or `off` to stop managing the scope. Omit to show.
+        value: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1891,6 +1908,44 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
             config_edit_location_bool(config_path, "share_in_advert", value);
             println!("share_in_advert = {value}. Restart the BBS for the change to take effect.");
         }
+        #[cfg(feature = "transport-mesh")]
+        ConfigAction::AdvertScope { value } => match value {
+            None => match cfg.plugins.mesh.flood_scope() {
+                Some(scope) => {
+                    let key: String = scope.key.iter().map(|b| format!("{b:02x}")).collect();
+                    println!("advert_scope = \"{}\"", scope.name);
+                    println!("  region key: {key}");
+                    println!("  (set on the radio at connect; scopes its adverts and its floods to new contacts)");
+                }
+                None => println!(
+                    "advert_scope is not set: the BBS leaves the radio's flood scope alone."
+                ),
+            },
+            Some(v) if v.trim().eq_ignore_ascii_case("off") => {
+                config_remove_mesh_key(config_path, "advert_scope");
+                println!(
+                    "advert_scope cleared. A scope already on the radio stays until you clear \
+                     it in the MeshCore app. Restart the BBS for the change to take effect."
+                );
+            }
+            Some(v) => {
+                let name = match meshcore_companion::normalize_region_name(&v) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                config_edit_mesh_string(config_path, "advert_scope", &name);
+                println!(
+                    "advert_scope = \"{name}\". Restart the BBS for the change to take effect. \
+                     Floods the radio starts to reach someone it has no path to are scoped to it \
+                     too, not only adverts, and a repeater passes a scoped flood on only if it \
+                     carries this exact region: pick one that every repeater between the BBS \
+                     and your users carries."
+                );
+            }
+        },
     }
 }
 
@@ -2005,6 +2060,40 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
     with_locked_config_edit(config_path, |doc| {
         if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
             bbs.remove(key);
+        }
+        Ok(())
+    });
+}
+
+/// `[plugins.mesh]`, created if absent. `[plugins]` itself is left implicit so
+/// no empty header is written for a table that only holds a subtable.
+#[cfg(feature = "transport-mesh")]
+fn ensure_mesh_table(doc: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Table, String> {
+    let plugins = bbs_core::toml_util::ensure_table(doc, "plugins")?;
+    if plugins.is_empty() {
+        plugins.set_implicit(true);
+    }
+    bbs_core::toml_util::ensure_subtable(plugins, "mesh")
+}
+
+#[cfg(feature = "transport-mesh")]
+fn config_edit_mesh_string(config_path: Option<&std::path::Path>, key: &str, value: &str) {
+    with_locked_config_edit(config_path, |doc| {
+        bbs_core::toml_util::set_string_keeping_comments(ensure_mesh_table(doc)?, key, value);
+        Ok(())
+    });
+}
+
+#[cfg(feature = "transport-mesh")]
+fn config_remove_mesh_key(config_path: Option<&std::path::Path>, key: &str) {
+    with_locked_config_edit(config_path, |doc| {
+        if let Some(mesh) = doc
+            .get_mut("plugins")
+            .and_then(|p| p.as_table_mut())
+            .and_then(|p| p.get_mut("mesh"))
+            .and_then(|m| m.as_table_mut())
+        {
+            mesh.remove(key);
         }
         Ok(())
     });
@@ -3326,6 +3415,7 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
             // Don't retry on CLI — if the port is unavailable, fail fast.
             reconnect_delay_initial: Duration::from_secs(60),
             reconnect_delay_max: Duration::from_secs(60),
+            default_flood_scope: None,
         };
 
         let mut client = CompanionClient::connect_serial(serial_cfg);
@@ -4477,5 +4567,47 @@ mod backup_cli_tests {
                 "{arg:?}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "transport-mesh"))]
+mod advert_scope_cli_tests {
+    use super::{config_edit_mesh_string, config_remove_mesh_key, Cli};
+    use clap::Parser as _;
+
+    #[test]
+    fn the_command_parses_with_and_without_a_value() {
+        assert!(Cli::try_parse_from(["x", "config", "advert-scope"]).is_ok());
+        assert!(Cli::try_parse_from(["x", "config", "advert-scope", "usa"]).is_ok());
+        assert!(Cli::try_parse_from(["x", "config", "advert-scope", "off"]).is_ok());
+    }
+
+    #[test]
+    fn setting_and_clearing_round_trips_through_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[bbs]\nname = \"Test\"\n").unwrap();
+
+        config_edit_mesh_string(Some(&path), "advert_scope", "usa");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[plugins.mesh]"), "{text}");
+        assert!(
+            !text.contains("[plugins]\n"),
+            "no empty [plugins] header: {text}"
+        );
+        let cfg = crate::config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.plugins.mesh.advert_scope.as_deref(), Some("usa"));
+
+        // The rest of the file is untouched, and the key can be changed.
+        assert!(text.contains("name = \"Test\""));
+        config_edit_mesh_string(Some(&path), "advert_scope", "west");
+        let cfg = crate::config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.plugins.mesh.advert_scope.as_deref(), Some("west"));
+
+        config_remove_mesh_key(Some(&path), "advert_scope");
+        let cfg = crate::config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.plugins.mesh.advert_scope, None);
+        // Clearing something that is not there is not an error.
+        config_remove_mesh_key(Some(&path), "advert_scope");
     }
 }

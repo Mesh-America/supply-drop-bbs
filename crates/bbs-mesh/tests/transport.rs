@@ -1499,6 +1499,94 @@ async fn self_advert_broadcast_on_connect() {
     transport.stop().await.unwrap();
 }
 
+/// Every command the transport sends after SelfInfo, up to and including the
+/// on-connect advert.
+async fn commands_up_to_the_advert(bridge: &mut Bridge) -> Vec<Vec<u8>> {
+    let mut seen = Vec::new();
+    loop {
+        let cmd = tokio::time::timeout(Duration::from_secs(2), bridge.read_command())
+            .await
+            .expect("expected the on-connect advert");
+        let done = cmd[0] == CMD_SEND_SELF_ADVERT;
+        seen.push(cmd);
+        if done {
+            return seen;
+        }
+    }
+}
+
+/// With `advert_scope` set, the radio's default flood scope is set and read back
+/// during the handshake, so it is in place before the on-connect advert (which
+/// uses it) is sent.
+#[tokio::test]
+async fn advert_scope_is_set_on_the_radio_before_the_on_connect_advert() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
+        cfg.advert_on_connect = true;
+        cfg.advert_scope = Some("usa".into());
+    })
+    .await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    // The Set: [prefix][len=48][cmd][name×31][key×16]; then the Get. The
+    // transport has not started its own commands yet, so these come first.
+    let set = bridge.recv_n(3 + 48).await;
+    assert_eq!(set[3], CMD_SET_DEFAULT_FLOOD_SCOPE);
+    assert_eq!(&set[4..7], b"usa");
+    assert!(set[7..35].iter().all(|b| *b == 0));
+    let key = meshcore_companion::region_key("usa");
+    assert_eq!(&set[35..51], &key);
+    bridge.send(&radio_frame(&[RESP_CODE_OK])).await;
+    let get = bridge.recv_n(4).await;
+    assert_eq!(get[3], CMD_GET_DEFAULT_FLOOD_SCOPE);
+    let mut reply = vec![RESP_CODE_DEFAULT_FLOOD_SCOPE];
+    reply.extend_from_slice(b"usa");
+    reply.resize(1 + 31, 0);
+    reply.extend_from_slice(&key);
+    bridge.send(&radio_frame(&reply)).await;
+
+    // Everything after that is the ordinary connect burst, ending in the advert,
+    // with no further scope commands.
+    let cmds = commands_up_to_the_advert(&mut bridge).await;
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| c[0] == CMD_SET_DEFAULT_FLOOD_SCOPE || c[0] == CMD_GET_DEFAULT_FLOOD_SCOPE),
+        "{cmds:?}"
+    );
+    assert_eq!(cmds.last().unwrap()[0], CMD_SEND_SELF_ADVERT);
+
+    transport.stop().await.unwrap();
+}
+
+/// Without `advert_scope` the BBS never touches the radio's scope, so one set in
+/// the MeshCore app is left alone.
+#[tokio::test]
+async fn no_advert_scope_leaves_the_radios_scope_alone() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport_with(Arc::clone(&host), |cfg| {
+        cfg.advert_on_connect = true;
+    })
+    .await;
+
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("Node")).await;
+
+    let cmds = commands_up_to_the_advert(&mut bridge).await;
+    assert!(
+        !cmds
+            .iter()
+            .any(|c| c[0] == CMD_SET_DEFAULT_FLOOD_SCOPE || c[0] == CMD_GET_DEFAULT_FLOOD_SCOPE),
+        "{cmds:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
+
 // The periodic self-advert fires on a fixed 24h timer (ADVERT_INTERVAL), which is
 // impractical to exercise in real time. It reuses the same broadcast path as the
 // on-connect advert (asserted above) and the web-UI trigger.
