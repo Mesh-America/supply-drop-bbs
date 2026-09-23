@@ -3772,16 +3772,11 @@ impl BbsHost {
         // The room has to still be one this reader may read: raising a room's
         // permission level doesn't evict whoever is sitting in it, and G
         // shouldn't start delivering posts the reader has since lost access to.
-        if rooms.iter().any(|r| r.id == current_room)
-            && self.unread_in(&username, user_id, current_room).await? > 0
-        {
-            // `handle_read_new` returns MultiText only when it actually has
-            // something to show. Anything else means the current room has
-            // nothing readable after all — every unread message is from a
-            // blocked sender, say — so fall through and search the rest.
-            let resp = self.handle_read_new(session).await?;
-            if matches!(resp, Response::MultiText(_)) {
-                return Ok(resp);
+        if let Some(room) = rooms.iter().find(|r| r.id == current_room) {
+            if self.unread_in(&username, user_id, current_room).await? > 0 {
+                if let Some(resp) = self.read_new_unless_empty(session, &room.name).await? {
+                    return Ok(resp);
+                }
             }
         }
 
@@ -3793,17 +3788,52 @@ impl BbsHost {
             .map(|i| i + 1)
             .unwrap_or(0);
 
+        let mut moved = false;
         for room in rooms[start..].iter().chain(rooms[..start].iter()) {
             if room.id == current_room {
                 continue;
             }
             if self.unread_in(&username, user_id, room.id).await? > 0 {
                 self.set_current_room(session, room.id).await;
-                return self.handle_read_new(session).await;
+                moved = true;
+                if let Some(resp) = self.read_new_unless_empty(session, &room.name).await? {
+                    return Ok(resp);
+                }
+                // Nothing the reader can actually see in there — the unread
+                // counts don't know about blocked senders — so keep looking
+                // rather than stopping here and reporting nothing, which is
+                // the very failure this handler exists to avoid.
             }
         }
 
+        // Nothing anywhere. Any room entered along the way had nothing to
+        // show, so put the reader back where they started instead of
+        // stranding them in the last one tried.
+        if moved {
+            self.set_current_room(session, current_room).await;
+        }
         Ok(Response::Text("No unread messages in any room.".into()))
+    }
+
+    /// Read a room's new messages, separating "showed the reader something"
+    /// from "there was nothing here after all".
+    ///
+    /// Returns `None` only for [`handle_read_new`]'s own "no new messages"
+    /// answer for `room_name`, which is what a room whose unread messages are
+    /// all from blocked senders produces. Everything else — including an
+    /// error, or an auth response from a session evicted mid-call — comes back
+    /// as `Some` to be surfaced, rather than being mistaken for an empty room
+    /// and silently swallowed.
+    async fn read_new_unless_empty(
+        &self,
+        session: SessionId,
+        room_name: &str,
+    ) -> Result<Option<Response>, HostError> {
+        let empty = format!("No new messages in {room_name}.");
+        Ok(match self.handle_read_new(session).await? {
+            Response::Text(t) if t == empty => None,
+            other => Some(other),
+        })
     }
 
     async fn handle_change_room(
@@ -10264,9 +10294,99 @@ mod tests {
             !text.contains("blocked chatter") && !text.contains("also blocked"),
             "G must not surface a blocked sender's messages, got: {text:?}"
         );
+        assert_eq!(
+            text, "No unread messages in any room.",
+            "with every unread message blocked, G has genuinely nothing to show"
+        );
+    }
+
+    /// A room whose unread messages are all from a blocked sender must not
+    /// swallow the search: G has to keep going and find the room further
+    /// down the list that does have something readable. Needs three rooms —
+    /// with only two, the blocked room is the last one tried and the bug is
+    /// invisible.
+    #[tokio::test]
+    async fn go_next_unread_looks_past_a_blocked_only_room_to_a_later_one() {
+        let (host, _db) = make_host().await;
+
+        let blocked_room = RoomStore::create(
+            &host.db,
+            "Blocked Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        let good_room = RoomStore::create(
+            &host.db,
+            "Good Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        let carol_sid = host.create_session("test").await.unwrap();
+        let carol_name = Username::new("carol").unwrap();
+        register_and_login(&host, carol_sid, &carol_name, "pass1234").await;
+
+        // Drain Mail, then park the sysop in the Lobby with nothing new.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            sysop_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        host.process_command(
+            sysop_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Blocked Room sorts before Good Room, so G reaches it first.
+        host.db
+            .post_to_room(blocked_room, &bob_name, "nothing to see", Timestamp::now())
+            .await
+            .unwrap();
+        host.db
+            .post_to_room(good_room, &carol_name, "hi from carol", Timestamp::now())
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
         assert!(
-            text.contains("Custom Room"),
-            "G should have moved past the all-blocked Lobby to the custom room, got: {text:?}"
+            text.contains("hi from carol"),
+            "G should have looked past the blocked-only room to the readable one, got: {text:?}"
         );
     }
 
