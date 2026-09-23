@@ -3385,8 +3385,13 @@ impl BbsHost {
                                 r.workflow = Workflow::None;
                             }
                         }
-                        self.set_current_room(session, target_id).await;
-                        return self.handle_change_to_room(session, target_id).await;
+                        // Hand off to the same handler `C <number>` uses, so
+                        // picking a room off the list can't diverge from
+                        // typing its number. It used to go somewhere that
+                        // turned guests away from the very room K had just
+                        // offered them, and it moved the session before
+                        // checking whether the move was allowed. (#368)
+                        return self.handle_change_room(session, trimmed).await;
                     }
                 }
                 // Anything else: re-parse the input through the canonical
@@ -8352,6 +8357,44 @@ mod tests {
         assert!(
             matches!(r, Response::Text(ref t) if t.contains("verified")),
             "expected verification required message, got: {r:?}"
+        );
+    }
+
+    /// A guest sees their own room in the `K` list ("Guests [here]") and can
+    /// pick it by number, the same as `C Guests` by name already allowed.
+    /// This used to answer "pending validation by an aide" instead. (#368)
+    #[tokio::test]
+    async fn guest_can_select_their_own_room_by_number() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        let guest_rid = host.guest_room_id().expect("guest room configured");
+
+        // `K` first: the numeric selection arrives as a workflow reply, which
+        // is the path that was broken — `C <number>` goes elsewhere and was
+        // always fine.
+        host.process_command(s2, Command::ListRooms).await.unwrap();
+        let r = host
+            .process_command(
+                s2,
+                Command::WorkflowReply {
+                    reply: guest_rid.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Text(ref t) if t.contains("Now in: Guests")),
+            "guest should enter their own room by number, got: {r:?}"
         );
     }
 
