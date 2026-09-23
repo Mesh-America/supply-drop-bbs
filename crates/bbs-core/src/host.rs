@@ -3508,9 +3508,18 @@ impl BbsHost {
     /// Like `session_auth` but also requires `PermissionLevel::User` or above.
     /// Unvalidated accounts get a pending-validation message.
     ///
-    /// When the cached level is Unvalidated, the DB is re-read once to catch
-    /// out-of-process promotions (e.g. `supply-drop-bbs user promote`) without
-    /// requiring the user to log out and back in.
+    /// The account's level is re-read on every call, so a change made outside
+    /// this process — `supply-drop-bbs user promote` or `demote`, a direct
+    /// edit of the database — takes effect on the next command in either
+    /// direction, without the user logging out and back in. The level on the
+    /// session is a cache, corrected here when it disagrees.
+    ///
+    /// This does **not** consult the account's `status`, so a ban, suspension
+    /// or deletion applied outside this process still does not reach a live
+    /// session — banning deliberately preserves `permission_level` (see
+    /// [`crate::user`]), so there is nothing here for it to notice. Nor does
+    /// it reach the web admin API, which keeps its own session cache. Both
+    /// are tracked separately.
     ///
     /// When `access_policy.require_verify` is `false`, Unvalidated sessions
     /// are promoted to `User` in-memory so they pass this check without a
