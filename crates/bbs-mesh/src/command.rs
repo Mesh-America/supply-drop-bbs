@@ -234,6 +234,20 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             }),
         },
 
+        "timeout" => {
+            let mut parts = rest.unwrap_or("").split_whitespace();
+            let username = parts.next().and_then(|s| Username::new(s).ok());
+            let days = parts.next().and_then(|s| s.parse::<u8>().ok());
+            match (username, days) {
+                (Some(username), Some(days)) if (1..=5).contains(&days) => {
+                    Some(Command::TimeoutUser { username, days })
+                }
+                _ => Some(Command::Unknown {
+                    raw: text.to_owned(),
+                }),
+            }
+        }
+
         "u" | "users" => Some(Command::ListUsers {
             filter: rest.map(str::to_owned),
         }),
@@ -296,6 +310,21 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         ".aide" => Some(parse_set_level(rest, PermissionLevel::Aide)),
         ".sysop" => Some(parse_set_level(rest, PermissionLevel::Sysop)),
         ".user" => Some(parse_set_level(rest, PermissionLevel::User)),
+
+        // ── Access policy ────────────────────────────────────────────────────
+        "openaccess" => Some(Command::OpenAccess),
+        "closeaccess" => Some(Command::CloseAccess),
+        "guestroom" => match rest {
+            Some(arg) if arg.eq_ignore_ascii_case("off") => {
+                Some(Command::SetGuestRoom { name: None })
+            }
+            Some(name) if !name.is_empty() => Some(Command::SetGuestRoom {
+                name: Some(name.to_owned()),
+            }),
+            _ => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
 
         _ => Some(Command::Unknown {
             raw: text.to_owned(),
@@ -588,6 +617,95 @@ mod tests {
     #[test]
     fn whitespace_trimmed() {
         assert_eq!(cmd("  help  "), Some(Command::Help { topic: None }));
+    }
+
+    #[test]
+    fn timeout_user_and_days() {
+        let u = Username::new("bob").unwrap();
+        assert_eq!(
+            parse_command("timeout bob 3", None, false),
+            Some(Command::TimeoutUser {
+                username: u.clone(),
+                days: 3
+            })
+        );
+        assert_eq!(
+            parse_command("TIMEOUT bob 5", None, false),
+            Some(Command::TimeoutUser {
+                username: u,
+                days: 5
+            })
+        );
+    }
+
+    #[test]
+    fn timeout_bad_args_is_unknown() {
+        for text in [
+            "timeout",
+            "timeout bob",
+            "timeout bob 0",
+            "timeout bob 6",
+            "timeout bob x",
+        ] {
+            assert_eq!(
+                parse_command(text, None, false),
+                Some(Command::Unknown {
+                    raw: text.to_owned()
+                }),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_policy_words() {
+        assert_eq!(
+            parse_command("openaccess", None, false),
+            Some(Command::OpenAccess)
+        );
+        assert_eq!(
+            parse_command("CloseAccess", None, false),
+            Some(Command::CloseAccess)
+        );
+        assert_eq!(
+            parse_command("guestroom Lobby", None, false),
+            Some(Command::SetGuestRoom {
+                name: Some("Lobby".to_owned())
+            })
+        );
+        assert_eq!(
+            parse_command("guestroom OFF", None, false),
+            Some(Command::SetGuestRoom { name: None })
+        );
+        assert_eq!(
+            parse_command("guestroom", None, false),
+            Some(Command::Unknown {
+                raw: "guestroom".to_owned()
+            })
+        );
+    }
+
+    /// The radio parser must agree with the canonical `Command::parse` on the
+    /// sysop/aide words — they drifted once (timeout, openaccess, closeaccess,
+    /// guestroom fell through to Unknown on radio).
+    #[test]
+    fn sysop_words_match_canonical_parser() {
+        for text in [
+            "timeout bob 1",
+            "timeout bob 9",
+            "timeout",
+            "openaccess",
+            "closeaccess",
+            "guestroom Lobby",
+            "guestroom off",
+            "guestroom",
+        ] {
+            assert_eq!(
+                parse_command(text, None, false),
+                Some(Command::parse(text, false)),
+                "{text}"
+            );
+        }
     }
 
     // ── Workflow reply ───────────────────────────────────────────────────────

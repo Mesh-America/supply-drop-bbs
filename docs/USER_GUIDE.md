@@ -350,15 +350,17 @@ C 3
 
 Room names are **case-insensitive**.
 
-### Jump to next room with unread messages
+### Read unread messages, here or in the next room that has them
 
 ```
 G
 ```
 
-Moves you to the next room (in list order) that has messages you haven't
-read. Wraps around. Useful for quickly working through activity across all
-rooms.
+If the room you're currently in has messages you haven't read, shows those
+first — the same messages `N` would show, a page at a time, so press `G`
+again to continue through a busy room. Otherwise moves you to the next room
+(in list order) that has messages you haven't read. Wraps around. Useful for
+quickly working through activity across all rooms.
 
 ### Skip past unread messages without reading them
 
@@ -793,6 +795,28 @@ B -<username>
 
 Blocking is per-session-and-database — it persists across logins.
 
+### What unblocking does and doesn't bring back
+
+Unblocking someone doesn't resurface what they said while blocked. Reading
+moves your position in a room forward past hidden messages — it has to, or
+`N` would keep stopping on the same hidden ones — so by the time you unblock,
+your position is already past them.
+
+You aren't left guessing, though. Unblocking tells you how many of their
+messages went by and where to pick them up:
+
+```
+'bob' is no longer blocked. 2 earlier messages of theirs stayed hidden — F 143 to read from the oldest.
+```
+
+`F 143` reads from that message onward, so you can catch up if you want to.
+Nothing is deleted; it just doesn't come back to you unasked. Messages you
+read normally *before* blocking them aren't counted here — only what the
+block itself hid.
+
+Blocks placed before this was added can't report a count, because the BBS
+didn't record where those blocks started.
+
 ---
 
 ## 14. System administration
@@ -895,6 +919,22 @@ You have been suspended for 2 more day(s).
 Use `UNBAN` to lift a timeout early. The same rules as `BAN` apply (an
 Aide cannot suspend another Aide or a Sysop), and it's logged in the
 audit trail.
+
+A ban, timeout or deletion made from outside the BBS, with
+`supply-drop-bbs user ban` or `user timeout` or by editing the database,
+can't disconnect anyone directly. It takes effect on the user's next
+command instead: the command doesn't run, and the user is logged out with
+one of these:
+
+```
+Your account has been banned. You have been logged out.
+Your account has been suspended for 2 more day(s). You have been logged out.
+Your account no longer exists. You have been logged out.
+```
+
+The user's other sessions, if any, end at the same time. A timeout that
+runs out while the user is logged in is lifted, not enforced, the same as
+at login.
 
 ### Unbanning a user (Sysop only)
 
@@ -1026,6 +1066,15 @@ If the web admin is enabled, sysops can manage users, rooms, messages, and
 view audit logs through a browser interface. The URL is set by the operator
 (typically `http://<bbs-host>:8080`).
 
+Signing in needs an active Aide or Sysop account, and that is checked again on
+every request, not just at sign-in. If your account is banned, suspended,
+deleted or dropped below Aide from anywhere (the command line, the BBS, or
+another sysop's browser), your next click signs you out, and the live feeds
+behind the dashboard badges close within about 15 seconds. A change of level
+between Aide and Sysop applies on your next click. If the server can't read
+your account for a moment, the request fails with a "try again" rather than
+signing you out.
+
 From the **Users** page you can:
 
 - Filter to **"pending verification"** to see only unvalidated accounts
@@ -1094,7 +1143,7 @@ account and you can re-register with the same username.
 | `K` | List rooms |
 | `C <name>` | Change to room by name (case-insensitive) |
 | `C <number>` | Change to room by number |
-| `G` | Jump to next room with unread messages |
+| `G` | Read unread here, else jump to the next room with unread |
 | `M` | Go to Mail (private messages) |
 
 ### Logged in — reading

@@ -1,0 +1,20 @@
+-- Record where a block started, so unblocking can say what it hid.
+--
+-- Reading with N advances the read pointer past a blocked sender's messages
+-- even though they were never shown, otherwise N would re-fetch the same
+-- hidden page forever. Those messages then sit behind the pointer and never
+-- reappear, including after an unblock -- and nothing told the reader they
+-- were there (#367).
+--
+-- Counting them needs the start of the block: without it, "messages from
+-- this sender behind your pointer" also sweeps in every message of theirs
+-- the reader read normally before the block existed. blocked_at_message_id
+-- is the newest message id at the moment the block was placed, so the
+-- messages hidden by it are the ones newer than that and no newer than the
+-- reader's pointer.
+--
+-- NULL for blocks placed before this migration: their start is genuinely
+-- unknown, and reporting a guessed count is worse than reporting none.
+--
+-- Append-only: never edit this file once applied (sqlx records its checksum).
+ALTER TABLE user_blocks ADD COLUMN blocked_at_message_id INTEGER;

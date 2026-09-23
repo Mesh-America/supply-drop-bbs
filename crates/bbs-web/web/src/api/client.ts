@@ -18,6 +18,9 @@ async function parseError(res: globalThis.Response): Promise<ApiError> {
   return new ApiError(res.status, message, body?.error?.code)
 }
 
+// Fired on `window` when a request finds the session no longer valid.
+export const SIGNED_OUT_EVENT = 'bbs:signed-out'
+
 export async function request<T>(path: string, init: RequestInit & { json?: any } = {}): Promise<T> {
   const headers = new Headers(init.headers)
   let body = init.body as BodyInit | undefined
@@ -26,6 +29,11 @@ export async function request<T>(path: string, init: RequestInit & { json?: any 
     body = JSON.stringify(init.json)
   }
   const res = await fetch(path, { ...init, body, headers, credentials: 'include' })
+  if (res.status === 401 && !path.endsWith('/auth/login')) {
+    // The session is gone: it expired, or the account was banned, suspended,
+    // deleted or demoted from elsewhere. App.vue takes the user to sign-in.
+    window.dispatchEvent(new CustomEvent(SIGNED_OUT_EVENT))
+  }
   if (!res.ok) throw await parseError(res)
   if (res.status === 204) return undefined as unknown as T
   const text = await res.text()

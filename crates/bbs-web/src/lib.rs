@@ -102,6 +102,7 @@ use bbs_plugin_api::host::Host;
 use bbs_plugin_api::plugin::Plugin;
 use bbs_plugin_api::registry::{PluginRegistryApi, ProcessPluginConfig, RegistryError};
 use bbs_plugin_api::transport::TransportStats;
+use bbs_plugin_api::PermissionLevel;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::net::TcpListener;
@@ -209,6 +210,26 @@ struct CurrentUser {
     permission_level: u8,
 }
 
+/// The session token a request was authorised with, injected alongside
+/// [`CurrentUser`] so a long-lived response (an SSE stream) can re-check it.
+#[derive(Debug, Clone)]
+struct SessionToken(String);
+
+/// What [`AppState::authorize`] decided about a request.
+enum Authorized {
+    /// Proceed as this user.
+    Yes(CurrentUser),
+    /// No session, or the account may no longer hold one: 401.
+    No,
+    /// The account could not be checked. The session is kept, the request
+    /// is not served: 503, try again.
+    Unavailable,
+}
+
+/// How often a live SSE stream re-checks the session that opened it. Quoted
+/// in docs/USER_GUIDE.md and docs/ARCHITECTURE.md.
+const SSE_REAUTH_SECS: u64 = 15;
+
 // ── Transport flags ───────────────────────────────────────────────────────────
 
 /// Which built-in transports are compiled in and/or currently enabled.
@@ -250,6 +271,13 @@ struct AppState {
     /// backup directory) where `main.rs`'s startup check will find it
     /// (issues #195 and #309).
     data_dir: std::sync::Mutex<Option<String>>,
+    /// Directory holding monthly audit log archives.
+    ///
+    /// Sourced from `[audit] directory` in the operator config and injected by
+    /// the host binary via [`WebPlugin::set_audit_archive_dir`]. When `None`
+    /// the archive endpoints return 400 (`audit archive directory not
+    /// configured`).
+    audit_archive_dir: std::sync::Mutex<Option<String>>,
     /// Serializes the whole validate-and-stage / confirm sequence for a
     /// restore so two concurrent uploads (or an upload racing a confirm)
     /// can't clobber the shared `pending_restore*.db` paths — an async
@@ -296,6 +324,7 @@ impl AppState {
             config,
             backup_dir: std::sync::Mutex::new(None),
             data_dir: std::sync::Mutex::new(None),
+            audit_archive_dir: std::sync::Mutex::new(None),
             restore_lock: tokio::sync::Mutex::new(()),
             restore_confirmed: AtomicBool::new(false),
             boot_id: Uuid::new_v4().to_string(),
@@ -325,6 +354,14 @@ impl AppState {
         self.data_dir.lock().expect("data_dir poisoned").clone()
     }
 
+    /// Return the audit archive directory, if any.
+    fn audit_archive_dir(&self) -> Option<String> {
+        self.audit_archive_dir
+            .lock()
+            .expect("audit_archive_dir poisoned")
+            .clone()
+    }
+
     fn create_session(&self, username: String, permission_level: u8) -> String {
         let token = Uuid::new_v4().to_string();
         let mut sessions = self.sessions.lock().expect("sessions poisoned");
@@ -339,7 +376,11 @@ impl AppState {
         token
     }
 
-    fn validate_session(&self, token: &str) -> Option<CurrentUser> {
+    /// The session as cached at login, if `token` names one that hasn't
+    /// expired. This is a cache lookup, not an authorisation check: nothing
+    /// that serves a request may call it directly. [`Self::authorize`] is the
+    /// check, and checks the account behind the cache.
+    fn cached_session(&self, token: &str) -> Option<CurrentUser> {
         let mut sessions = self.sessions.lock().expect("sessions poisoned");
         match sessions.get(token) {
             Some(s) if s.expires_at > Instant::now() => Some(CurrentUser {
@@ -353,6 +394,64 @@ impl AppState {
         }
     }
 
+    /// Authorise a request carrying `token`, checking the account behind the
+    /// session against the host rather than trusting what was cached at login.
+    ///
+    /// The cached level and the 12-hour expiry used to be the whole check, so
+    /// a sysop demoted or banned from anywhere but this web process (the CLI,
+    /// the BBS's `.USER`/`BAN` commands, the database) kept full admin access
+    /// until the session expired (#380). Now an account that is gone, banned,
+    /// suspended or below Aide (the floor web login applies) loses every
+    /// session it holds here, and a level change is picked up on the next
+    /// request.
+    ///
+    /// If the account can't be read, or the host doesn't implement the
+    /// check, the request is refused as unavailable and the session kept: a
+    /// transient storage error neither serves a possibly-revoked session nor
+    /// signs a sysop out, and a host without the check never gets to trade
+    /// on a cached level.
+    async fn authorize(&self, token: &str) -> Authorized {
+        let Some(cached) = self.cached_session(token) else {
+            return Authorized::No;
+        };
+        match self.host.admin_account_level(&cached.username).await {
+            Ok(Some(level)) if level >= PermissionLevel::Aide => {
+                let level = level as u8;
+                // The session may have been logged out or invalidated while
+                // the account was being read; a request is only served on a
+                // session that still exists.
+                match self
+                    .sessions
+                    .lock()
+                    .expect("sessions poisoned")
+                    .get_mut(token)
+                {
+                    Some(s) => s.permission_level = level,
+                    None => return Authorized::No,
+                }
+                Authorized::Yes(CurrentUser {
+                    username: cached.username,
+                    permission_level: level,
+                })
+            }
+            Ok(_) => {
+                info!(
+                    username = %cached.username,
+                    "web: ending admin sessions for an account that may no longer use them"
+                );
+                self.invalidate_sessions_for(&cached.username);
+                Authorized::No
+            }
+            Err(e) => {
+                warn!(
+                    username = %cached.username,
+                    "web: could not re-check the account behind a session, refusing the request: {e}"
+                );
+                Authorized::Unavailable
+            }
+        }
+    }
+
     fn remove_session(&self, token: &str) {
         self.sessions
             .lock()
@@ -360,8 +459,9 @@ impl AppState {
             .remove(token);
     }
 
-    /// Remove all web sessions for `username` — called after ban or permission change
-    /// so stale cached `permission_level` values cannot be exploited.
+    /// Remove all web sessions for `username`: after a ban or level change
+    /// made through this API, and from [`Self::authorize`] when a request
+    /// finds the account changed from elsewhere.
     fn invalidate_sessions_for(&self, username: &str) {
         self.sessions
             .lock()
@@ -608,6 +708,17 @@ impl WebPlugin {
     pub fn set_data_dir(&self, dir: Option<String>) {
         *self.state.data_dir.lock().expect("data_dir poisoned") = dir;
     }
+
+    /// Set the directory holding monthly audit log archives, sourced from
+    /// `[audit] directory`. Safe to call at any time, including after
+    /// `start()`: request handlers read this value live from its `Mutex`.
+    pub fn set_audit_archive_dir(&self, dir: Option<String>) {
+        *self
+            .state
+            .audit_archive_dir
+            .lock()
+            .expect("audit_archive_dir poisoned") = dir;
+    }
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -718,6 +829,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api_download_backup).delete(api_delete_backup),
         )
         .route("/backups/:filename/restore", post(api_stage_backup_restore))
+        .route("/audit-archives", get(api_list_audit_archives))
+        .route(
+            "/audit-archives/:filename",
+            get(api_download_audit_archive).delete(api_delete_audit_archive),
+        )
         .route(
             "/backups/restore",
             post(api_upload_restore).layer(DefaultBodyLimit::max(RESTORE_UPLOAD_MAX_BYTES)),
@@ -786,14 +902,20 @@ async fn auth_middleware(
         .map(|c| c.value().to_owned())
         .unwrap_or_default();
 
-    match state.validate_session(&token) {
-        Some(user) => {
+    match state.authorize(&token).await {
+        Authorized::Yes(user) => {
             req.extensions_mut().insert(user);
+            req.extensions_mut().insert(SessionToken(token));
             next.run(req).await
         }
-        None => (
+        Authorized::No => (
             StatusCode::UNAUTHORIZED,
             Json(json_error("not authenticated")),
+        )
+            .into_response(),
+        Authorized::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("could not check the session; try again")),
         )
             .into_response(),
     }
@@ -1927,6 +2049,138 @@ async fn api_audit_log(
     }
 }
 
+// ── Audit log archives (#362) ─────────────────────────────────────────────────
+//
+// Sysop-only, all three: an archive is the full record of privileged actions
+// for a month, so reading one out of the system and removing one are both
+// held to the same bar as taking a database backup. Nothing here archives on
+// request or clears the live log — archiving happens on a schedule in the host
+// binary, and the live log has no endpoint that can empty it.
+
+async fn api_list_audit_archives(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    match state.host.admin_list_audit_archives(&dir).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_download_audit_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(filename): Path<String>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    // The archive directory can be shared with database backups and the
+    // restore's working files; this serves only this feature's own archives.
+    if !bbs_core::audit_archive::is_audit_archive(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("not an audit log archive")),
+        )
+            .into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    let path = std::path::Path::new(&dir).join(&filename);
+    // An archive is a regular file the BBS wrote. Anything else wearing the
+    // name — a link pointing out of the directory in particular — is not
+    // served, matching the O_NOFOLLOW the archive writer opens with.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("not an audit log archive")),
+            )
+                .into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => return server_error(&e.to_string()),
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/zip".to_owned()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_delete_audit_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(filename): Path<String>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    if !bbs_core::audit_archive::is_audit_archive(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("not an audit log archive")),
+        )
+            .into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    match state.host.admin_delete_audit_archive(&dir, &filename).await {
+        Ok(()) => {
+            // Deleting a month of audit history is itself worth recording.
+            let actor = format!("web:{}", caller.username);
+            if let Err(e) = state
+                .host
+                .admin_write_audit(&actor, "delete_audit_archive", Some(&filename), None)
+                .await
+            {
+                tracing::warn!("could not audit the audit-archive deletion: {e}");
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(HostError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 async fn api_stats(State(state): State<Arc<AppState>>) -> Response {
@@ -1959,6 +2213,7 @@ async fn api_errors(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn api_sse_errors(
     State(state): State<Arc<AppState>>,
+    Extension(token): Extension<SessionToken>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx_opt = state
         .error_tx
@@ -1980,11 +2235,13 @@ async fn api_sse_errors(
             None => Box::new(tokio_stream::empty()),
         };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(end_when_revoked(state, token, stream))
+        .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 async fn api_sse_rss_alert(
     State(state): State<Arc<AppState>>,
+    Extension(token): Extension<SessionToken>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx_opt = state
         .rss_alert_tx
@@ -2006,7 +2263,8 @@ async fn api_sse_rss_alert(
             None => Box::new(tokio_stream::empty()),
         };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(end_when_revoked(state, token, stream))
+        .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── System metrics ───────────────────────────────────────────────────────────
@@ -2023,11 +2281,13 @@ async fn api_metrics() -> Response {
 #[derive(Serialize)]
 struct SettingsResponse {
     backup_dir: Option<String>,
+    audit_archive_dir: Option<String>,
 }
 
 async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(SettingsResponse {
         backup_dir: state.backup_dir(),
+        audit_archive_dir: state.audit_archive_dir(),
     })
 }
 
@@ -3925,8 +4185,70 @@ async fn api_logs(
 
 // ── SSE log stream ────────────────────────────────────────────────────────────
 
+/// End `events` once the session that opened it stops authorising.
+///
+/// The middleware checks a session when the stream opens, and an SSE stream
+/// then stays open indefinitely, so without this a revoked session kept
+/// receiving the live log after logout, a ban or a demotion. The session is
+/// re-checked every [`SSE_REAUTH_SECS`] seconds; the user guide and
+/// architecture doc quote that figure, so change them together.
+fn end_when_revoked<S>(
+    state: Arc<AppState>,
+    token: SessionToken,
+    events: S,
+) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static
+where
+    S: tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    end_when_revoked_every(
+        state,
+        token,
+        events,
+        std::time::Duration::from_secs(SSE_REAUTH_SECS),
+    )
+}
+
+/// [`end_when_revoked`] with the re-check period as a parameter, for tests.
+fn end_when_revoked_every<S>(
+    state: Arc<AppState>,
+    token: SessionToken,
+    events: S,
+    period: std::time::Duration,
+) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static
+where
+    S: tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    enum Tick {
+        Event(Result<Event, Infallible>),
+        StillAuthorized,
+        End,
+    }
+    let checks = tokio_stream::iter(std::iter::repeat(())).then(move |()| {
+        let state = Arc::clone(&state);
+        let token = token.0.clone();
+        async move {
+            tokio::time::sleep(period).await;
+            // Anything but a yes ends the stream, including "couldn't check":
+            // the client reconnects and gets a plain answer.
+            match state.authorize(&token).await {
+                Authorized::Yes(_) => Tick::StillAuthorized,
+                Authorized::No | Authorized::Unavailable => Tick::End,
+            }
+        }
+    });
+    events
+        .map(Tick::Event)
+        .merge(checks)
+        .take_while(|t| !matches!(t, Tick::End))
+        .filter_map(|t| match t {
+            Tick::Event(e) => Some(e),
+            _ => None,
+        })
+}
+
 async fn api_sse_logs(
     State(state): State<Arc<AppState>>,
+    Extension(token): Extension<SessionToken>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.log_tx.subscribe();
 
@@ -3941,14 +4263,19 @@ async fn api_sse_logs(
         Err(_lagged) => None,
     });
 
-    Sse::new(tokio_stream::StreamExt::chain(init, live))
-        .keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(end_when_revoked(
+        state,
+        token,
+        tokio_stream::StreamExt::chain(init, live),
+    ))
+    .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── SSE domain events ─────────────────────────────────────────────────────────
 
 async fn api_sse_events(
     State(state): State<Arc<AppState>>,
+    Extension(token): Extension<SessionToken>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.host.events();
 
@@ -3964,7 +4291,8 @@ async fn api_sse_events(
         Err(_) => None,
     });
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(end_when_revoked(state, token, stream))
+        .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── Backups ───────────────────────────────────────────────────────────────────
@@ -4945,6 +5273,268 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = n;
         k
+    }
+
+    /// Web state over a real host and database, with two sysops, so an
+    /// account can be changed behind the web layer's back the way the CLI or
+    /// the BBS's own commands change it. (#380)
+    async fn real_host_state() -> (Arc<AppState>, tempfile::NamedTempFile) {
+        let (state, _db, file) = real_host_state_with_db().await;
+        (state, file)
+    }
+
+    /// As [`real_host_state`], keeping a handle on the database for a test
+    /// that has to write what the host's own admin methods won't.
+    async fn real_host_state_with_db(
+    ) -> (Arc<AppState>, bbs_core::Database, tempfile::NamedTempFile) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = bbs_core::Database::open(&db_file.path().to_string_lossy())
+            .await
+            .expect("open database");
+        let host: Arc<dyn Host> = Arc::new(bbs_core::BbsHost::new(db.clone()));
+        let state = Arc::new(AppState::new(host, WebConfig::default()));
+        for name in ["root", "other"] {
+            state
+                .host
+                .admin_create_user(name, "pass1234", 100)
+                .await
+                .unwrap();
+        }
+        (state, db, db_file)
+    }
+
+    async fn level_of(state: &AppState, token: &str) -> Option<u8> {
+        match state.authorize(token).await {
+            Authorized::Yes(u) => Some(u.permission_level),
+            Authorized::No => None,
+            Authorized::Unavailable => panic!("the host should have answered"),
+        }
+    }
+
+    /// A ban applied through the host directly, as the CLI does, ends the web
+    /// session on its next request. It used to last out the 12-hour TTL.
+    #[tokio::test]
+    async fn a_ban_made_elsewhere_ends_the_web_session() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+        assert_eq!(level_of(&state, &token).await, Some(100));
+
+        state
+            .host
+            .admin_update_user("root", Some(1), None)
+            .await
+            .unwrap();
+
+        assert_eq!(level_of(&state, &token).await, None);
+        assert!(
+            state.cached_session(&token).is_none(),
+            "the session should be gone, not just refused once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suspension_made_elsewhere_ends_the_web_session() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+        state.host.admin_suspend_user("root", 2).await.unwrap();
+        assert_eq!(level_of(&state, &token).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_deletion_made_elsewhere_ends_the_web_session() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+        state
+            .host
+            .admin_update_user("root", Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(level_of(&state, &token).await, None);
+    }
+
+    /// A demotion made elsewhere is picked up on the next request: to Aide it
+    /// narrows the session, below Aide (which web login requires) it ends it.
+    #[tokio::test]
+    async fn a_demotion_made_elsewhere_reaches_the_web_session() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+
+        state
+            .host
+            .admin_update_user("root", None, Some(50))
+            .await
+            .unwrap();
+        assert_eq!(level_of(&state, &token).await, Some(50));
+        assert_eq!(
+            state.cached_session(&token).map(|u| u.permission_level),
+            Some(50),
+            "the cached level should be corrected, not just the answer"
+        );
+
+        state
+            .host
+            .admin_update_user("root", None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(level_of(&state, &token).await, None);
+    }
+
+    /// An elapsed suspension is lifted by the re-check and by web login alike,
+    /// so an account can't be let through on one and refused on the other.
+    #[tokio::test]
+    async fn an_elapsed_suspension_is_lifted_for_web_login_and_re_check_alike() {
+        let (state, db, _file) = real_host_state_with_db().await;
+        let token = state.create_session("root".into(), 100);
+        let id = bbs_core::db::UserStore::get_by_username(
+            &db,
+            &bbs_plugin_api::Username::new("root").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+        let past = bbs_core::timestamp::Timestamp::from_utc(
+            bbs_core::timestamp::Timestamp::now().as_offset_datetime() - time::Duration::hours(1),
+        );
+        bbs_core::db::UserStore::suspend(&db, id, past)
+            .await
+            .unwrap();
+
+        assert_eq!(level_of(&state, &token).await, Some(100));
+        assert_eq!(
+            state
+                .host
+                .admin_verify_credentials("root", "pass1234")
+                .await
+                .unwrap(),
+            PermissionLevel::Sysop
+        );
+    }
+
+    /// Only the changed account's sessions go.
+    #[tokio::test]
+    async fn banning_one_account_leaves_other_web_sessions_alone() {
+        let (state, _db) = real_host_state().await;
+        let root = state.create_session("root".into(), 100);
+        let other = state.create_session("other".into(), 100);
+        state
+            .host
+            .admin_update_user("root", Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(level_of(&state, &root).await, None);
+        assert_eq!(level_of(&state, &other).await, Some(100));
+    }
+
+    /// The cached level is never the answer on its own: an account the host
+    /// doesn't vouch for is refused, and one it does is served at the level
+    /// the host gives, not the cached one.
+    #[tokio::test]
+    async fn the_host_answer_decides_not_the_cache() {
+        let (state, mock) = test_state();
+        let token = state.create_session("sysop".into(), 100);
+        assert_eq!(level_of(&state, &token).await, None);
+
+        let token = state.create_session("sysop".into(), 100);
+        mock.set_account_level("sysop", Some(PermissionLevel::Aide));
+        assert_eq!(level_of(&state, &token).await, Some(50));
+    }
+
+    /// A host that can't answer refuses the request but keeps the session,
+    /// so a transient storage error neither serves a revoked session nor
+    /// signs a sysop out.
+    #[tokio::test]
+    async fn an_unavailable_host_refuses_without_signing_out() {
+        struct Silent(MockHost);
+        #[async_trait]
+        impl Host for Silent {
+            async fn create_session(
+                &self,
+                t: &'static str,
+            ) -> Result<bbs_plugin_api::SessionId, HostError> {
+                self.0.create_session(t).await
+            }
+            async fn end_session(&self, s: bbs_plugin_api::SessionId) -> Result<(), HostError> {
+                self.0.end_session(s).await
+            }
+            async fn permission_ctx(
+                &self,
+                s: bbs_plugin_api::SessionId,
+            ) -> Result<bbs_plugin_api::PermissionCtx, HostError> {
+                self.0.permission_ctx(s).await
+            }
+            async fn process_command(
+                &self,
+                s: bbs_plugin_api::SessionId,
+                c: bbs_plugin_api::Command,
+            ) -> Result<bbs_plugin_api::Response, HostError> {
+                self.0.process_command(s, c).await
+            }
+            fn events(&self) -> broadcast::Receiver<DomainEvent> {
+                self.0.events()
+            }
+            fn advert_bus(&self) -> Arc<bbs_plugin_api::advert::AdvertBus> {
+                self.0.advert_bus()
+            }
+            fn node_location(&self) -> Option<(f64, f64)> {
+                self.0.node_location()
+            }
+            async fn admin_account_level(
+                &self,
+                _: &str,
+            ) -> Result<Option<PermissionLevel>, HostError> {
+                Err(HostError::Storage("database is locked".into()))
+            }
+        }
+        let host: Arc<dyn Host> = Arc::new(Silent(MockHost::new()));
+        let state = Arc::new(AppState::new(host, WebConfig::default()));
+        let token = state.create_session("sysop".into(), 100);
+        assert!(matches!(
+            state.authorize(&token).await,
+            Authorized::Unavailable
+        ));
+        assert!(
+            state.cached_session(&token).is_some(),
+            "the session should survive a failed check"
+        );
+    }
+
+    /// An open SSE stream passes events through while its session is good and
+    /// ends once the session is revoked. Before, it stayed open indefinitely.
+    #[tokio::test]
+    async fn an_sse_stream_ends_when_its_session_is_revoked() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+        let events = tokio_stream::iter([Ok::<_, Infallible>(Event::default().data("hello"))])
+            .chain(tokio_stream::pending());
+        let stream = end_when_revoked_every(
+            Arc::clone(&state),
+            SessionToken(token.clone()),
+            events,
+            std::time::Duration::from_millis(20),
+        );
+        tokio::pin!(stream);
+
+        assert!(
+            stream.next().await.is_some(),
+            "an event should pass through"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                .await
+                .is_err(),
+            "the stream should stay open while the session is good"
+        );
+
+        state
+            .host
+            .admin_update_user("root", Some(1), None)
+            .await
+            .unwrap();
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("the stream should end once the session is revoked");
+        assert!(end.is_none());
     }
 
     // Issue #194: PATCH bodies that need to distinguish "field omitted" from
@@ -6444,6 +7034,277 @@ mod tests {
         // at router build time on a route conflict, so building it is the test.
         #[tokio::test]
         async fn router_builds_with_the_new_route() {
+            let f = fixture().await;
+            let _router = build_router(Arc::clone(&f.state));
+        }
+    }
+
+    // Issue #362: the audit archive endpoints, against a real BbsHost and
+    // real archive files, so the gating and the file handling are the
+    // production paths.
+    mod audit_archive_tests {
+        use super::*;
+
+        struct Fixture {
+            state: Arc<AppState>,
+            archive_dir: tempfile::TempDir,
+            _live_db: tempfile::NamedTempFile,
+        }
+
+        async fn fixture() -> Fixture {
+            let live_db = tempfile::NamedTempFile::new().unwrap();
+            let db = bbs_core::Database::open(&live_db.path().to_string_lossy())
+                .await
+                .expect("open database");
+            let host: Arc<dyn Host> = Arc::new(bbs_core::BbsHost::new(db));
+            let state = Arc::new(AppState::new(host, WebConfig::default()));
+            let archive_dir = tempfile::tempdir().unwrap();
+            *state.audit_archive_dir.lock().unwrap() =
+                Some(archive_dir.path().to_string_lossy().into());
+            Fixture {
+                state,
+                archive_dir,
+                _live_db: live_db,
+            }
+        }
+
+        /// Put a real archive in place, the way the scheduler would.
+        async fn make_archive(f: &Fixture) -> String {
+            f.state
+                .host
+                .admin_write_audit("sysop", "ban", Some("bob"), None)
+                .await
+                .expect("write an audit entry");
+            f.state
+                .host
+                .admin_archive_audit_log(&f.archive_dir.path().to_string_lossy(), 2026, 9)
+                .await
+                .expect("archive")
+                .expect("something to archive")
+                .filename
+        }
+
+        #[tokio::test]
+        async fn listing_needs_a_sysop() {
+            let f = fixture().await;
+            for caller in [aide(), regular_user()] {
+                let name = caller.username.clone();
+                let resp =
+                    api_list_audit_archives(State(Arc::clone(&f.state)), Extension(caller)).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "{name} should not list audit archives"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_sysop_sees_the_archives() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let resp =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            let list = body.as_array().expect("an array of archives");
+            assert_eq!(list.len(), 1, "expected one archive: {body}");
+            assert_eq!(list[0]["filename"], name);
+        }
+
+        #[tokio::test]
+        async fn downloading_needs_a_sysop_and_serves_the_zip() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let denied = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(aide()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/zip"
+            );
+            let disposition = resp
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                disposition.contains(&name),
+                "the download should be named after the archive: {disposition}"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..2], b"PK", "the body should be a zip");
+        }
+
+        #[tokio::test]
+        async fn only_archives_can_be_downloaded() {
+            let f = fixture().await;
+            // A database backup sharing the directory, and traversals.
+            std::fs::write(f.archive_dir.path().join("backup_2026-09-01.zip"), b"x").unwrap();
+            for name in [
+                "backup_2026-09-01.zip",
+                "../../etc/passwd",
+                "audit-2026-09.zip/../secret",
+            ] {
+                let resp = api_download_audit_archive(
+                    State(Arc::clone(&f.state)),
+                    Extension(sysop()),
+                    Path(name.to_owned()),
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{name} should not be downloadable"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_missing_archive_is_a_404_not_a_500() {
+            let f = fixture().await;
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-1999-01.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn deleting_needs_a_sysop_and_records_itself() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let denied = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(aide()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            assert!(
+                f.archive_dir.path().join(&name).exists(),
+                "a refused delete must leave the archive alone"
+            );
+
+            let resp = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            assert!(!f.archive_dir.path().join(&name).exists());
+
+            // Removing a month of history is itself a privileged action.
+            let log = f.state.host.admin_audit_log(50, 0, None).await.unwrap();
+            assert!(
+                log.iter().any(|e| e.action == "delete_audit_archive"
+                    && e.target.as_deref() == Some(name.as_str())),
+                "the deletion should be in the audit log: {log:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn only_archives_can_be_deleted() {
+            let f = fixture().await;
+            let backup = f.archive_dir.path().join("backup_2026-09-01.zip");
+            std::fs::write(&backup, b"x").unwrap();
+
+            let resp = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("backup_2026-09-01.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(backup.exists(), "a database backup must survive this");
+        }
+
+        #[tokio::test]
+        async fn the_endpoints_say_so_when_no_directory_is_configured() {
+            let f = fixture().await;
+            *f.state.audit_archive_dir.lock().unwrap() = None;
+
+            let listed =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(listed.status(), StatusCode::BAD_REQUEST);
+
+            let downloaded = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(downloaded.status(), StatusCode::BAD_REQUEST);
+
+            let deleted = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(deleted.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// An archive is a regular file. A link wearing the name is not
+        /// served, even though the name itself is a valid archive name —
+        /// the writer opens with O_NOFOLLOW and reading has to match.
+        #[tokio::test]
+        async fn a_link_wearing_an_archive_name_is_not_served() {
+            let f = fixture().await;
+            let secret = f.archive_dir.path().join("secret.txt");
+            std::fs::write(&secret, b"not for serving").unwrap();
+            let link = f.archive_dir.path().join("audit-2026-09.zip");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "a symlink must not be served as an archive"
+            );
+
+            // Nor listed as one.
+            let listed =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            let body = body_json(listed).await;
+            assert_eq!(
+                body.as_array().map(Vec::len),
+                Some(0),
+                "a symlink must not be listed as an archive: {body}"
+            );
+        }
+
+        /// The archive routes sit beside `/audit-log`; axum panics at router
+        /// build time on a conflict, so building the router is the test.
+        #[tokio::test]
+        async fn router_builds_with_the_archive_routes() {
             let f = fixture().await;
             let _router = build_router(Arc::clone(&f.state));
         }

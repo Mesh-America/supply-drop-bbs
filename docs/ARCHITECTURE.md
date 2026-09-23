@@ -541,9 +541,18 @@ binary via `rust-embed`. Speaks a JSON API documented as OpenAPI.
 
 Sysop logs in with username + password. Session cookie is HttpOnly,
 Secure (operator must front with TLS or accept the warning),
-SameSite=Strict. Session tokens are 256-bit random; stored hashed
-in the DB so a stolen DB doesn't grant session takeover. Logout
-invalidates the server-side record.
+SameSite=Strict. Session tokens are random UUIDs held in memory in the
+web plugin, never written to the database, and gone on restart. Logout
+removes the record.
+
+Every request re-checks the account behind the session with the host
+(`Host::admin_account_level`) rather than trusting the level cached at
+login. An account that is gone, banned, suspended or below Aide loses all
+its web sessions on its next request; a level change applies at once. A
+live SSE stream re-checks its session every 15 seconds and ends when the
+check fails. If the account can't be read, the request is answered 503
+and the session kept, so a transient storage error neither serves a
+revoked session nor signs anyone out.
 
 CSRF tokens on every state-changing endpoint. Origin header check
 as a defense-in-depth layer.
