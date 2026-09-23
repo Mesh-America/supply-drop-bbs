@@ -59,7 +59,8 @@ pub trait RoomStore: Send + Sync {
     /// Return all rooms in linked-list walk order (head first).
     async fn list_in_order(&self) -> Result<Vec<Room>, StoreError>;
 
-    /// Return rooms whose `min_permission_level` is at most `min_permission`.
+    /// Return rooms whose `min_permission_level` is at most `min_permission`,
+    /// in the same linked-list walk order as [`RoomStore::list_in_order`].
     async fn list_readable(&self, min_permission: PermissionLevel)
         -> Result<Vec<Room>, StoreError>;
 
@@ -208,30 +209,19 @@ impl RoomStore for Database {
         &self,
         min_permission: PermissionLevel,
     ) -> Result<Vec<Room>, StoreError> {
+        // Filter the ordered walk rather than running a second, unordered
+        // query. Rooms are a linked list and that list is the room order the
+        // rest of the BBS means by "next room" — `G`'s traversal and `K`'s
+        // listing both rely on it. A bare `WHERE` returns rows in whatever
+        // order SQLite finds convenient, which happens to be rowid today and
+        // is guaranteed to be nothing at all. (#366)
         let level = min_permission as i64;
-        let rows = sqlx::query!(
-            r#"SELECT id AS "id!", name AS "name!", description, read_only AS "read_only!",
-                      min_permission_level AS "min_permission_level!",
-                      prev_neighbor, next_neighbor, created_at AS "created_at!"
-               FROM rooms WHERE min_permission_level <= ?"#,
-            level
-        )
-        .fetch_all(&self.read_pool)
-        .await?;
-        rows.into_iter()
-            .map(|r| {
-                map_room_row(
-                    r.id,
-                    r.name,
-                    r.description,
-                    r.read_only,
-                    r.min_permission_level,
-                    r.prev_neighbor,
-                    r.next_neighbor,
-                    r.created_at,
-                )
-            })
-            .collect()
+        Ok(self
+            .list_in_order()
+            .await?
+            .into_iter()
+            .filter(|r| (r.min_permission_level as i64) <= level)
+            .collect())
     }
 
     async fn create(

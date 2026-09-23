@@ -795,6 +795,28 @@ B -<username>
 
 Blocking is per-session-and-database — it persists across logins.
 
+### What unblocking does and doesn't bring back
+
+Unblocking someone doesn't resurface what they said while blocked. Reading
+moves your position in a room forward past hidden messages — it has to, or
+`N` would keep stopping on the same hidden ones — so by the time you unblock,
+your position is already past them.
+
+You aren't left guessing, though. Unblocking tells you how many of their
+messages went by and where to pick them up:
+
+```
+'bob' is no longer blocked. 2 earlier messages of theirs stayed hidden — F 143 to read from the oldest.
+```
+
+`F 143` reads from that message onward, so you can catch up if you want to.
+Nothing is deleted; it just doesn't come back to you unasked. Messages you
+read normally *before* blocking them aren't counted here — only what the
+block itself hid.
+
+Blocks placed before this was added can't report a count, because the BBS
+didn't record where those blocks started.
+
 ---
 
 ## 14. System administration

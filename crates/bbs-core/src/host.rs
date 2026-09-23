@@ -3654,8 +3654,15 @@ impl BbsHost {
                 // diverged from the real id whenever a permission-gated room
                 // was missing from this session's filtered list — the same
                 // number then meant a different room depending on whether it
-                // came from K's listing or from `C <number>`). Only ids K
-                // actually showed this session are accepted, same as before.
+                // came from K's listing or from `C <number>`).
+                //
+                // This is a fast path, not an authorization boundary: a
+                // number K didn't show falls through to the parser below,
+                // which sends anything unrecognised — a bare numeral
+                // included — to the same `handle_change_room`. That handler
+                // is where permission and guest checks actually happen, for
+                // this path and for `C <number>` alike. Don't read
+                // `room_ids` as a gate on which rooms are reachable.
                 if let Ok(n) = trimmed.parse::<i64>() {
                     let target_id = RoomId::new(n);
                     if room_ids.contains(&target_id) {
@@ -3665,8 +3672,13 @@ impl BbsHost {
                                 r.workflow = Workflow::None;
                             }
                         }
-                        self.set_current_room(session, target_id).await;
-                        return self.handle_change_to_room(session, target_id).await;
+                        // Hand off to the same handler `C <number>` uses, so
+                        // picking a room off the list can't diverge from
+                        // typing its number. It used to go somewhere that
+                        // turned guests away from the very room K had just
+                        // offered them, and it moved the session before
+                        // checking whether the move was allowed. (#368)
+                        return self.handle_change_room(session, trimmed).await;
                     }
                 }
                 // Anything else: re-parse the input through the canonical
@@ -5565,7 +5577,7 @@ impl BbsHost {
         target: Username,
         force: Option<bool>,
     ) -> Result<Response, HostError> {
-        let (caller, _, _, _) = match self.session_auth_user(session).await {
+        let (caller, caller_id, _, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -5609,19 +5621,11 @@ impl BbsHost {
                         "'{blocked}' is not currently blocked."
                     )));
                 }
-                self.db
-                    .unblock_user(blocker, blocked)
-                    .await
-                    .map_err(|e| HostError::Storage(format!("{e}")))?;
-                Ok(Response::Text(format!("'{blocked}' is no longer blocked.")))
+                self.unblock_and_report(caller_id, blocker, blocked).await
             }
             None => {
                 if currently {
-                    self.db
-                        .unblock_user(blocker, blocked)
-                        .await
-                        .map_err(|e| HostError::Storage(format!("{e}")))?;
-                    Ok(Response::Text(format!("'{blocked}' is no longer blocked.")))
+                    self.unblock_and_report(caller_id, blocker, blocked).await
                 } else {
                     self.db
                         .block_user(blocker, blocked)
@@ -5631,6 +5635,44 @@ impl BbsHost {
                 }
             }
         }
+    }
+
+    /// Lift a block and say what it hid.
+    ///
+    /// Messages sent while the block was up that reading has already carried
+    /// the read pointer past won't come back in `N` — the pointer moved over
+    /// them unseen so `N` wouldn't re-fetch the same hidden page forever.
+    /// Rather than resurface them (which would mean rewinding the pointer and
+    /// re-delivering everyone else's messages from that stretch too), say how
+    /// many there were and where to start reading. (#367)
+    async fn unblock_and_report(
+        &self,
+        blocker_id: UserId,
+        blocker: &str,
+        blocked: &str,
+    ) -> Result<Response, HostError> {
+        // Read before the block row goes away — it holds the start point.
+        let hidden = self
+            .db
+            .hidden_while_blocked(blocker_id.as_i64(), blocker, blocked)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        self.db
+            .unblock_user(blocker, blocked)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let mut msg = format!("'{blocked}' is no longer blocked.");
+        if let Some(h) = hidden {
+            let plural = if h.count == 1 { "message" } else { "messages" };
+            msg.push_str(&format!(
+                " {} earlier {plural} of theirs stayed hidden — F {} to read from the oldest.",
+                h.count,
+                h.oldest.as_i64()
+            ));
+        }
+        Ok(Response::Text(msg))
     }
 
     async fn handle_ban_user(
@@ -8635,6 +8677,174 @@ mod tests {
         );
     }
 
+    /// A guest sees their own room in the `K` list ("Guests [here]") and can
+    /// pick it by number, the same as `C Guests` by name already allowed.
+    /// This used to answer "pending validation by an aide" instead. (#368)
+    #[tokio::test]
+    async fn guest_can_select_their_own_room_by_number() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        let guest_rid = host.guest_room_id().expect("guest room configured");
+
+        // `K` first: the numeric selection arrives as a workflow reply, which
+        // is the path that was broken — `C <number>` goes elsewhere and was
+        // always fine.
+        host.process_command(s2, Command::ListRooms).await.unwrap();
+        let r = host
+            .process_command(
+                s2,
+                Command::WorkflowReply {
+                    reply: guest_rid.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Text(ref t) if t.contains("Now in: Guests")),
+            "guest should enter their own room by number, got: {r:?}"
+        );
+    }
+
+    /// The ordinary case the guest fix routes through: a validated user
+    /// picking a room off the K list still lands in it, with the same
+    /// message as before the handoff changed.
+    #[tokio::test]
+    async fn validated_user_can_still_select_a_room_by_number() {
+        let (host, _db) = make_host().await;
+
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("sysop").unwrap(), "pass1234").await;
+
+        let custom = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        host.process_command(sid, Command::ListRooms).await.unwrap();
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: custom.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Text(ref t) if t.contains("Now in: Custom Room")),
+            "a validated user should enter the room they picked, got: {r:?}"
+        );
+
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&sid].current_room, custom,
+            "the session should actually be in the room it reported"
+        );
+    }
+
+    /// A refused selection must leave the session where it was. The old path
+    /// called set_current_room before the permission check could say no, so
+    /// a denied pick still moved the reader. (#368)
+    ///
+    /// Reaching a refusal takes a race, because K only ever lists rooms the
+    /// reader may already enter: list the room, raise its level, then pick
+    /// it. That's the window the pre-move bug lived in.
+    #[tokio::test]
+    async fn a_refused_room_selection_leaves_the_session_put() {
+        let (host, _db) = make_host().await;
+
+        let custom = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // First registrant is Sysop; make a plain User to do the picking.
+        let admin_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            admin_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let user_sid = host.create_session("test").await.unwrap();
+        let user_name = Username::new("alice").unwrap();
+        register_and_login(&host, user_sid, &user_name, "pass1234").await;
+        let user_id = UserStore::get_by_username(&host.db, &user_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            user_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let started_in = {
+            let sessions = host.sessions.read().await;
+            sessions[&user_sid].current_room
+        };
+
+        // K lists Custom Room, which alice may enter at this point.
+        host.process_command(user_sid, Command::ListRooms)
+            .await
+            .unwrap();
+
+        // It becomes Sysop-only before she picks it.
+        RoomStore::update(&host.db, custom, None, None, Some(PermissionLevel::Sysop))
+            .await
+            .unwrap();
+
+        let r = host
+            .process_command(
+                user_sid,
+                Command::WorkflowReply {
+                    reply: custom.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !matches!(r, Response::Text(ref t) if t.contains("Now in: Custom Room")),
+            "a User must not enter a room that just became Sysop-only, got: {r:?}"
+        );
+
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&user_sid].current_room, started_in,
+            "a refused pick must not move the session"
+        );
+    }
+
     /// guest_room configured: guest can post in the guest room.
     #[tokio::test]
     async fn guest_can_post_in_guest_room() {
@@ -10228,6 +10438,94 @@ mod tests {
         }
     }
 
+    /// `list_readable` has to follow the room linked list, not whatever order
+    /// SQLite hands back. Reorder a room to the head and it must come back
+    /// first — with a bare `WHERE` and no `ORDER BY` it stayed in rowid
+    /// order, and "next room" in `G`/`K` meant nothing in particular. (#366)
+    #[tokio::test]
+    async fn list_readable_follows_the_room_walk_order() {
+        let (host, _db) = make_host().await;
+
+        let late = RoomStore::create(
+            &host.db,
+            "Zulu",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // Freshly created rooms land at the tail, so this one starts last.
+        let before = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.last().map(|r| r.id),
+            Some(late),
+            "a new room should start at the tail of the walk order"
+        );
+
+        // Move it to the head; rowid order is unchanged by this.
+        RoomStore::reorder(&host.db, late, None).await.unwrap();
+
+        let after = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.first().map(|r| r.id),
+            Some(late),
+            "list_readable must reflect the reorder, not rowid order"
+        );
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "reordering must not add or drop rooms"
+        );
+    }
+
+    /// Permission filtering still applies on top of the walk order: a User
+    /// doesn't see the Aide/Sysop rooms a Sysop does, and what they do see
+    /// stays in the same relative order.
+    #[tokio::test]
+    async fn list_readable_filters_by_permission_while_keeping_order() {
+        let (host, _db) = make_host().await;
+
+        let as_sysop = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        let as_user = RoomStore::list_readable(&host.db, PermissionLevel::User)
+            .await
+            .unwrap();
+
+        assert!(
+            as_user.len() < as_sysop.len(),
+            "a User should see fewer rooms than a Sysop, got {} and {}",
+            as_user.len(),
+            as_sysop.len()
+        );
+        assert!(
+            as_user
+                .iter()
+                .all(|r| r.min_permission_level <= PermissionLevel::User),
+            "a User must not be shown a room above their level"
+        );
+
+        // The User's rooms appear in the same relative order as in the
+        // Sysop's full walk.
+        let sysop_ids: Vec<_> = as_sysop.iter().map(|r| r.id).collect();
+        let user_ids: Vec<_> = as_user.iter().map(|r| r.id).collect();
+        let filtered: Vec<_> = sysop_ids
+            .into_iter()
+            .filter(|id| user_ids.contains(id))
+            .collect();
+        assert_eq!(
+            user_ids, filtered,
+            "filtering must preserve the walk order, not reshuffle it"
+        );
+    }
+
     // ── Issue #187: K lists rooms by real id, not filtered-list position ──────
 
     /// A room's default `min_permission_level` (User) means every custom
@@ -11246,6 +11544,222 @@ mod tests {
             .read_to_string(&mut body)
             .unwrap();
         body
+    }
+
+    /// Reading past a blocked sender moves the read pointer over their
+    /// messages without showing them, so unblocking can't bring them back in
+    /// N. Unblocking now says how many there were and where to start. (#367)
+    #[tokio::test]
+    async fn unblocking_reports_what_the_block_hid() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice_name = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // Park alice in the Lobby with nothing new, and block bob there.
+        host.process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let first = host
+            .db
+            .post_to_room(lobby_id, &bob_name, "hidden one", Timestamp::now())
+            .await
+            .unwrap();
+        host.db
+            .post_to_room(lobby_id, &bob_name, "hidden two", Timestamp::now())
+            .await
+            .unwrap();
+
+        // N shows nothing (both are blocked) but carries the pointer past them.
+        let read = host
+            .process_command(alice_sid, Command::ReadNew)
+            .await
+            .unwrap();
+        assert!(
+            matches!(read, Response::Text(ref t) if t.contains("No new messages")),
+            "both messages are blocked, so N should show nothing: {read:?}"
+        );
+
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("no longer blocked"),
+            "should confirm the unblock, got: {text:?}"
+        );
+        assert!(
+            text.contains("2 earlier messages"),
+            "should report both hidden messages, got: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("F {}", first.as_i64())),
+            "should point at the oldest hidden message ({}), got: {text:?}",
+            first.as_i64()
+        );
+    }
+
+    /// Nothing was hidden, so the unblock says only that.
+    #[tokio::test]
+    async fn unblocking_stays_quiet_when_nothing_was_hidden() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            alice_sid,
+            &Username::new("alice").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Bob says nothing at all while blocked.
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp,
+            Response::Text("'bob' is no longer blocked.".into()),
+            "with nothing hidden the unblock should say nothing more"
+        );
+    }
+
+    /// A message sent before the block went up isn't something the block hid,
+    /// so it mustn't be counted — that's why the block records where it
+    /// started rather than just counting everything behind the pointer.
+    #[tokio::test]
+    async fn unblocking_ignores_messages_from_before_the_block() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice_name = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        host.process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        // Bob posts and alice reads it normally, before any block exists.
+        host.db
+            .post_to_room(lobby_id, &bob_name, "seen normally", Timestamp::now())
+            .await
+            .unwrap();
+        let read = host
+            .process_command(alice_sid, Command::ReadNew)
+            .await
+            .unwrap();
+        let read_text = match read {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            read_text.contains("seen normally"),
+            "alice should read bob's message before blocking him: {read_text:?}"
+        );
+
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp,
+            Response::Text("'bob' is no longer blocked.".into()),
+            "a message read before the block isn't something the block hid"
+        );
     }
 
     /// Neither the current room nor any other room has unread: G reports
