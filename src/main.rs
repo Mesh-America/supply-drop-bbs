@@ -3909,7 +3909,6 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod audit_archive_tests {
-    use super::*;
 
     #[test]
     fn the_current_month_is_what_the_catch_up_stops_before() {
