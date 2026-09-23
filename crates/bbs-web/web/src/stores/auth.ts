@@ -41,8 +41,13 @@ export const useAuthStore = defineStore('auth', {
       try {
         await api.post('/api/v1/auth/logout')
       } finally {
-        this.user = null
+        this.forget()
       }
+    },
+    /// The server already dropped the session (it expired, or the account
+    /// was banned, suspended, deleted or demoted): clear what's held here.
+    forget() {
+      this.user = null
     },
   },
 })

@@ -28,9 +28,9 @@ use async_trait::async_trait;
 use bbs_plugin_api::advert::AdvertBus;
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
-    AdminAccessPolicy, AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo,
-    AdminStats, AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient, PermissionCtx,
-    PermissionLevel, Response, Secret, SessionId, Username,
+    AdminAccessPolicy, AdminAuditArchive, AdminBackupRecord, AdminMessageRecord, AdminRoomSummary,
+    AdminSessionInfo, AdminStats, AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient,
+    PermissionCtx, PermissionLevel, Response, Secret, SessionId, Username,
 };
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -214,6 +214,25 @@ enum LoginSuspensionCheck {
     /// a timeout. Callers should reject with the same generic message a
     /// permanent ban already got before this feature existed.
     PermanentlyBanned,
+}
+
+/// The tail of every forced-logout message.
+const LOGGED_OUT: &str = "You have been logged out.";
+
+/// An account that may not hold a session: the reason recorded on the
+/// [`DomainEvent::SessionEnded`] and the text shown to the user.
+struct Barred {
+    reason: &'static str,
+    text: String,
+}
+
+impl Barred {
+    fn gone() -> Self {
+        Barred {
+            reason: "user deleted",
+            text: format!("Your account no longer exists. {LOGGED_OUT}"),
+        }
+    }
 }
 
 /// Whole days left in a suspension ending at `until`, as seen at `now`, rounded
@@ -501,6 +520,13 @@ impl Host for BbsHost {
         cmd: Command,
     ) -> Result<Response, HostError> {
         debug!(%session, ?cmd, "processing command");
+
+        // A ban, suspension or deletion made outside this process can't reach
+        // into the session map, so the account is checked before every command
+        // rather than trusting that it was fine when the user logged in.
+        if let Some(response) = self.log_out_if_account_barred(session).await? {
+            return Ok(response);
+        }
 
         // Emit a CommandExecuted event for every non-WorkflowReply command so
         // the web admin log view shows live BBS activity.
@@ -1155,18 +1181,10 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("user {username:?}")))?;
 
-        if !user.is_active() {
-            return Err(HostError::PermissionDenied {
-                required: PermissionLevel::Aide,
-            });
-        }
-
-        if user.permission_level < PermissionLevel::Aide {
-            return Err(HostError::PermissionDenied {
-                required: PermissionLevel::Aide,
-            });
-        }
-
+        // Password first, as at the BBS login prompt: the standing check
+        // below can lift an elapsed suspension, and nothing about an account
+        // should change, or be hinted at, for a caller who doesn't know its
+        // password. See resolve_suspension's doc comment.
         let ok = self
             .db
             .credentials()
@@ -1180,7 +1198,57 @@ impl Host for BbsHost {
             });
         }
 
+        // The same standing rule as the per-request re-check in the web admin
+        // (`admin_account_level`): an elapsed suspension is lifted here too,
+        // so the two can't disagree about the same account.
+        let user = match user.status {
+            UserStatus::Active => user,
+            UserStatus::Banned => match self.resolve_suspension(user).await? {
+                LoginSuspensionCheck::Allowed(u) => u,
+                _ => {
+                    return Err(HostError::PermissionDenied {
+                        required: PermissionLevel::Aide,
+                    })
+                }
+            },
+            _ => {
+                return Err(HostError::PermissionDenied {
+                    required: PermissionLevel::Aide,
+                })
+            }
+        };
+
+        if user.permission_level < PermissionLevel::Aide {
+            return Err(HostError::PermissionDenied {
+                required: PermissionLevel::Aide,
+            });
+        }
+
         Ok(user.permission_level)
+    }
+
+    async fn admin_account_level(
+        &self,
+        username: &str,
+    ) -> Result<Option<PermissionLevel>, HostError> {
+        let Ok(uname) = Username::new(username) else {
+            return Ok(None);
+        };
+        let Some(user) = UserStore::get_by_username(&self.db, &uname)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(match user.status {
+            UserStatus::Active => Some(user.permission_level),
+            UserStatus::Banned => match self.resolve_suspension(user).await? {
+                LoginSuspensionCheck::Allowed(u) => Some(u.permission_level),
+                LoginSuspensionCheck::Suspended { .. }
+                | LoginSuspensionCheck::PermanentlyBanned => None,
+            },
+            _ => None,
+        })
     }
 
     async fn admin_list_sessions(&self) -> Result<Vec<AdminSessionInfo>, HostError> {
@@ -1640,6 +1708,286 @@ impl Host for BbsHost {
 
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
         crate::db::Database::admin_delete_backup(backup_dir, filename)
+            .await
+            .map_err(|e| match e {
+                crate::db::StoreError::NotFound => HostError::NotFound(filename.to_owned()),
+                e => HostError::Storage(format!("{e}")),
+            })
+    }
+
+    async fn admin_archive_audit_log(
+        &self,
+        archive_dir: &str,
+        year: i32,
+        month: u32,
+    ) -> Result<Option<AdminAuditArchive>, HostError> {
+        use crate::audit_archive::{archive_name, entry_name, header, ArchiveWriter};
+
+        let storage = |e: crate::db::StoreError| HostError::Storage(format!("{e}"));
+
+        // An archive holds the month it is named for, and nothing else, so
+        // this works on a half-open date range. A run on the first of the
+        // month doesn't sweep that morning's entries in under last month's
+        // name, and a month is archived correctly whether or not the caller
+        // happens to be working forward from the oldest one — bounding by id
+        // alone would quietly fold every older entry into whichever month
+        // was asked for first.
+        //
+        // `created_at` is stored as `YYYY-MM-DDTHH:MM:SSZ` by the column's
+        // own default, fixed width and UTC, so these string comparisons are
+        // date comparisons.
+        if !(1..=12).contains(&month) {
+            return Err(HostError::PreconditionFailed(format!(
+                "{month} is not a month"
+            )));
+        }
+        let (next_year, next_month) = if month == 12 {
+            (year + 1, 1)
+        } else {
+            (year, month + 1)
+        };
+        let month_start = format!("{year:04}-{month:02}-01T00:00:00Z");
+        let month_end = format!("{next_year:04}-{next_month:02}-01T00:00:00Z");
+
+        // The id ceiling holds the upper edge still: anything written from
+        // here on gets a higher id, stays in the live log, and is neither
+        // archived twice nor dropped when the archived range is cleared.
+        let Some(through) = self
+            .db
+            .audit_max_id_before(&month_end)
+            .await
+            .map_err(storage)?
+        else {
+            return Ok(None); // Nothing from that month or earlier.
+        };
+        let count = self
+            .db
+            .audit_count_in_range(through, &month_start, &month_end)
+            .await
+            .map_err(storage)?;
+        if count == 0 {
+            return Ok(None); // Nothing from this month in particular.
+        }
+
+        tokio::fs::create_dir_all(archive_dir)
+            .await
+            .map_err(|e| HostError::Storage(format!("audit archive directory: {e}")))?;
+
+        let target = std::path::Path::new(archive_dir).join(archive_name(year, month));
+        if tokio::fs::try_exists(&target).await.unwrap_or(false) {
+            // The archive is renamed into place before the entries it took
+            // are cleared, so an existing archive with those entries still
+            // live means a previous run died in that gap. Finish its clear —
+            // bounded by the range the archive itself records, so only
+            // entries demonstrably inside it are removed — rather than
+            // leaving them to be swept into next month's archive under the
+            // wrong name.
+            let path = target.clone();
+            let expected = entry_name(year, month);
+            // A file that can't be opened, isn't a zip, or won't produce a
+            // range is all the same answer here: it can't tell us what it
+            // holds. Only a file that does is allowed to bound a delete.
+            let archived = tokio::task::spawn_blocking(move || {
+                crate::audit_archive::archived_through(&path, &expected)
+            })
+            .await
+            .map_err(|e| HostError::Internal(format!("{e}")))?
+            .unwrap_or(None);
+
+            match archived {
+                Some(archived_through) => {
+                    let stranded = self
+                        .db
+                        .audit_count_through(archived_through)
+                        .await
+                        .map_err(storage)?;
+                    if stranded > 0 {
+                        let removed = self
+                            .db
+                            .audit_delete_through(archived_through)
+                            .await
+                            .map_err(storage)?;
+                        tracing::warn!(
+                            "audit archive {}: finished an interrupted clear, removing \
+                             {removed} entries already held in it",
+                            archive_name(year, month)
+                        );
+                    }
+                    return Ok(None);
+                }
+                None => {
+                    // A file is sitting at the name but won't say what it
+                    // holds, so it can't be used to finish a clear. Refusing
+                    // would refuse again every hour and that month would
+                    // never archive, its entries growing in the live log for
+                    // good, behind nothing but a warning. Move the file aside
+                    // and archive afresh: it is never deleted, so whatever it
+                    // held is still there to look at, and the month stops
+                    // being stuck.
+                    //
+                    // The new name is deliberately not one a listing will
+                    // show or the delete endpoint will accept — it isn't a
+                    // valid archive, and shouldn't pose as one.
+                    let aside = std::path::Path::new(archive_dir).join(format!(
+                        "{}.unreadable-{}",
+                        archive_name(year, month),
+                        Timestamp::now().as_offset_datetime().unix_timestamp()
+                    ));
+                    tokio::fs::rename(&target, &aside).await.map_err(|e| {
+                        HostError::Storage(format!(
+                            "an audit archive for {year:04}-{month:02} exists but won't say \
+                             what it holds, and could not be moved aside: {e}"
+                        ))
+                    })?;
+                    tracing::warn!(
+                        "audit archive {}: the existing file could not be read, so it has \
+                         been moved to {} and the month archived afresh",
+                        archive_name(year, month),
+                        aside.display()
+                    );
+                }
+            }
+        }
+
+        // Read the first id for the header, then stream the rest in batches —
+        // a log left to grow for months shouldn't need to fit in memory.
+        const BATCH: u32 = 500;
+        let first_id = self
+            .db
+            .audit_page_in_range(0, through, &month_start, &month_end, 1)
+            .await
+            .map_err(storage)?
+            .first()
+            .map_or(through, |e| e.id);
+        let taken_at = Timestamp::now().to_rfc3339();
+
+        let mut writer = ArchiveWriter::create(
+            &target,
+            &entry_name(year, month),
+            &header(count, first_id, through, &taken_at),
+        )
+        .map_err(|e| HostError::Storage(format!("write audit archive: {e}")))?;
+
+        let mut after = 0i64;
+        loop {
+            let batch = match self
+                .db
+                .audit_page_in_range(after, through, &month_start, &month_end, BATCH)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    writer.abandon();
+                    return Err(storage(e));
+                }
+            };
+            if batch.is_empty() {
+                break;
+            }
+            after = batch.last().map_or(after, |e| e.id);
+            if let Err(e) = writer.write_batch(&batch) {
+                writer.abandon();
+                return Err(HostError::Storage(format!("write audit archive: {e}")));
+            }
+        }
+
+        let written = writer.entries_written();
+        let size_bytes = writer
+            .finish()
+            .map_err(|e| HostError::Storage(format!("finish audit archive: {e}")))?;
+
+        // Only now that the archive is complete and in place: clear what it
+        // holds — the same range it was written from, nothing wider. A
+        // failure above leaves the live log whole.
+        let removed = self
+            .db
+            .audit_delete_in_range(through, &month_start, &month_end)
+            .await
+            .map_err(storage)?;
+        if removed != written {
+            tracing::warn!(
+                "audit archive {}: archived {written} entries but cleared {removed}",
+                archive_name(year, month)
+            );
+        }
+
+        // Record the archiving itself, in the now-fresh log.
+        let detail = format!("{written} entries, ids {first_id}-{through}");
+        if let Err(e) = self
+            .db
+            .audit_write(
+                "system",
+                "archive_audit_log",
+                Some(&archive_name(year, month)),
+                Some(&detail),
+            )
+            .await
+        {
+            tracing::warn!("could not record the audit archive in the audit log: {e}");
+        }
+
+        Ok(Some(AdminAuditArchive {
+            filename: archive_name(year, month),
+            size_bytes,
+            created_at: taken_at,
+            entry_count: Some(written),
+        }))
+    }
+
+    async fn admin_archive_due_audit_months(
+        &self,
+        archive_dir: &str,
+        before_year: i32,
+        before_month: u32,
+    ) -> Result<Vec<AdminAuditArchive>, HostError> {
+        let storage = |e: crate::db::StoreError| HostError::Storage(format!("{e}"));
+
+        let Some((mut year, mut month)) = self.db.audit_oldest_month().await.map_err(storage)?
+        else {
+            return Ok(Vec::new()); // Empty log, or a timestamp we can't place.
+        };
+
+        let mut written = Vec::new();
+        // Walk forward a month at a time, stopping at the month in progress.
+        // Bounded by construction: each step advances the month, and the loop
+        // only runs while it is behind `before_*`.
+        while (year, month) < (before_year, before_month) {
+            match self.admin_archive_audit_log(archive_dir, year, month).await {
+                Ok(Some(rec)) => written.push(rec),
+                // Nothing from that month — the log can have gaps.
+                Ok(None) => {}
+                // One month failing shouldn't stop the others: a single
+                // unreadable archive would otherwise wedge the catch-up and
+                // leave the log growing for good.
+                Err(e) => tracing::warn!(
+                    "audit archive for {year:04}-{month:02} failed, carrying on: {e}"
+                ),
+            }
+            if month == 12 {
+                year += 1;
+                month = 1;
+            } else {
+                month += 1;
+            }
+        }
+        Ok(written)
+    }
+
+    async fn admin_list_audit_archives(
+        &self,
+        archive_dir: &str,
+    ) -> Result<Vec<AdminAuditArchive>, HostError> {
+        crate::db::Database::admin_list_audit_archives(archive_dir)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_delete_audit_archive(
+        &self,
+        archive_dir: &str,
+        filename: &str,
+    ) -> Result<(), HostError> {
+        crate::db::Database::admin_delete_audit_archive(archive_dir, filename)
             .await
             .map_err(|e| match e {
                 crate::db::StoreError::NotFound => HostError::NotFound(filename.to_owned()),
@@ -3374,8 +3722,15 @@ impl BbsHost {
                 // diverged from the real id whenever a permission-gated room
                 // was missing from this session's filtered list — the same
                 // number then meant a different room depending on whether it
-                // came from K's listing or from `C <number>`). Only ids K
-                // actually showed this session are accepted, same as before.
+                // came from K's listing or from `C <number>`).
+                //
+                // This is a fast path, not an authorization boundary: a
+                // number K didn't show falls through to the parser below,
+                // which sends anything unrecognised — a bare numeral
+                // included — to the same `handle_change_room`. That handler
+                // is where permission and guest checks actually happen, for
+                // this path and for `C <number>` alike. Don't read
+                // `room_ids` as a gate on which rooms are reachable.
                 if let Ok(n) = trimmed.parse::<i64>() {
                     let target_id = RoomId::new(n);
                     if room_ids.contains(&target_id) {
@@ -3385,8 +3740,13 @@ impl BbsHost {
                                 r.workflow = Workflow::None;
                             }
                         }
-                        self.set_current_room(session, target_id).await;
-                        return self.handle_change_to_room(session, target_id).await;
+                        // Hand off to the same handler `C <number>` uses, so
+                        // picking a room off the list can't diverge from
+                        // typing its number. It used to go somewhere that
+                        // turned guests away from the very room K had just
+                        // offered them, and it moved the session before
+                        // checking whether the move was allowed. (#368)
+                        return self.handle_change_room(session, trimmed).await;
                     }
                 }
                 // Anything else: re-parse the input through the canonical
@@ -3474,6 +3834,138 @@ impl BbsHost {
 // ── Room navigation helpers ───────────────────────────────────────────────────
 
 impl BbsHost {
+    /// Check whether the account behind `session` may still be logged in, and
+    /// if not, log the account out everywhere and return what to tell the
+    /// user. Returns `None` for a session that isn't logged in or whose
+    /// account is in good standing.
+    ///
+    /// The in-process `BAN`, `TIMEOUT` and `.DU` commands and the web admin
+    /// end a user's sessions when they act (#127). `supply-drop-bbs user ban`,
+    /// `user timeout` and a direct edit of the database run in another process
+    /// and can't, so without this a banned user carried on until they logged
+    /// out (#377, #381). This catches up on the account's next command.
+    ///
+    /// Banning keeps the account's permission level (see [`crate::user`]), so
+    /// the level re-read in [`Self::session_auth_user`] can't notice a ban;
+    /// this reads the status. It is a second read of the same row per command;
+    /// the two are kept apart because this one runs before any command and
+    /// the other only for commands that need a validated user.
+    ///
+    /// The session that sent the command is logged out in place rather than
+    /// removed: transports map a node to a session id and only drop that
+    /// mapping on [`Response::LoggedOut`], so a removed session would leave the
+    /// node sending commands into a dead id until it typed `LOGIN`. Keeping
+    /// the id and clearing the login gives the user the same footing as a
+    /// fresh, unauthenticated session. The account's other sessions, which
+    /// aren't mid-command, are removed exactly as the in-process commands do.
+    ///
+    /// A suspension that has run out is lifted here exactly as it is at login,
+    /// so a user whose timeout expires mid-session is not thrown out for it.
+    ///
+    /// Only a command triggers this. A session of a barred account that never
+    /// sends one keeps receiving whatever a transport pushes to it (new-user
+    /// notices for aides) until any session of that account sends a command,
+    /// which logs them all out. `permission_ctx`, which transports call on
+    /// every message, stays a plain map lookup for that reason.
+    ///
+    /// If the account can't be read, the session carries on: a storage error
+    /// is not a reason to lock every user out of the BBS.
+    async fn log_out_if_account_barred(
+        &self,
+        session: SessionId,
+    ) -> Result<Option<Response>, HostError> {
+        let user_id = {
+            let sessions = self.sessions.read().await;
+            match sessions.get(&session).and_then(|r| r.user_id) {
+                Some(id) => id,
+                None => return Ok(None),
+            }
+        };
+        let Some(barred) = self.account_barred(session, user_id).await? else {
+            return Ok(None);
+        };
+        self.log_out_account(user_id, Some(session), barred.reason)
+            .await;
+        Ok(Some(Response::Error(barred.text)))
+    }
+
+    /// Why an account may not hold a session, and what to tell it.
+    async fn account_barred(
+        &self,
+        session: SessionId,
+        user_id: UserId,
+    ) -> Result<Option<Barred>, HostError> {
+        let user = match UserStore::get_by_id(&self.db, user_id).await {
+            Ok(user) => user,
+            Err(e) => {
+                warn!(%session, "could not read the account behind a session, letting it carry on: {e}");
+                return Ok(None);
+            }
+        };
+        Ok(match user {
+            None => Some(Barred::gone()),
+            Some(u) => match u.status {
+                UserStatus::Active => None,
+                UserStatus::Banned => match self.resolve_suspension(u).await? {
+                    LoginSuspensionCheck::Allowed(_) => None,
+                    LoginSuspensionCheck::Suspended { days_remaining } => Some(Barred {
+                        reason: "user suspended",
+                        text: format!(
+                            "Your account has been suspended for {days_remaining} more day(s). {LOGGED_OUT}"
+                        ),
+                    }),
+                    LoginSuspensionCheck::PermanentlyBanned => Some(Barred {
+                        reason: "user banned",
+                        text: format!("Your account has been banned. {LOGGED_OUT}"),
+                    }),
+                },
+                // Deleted, and any status added later: refuse unless the
+                // account is known to be allowed in.
+                _ => Some(Barred::gone()),
+            },
+        })
+    }
+
+    /// Log `user_id` out of every session it holds. `keep` is logged out in
+    /// place (see [`Self::log_out_if_account_barred`] for why); every other
+    /// session of the account is removed and reported as ended for `reason`,
+    /// the same as the in-process ban.
+    async fn log_out_account(&self, user_id: UserId, keep: Option<SessionId>, reason: &str) {
+        let removed: Vec<SessionId> = {
+            let mut sessions = self.sessions.write().await;
+            let ids: Vec<SessionId> = sessions
+                .iter()
+                .filter(|(id, r)| r.user_id == Some(user_id) && Some(**id) != keep)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &ids {
+                sessions.remove(id);
+            }
+            if let Some(r) = keep.and_then(|k| sessions.get_mut(&k)) {
+                // Only if it still belongs to this account: an in-process
+                // eviction may have removed it meanwhile, and a removed id
+                // is never reused.
+                if r.user_id == Some(user_id) {
+                    r.username = None;
+                    r.user_id = None;
+                    r.level = PermissionLevel::Unvalidated;
+                    r.workflow = Workflow::None;
+                    r.current_room = LOBBY_ROOM_ID;
+                    r.current_message_id = None;
+                    r.last_post_confirmation = None;
+                }
+            }
+            ids
+        };
+        for id in removed {
+            let _ = self.events_tx.send(DomainEvent::SessionEnded {
+                session: id,
+                reason: reason.into(),
+            });
+        }
+        info!(%user_id, reason, "logged an account out of its sessions");
+    }
+
     /// Extract (username, user_id, level, current_room) from a live session,
     /// returning an auth error response if the session isn't logged in.
     async fn session_auth(
@@ -3496,9 +3988,16 @@ impl BbsHost {
     /// Like `session_auth` but also requires `PermissionLevel::User` or above.
     /// Unvalidated accounts get a pending-validation message.
     ///
-    /// When the cached level is Unvalidated, the DB is re-read once to catch
-    /// out-of-process promotions (e.g. `supply-drop-bbs user promote`) without
-    /// requiring the user to log out and back in.
+    /// The account's level is re-read on every call, so a change made outside
+    /// this process — `supply-drop-bbs user promote` or `demote`, a direct
+    /// edit of the database — takes effect on the next command in either
+    /// direction, without the user logging out and back in. The level on the
+    /// session is a cache, corrected here when it disagrees.
+    ///
+    /// This does not consult the account's `status`. A ban, suspension or
+    /// deletion is handled before any command runs, by
+    /// [`Self::log_out_if_account_barred`]. Neither reaches the web admin API,
+    /// which keeps its own session cache (#380).
     ///
     /// When `access_policy.require_verify` is `false`, Unvalidated sessions
     /// are promoted to `User` in-memory so they pass this check without a
@@ -3507,28 +4006,49 @@ impl BbsHost {
         &self,
         session: SessionId,
     ) -> Result<(Username, UserId, PermissionLevel, RoomId), Response> {
-        let (username, user_id, level, room_id) = self.session_auth(session).await?;
+        let (username, user_id, cached, room_id) = self.session_auth(session).await?;
+
+        // The level held on the session is a cache of the account's. A change
+        // made outside this process — `supply-drop-bbs user demote`, a direct
+        // edit of the database — cannot reach into this process's session map,
+        // so the account is read back on every command.
+        //
+        // This used to happen only when the cached level was Unvalidated,
+        // which caught promotions and nothing else: a demoted user kept the
+        // level they logged in with, and with it access to rooms and commands
+        // they had just lost, until they happened to log out. The in-BBS
+        // `.USER`/`.AIDE` path is fine because it evicts the user's sessions
+        // (#127), but a separate process has no way to do that. (#373)
+        //
+        // It costs one lookup by primary key per command, against commands
+        // that arrive at radio speed. `log_out_if_account_barred` reads the
+        // same row just before, for the status; see its doc comment.
+        let level = match UserStore::get_by_id(&self.db, user_id).await {
+            Ok(Some(u)) => u.permission_level,
+            // The row is gone. `log_out_if_account_barred` logs such a session
+            // out before the command gets here, so this is only reachable if
+            // the row vanished in between; the next command catches it.
+            Ok(None) => cached,
+            // A storage error is not a reason to lock every session out of the
+            // BBS, so carry on with the cached level and say why in the log.
+            Err(e) => {
+                tracing::warn!(
+                    "could not re-read the account behind a session, \
+                     continuing on its cached permission level: {e}"
+                );
+                cached
+            }
+        };
+
+        if level != cached {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.level = level;
+            }
+        }
 
         if level >= PermissionLevel::User {
             return Ok((username, user_id, level, room_id));
-        }
-
-        // Level is Unvalidated — re-read from DB in case an out-of-process
-        // tool (CLI, direct DB edit) promoted this user since they logged in.
-        let fresh_level = UserStore::get_by_id(&self.db, user_id)
-            .await
-            .ok()
-            .flatten()
-            .map(|u| u.permission_level)
-            .unwrap_or(level);
-
-        if fresh_level >= PermissionLevel::User {
-            // Refresh the in-memory session so subsequent commands don't DB-check again.
-            let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.level = fresh_level;
-            }
-            return Ok((username, user_id, fresh_level, room_id));
         }
 
         // If require_verify is disabled, treat Unvalidated as User-level.
@@ -3653,14 +4173,7 @@ impl BbsHost {
 
         let mut lines = Vec::new();
         for room in &rooms {
-            let unread = if room.id == MAIL_ROOM_ID {
-                self.db
-                    .unread_direct_count(&username, user_id, room.id)
-                    .await
-            } else {
-                self.db.unread_count(user_id, room.id).await
-            }
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+            let unread = self.unread_in(&username, user_id, room.id).await?;
             let marker = if unread > 0 { "*" } else { " " };
             let here = if room.id == current_room {
                 " [here]"
@@ -3726,6 +4239,24 @@ impl BbsHost {
         })
     }
 
+    /// How many messages in `room_id` this reader hasn't read yet. Mail counts
+    /// only the DMs involving them, every other room counts the whole room.
+    async fn unread_in(
+        &self,
+        username: &Username,
+        user_id: UserId,
+        room_id: RoomId,
+    ) -> Result<u64, HostError> {
+        if room_id == MAIL_ROOM_ID {
+            self.db
+                .unread_direct_count(username, user_id, room_id)
+                .await
+        } else {
+            self.db.unread_count(user_id, room_id).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
     async fn handle_go_next_unread(&self, session: SessionId) -> Result<Response, HostError> {
         let (username, user_id, level, current_room) =
             match self.session_auth_or_guest(session).await {
@@ -3751,33 +4282,81 @@ impl BbsHost {
             }
         };
 
+        // If the room the reader is already in has unread messages, read
+        // those first — a companion session can easily be sitting in the
+        // very room a new message just landed in, and "no unread anywhere"
+        // would be a confusing answer when N, run in place, finds it right
+        // away. Only once the current room is caught up does G move on to
+        // hunt through the rest of the list.
+        //
+        // The room has to still be one this reader may read: raising a room's
+        // permission level doesn't evict whoever is sitting in it, and G
+        // shouldn't newly volunteer posts the reader has since lost access to.
+        // This guards G's own behavior only — `N` and `F` in that same room
+        // don't check `min_permission_level` at all, so it isn't a general
+        // access control and shouldn't be mistaken for one.
+        if let Some(room) = rooms.iter().find(|r| r.id == current_room) {
+            if self.unread_in(&username, user_id, current_room).await? > 0 {
+                if let Some(resp) = self.read_new_unless_empty(session, &room.name).await? {
+                    return Ok(resp);
+                }
+            }
+        }
+
         // Walk the room list starting just after the current room,
-        // wrapping around. Skip the current room if encountered during wrap.
+        // wrapping around. Skip the current room — already checked above.
         let start = rooms
             .iter()
             .position(|r| r.id == current_room)
             .map(|i| i + 1)
             .unwrap_or(0);
 
+        let mut moved = false;
         for room in rooms[start..].iter().chain(rooms[..start].iter()) {
             if room.id == current_room {
                 continue;
             }
-            let unread = if room.id == MAIL_ROOM_ID {
-                self.db
-                    .unread_direct_count(&username, user_id, room.id)
-                    .await
-            } else {
-                self.db.unread_count(user_id, room.id).await
-            }
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-            if unread > 0 {
+            if self.unread_in(&username, user_id, room.id).await? > 0 {
                 self.set_current_room(session, room.id).await;
-                return self.handle_read_new(session).await;
+                moved = true;
+                if let Some(resp) = self.read_new_unless_empty(session, &room.name).await? {
+                    return Ok(resp);
+                }
+                // Nothing the reader can actually see in there — the unread
+                // counts don't know about blocked senders — so keep looking
+                // rather than stopping here and reporting nothing, which is
+                // the very failure this handler exists to avoid.
             }
         }
 
+        // Nothing anywhere. Any room entered along the way had nothing to
+        // show, so put the reader back where they started instead of
+        // stranding them in the last one tried.
+        if moved {
+            self.set_current_room(session, current_room).await;
+        }
         Ok(Response::Text("No unread messages in any room.".into()))
+    }
+
+    /// Read a room's new messages, separating "showed the reader something"
+    /// from "there was nothing here after all".
+    ///
+    /// Returns `None` only for [`handle_read_new`]'s own "no new messages"
+    /// answer for `room_name`, which is what a room whose unread messages are
+    /// all from blocked senders produces. Everything else — including an
+    /// error, or an auth response from a session evicted mid-call — comes back
+    /// as `Some` to be surfaced, rather than being mistaken for an empty room
+    /// and silently swallowed.
+    async fn read_new_unless_empty(
+        &self,
+        session: SessionId,
+        room_name: &str,
+    ) -> Result<Option<Response>, HostError> {
+        let empty = format!("No new messages in {room_name}.");
+        Ok(match self.handle_read_new(session).await? {
+            Response::Text(t) if t == empty => None,
+            other => Some(other),
+        })
     }
 
     async fn handle_change_room(
@@ -3808,9 +4387,6 @@ impl BbsHost {
             Err(r) => return Ok(r),
         };
 
-        let is_guest = level < PermissionLevel::User;
-        let guest_rid = self.guest_room_id();
-
         // Try by name first; then by numeric ID.
         let room = if let Ok(id) = target.parse::<i64>() {
             RoomStore::get_by_id(&self.db, RoomId::new(id))
@@ -3828,6 +4404,57 @@ impl BbsHost {
             Some(r) => r,
         };
 
+        self.enter_room(session, &room, &username, user_id, level)
+            .await
+    }
+
+    async fn handle_change_to_room(
+        &self,
+        session: SessionId,
+        room_id: RoomId,
+    ) -> Result<Response, HostError> {
+        // `session_auth_or_guest`, so a guest asking for Mail is turned away
+        // by the room rule below with the same wording every other room path
+        // uses, rather than by the generic pending-validation message. (#372)
+        let (username, user_id, level, _) = match self.session_auth_or_guest(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+
+        let room = match RoomStore::get_by_id(&self.db, room_id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+        {
+            Some(r) => r,
+            // Was an Err(HostError::NotFound), which every transport renders
+            // through Display as "not found: room room:2" — an internal
+            // string, doubled, shown to a user. Say what the other paths say.
+            None => {
+                return Ok(Response::Error(format!(
+                    "Room '{}' not found.",
+                    room_id.as_i64()
+                )))
+            }
+        };
+
+        self.enter_room(session, &room, &username, user_id, level)
+            .await
+    }
+
+    /// Put `session` in `room` and report what's waiting there.
+    ///
+    /// The permission rule, the guest rule, and the wording of both the
+    /// refusals and the confirmation live here only. They used to be written
+    /// out separately in each room-entry handler, which is how `M` came to
+    /// answer a guest differently from `C` for the same reason. (#372)
+    async fn enter_room(
+        &self,
+        session: SessionId,
+        room: &crate::room::Room,
+        username: &Username,
+        user_id: UserId,
+        level: PermissionLevel,
+    ) -> Result<Response, HostError> {
         if level < room.min_permission_level {
             return Ok(Response::Error(format!(
                 "You don't have permission to enter '{}'.",
@@ -3836,61 +4463,14 @@ impl BbsHost {
         }
 
         // Guests may only navigate to the guest room.
-        if is_guest && Some(room.id) != guest_rid {
+        if level < PermissionLevel::User && Some(room.id) != self.guest_room_id() {
             return Ok(Response::Text(
                 "You must be verified to access that room.".into(),
             ));
         }
 
         self.set_current_room(session, room.id).await;
-        let unread = if room.id == MAIL_ROOM_ID {
-            self.db
-                .unread_direct_count(&username, user_id, room.id)
-                .await
-        } else {
-            self.db.unread_count(user_id, room.id).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?;
-
-        let msg = if unread > 0 {
-            format!("Now in: {} ({unread} new). Type N to read.", room.name)
-        } else {
-            format!("Now in: {} (no new messages).", room.name)
-        };
-        Ok(Response::Text(msg))
-    }
-
-    async fn handle_change_to_room(
-        &self,
-        session: SessionId,
-        room_id: RoomId,
-    ) -> Result<Response, HostError> {
-        let (username, user_id, level, _) = match self.session_auth_user(session).await {
-            Ok(t) => t,
-            Err(r) => return Ok(r),
-        };
-
-        let room = RoomStore::get_by_id(&self.db, room_id)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?
-            .ok_or_else(|| HostError::NotFound(format!("room {room_id}")))?;
-
-        if level < room.min_permission_level {
-            return Ok(Response::Error(format!(
-                "You don't have permission to enter '{}'.",
-                room.name
-            )));
-        }
-
-        self.set_current_room(session, room.id).await;
-        let unread = if room.id == MAIL_ROOM_ID {
-            self.db
-                .unread_direct_count(&username, user_id, room.id)
-                .await
-        } else {
-            self.db.unread_count(user_id, room.id).await
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let unread = self.unread_in(username, user_id, room.id).await?;
 
         let msg = if unread > 0 {
             format!("Now in: {} ({unread} new). Type N to read.", room.name)
@@ -5240,7 +5820,7 @@ impl BbsHost {
         target: Username,
         force: Option<bool>,
     ) -> Result<Response, HostError> {
-        let (caller, _, _, _) = match self.session_auth_user(session).await {
+        let (caller, caller_id, _, _) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -5284,19 +5864,11 @@ impl BbsHost {
                         "'{blocked}' is not currently blocked."
                     )));
                 }
-                self.db
-                    .unblock_user(blocker, blocked)
-                    .await
-                    .map_err(|e| HostError::Storage(format!("{e}")))?;
-                Ok(Response::Text(format!("'{blocked}' is no longer blocked.")))
+                self.unblock_and_report(caller_id, blocker, blocked).await
             }
             None => {
                 if currently {
-                    self.db
-                        .unblock_user(blocker, blocked)
-                        .await
-                        .map_err(|e| HostError::Storage(format!("{e}")))?;
-                    Ok(Response::Text(format!("'{blocked}' is no longer blocked.")))
+                    self.unblock_and_report(caller_id, blocker, blocked).await
                 } else {
                     self.db
                         .block_user(blocker, blocked)
@@ -5306,6 +5878,44 @@ impl BbsHost {
                 }
             }
         }
+    }
+
+    /// Lift a block and say what it hid.
+    ///
+    /// Messages sent while the block was up that reading has already carried
+    /// the read pointer past won't come back in `N` — the pointer moved over
+    /// them unseen so `N` wouldn't re-fetch the same hidden page forever.
+    /// Rather than resurface them (which would mean rewinding the pointer and
+    /// re-delivering everyone else's messages from that stretch too), say how
+    /// many there were and where to start reading. (#367)
+    async fn unblock_and_report(
+        &self,
+        blocker_id: UserId,
+        blocker: &str,
+        blocked: &str,
+    ) -> Result<Response, HostError> {
+        // Read before the block row goes away — it holds the start point.
+        let hidden = self
+            .db
+            .hidden_while_blocked(blocker_id.as_i64(), blocker, blocked)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        self.db
+            .unblock_user(blocker, blocked)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+
+        let mut msg = format!("'{blocked}' is no longer blocked.");
+        if let Some(h) = hidden {
+            let plural = if h.count == 1 { "message" } else { "messages" };
+            msg.push_str(&format!(
+                " {} earlier {plural} of theirs stayed hidden — F {} to read from the oldest.",
+                h.count,
+                h.oldest.as_i64()
+            ));
+        }
+        Ok(Response::Text(msg))
     }
 
     async fn handle_ban_user(
@@ -6181,7 +6791,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         ".ff" if logged_in => ".FF — fast-forward past unread\nResets your last-read pointer to the latest message.",
         "e" if logged_in => "E — enter a message\nE <text> to post without a prompt\nIn Mail: E @user message",
         "d" if logged_in => "D <id> — delete a message\nAides and sysops can delete any message.",
-        "g" if logged_in => "G — go to next room with unread messages",
+        "g" if logged_in => "G — read unread here, else go to the next room with unread",
         "c" if logged_in => "C <name> — change room by name or number",
         "k" if logged_in => "K — list known rooms",
         "m" if logged_in => {
@@ -6324,7 +6934,7 @@ Posting:\n\
 const HELP_NAVIGATION: &str = "\
 Navigation:\n\
  C    change room\n\
- G    next unread room\n\
+ G    unread here, else next room\n\
  K    list known rooms\n\
  M    go to Mail";
 
@@ -7600,6 +8210,392 @@ mod tests {
         );
     }
 
+    /// A demotion made outside this process has to reach a live session.
+    ///
+    /// `supply-drop-bbs user demote` writes to the database from another
+    /// process and cannot evict sessions the way the in-BBS `.USER` command
+    /// does, so the level is read back per command. Before that, the session
+    /// kept the level it logged in with and the aide-only commands that came
+    /// with it. (#373)
+    #[tokio::test]
+    async fn a_demotion_from_outside_the_process_takes_effect_at_once() {
+        let (host, _db) = make_host().await;
+
+        // First registrant is Sysop and stays logged in throughout.
+        let sysop_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sysop_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let aide_sid = host.create_session("test").await.unwrap();
+        let aide_name = Username::new("bob").unwrap();
+        register_and_login(&host, aide_sid, &aide_name, "pass1234").await;
+        let aide_id = UserStore::get_by_username(&host.db, &aide_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            aide_id,
+            None,
+            None,
+            Some(PermissionLevel::Aide),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // An aide can see the pending-user queue.
+        let allowed = host
+            .process_command(aide_sid, Command::ListPending)
+            .await
+            .unwrap();
+        assert!(
+            !matches!(allowed, Response::Error(_)),
+            "an aide should be allowed PENDING, got: {allowed:?}"
+        );
+
+        // Demote straight in the database, as a separate process would. The
+        // session map still says Aide.
+        UserStore::update(
+            &host.db,
+            aide_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let refused = host
+            .process_command(aide_sid, Command::ListPending)
+            .await
+            .unwrap();
+        assert!(
+            matches!(refused, Response::Error(ref e) if e.contains("Aide access required")),
+            "the demotion should take effect on the next command, got: {refused:?}"
+        );
+
+        // And the session's cached level was corrected, not just the answer.
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&aide_sid].level,
+            PermissionLevel::User,
+            "the session should hold the level the account now has"
+        );
+    }
+
+    /// Log in `name` as the second registrant (a User; the first registrant,
+    /// who becomes Sysop, stays logged in on its own session) and return the
+    /// session, the account id, and an event receiver past the logins.
+    async fn second_user_logged_in(
+        host: &BbsHost,
+        name: &str,
+    ) -> (SessionId, UserId, broadcast::Receiver<DomainEvent>) {
+        let sysop_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            host,
+            sysop_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+        let sid = host.create_session("test").await.unwrap();
+        let uname = Username::new(name).unwrap();
+        register_and_login(host, sid, &uname, "pass1234").await;
+        let id = UserStore::get_by_username(&host.db, &uname)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let rx = host.events_tx.subscribe();
+        (sid, id, rx)
+    }
+
+    /// The session still exists, so the transport's id stays good, but nobody
+    /// is logged in on it any more.
+    async fn logged_out_in_place(host: &BbsHost, sid: SessionId) -> bool {
+        let sessions = host.sessions.read().await;
+        match sessions.get(&sid) {
+            Some(r) => r.username.is_none() && r.user_id.is_none(),
+            None => false,
+        }
+    }
+
+    fn expect_session_ended(
+        rx: &mut broadcast::Receiver<DomainEvent>,
+        sid: SessionId,
+        reason: &str,
+    ) {
+        loop {
+            match rx.try_recv() {
+                Ok(DomainEvent::SessionEnded { session, reason: r }) => {
+                    assert_eq!(session, sid);
+                    assert_eq!(r, reason);
+                    return;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("expected SessionEnded({reason}), got {e:?}"),
+            }
+        }
+    }
+
+    const BANNED: &str = "Your account has been banned. You have been logged out.";
+    const GONE: &str = "Your account no longer exists. You have been logged out.";
+    const SUSPENDED_3: &str =
+        "Your account has been suspended for 3 more day(s). You have been logged out.";
+
+    /// A ban made outside this process ends the live session on its next
+    /// command, and the command does not run.
+    ///
+    /// Banning keeps the permission level, so the per-command level re-read
+    /// sees nothing to change; the status has to be read. The CLI used to
+    /// print "session ended" here while the session went on. (#377, #381)
+    #[tokio::test]
+    async fn a_ban_from_outside_the_process_ends_the_session() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "mallory").await;
+        let before = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert!(!matches!(before, Response::Error(_)), "got: {before:?}");
+
+        UserStore::update(&host.db, id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+
+        let resp = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert_eq!(resp, Response::Error(BANNED.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+
+        // The id is still good: the next command is refused as not logged in,
+        // not as an unknown session, and a login is refused as a ban.
+        let next = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert!(
+            matches!(&next, Response::Error(e) if e.starts_with("Not logged in")),
+            "got: {next:?}"
+        );
+    }
+
+    /// The same for a sysop, whose preserved level would otherwise keep every
+    /// sysop command open to them. This is the compromised-account case the
+    /// CLI ban exists for. (#381)
+    #[tokio::test]
+    async fn a_banned_sysop_loses_sysop_commands_at_once() {
+        let (host, _db) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let name = Username::new("root").unwrap();
+        register_and_login(&host, sid, &name, "pass1234").await;
+        let id = UserStore::get_by_username(&host.db, &name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let allowed = host
+            .process_command(sid, Command::ListPending)
+            .await
+            .unwrap();
+        assert!(!matches!(allowed, Response::Error(_)), "got: {allowed:?}");
+
+        UserStore::update(&host.db, id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(sid, Command::ListPending)
+            .await
+            .unwrap();
+        assert_eq!(resp, Response::Error(BANNED.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// A suspension made outside this process ends the session and says how
+    /// long is left.
+    #[tokio::test]
+    async fn a_suspension_from_outside_the_process_ends_the_session() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "mallory").await;
+
+        let until =
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() + time::Duration::hours(60));
+        UserStore::suspend(&host.db, id, until).await.unwrap();
+
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert_eq!(resp, Response::Error(SUSPENDED_3.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// A suspension that runs out while the user is logged in is lifted, as at
+    /// login, rather than throwing them out.
+    #[tokio::test]
+    async fn an_expired_suspension_is_lifted_not_enforced() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "carol").await;
+
+        let until =
+            Timestamp::from_utc(Timestamp::now().as_offset_datetime() - time::Duration::hours(1));
+        UserStore::suspend(&host.db, id, until).await.unwrap();
+
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            !matches!(resp, Response::Error(_)),
+            "an expired suspension should not refuse the command, got: {resp:?}"
+        );
+        assert!(!logged_out_in_place(&host, sid).await);
+        let user = UserStore::get_by_id(&host.db, id).await.unwrap().unwrap();
+        assert_eq!(
+            user.status,
+            UserStatus::Active,
+            "the suspension should be lifted"
+        );
+        assert_eq!(user.suspended_until, None);
+    }
+
+    /// A soft-deleted account ends the session.
+    #[tokio::test]
+    async fn a_deleted_account_ends_the_session() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "dave").await;
+        UserStore::update(&host.db, id, None, Some(UserStatus::Deleted), None, None)
+            .await
+            .unwrap();
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert_eq!(resp, Response::Error(GONE.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// An account row removed outright ends the session too, where the level
+    /// re-read used to carry on with the cached level.
+    #[tokio::test]
+    async fn a_removed_account_row_ends_the_session() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "erin").await;
+        UserStore::hard_delete(&host.db, id).await.unwrap();
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert_eq!(resp, Response::Error(GONE.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// The account's other sessions go too, the way the in-process ban sweeps
+    /// them, not just the one that sent the command.
+    #[tokio::test]
+    async fn a_ban_logs_the_account_out_of_its_other_sessions_too() {
+        let (host, _db) = make_host().await;
+        let (sid, id, mut rx) = second_user_logged_in(&host, "mallory").await;
+        let second = host.create_session("test").await.unwrap();
+        let ok = host
+            .process_command(
+                second,
+                Command::LoginOneShot {
+                    username: Username::new("mallory").unwrap(),
+                    password: "pass1234".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(ok, Response::LoggedIn { .. }), "got: {ok:?}");
+        while rx.try_recv().is_ok() {}
+
+        UserStore::update(&host.db, id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+        let resp = host.process_command(sid, Command::ReadNew).await.unwrap();
+        assert_eq!(resp, Response::Error(BANNED.into()));
+
+        assert!(logged_out_in_place(&host, sid).await);
+        assert!(
+            !host.sessions.read().await.contains_key(&second),
+            "the account's other session should be removed"
+        );
+        expect_session_ended(&mut rx, second, "user banned");
+    }
+
+    /// Only the barred account's sessions end. Another user's session, and a
+    /// session nobody has logged into, carry on.
+    #[tokio::test]
+    async fn barring_one_account_leaves_other_sessions_alone() {
+        let (host, _db) = make_host().await;
+        let (sid, id, _rx) = second_user_logged_in(&host, "mallory").await;
+        let other = host.create_session("test").await.unwrap();
+        register_and_login(&host, other, &Username::new("frank").unwrap(), "pass1234").await;
+        let anon = host.create_session("test").await.unwrap();
+
+        UserStore::update(&host.db, id, None, Some(UserStatus::Banned), None, None)
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(other, Command::ListRooms)
+            .await
+            .unwrap();
+        assert!(!matches!(resp, Response::Error(_)), "got: {resp:?}");
+        let resp = host
+            .process_command(anon, Command::Help { topic: None })
+            .await
+            .unwrap();
+        assert!(!matches!(resp, Response::Error(_)), "got: {resp:?}");
+        {
+            let sessions = host.sessions.read().await;
+            assert!(sessions.contains_key(&other));
+            assert!(sessions.contains_key(&anon));
+            assert!(
+                sessions.get(&sid).and_then(|r| r.user_id).is_some(),
+                "a barred session is logged out on its own next command, not someone else's"
+            );
+        }
+
+        // The barred session itself is refused on its own next command.
+        let resp = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert_eq!(resp, Response::Error(BANNED.into()));
+        assert!(logged_out_in_place(&host, sid).await);
+    }
+
+    /// The same read that catches a demotion still catches a promotion, which
+    /// is what it was originally there for.
+    #[tokio::test]
+    async fn a_promotion_from_outside_the_process_still_takes_effect() {
+        let (host, _db) = make_host().await;
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sysop_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        // A second account stays Unvalidated, so rooms are closed to it.
+        let sid = host.create_session("test").await.unwrap();
+        let name = Username::new("bob").unwrap();
+        register_and_login(&host, sid, &name, "pass1234").await;
+        let id = UserStore::get_by_username(&host.db, &name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let before = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(before, Response::Text(ref t) if t.contains("pending validation")),
+            "an unvalidated account should be held back, got: {before:?}"
+        );
+
+        UserStore::update(&host.db, id, None, None, Some(PermissionLevel::User), None)
+            .await
+            .unwrap();
+
+        let after = host.process_command(sid, Command::ListRooms).await.unwrap();
+        assert!(
+            matches!(after, Response::Prompt { .. }),
+            "the promotion should take effect on the next command, got: {after:?}"
+        );
+    }
+
     /// Issue #127: a sysop can promote/demote a validated user's level, with
     /// guards (validated-first, no self-change, sysop-only).
     #[tokio::test]
@@ -8280,6 +9276,105 @@ mod tests {
         }
     }
 
+    /// `M` for a room that has gone missing used to answer with a raw
+    /// internal string — `HostError::NotFound`'s Display wrapped around
+    /// `RoomId`'s, giving "not found: room room:2". Every other room path
+    /// says "Room 'N' not found." (#372)
+    #[tokio::test]
+    async fn a_missing_room_reads_the_same_on_every_path() {
+        let (host, _db) = make_host().await;
+
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("sysop").unwrap(), "pass1234").await;
+
+        // A room id that was never created.
+        let resp = host
+            .handle_change_to_room(sid, RoomId::new(4242))
+            .await
+            .expect("a missing room is an answer, not an error");
+        let text = match resp {
+            Response::Error(t) | Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(text, "Room '4242' not found.");
+        assert!(
+            !text.contains("not found: room"),
+            "the internal Display form must not reach the user: {text:?}"
+        );
+
+        // And `C 4242` says the same thing.
+        let via_c = host
+            .process_command(
+                sid,
+                Command::ChangeRoom {
+                    target: "4242".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let c_text = match via_c {
+            Response::Error(t) | Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(c_text, text, "both paths should word it the same way");
+    }
+
+    /// A guest sent `M` used to get the generic pending-validation message,
+    /// where every other room path tells them it's the room they can't reach.
+    /// Same reason, same wording now. (#372)
+    #[tokio::test]
+    async fn a_guest_is_refused_mail_the_same_way_as_any_other_room() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        let via_m = host.process_command(s2, Command::GoMail).await.unwrap();
+        let m_text = match via_m {
+            Response::Error(t) | Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        // Mail requires User, so this is the permission refusal rather than
+        // the guest-room one — either is fine, the point is that it's a
+        // refusal about the room and not the generic account message.
+        assert_eq!(m_text, "You don't have permission to enter 'Mail'.");
+        assert!(
+            !m_text.contains("pending validation"),
+            "M should refuse by room, not by account state: {m_text:?}"
+        );
+
+        // Naming the same room by hand says exactly the same thing.
+        let via_c = host
+            .process_command(
+                s2,
+                Command::ChangeRoom {
+                    target: "Mail".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let c_text = match via_c {
+            Response::Error(t) | Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(c_text, m_text, "both refusals should read the same");
+
+        // And the guest is still in their own room, not moved into Mail.
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&s2].current_room,
+            host.guest_room_id().expect("guest room configured"),
+            "a refused M must not move the guest"
+        );
+    }
+
     /// guest_room configured: guest cannot navigate to Lobby.
     #[tokio::test]
     async fn guest_cannot_change_to_non_guest_room() {
@@ -8307,6 +9402,174 @@ mod tests {
         assert!(
             matches!(r, Response::Text(ref t) if t.contains("verified")),
             "expected verification required message, got: {r:?}"
+        );
+    }
+
+    /// A guest sees their own room in the `K` list ("Guests [here]") and can
+    /// pick it by number, the same as `C Guests` by name already allowed.
+    /// This used to answer "pending validation by an aide" instead. (#368)
+    #[tokio::test]
+    async fn guest_can_select_their_own_room_by_number() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        let guest_rid = host.guest_room_id().expect("guest room configured");
+
+        // `K` first: the numeric selection arrives as a workflow reply, which
+        // is the path that was broken — `C <number>` goes elsewhere and was
+        // always fine.
+        host.process_command(s2, Command::ListRooms).await.unwrap();
+        let r = host
+            .process_command(
+                s2,
+                Command::WorkflowReply {
+                    reply: guest_rid.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Text(ref t) if t.contains("Now in: Guests")),
+            "guest should enter their own room by number, got: {r:?}"
+        );
+    }
+
+    /// The ordinary case the guest fix routes through: a validated user
+    /// picking a room off the K list still lands in it, with the same
+    /// message as before the handoff changed.
+    #[tokio::test]
+    async fn validated_user_can_still_select_a_room_by_number() {
+        let (host, _db) = make_host().await;
+
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("sysop").unwrap(), "pass1234").await;
+
+        let custom = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        host.process_command(sid, Command::ListRooms).await.unwrap();
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: custom.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Text(ref t) if t.contains("Now in: Custom Room")),
+            "a validated user should enter the room they picked, got: {r:?}"
+        );
+
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&sid].current_room, custom,
+            "the session should actually be in the room it reported"
+        );
+    }
+
+    /// A refused selection must leave the session where it was. The old path
+    /// called set_current_room before the permission check could say no, so
+    /// a denied pick still moved the reader. (#368)
+    ///
+    /// Reaching a refusal takes a race, because K only ever lists rooms the
+    /// reader may already enter: list the room, raise its level, then pick
+    /// it. That's the window the pre-move bug lived in.
+    #[tokio::test]
+    async fn a_refused_room_selection_leaves_the_session_put() {
+        let (host, _db) = make_host().await;
+
+        let custom = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // First registrant is Sysop; make a plain User to do the picking.
+        let admin_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            admin_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let user_sid = host.create_session("test").await.unwrap();
+        let user_name = Username::new("alice").unwrap();
+        register_and_login(&host, user_sid, &user_name, "pass1234").await;
+        let user_id = UserStore::get_by_username(&host.db, &user_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            user_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let started_in = {
+            let sessions = host.sessions.read().await;
+            sessions[&user_sid].current_room
+        };
+
+        // K lists Custom Room, which alice may enter at this point.
+        host.process_command(user_sid, Command::ListRooms)
+            .await
+            .unwrap();
+
+        // It becomes Sysop-only before she picks it.
+        RoomStore::update(&host.db, custom, None, None, Some(PermissionLevel::Sysop))
+            .await
+            .unwrap();
+
+        let r = host
+            .process_command(
+                user_sid,
+                Command::WorkflowReply {
+                    reply: custom.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !matches!(r, Response::Text(ref t) if t.contains("Now in: Custom Room")),
+            "a User must not enter a room that just became Sysop-only, got: {r:?}"
+        );
+
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&user_sid].current_room, started_in,
+            "a refused pick must not move the session"
         );
     }
 
@@ -9903,6 +11166,94 @@ mod tests {
         }
     }
 
+    /// `list_readable` has to follow the room linked list, not whatever order
+    /// SQLite hands back. Reorder a room to the head and it must come back
+    /// first — with a bare `WHERE` and no `ORDER BY` it stayed in rowid
+    /// order, and "next room" in `G`/`K` meant nothing in particular. (#366)
+    #[tokio::test]
+    async fn list_readable_follows_the_room_walk_order() {
+        let (host, _db) = make_host().await;
+
+        let late = RoomStore::create(
+            &host.db,
+            "Zulu",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // Freshly created rooms land at the tail, so this one starts last.
+        let before = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.last().map(|r| r.id),
+            Some(late),
+            "a new room should start at the tail of the walk order"
+        );
+
+        // Move it to the head; rowid order is unchanged by this.
+        RoomStore::reorder(&host.db, late, None).await.unwrap();
+
+        let after = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.first().map(|r| r.id),
+            Some(late),
+            "list_readable must reflect the reorder, not rowid order"
+        );
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "reordering must not add or drop rooms"
+        );
+    }
+
+    /// Permission filtering still applies on top of the walk order: a User
+    /// doesn't see the Aide/Sysop rooms a Sysop does, and what they do see
+    /// stays in the same relative order.
+    #[tokio::test]
+    async fn list_readable_filters_by_permission_while_keeping_order() {
+        let (host, _db) = make_host().await;
+
+        let as_sysop = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        let as_user = RoomStore::list_readable(&host.db, PermissionLevel::User)
+            .await
+            .unwrap();
+
+        assert!(
+            as_user.len() < as_sysop.len(),
+            "a User should see fewer rooms than a Sysop, got {} and {}",
+            as_user.len(),
+            as_sysop.len()
+        );
+        assert!(
+            as_user
+                .iter()
+                .all(|r| r.min_permission_level <= PermissionLevel::User),
+            "a User must not be shown a room above their level"
+        );
+
+        // The User's rooms appear in the same relative order as in the
+        // Sysop's full walk.
+        let sysop_ids: Vec<_> = as_sysop.iter().map(|r| r.id).collect();
+        let user_ids: Vec<_> = as_user.iter().map(|r| r.id).collect();
+        let filtered: Vec<_> = sysop_ids
+            .into_iter()
+            .filter(|id| user_ids.contains(id))
+            .collect();
+        assert_eq!(
+            user_ids, filtered,
+            "filtering must preserve the walk order, not reshuffle it"
+        );
+    }
+
     // ── Issue #187: K lists rooms by real id, not filtered-list position ──────
 
     /// A room's default `min_permission_level` (User) means every custom
@@ -9998,6 +11349,1329 @@ mod tests {
                 "current room must be BAYCO ARES, not whatever sat at position 3"
             );
         }
+    }
+
+    /// Reported bug: G ("next room with unread") returned "No unread messages
+    /// in any room." while N, run right after, found a new message straight
+    /// away. Root cause was that G skipped the reader's own current room
+    /// while hunting for unread — exactly the case where a companion
+    /// session's current room is the one that just got a new message. G now
+    /// checks the current room first, matching what N would show there,
+    /// before moving on to the rest of the room list.
+    #[tokio::test]
+    async fn go_next_unread_reads_the_current_room_first_if_it_has_unread() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        // Bob registers now (not later), so his "new user registered" notice
+        // to the sysop's Mail can be drained before the room under test gets
+        // its own message — otherwise this G would land on Mail instead of
+        // Custom Room, for reasons unrelated to what this test checks.
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+
+        // Sysop switches into the custom room and stays there.
+        host.process_command(
+            sysop_sid,
+            Command::ChangeRoom {
+                target: "Custom Room".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        host.db
+            .post_to_room(custom_id, &bob_name, "hi from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        // G should read the current room's new message directly, the same
+        // as N would, instead of hunting past it and finding nothing.
+        let g_resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let g_text = match g_resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            g_text.contains("hi from bob"),
+            "G should read the current room's own unread message, got: {g_text:?}"
+        );
+    }
+
+    /// With the current room caught up, G still falls through to search the
+    /// rest of the room list — the pre-existing "go find unread elsewhere"
+    /// behavior is unchanged.
+    #[tokio::test]
+    async fn go_next_unread_still_searches_other_rooms_once_current_is_caught_up() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // Drain the registration notice. That first G moves the sysop into
+        // Mail and reads it, so Mail — the room they're now sitting in — is
+        // the caught-up "current room" for the G under test.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+
+        host.db
+            .post_to_room(custom_id, &bob_name, "hi from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        let g_resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let g_text = match g_resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            g_text.contains("hi from bob"),
+            "G should still find unread in another room when the current one is caught up, got: {g_text:?}"
+        );
+    }
+
+    /// The current-room-first path counts Mail by the reader's own DMs, not
+    /// by the whole room — G run while sitting in Mail reads a new DM in
+    /// place rather than hunting past it.
+    #[tokio::test]
+    async fn go_next_unread_reads_mail_in_place_when_that_is_the_current_room() {
+        let (host, _db) = make_host().await;
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // First G moves the sysop into Mail and clears the registration notice.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+
+        // Bob DMs the sysop, landing a new message in the room they're in.
+        host.db
+            .post_direct(
+                &bob_name,
+                &sysop_name,
+                "psst, a direct message",
+                Timestamp::now(),
+            )
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("psst, a direct message"),
+            "G should read the new DM in Mail without moving, got: {text:?}"
+        );
+    }
+
+    /// If everything unread in the current room is from a blocked sender,
+    /// the room has nothing to show — G must not stop there. It carries on
+    /// and finds the room that does have something readable.
+    #[tokio::test]
+    async fn go_next_unread_passes_over_a_current_room_of_only_blocked_messages() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // Drain the registration notice, then park the sysop in the Lobby.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            sysop_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Sysop blocks bob, then bob posts in the Lobby (the current room,
+        // now all-blocked) and in the custom room.
+        host.process_command(
+            sysop_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        host.db
+            .post_to_room(lobby_id, &bob_name, "blocked chatter", Timestamp::now())
+            .await
+            .unwrap();
+        host.db
+            .post_to_room(custom_id, &bob_name, "also blocked", Timestamp::now())
+            .await
+            .unwrap();
+
+        // The Lobby's only unread message is from a blocked sender, so it has
+        // nothing to show: G must carry on past it to the custom room rather
+        // than stopping in the Lobby and calling it a day.
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            !text.contains("blocked chatter") && !text.contains("also blocked"),
+            "G must not surface a blocked sender's messages, got: {text:?}"
+        );
+        assert_eq!(
+            text, "No unread messages in any room.",
+            "with every unread message blocked, G has genuinely nothing to show"
+        );
+    }
+
+    /// Before the current-room-first change, G was a dead command for
+    /// guests: their room list is filtered to just the guest room, which is
+    /// also the room they're in, and the loop skips the current room — so G
+    /// always answered "no unread messages in any room" no matter what was
+    /// waiting there. Reading the current room first makes it work.
+    #[tokio::test]
+    async fn go_next_unread_works_for_a_guest_in_the_guest_room() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let admin_sid = host.create_session("test").await.unwrap();
+        do_register(&host, admin_sid, "admin", "s3cr3t!!").await;
+
+        // alice stays Unvalidated, so she's a guest sitting in the guest room.
+        let alice_sid = host.create_session("test").await.unwrap();
+        do_register(&host, alice_sid, "alice", "alice123!!").await;
+
+        let guest_rid = host.guest_room_id().expect("guest room configured");
+        let admin_name = Username::new("admin").unwrap();
+        host.db
+            .post_to_room(guest_rid, &admin_name, "welcome, guest", Timestamp::now())
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("welcome, guest"),
+            "G should read the guest room's unread for a guest, got: {text:?}"
+        );
+    }
+
+    /// A room whose unread messages are all from a blocked sender must not
+    /// swallow the search: G has to keep going and find the room further
+    /// down the list that does have something readable. Needs three rooms —
+    /// with only two, the blocked room is the last one tried and the bug is
+    /// invisible.
+    #[tokio::test]
+    async fn go_next_unread_looks_past_a_blocked_only_room_to_a_later_one() {
+        let (host, _db) = make_host().await;
+
+        let blocked_room = RoomStore::create(
+            &host.db,
+            "Blocked Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        let good_room = RoomStore::create(
+            &host.db,
+            "Good Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        let carol_sid = host.create_session("test").await.unwrap();
+        let carol_name = Username::new("carol").unwrap();
+        register_and_login(&host, carol_sid, &carol_name, "pass1234").await;
+
+        // Drain Mail, then park the sysop in the Lobby with nothing new.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            sysop_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        host.process_command(
+            sysop_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Blocked Room sorts before Good Room, so G reaches it first.
+        host.db
+            .post_to_room(blocked_room, &bob_name, "nothing to see", Timestamp::now())
+            .await
+            .unwrap();
+        host.db
+            .post_to_room(good_room, &carol_name, "hi from carol", Timestamp::now())
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("hi from carol"),
+            "G should have looked past the blocked-only room to the readable one, got: {text:?}"
+        );
+    }
+
+    // ── Issue #362: monthly audit log archives ────────────────────────────
+
+    /// Archiving writes every entry to the zip, clears the live log, and
+    /// leaves one entry behind: the record that it archived.
+    #[tokio::test]
+    async fn archiving_the_audit_log_moves_entries_into_the_archive() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        for i in 0..3 {
+            host.db
+                .audit_write("sysop", "ban", Some(&format!("bob{i}")), None)
+                .await
+                .unwrap();
+        }
+
+        let rec = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .expect("something to archive");
+        assert_eq!(rec.filename, "audit-2026-09.zip");
+        assert_eq!(rec.entry_count, Some(3));
+        assert!(rec.size_bytes > 0);
+        assert!(dir.path().join("audit-2026-09.zip").exists());
+
+        // The live log now holds only the note that archiving happened.
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert_eq!(left.len(), 1, "expected only the archive record: {left:?}");
+        assert_eq!(left[0].action, "archive_audit_log");
+        assert_eq!(left[0].target.as_deref(), Some("audit-2026-09.zip"));
+
+        // And the archive really holds the three originals.
+        let body = read_archive_text(dir.path(), "audit-2026-09.zip", "audit-2026-09.txt");
+        assert!(body.contains("# entries: 3"));
+        for i in 0..3 {
+            assert!(body.contains(&format!("bob{i}")), "missing bob{i}: {body}");
+        }
+    }
+
+    /// An empty log archives to nothing rather than an empty zip.
+    #[tokio::test]
+    async fn archiving_an_empty_audit_log_writes_no_file() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        let rec = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap();
+        assert!(rec.is_none(), "nothing to archive should write nothing");
+        assert!(!dir.path().join("audit-2026-09.zip").exists());
+    }
+
+    /// A month that already has an archive is never overwritten, and the
+    /// interrupted-clear recovery is bounded by what that archive holds — so
+    /// entries written after it was taken survive a second run untouched.
+    #[tokio::test]
+    async fn a_second_run_cannot_touch_entries_the_archive_does_not_hold() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+        let first = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .expect("first archive");
+        let before = std::fs::metadata(dir.path().join(&first.filename))
+            .unwrap()
+            .len();
+
+        host.db
+            .audit_write("sysop", "ban", Some("carol"), None)
+            .await
+            .unwrap();
+        let again = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .expect("a second run should not be an error");
+        assert!(again.is_none(), "nothing new should be archived");
+
+        // The archive on disk is untouched.
+        assert_eq!(
+            std::fs::metadata(dir.path().join(&first.filename))
+                .unwrap()
+                .len(),
+            before,
+            "the existing archive must not be rewritten"
+        );
+
+        // And carol, written after the archive was taken, is still here.
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert!(
+            left.iter().any(|e| e.target.as_deref() == Some("carol")),
+            "an entry the archive doesn't hold must not be cleared: {left:?}"
+        );
+    }
+
+    /// A log holding several months is archived one month per file, each
+    /// named for what it holds. It used to take everything in the log and
+    /// stamp it with a single month's name, so a BBS that had been off for a
+    /// while wrote months of history into one misleadingly-named archive.
+    #[tokio::test]
+    async fn each_month_is_archived_under_its_own_name() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        // Three months of history, plus an entry in the month in progress.
+        for (id, when) in [
+            (1, "2026-07-14T09:00:00Z"),
+            (2, "2026-07-20T09:00:00Z"),
+            (3, "2026-08-02T09:00:00Z"),
+            (4, "2026-10-05T09:00:00Z"),
+        ] {
+            host.db
+                .audit_write_at_for_test(id, "sysop", "ban", &format!("target{id}"), when)
+                .await
+                .unwrap();
+        }
+
+        // Catch up everything before November.
+        let written = host
+            .admin_archive_due_audit_months(&dir_str, 2026, 11)
+            .await
+            .unwrap();
+
+        // One archive per month that held entries, oldest first. Archiving
+        // writes its own note stamped with the real clock, so a month can
+        // also appear for that note alone — what matters is that each seeded
+        // month got its own file, in order.
+        let names: Vec<String> = written.iter().map(|r| r.filename.clone()).collect();
+        for expected in [
+            "audit-2026-07.zip",
+            "audit-2026-08.zip",
+            "audit-2026-10.zip",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "expected {expected} among {names:?}"
+            );
+        }
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "archives should be written oldest first");
+
+        // July's two entries are in July's archive, and only those.
+        let july = read_archive_text(dir.path(), "audit-2026-07.zip", "audit-2026-07.txt");
+        assert!(july.contains("target1") && july.contains("target2"));
+        assert!(
+            !july.contains("target3") && !july.contains("target4"),
+            "July's archive must not hold another month's entries: {july}"
+        );
+
+        // August's single entry is in August's.
+        let august = read_archive_text(dir.path(), "audit-2026-08.zip", "audit-2026-08.txt");
+        assert!(august.contains("target3"));
+        assert!(!august.contains("target1"));
+
+        // The log is empty apart from the notes archiving left behind.
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert!(
+            left.iter().all(|e| e.action == "archive_audit_log"),
+            "only archive records should remain: {left:?}"
+        );
+    }
+
+    /// Archiving one month must not drag older months in with it. Bounding
+    /// only by id made that happen and hid it, because the catch-up always
+    /// asks for the oldest month first — anything calling for a single month
+    /// directly would have folded every earlier entry into it.
+    #[tokio::test]
+    async fn archiving_one_month_leaves_older_months_alone() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write_at_for_test(1, "sysop", "ban", "july", "2026-07-14T09:00:00Z")
+            .await
+            .unwrap();
+        host.db
+            .audit_write_at_for_test(2, "sysop", "ban", "august", "2026-08-14T09:00:00Z")
+            .await
+            .unwrap();
+
+        // Ask for August alone, skipping July.
+        let rec = host
+            .admin_archive_audit_log(&dir_str, 2026, 8)
+            .await
+            .unwrap()
+            .expect("August has an entry");
+        assert_eq!(rec.entry_count, Some(1), "August holds one entry, not two");
+
+        let august = read_archive_text(dir.path(), "audit-2026-08.zip", "audit-2026-08.txt");
+        assert!(august.contains("august"));
+        assert!(
+            !august.contains("july"),
+            "July's entry must not be in August's archive: {august}"
+        );
+
+        // And July is still live, waiting for its own archive.
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert!(
+            left.iter().any(|e| e.target.as_deref() == Some("july")),
+            "July's entry must stay in the live log: {left:?}"
+        );
+    }
+
+    /// A month number that isn't a month is refused rather than producing a
+    /// file no listing would ever show.
+    #[tokio::test]
+    async fn a_month_outside_one_to_twelve_is_refused() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+
+        for bad in [0, 13, 99] {
+            assert!(
+                host.admin_archive_audit_log(&dir_str, 2026, bad)
+                    .await
+                    .is_err(),
+                "month {bad} should be refused"
+            );
+        }
+        // Nothing was written, and nothing was cleared.
+        assert_eq!(host.admin_audit_log(50, 0, None).await.unwrap().len(), 1);
+    }
+
+    /// The month in progress isn't over, so it isn't archived.
+    #[tokio::test]
+    async fn the_current_month_is_left_alone() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write_at_for_test(1, "sysop", "ban", "old", "2026-09-10T09:00:00Z")
+            .await
+            .unwrap();
+        host.db
+            .audit_write_at_for_test(2, "sysop", "ban", "current", "2026-10-02T09:00:00Z")
+            .await
+            .unwrap();
+
+        let written = host
+            .admin_archive_due_audit_months(&dir_str, 2026, 10)
+            .await
+            .unwrap();
+        assert_eq!(written.len(), 1, "only September is complete");
+        assert_eq!(written[0].filename, "audit-2026-09.zip");
+
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert!(
+            left.iter().any(|e| e.target.as_deref() == Some("current")),
+            "an entry from the month in progress must stay live: {left:?}"
+        );
+    }
+
+    /// The archive is renamed into place before the entries it holds are
+    /// cleared. A crash in that gap used to strand them: the month would
+    /// never be archived again (its file exists) and they'd be swept into the
+    /// next month's archive under the wrong name. Re-running now finishes
+    /// that clear instead.
+    #[tokio::test]
+    async fn a_second_run_finishes_an_interrupted_clear() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+        host.admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .expect("first archive");
+
+        // Stand in for the crash: the archive is on disk, and the entries it
+        // holds are back in the live log with their original ids.
+        let archived_through = crate::audit_archive::archived_through(
+            &dir.path().join("audit-2026-09.zip"),
+            &crate::audit_archive::entry_name(2026, 9),
+        )
+        .unwrap()
+        .expect("the archive records its range");
+        host.db
+            .audit_restore_for_test(archived_through, "sysop", "ban", "bob")
+            .await
+            .unwrap();
+        assert_eq!(
+            host.db.audit_count_through(archived_through).await.unwrap(),
+            1,
+            "the stranded entry should be back in the live log"
+        );
+
+        // Re-running clears them rather than refusing or re-archiving.
+        let again = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .expect("re-running should not be an error");
+        assert!(
+            again.is_none(),
+            "nothing new was archived, so no record should come back"
+        );
+        assert_eq!(
+            host.db.audit_count_through(archived_through).await.unwrap(),
+            0,
+            "the stranded entry should have been cleared"
+        );
+    }
+
+    /// An existing archive whose range can't be read leaves the live log
+    /// alone and says so, rather than guessing at what it holds.
+    #[tokio::test]
+    async fn an_unreadable_archive_refuses_rather_than_guessing() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        // Not a zip at all.
+        std::fs::write(dir.path().join("audit-2026-09.zip"), b"not a zip").unwrap();
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+
+        // It can't be read, so it can't be used to finish a clear. Refusing
+        // for good would leave this month un-archived for ever behind a log
+        // line, so the file is moved aside and the month archived afresh.
+        let rec = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .expect("archiving should not be stuck behind an unreadable file")
+            .expect("there was an entry to archive");
+        assert_eq!(rec.filename, "audit-2026-09.zip");
+
+        // The unreadable file still exists, under a name that isn't an
+        // archive — nothing deletes audit data, and it mustn't pose as a
+        // valid archive either.
+        let aside: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".unreadable-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the old file should be kept: {aside:?}");
+        assert_eq!(
+            std::fs::read(dir.path().join(&aside[0])).unwrap(),
+            b"not a zip",
+            "its contents should be untouched"
+        );
+        assert!(
+            !crate::audit_archive::is_audit_archive(&aside[0]),
+            "the moved-aside file must not pass as an archive: {}",
+            aside[0]
+        );
+
+        // And the fresh archive is the real one, holding the entry.
+        let listed = host.admin_list_audit_archives(&dir_str).await.unwrap();
+        assert_eq!(listed.len(), 1, "only the fresh archive lists: {listed:?}");
+        let body = read_archive_text(dir.path(), "audit-2026-09.zip", "audit-2026-09.txt");
+        assert!(body.contains("bob"), "the entry should be archived: {body}");
+    }
+
+    /// The catch-up crosses a year boundary — December to January is where
+    /// the month arithmetic is easiest to get wrong.
+    #[tokio::test]
+    async fn the_catch_up_crosses_a_year_boundary() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write_at_for_test(1, "sysop", "ban", "december", "2025-12-20T09:00:00Z")
+            .await
+            .unwrap();
+        host.db
+            .audit_write_at_for_test(2, "sysop", "ban", "january", "2026-01-05T09:00:00Z")
+            .await
+            .unwrap();
+
+        let written = host
+            .admin_archive_due_audit_months(&dir_str, 2026, 2)
+            .await
+            .unwrap();
+        let names: Vec<_> = written.iter().map(|r| r.filename.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "audit-2025-12.zip"),
+            "December 2025 should get its own archive: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "audit-2026-01.zip"),
+            "January 2026 should get its own archive: {names:?}"
+        );
+
+        let dec = read_archive_text(dir.path(), "audit-2025-12.zip", "audit-2025-12.txt");
+        assert!(dec.contains("december") && !dec.contains("january"));
+    }
+
+    /// Archives list newest first, and only this feature's own files are
+    /// listed — the directory can be shared with database backups.
+    #[tokio::test]
+    async fn listing_archives_ignores_everything_else_in_the_directory() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        std::fs::write(dir.path().join("backup_2026-09-01.zip"), b"not ours").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"not ours").unwrap();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+        host.admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let listed = host.admin_list_audit_archives(&dir_str).await.unwrap();
+        assert_eq!(listed.len(), 1, "only our archive should list: {listed:?}");
+        assert_eq!(listed[0].filename, "audit-2026-09.zip");
+    }
+
+    /// Deleting takes a sysop's named archive and refuses anything else,
+    /// including a database backup sharing the directory.
+    #[tokio::test]
+    async fn deleting_an_archive_refuses_files_that_are_not_archives() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        let backup = dir.path().join("backup_2026-09-01.zip");
+        std::fs::write(&backup, b"not ours").unwrap();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+        host.admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A backup is not an archive.
+        assert!(
+            host.admin_delete_audit_archive(&dir_str, "backup_2026-09-01.zip")
+                .await
+                .is_err(),
+            "a database backup must not be deletable through this"
+        );
+        assert!(backup.exists(), "the backup should still be there");
+
+        // Nor is a traversal.
+        assert!(host
+            .admin_delete_audit_archive(&dir_str, "../audit-2026-09.zip")
+            .await
+            .is_err());
+
+        // The real archive goes when asked for by name.
+        host.admin_delete_audit_archive(&dir_str, "audit-2026-09.zip")
+            .await
+            .unwrap();
+        assert!(!dir.path().join("audit-2026-09.zip").exists());
+
+        // And deleting it again says so rather than pretending.
+        assert!(host
+            .admin_delete_audit_archive(&dir_str, "audit-2026-09.zip")
+            .await
+            .is_err());
+    }
+
+    /// Entries written while an archive is being built keep their place in
+    /// the live log: the archive is bounded by the id it started from.
+    #[tokio::test]
+    async fn entries_written_after_the_bound_survive_archiving() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write("sysop", "ban", Some("early"), None)
+            .await
+            .unwrap();
+        let through = host
+            .db
+            .audit_max_id_before("9999-12-31T23:59:59Z")
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Stand in for a write that lands mid-archive.
+        host.db
+            .audit_write("sysop", "ban", Some("late"), None)
+            .await
+            .unwrap();
+
+        let removed = host.db.audit_delete_through(through).await.unwrap();
+        assert_eq!(removed, 1, "only the bounded entry should go");
+
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].target.as_deref(), Some("late"));
+        let _ = dir_str;
+    }
+
+    fn read_archive_text(dir: &std::path::Path, zip_name: &str, entry: &str) -> String {
+        use std::io::Read as _;
+        let file = std::fs::File::open(dir.join(zip_name)).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut body = String::new();
+        zip.by_name(entry)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        body
+    }
+
+    /// Reading past a blocked sender moves the read pointer over their
+    /// messages without showing them, so unblocking can't bring them back in
+    /// N. Unblocking now says how many there were and where to start. (#367)
+    #[tokio::test]
+    async fn unblocking_reports_what_the_block_hid() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice_name = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // Park alice in the Lobby with nothing new, and block bob there.
+        host.process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let first = host
+            .db
+            .post_to_room(lobby_id, &bob_name, "hidden one", Timestamp::now())
+            .await
+            .unwrap();
+        host.db
+            .post_to_room(lobby_id, &bob_name, "hidden two", Timestamp::now())
+            .await
+            .unwrap();
+
+        // N shows nothing (both are blocked) but carries the pointer past them.
+        let read = host
+            .process_command(alice_sid, Command::ReadNew)
+            .await
+            .unwrap();
+        assert!(
+            matches!(read, Response::Text(ref t) if t.contains("No new messages")),
+            "both messages are blocked, so N should show nothing: {read:?}"
+        );
+
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("no longer blocked"),
+            "should confirm the unblock, got: {text:?}"
+        );
+        assert!(
+            text.contains("2 earlier messages"),
+            "should report both hidden messages, got: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("F {}", first.as_i64())),
+            "should point at the oldest hidden message ({}), got: {text:?}",
+            first.as_i64()
+        );
+    }
+
+    /// Nothing was hidden, so the unblock says only that.
+    #[tokio::test]
+    async fn unblocking_stays_quiet_when_nothing_was_hidden() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            alice_sid,
+            &Username::new("alice").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Bob says nothing at all while blocked.
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp,
+            Response::Text("'bob' is no longer blocked.".into()),
+            "with nothing hidden the unblock should say nothing more"
+        );
+    }
+
+    /// A message sent before the block went up isn't something the block hid,
+    /// so it mustn't be counted — that's why the block records where it
+    /// started rather than just counting everything behind the pointer.
+    #[tokio::test]
+    async fn unblocking_ignores_messages_from_before_the_block() {
+        let (host, _db) = make_host().await;
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice_name = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        host.process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        // Bob posts and alice reads it normally, before any block exists.
+        host.db
+            .post_to_room(lobby_id, &bob_name, "seen normally", Timestamp::now())
+            .await
+            .unwrap();
+        let read = host
+            .process_command(alice_sid, Command::ReadNew)
+            .await
+            .unwrap();
+        let read_text = match read {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            read_text.contains("seen normally"),
+            "alice should read bob's message before blocking him: {read_text:?}"
+        );
+
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp,
+            Response::Text("'bob' is no longer blocked.".into()),
+            "a message read before the block isn't something the block hid"
+        );
+    }
+
+    /// Neither the current room nor any other room has unread: G reports
+    /// there's nothing, same as before this fix.
+    #[tokio::test]
+    async fn go_next_unread_reports_none_when_fully_caught_up() {
+        let (host, _db) = make_host().await;
+
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(text, "No unread messages in any room.");
+    }
+
+    /// Reported: G ("next unread room") says "No unread messages in any room"
+    /// for a Sysop account even though N finds new messages once the user
+    /// manually switches to the room. Reproduces with a Sysop who is the
+    /// first registrant (auto-promoted), a custom (non-system) room, and
+    /// another user's message in it — as close to the report as a unit test
+    /// can get without a real mesh session.
+    #[tokio::test]
+    async fn go_next_unread_finds_a_custom_room_for_a_sysop() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // First registrant — auto-promoted to Sysop, same as any real deployment.
+        let sysop_sid = host.create_session("test").await.unwrap();
+        let sysop_name = Username::new("sysop").unwrap();
+        register_and_login(&host, sysop_sid, &sysop_name, "pass1234").await;
+
+        // A second, validated user registers (this drops a "new user registered"
+        // notice into the sysop's Mail) and posts to the custom room.
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        let bob_id = UserStore::get_by_username(&host.db, &bob_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            bob_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Drain the registration notice out of Mail before the room under test
+        // gets its message, so this doesn't depend on which of the two rooms
+        // the room list happens to yield first.
+        host.process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+
+        host.db
+            .post_to_room(custom_id, &bob_name, "hi from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(sysop_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("hi from bob"),
+            "G should land on the custom room and show bob's message, got: {text:?}"
+        );
+    }
+
+    /// Same setup, but the reader is a plain User (not the first registrant /
+    /// Sysop), to check whether the permission level actually matters.
+    #[tokio::test]
+    async fn go_next_unread_finds_a_custom_room_for_a_regular_user() {
+        let (host, _db) = make_host().await;
+
+        let custom_id = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // First registrant is auto-promoted to Sysop; make and validate a
+        // second, ordinary User to do the reading.
+        let sysop_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sysop_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let reader_sid = host.create_session("test").await.unwrap();
+        let reader_name = Username::new("carol").unwrap();
+        register_and_login(&host, reader_sid, &reader_name, "pass1234").await;
+        let reader_id = UserStore::get_by_username(&host.db, &reader_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            reader_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        let bob_id = UserStore::get_by_username(&host.db, &bob_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            bob_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+        host.db
+            .post_to_room(custom_id, &bob_name, "hi from bob", Timestamp::now())
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(reader_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("hi from bob"),
+            "G should land on the custom room and show bob's message, got: {text:?}"
+        );
     }
 
     // ── Issue #193: K pages a long room list instead of overflowing a frame ──

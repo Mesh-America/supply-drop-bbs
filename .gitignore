@@ -63,3 +63,10 @@ docs-site/.vitepress/cache/
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Beads runtime/local-only files not covered by .beads/.gitignore, which is
+# bd-managed and shouldn't be hand-edited. The backup files record whichever
+# local path `bd backup init` was pointed at, so they're per-machine.
+.beads.gate.lock
+.beads/dolt-backup.json
+.beads/dolt-backup-state.json
