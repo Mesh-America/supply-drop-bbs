@@ -10,8 +10,9 @@
 use super::{error::StoreError, Database};
 use crate::restore_apply::sibling_with_suffix;
 use bbs_plugin_api::{
-    AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity, AdminMessageRecord, AdminReports,
-    AdminRoomSummary, AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminWeeklySignups,
+    AdminAuditArchive, AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity,
+    AdminMessageRecord, AdminReports, AdminRoomSummary, AdminStaleRoom, AdminStats, AdminTopRoom,
+    AdminTopSender, AdminWeeklySignups,
 };
 use sqlx::Row;
 use std::path::Path;
@@ -499,6 +500,94 @@ impl Database {
         }
 
         Ok(())
+    }
+
+    /// List audit log archives in `archive_dir`, newest first.
+    ///
+    /// Only reads the directory, so it needs no open database.
+    pub async fn admin_list_audit_archives(
+        archive_dir: &str,
+    ) -> Result<Vec<AdminAuditArchive>, StoreError> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let dir = Path::new(archive_dir);
+        let mut entries = match tokio::fs::read_dir(dir).await {
+            Ok(e) => e,
+            Err(e) => {
+                // Normal before the first archive has ever been taken.
+                tracing::debug!(path = %dir.display(), err = %e, "audit archive: cannot read directory");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut records = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_owned();
+            // Only this feature's own archives: the directory may be shared
+            // with backups and with the restore's working files.
+            if !crate::audit_archive::is_audit_archive(&name) {
+                continue;
+            }
+            let Ok(meta) = tokio::fs::metadata(&path).await else {
+                continue;
+            };
+            let modified = meta
+                .modified()
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let created_at = time::OffsetDateTime::from_unix_timestamp(modified as i64)
+                .map(|dt| {
+                    dt.format(&time::format_description::well_known::Rfc3339)
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+
+            records.push(AdminAuditArchive {
+                filename: name,
+                size_bytes: meta.len(),
+                created_at,
+                entry_count: None,
+            });
+        }
+
+        // Newest first. The names sort chronologically (audit-YYYY-MM.zip), so
+        // fall back to the name when two files share a timestamp.
+        records.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| b.filename.cmp(&a.filename))
+        });
+        Ok(records)
+    }
+
+    /// Delete one audit log archive from `archive_dir`.
+    ///
+    /// Refuses anything that isn't one of this feature's own archives, so a
+    /// shared directory's backups and restore working files are safe from it.
+    /// Returns [`StoreError::NotFound`] if there is no such file.
+    pub async fn admin_delete_audit_archive(
+        archive_dir: &str,
+        filename: &str,
+    ) -> Result<(), StoreError> {
+        if !crate::audit_archive::is_audit_archive(filename) {
+            return Err(StoreError::Decode(
+                "not an audit log archive (only audit-YYYY-MM.zip files can be deleted)".into(),
+            ));
+        }
+
+        let path = Path::new(archive_dir).join(filename);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(StoreError::NotFound),
+            Err(e) => Err(StoreError::Decode(format!("delete audit archive: {e}"))),
+        }
     }
 
     /// Validate an uploaded file as a restorable supply-drop-bbs database,

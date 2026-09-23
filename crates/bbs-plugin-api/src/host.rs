@@ -119,9 +119,10 @@ pub enum MeshtasticAdminRequest {
 }
 
 use crate::admin::{
-    AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports,
-    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, DeliverySampleRecord,
-    MeshRadioParams, MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
+    AdminAccessPolicy, AdminAuditArchive, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord,
+    AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo,
+    DeliverySampleRecord, MeshRadioParams, MeshtasticLoRaConfig, MeshtasticOwnerInfo,
+    MeshtasticSecurityInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -399,6 +400,47 @@ pub trait Host: Send + Sync {
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
         let _ = (backup_dir, filename);
         Err(HostError::NotSupported("admin_delete_backup".into()))
+    }
+
+    /// Move the audit log into a dated archive in `archive_dir` and clear the
+    /// entries it took, leaving the live log fresh.
+    ///
+    /// `year`/`month` name the archive. Entries written while the archive is
+    /// being built stay in the live log. The log is only cleared once the
+    /// archive file is complete and in place, so a failure loses the archive
+    /// rather than the entries. Returns `None` when the log is empty, having
+    /// written nothing.
+    async fn admin_archive_audit_log(
+        &self,
+        archive_dir: &str,
+        year: i32,
+        month: u32,
+    ) -> Result<Option<AdminAuditArchive>, HostError> {
+        let _ = (archive_dir, year, month);
+        Err(HostError::NotSupported("admin_archive_audit_log".into()))
+    }
+
+    /// List audit log archives found in `archive_dir`, newest first.
+    async fn admin_list_audit_archives(
+        &self,
+        archive_dir: &str,
+    ) -> Result<Vec<AdminAuditArchive>, HostError> {
+        let _ = archive_dir;
+        Err(HostError::NotSupported("admin_list_audit_archives".into()))
+    }
+
+    /// Delete one audit log archive from `archive_dir`.
+    ///
+    /// Only ever called for a sysop who asked for it by name: nothing removes
+    /// an archive on a schedule. Returns `HostError::NotFound` if the file
+    /// does not exist.
+    async fn admin_delete_audit_archive(
+        &self,
+        archive_dir: &str,
+        filename: &str,
+    ) -> Result<(), HostError> {
+        let _ = (archive_dir, filename);
+        Err(HostError::NotSupported("admin_delete_audit_archive".into()))
     }
 
     /// Validate `uploaded_path` as a restorable database WITHOUT touching

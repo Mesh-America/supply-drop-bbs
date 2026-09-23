@@ -28,9 +28,9 @@ use async_trait::async_trait;
 use bbs_plugin_api::advert::AdvertBus;
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
-    AdminAccessPolicy, AdminBackupRecord, AdminMessageRecord, AdminRoomSummary, AdminSessionInfo,
-    AdminStats, AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient, PermissionCtx,
-    PermissionLevel, Response, Secret, SessionId, Username,
+    AdminAccessPolicy, AdminAuditArchive, AdminBackupRecord, AdminMessageRecord, AdminRoomSummary,
+    AdminSessionInfo, AdminStats, AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient,
+    PermissionCtx, PermissionLevel, Response, Secret, SessionId, Username,
 };
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -1640,6 +1640,144 @@ impl Host for BbsHost {
 
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
         crate::db::Database::admin_delete_backup(backup_dir, filename)
+            .await
+            .map_err(|e| match e {
+                crate::db::StoreError::NotFound => HostError::NotFound(filename.to_owned()),
+                e => HostError::Storage(format!("{e}")),
+            })
+    }
+
+    async fn admin_archive_audit_log(
+        &self,
+        archive_dir: &str,
+        year: i32,
+        month: u32,
+    ) -> Result<Option<AdminAuditArchive>, HostError> {
+        use crate::audit_archive::{archive_name, entry_name, header, ArchiveWriter};
+
+        let storage = |e: crate::db::StoreError| HostError::Storage(format!("{e}"));
+
+        // Fix the upper bound first. Anything written from here on gets a
+        // higher id, stays in the live log, and is neither archived twice nor
+        // dropped when the archived range is cleared.
+        let Some(through) = self.db.audit_max_id().await.map_err(storage)? else {
+            return Ok(None); // Nothing to archive.
+        };
+        let count = self
+            .db
+            .audit_count_through(through)
+            .await
+            .map_err(storage)?;
+        if count == 0 {
+            return Ok(None);
+        }
+
+        tokio::fs::create_dir_all(archive_dir)
+            .await
+            .map_err(|e| HostError::Storage(format!("audit archive directory: {e}")))?;
+
+        let target = std::path::Path::new(archive_dir).join(archive_name(year, month));
+        if tokio::fs::try_exists(&target).await.unwrap_or(false) {
+            return Err(HostError::PreconditionFailed(format!(
+                "an audit archive for {year:04}-{month:02} already exists"
+            )));
+        }
+
+        // Read the first id for the header, then stream the rest in batches —
+        // a log left to grow for months shouldn't need to fit in memory.
+        const BATCH: u32 = 500;
+        let first_id = self
+            .db
+            .audit_page_through(0, through, 1)
+            .await
+            .map_err(storage)?
+            .first()
+            .map_or(through, |e| e.id);
+        let taken_at = Timestamp::now().to_rfc3339();
+
+        let mut writer = ArchiveWriter::create(
+            &target,
+            &entry_name(year, month),
+            &header(count, first_id, through, &taken_at),
+        )
+        .map_err(|e| HostError::Storage(format!("write audit archive: {e}")))?;
+
+        let mut after = 0i64;
+        loop {
+            let batch = match self.db.audit_page_through(after, through, BATCH).await {
+                Ok(b) => b,
+                Err(e) => {
+                    writer.abandon();
+                    return Err(storage(e));
+                }
+            };
+            if batch.is_empty() {
+                break;
+            }
+            after = batch.last().map_or(after, |e| e.id);
+            if let Err(e) = writer.write_batch(&batch) {
+                writer.abandon();
+                return Err(HostError::Storage(format!("write audit archive: {e}")));
+            }
+        }
+
+        let written = writer.entries_written();
+        let size_bytes = writer
+            .finish()
+            .map_err(|e| HostError::Storage(format!("finish audit archive: {e}")))?;
+
+        // Only now that the archive is complete and in place: clear what it
+        // holds. A failure above leaves the live log whole.
+        let removed = self
+            .db
+            .audit_delete_through(through)
+            .await
+            .map_err(storage)?;
+        if removed != written {
+            tracing::warn!(
+                "audit archive {}: archived {written} entries but cleared {removed}",
+                archive_name(year, month)
+            );
+        }
+
+        // Record the archiving itself, in the now-fresh log.
+        let detail = format!("{written} entries, ids {first_id}-{through}");
+        if let Err(e) = self
+            .db
+            .audit_write(
+                "system",
+                "archive_audit_log",
+                Some(&archive_name(year, month)),
+                Some(&detail),
+            )
+            .await
+        {
+            tracing::warn!("could not record the audit archive in the audit log: {e}");
+        }
+
+        Ok(Some(AdminAuditArchive {
+            filename: archive_name(year, month),
+            size_bytes,
+            created_at: taken_at,
+            entry_count: Some(written),
+        }))
+    }
+
+    async fn admin_list_audit_archives(
+        &self,
+        archive_dir: &str,
+    ) -> Result<Vec<AdminAuditArchive>, HostError> {
+        crate::db::Database::admin_list_audit_archives(archive_dir)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))
+    }
+
+    async fn admin_delete_audit_archive(
+        &self,
+        archive_dir: &str,
+        filename: &str,
+    ) -> Result<(), HostError> {
+        crate::db::Database::admin_delete_audit_archive(archive_dir, filename)
             .await
             .map_err(|e| match e {
                 crate::db::StoreError::NotFound => HostError::NotFound(filename.to_owned()),
@@ -10434,6 +10572,214 @@ mod tests {
             text.contains("hi from carol"),
             "G should have looked past the blocked-only room to the readable one, got: {text:?}"
         );
+    }
+
+    // ── Issue #362: monthly audit log archives ────────────────────────────
+
+    /// Archiving writes every entry to the zip, clears the live log, and
+    /// leaves one entry behind: the record that it archived.
+    #[tokio::test]
+    async fn archiving_the_audit_log_moves_entries_into_the_archive() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        for i in 0..3 {
+            host.db
+                .audit_write("sysop", "ban", Some(&format!("bob{i}")), None)
+                .await
+                .unwrap();
+        }
+
+        let rec = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .expect("something to archive");
+        assert_eq!(rec.filename, "audit-2026-09.zip");
+        assert_eq!(rec.entry_count, Some(3));
+        assert!(rec.size_bytes > 0);
+        assert!(dir.path().join("audit-2026-09.zip").exists());
+
+        // The live log now holds only the note that archiving happened.
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert_eq!(left.len(), 1, "expected only the archive record: {left:?}");
+        assert_eq!(left[0].action, "archive_audit_log");
+        assert_eq!(left[0].target.as_deref(), Some("audit-2026-09.zip"));
+
+        // And the archive really holds the three originals.
+        let body = read_archive_text(dir.path(), "audit-2026-09.zip", "audit-2026-09.txt");
+        assert!(body.contains("# entries: 3"));
+        for i in 0..3 {
+            assert!(body.contains(&format!("bob{i}")), "missing bob{i}: {body}");
+        }
+    }
+
+    /// An empty log archives to nothing rather than an empty zip.
+    #[tokio::test]
+    async fn archiving_an_empty_audit_log_writes_no_file() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        let rec = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap();
+        assert!(rec.is_none(), "nothing to archive should write nothing");
+        assert!(!dir.path().join("audit-2026-09.zip").exists());
+    }
+
+    /// Archiving the same month twice refuses rather than overwriting an
+    /// archive that's already been taken.
+    #[tokio::test]
+    async fn archiving_a_month_twice_is_refused() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+        host.admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .expect("first archive");
+
+        host.db
+            .audit_write("sysop", "ban", Some("carol"), None)
+            .await
+            .unwrap();
+        let err = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .expect_err("a second archive for the same month should be refused");
+        assert!(
+            format!("{err}").contains("already exists"),
+            "unexpected error: {err}"
+        );
+
+        // The refusal left the live log alone.
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert!(
+            left.iter().any(|e| e.target.as_deref() == Some("carol")),
+            "the refused archive must not clear anything: {left:?}"
+        );
+    }
+
+    /// Archives list newest first, and only this feature's own files are
+    /// listed — the directory can be shared with database backups.
+    #[tokio::test]
+    async fn listing_archives_ignores_everything_else_in_the_directory() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        std::fs::write(dir.path().join("backup_2026-09-01.zip"), b"not ours").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"not ours").unwrap();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+        host.admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let listed = host.admin_list_audit_archives(&dir_str).await.unwrap();
+        assert_eq!(listed.len(), 1, "only our archive should list: {listed:?}");
+        assert_eq!(listed[0].filename, "audit-2026-09.zip");
+    }
+
+    /// Deleting takes a sysop's named archive and refuses anything else,
+    /// including a database backup sharing the directory.
+    #[tokio::test]
+    async fn deleting_an_archive_refuses_files_that_are_not_archives() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        let backup = dir.path().join("backup_2026-09-01.zip");
+        std::fs::write(&backup, b"not ours").unwrap();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+        host.admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A backup is not an archive.
+        assert!(
+            host.admin_delete_audit_archive(&dir_str, "backup_2026-09-01.zip")
+                .await
+                .is_err(),
+            "a database backup must not be deletable through this"
+        );
+        assert!(backup.exists(), "the backup should still be there");
+
+        // Nor is a traversal.
+        assert!(host
+            .admin_delete_audit_archive(&dir_str, "../audit-2026-09.zip")
+            .await
+            .is_err());
+
+        // The real archive goes when asked for by name.
+        host.admin_delete_audit_archive(&dir_str, "audit-2026-09.zip")
+            .await
+            .unwrap();
+        assert!(!dir.path().join("audit-2026-09.zip").exists());
+
+        // And deleting it again says so rather than pretending.
+        assert!(host
+            .admin_delete_audit_archive(&dir_str, "audit-2026-09.zip")
+            .await
+            .is_err());
+    }
+
+    /// Entries written while an archive is being built keep their place in
+    /// the live log: the archive is bounded by the id it started from.
+    #[tokio::test]
+    async fn entries_written_after_the_bound_survive_archiving() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write("sysop", "ban", Some("early"), None)
+            .await
+            .unwrap();
+        let through = host.db.audit_max_id().await.unwrap().unwrap();
+
+        // Stand in for a write that lands mid-archive.
+        host.db
+            .audit_write("sysop", "ban", Some("late"), None)
+            .await
+            .unwrap();
+
+        let removed = host.db.audit_delete_through(through).await.unwrap();
+        assert_eq!(removed, 1, "only the bounded entry should go");
+
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].target.as_deref(), Some("late"));
+        let _ = dir_str;
+    }
+
+    fn read_archive_text(dir: &std::path::Path, zip_name: &str, entry: &str) -> String {
+        use std::io::Read as _;
+        let file = std::fs::File::open(dir.join(zip_name)).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let mut body = String::new();
+        zip.by_name(entry)
+            .unwrap()
+            .read_to_string(&mut body)
+            .unwrap();
+        body
     }
 
     /// Neither the current room nor any other room has unread: G reports
