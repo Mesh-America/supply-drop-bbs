@@ -3771,7 +3771,10 @@ impl BbsHost {
         //
         // The room has to still be one this reader may read: raising a room's
         // permission level doesn't evict whoever is sitting in it, and G
-        // shouldn't start delivering posts the reader has since lost access to.
+        // shouldn't newly volunteer posts the reader has since lost access to.
+        // This guards G's own behavior only — `N` and `F` in that same room
+        // don't check `min_permission_level` at all, so it isn't a general
+        // access control and shouldn't be mistaken for one.
         if let Some(room) = rooms.iter().find(|r| r.id == current_room) {
             if self.unread_in(&username, user_id, current_room).await? > 0 {
                 if let Some(resp) = self.read_new_unless_empty(session, &room.name).await? {
@@ -10297,6 +10300,49 @@ mod tests {
         assert_eq!(
             text, "No unread messages in any room.",
             "with every unread message blocked, G has genuinely nothing to show"
+        );
+    }
+
+    /// Before the current-room-first change, G was a dead command for
+    /// guests: their room list is filtered to just the guest room, which is
+    /// also the room they're in, and the loop skips the current room — so G
+    /// always answered "no unread messages in any room" no matter what was
+    /// waiting there. Reading the current room first makes it work.
+    #[tokio::test]
+    async fn go_next_unread_works_for_a_guest_in_the_guest_room() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let admin_sid = host.create_session("test").await.unwrap();
+        do_register(&host, admin_sid, "admin", "s3cr3t!!").await;
+
+        // alice stays Unvalidated, so she's a guest sitting in the guest room.
+        let alice_sid = host.create_session("test").await.unwrap();
+        do_register(&host, alice_sid, "alice", "alice123!!").await;
+
+        let guest_rid = host.guest_room_id().expect("guest room configured");
+        let admin_name = Username::new("admin").unwrap();
+        host.db
+            .post_to_room(guest_rid, &admin_name, "welcome, guest", Timestamp::now())
+            .await
+            .unwrap();
+
+        let resp = host
+            .process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::MultiText(parts) => parts.join("\n"),
+            Response::Text(t) => t,
+            Response::Prompt { text, .. } => text,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("welcome, guest"),
+            "G should read the guest room's unread for a guest, got: {text:?}"
         );
     }
 
