@@ -9948,6 +9948,94 @@ mod tests {
         }
     }
 
+    /// `list_readable` has to follow the room linked list, not whatever order
+    /// SQLite hands back. Reorder a room to the head and it must come back
+    /// first — with a bare `WHERE` and no `ORDER BY` it stayed in rowid
+    /// order, and "next room" in `G`/`K` meant nothing in particular. (#366)
+    #[tokio::test]
+    async fn list_readable_follows_the_room_walk_order() {
+        let (host, _db) = make_host().await;
+
+        let late = RoomStore::create(
+            &host.db,
+            "Zulu",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // Freshly created rooms land at the tail, so this one starts last.
+        let before = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        assert_eq!(
+            before.last().map(|r| r.id),
+            Some(late),
+            "a new room should start at the tail of the walk order"
+        );
+
+        // Move it to the head; rowid order is unchanged by this.
+        RoomStore::reorder(&host.db, late, None).await.unwrap();
+
+        let after = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.first().map(|r| r.id),
+            Some(late),
+            "list_readable must reflect the reorder, not rowid order"
+        );
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "reordering must not add or drop rooms"
+        );
+    }
+
+    /// Permission filtering still applies on top of the walk order: a User
+    /// doesn't see the Aide/Sysop rooms a Sysop does, and what they do see
+    /// stays in the same relative order.
+    #[tokio::test]
+    async fn list_readable_filters_by_permission_while_keeping_order() {
+        let (host, _db) = make_host().await;
+
+        let as_sysop = RoomStore::list_readable(&host.db, PermissionLevel::Sysop)
+            .await
+            .unwrap();
+        let as_user = RoomStore::list_readable(&host.db, PermissionLevel::User)
+            .await
+            .unwrap();
+
+        assert!(
+            as_user.len() < as_sysop.len(),
+            "a User should see fewer rooms than a Sysop, got {} and {}",
+            as_user.len(),
+            as_sysop.len()
+        );
+        assert!(
+            as_user
+                .iter()
+                .all(|r| r.min_permission_level <= PermissionLevel::User),
+            "a User must not be shown a room above their level"
+        );
+
+        // The User's rooms appear in the same relative order as in the
+        // Sysop's full walk.
+        let sysop_ids: Vec<_> = as_sysop.iter().map(|r| r.id).collect();
+        let user_ids: Vec<_> = as_user.iter().map(|r| r.id).collect();
+        let filtered: Vec<_> = sysop_ids
+            .into_iter()
+            .filter(|id| user_ids.contains(id))
+            .collect();
+        assert_eq!(
+            user_ids, filtered,
+            "filtering must preserve the walk order, not reshuffle it"
+        );
+    }
+
     // ── Issue #187: K lists rooms by real id, not filtered-list position ──────
 
     /// A room's default `min_permission_level` (User) means every custom
