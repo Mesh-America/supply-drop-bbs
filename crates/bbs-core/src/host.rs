@@ -3374,8 +3374,15 @@ impl BbsHost {
                 // diverged from the real id whenever a permission-gated room
                 // was missing from this session's filtered list — the same
                 // number then meant a different room depending on whether it
-                // came from K's listing or from `C <number>`). Only ids K
-                // actually showed this session are accepted, same as before.
+                // came from K's listing or from `C <number>`).
+                //
+                // This is a fast path, not an authorization boundary: a
+                // number K didn't show falls through to the parser below,
+                // which sends anything unrecognised — a bare numeral
+                // included — to the same `handle_change_room`. That handler
+                // is where permission and guest checks actually happen, for
+                // this path and for `C <number>` alike. Don't read
+                // `room_ids` as a gate on which rooms are reachable.
                 if let Ok(n) = trimmed.parse::<i64>() {
                     let target_id = RoomId::new(n);
                     if room_ids.contains(&target_id) {
@@ -3385,8 +3392,13 @@ impl BbsHost {
                                 r.workflow = Workflow::None;
                             }
                         }
-                        self.set_current_room(session, target_id).await;
-                        return self.handle_change_to_room(session, target_id).await;
+                        // Hand off to the same handler `C <number>` uses, so
+                        // picking a room off the list can't diverge from
+                        // typing its number. It used to go somewhere that
+                        // turned guests away from the very room K had just
+                        // offered them, and it moved the session before
+                        // checking whether the move was allowed. (#368)
+                        return self.handle_change_room(session, trimmed).await;
                     }
                 }
                 // Anything else: re-parse the input through the canonical
@@ -8352,6 +8364,174 @@ mod tests {
         assert!(
             matches!(r, Response::Text(ref t) if t.contains("verified")),
             "expected verification required message, got: {r:?}"
+        );
+    }
+
+    /// A guest sees their own room in the `K` list ("Guests [here]") and can
+    /// pick it by number, the same as `C Guests` by name already allowed.
+    /// This used to answer "pending validation by an aide" instead. (#368)
+    #[tokio::test]
+    async fn guest_can_select_their_own_room_by_number() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        let guest_rid = host.guest_room_id().expect("guest room configured");
+
+        // `K` first: the numeric selection arrives as a workflow reply, which
+        // is the path that was broken — `C <number>` goes elsewhere and was
+        // always fine.
+        host.process_command(s2, Command::ListRooms).await.unwrap();
+        let r = host
+            .process_command(
+                s2,
+                Command::WorkflowReply {
+                    reply: guest_rid.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Text(ref t) if t.contains("Now in: Guests")),
+            "guest should enter their own room by number, got: {r:?}"
+        );
+    }
+
+    /// The ordinary case the guest fix routes through: a validated user
+    /// picking a room off the K list still lands in it, with the same
+    /// message as before the handoff changed.
+    #[tokio::test]
+    async fn validated_user_can_still_select_a_room_by_number() {
+        let (host, _db) = make_host().await;
+
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("sysop").unwrap(), "pass1234").await;
+
+        let custom = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        host.process_command(sid, Command::ListRooms).await.unwrap();
+        let r = host
+            .process_command(
+                sid,
+                Command::WorkflowReply {
+                    reply: custom.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(r, Response::Text(ref t) if t.contains("Now in: Custom Room")),
+            "a validated user should enter the room they picked, got: {r:?}"
+        );
+
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&sid].current_room, custom,
+            "the session should actually be in the room it reported"
+        );
+    }
+
+    /// A refused selection must leave the session where it was. The old path
+    /// called set_current_room before the permission check could say no, so
+    /// a denied pick still moved the reader. (#368)
+    ///
+    /// Reaching a refusal takes a race, because K only ever lists rooms the
+    /// reader may already enter: list the room, raise its level, then pick
+    /// it. That's the window the pre-move bug lived in.
+    #[tokio::test]
+    async fn a_refused_room_selection_leaves_the_session_put() {
+        let (host, _db) = make_host().await;
+
+        let custom = RoomStore::create(
+            &host.db,
+            "Custom Room",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+
+        // First registrant is Sysop; make a plain User to do the picking.
+        let admin_sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            admin_sid,
+            &Username::new("sysop").unwrap(),
+            "pass1234",
+        )
+        .await;
+
+        let user_sid = host.create_session("test").await.unwrap();
+        let user_name = Username::new("alice").unwrap();
+        register_and_login(&host, user_sid, &user_name, "pass1234").await;
+        let user_id = UserStore::get_by_username(&host.db, &user_name)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        UserStore::update(
+            &host.db,
+            user_id,
+            None,
+            None,
+            Some(PermissionLevel::User),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let started_in = {
+            let sessions = host.sessions.read().await;
+            sessions[&user_sid].current_room
+        };
+
+        // K lists Custom Room, which alice may enter at this point.
+        host.process_command(user_sid, Command::ListRooms)
+            .await
+            .unwrap();
+
+        // It becomes Sysop-only before she picks it.
+        RoomStore::update(&host.db, custom, None, None, Some(PermissionLevel::Sysop))
+            .await
+            .unwrap();
+
+        let r = host
+            .process_command(
+                user_sid,
+                Command::WorkflowReply {
+                    reply: custom.as_i64().to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            !matches!(r, Response::Text(ref t) if t.contains("Now in: Custom Room")),
+            "a User must not enter a room that just became Sysop-only, got: {r:?}"
+        );
+
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&user_sid].current_room, started_in,
+            "a refused pick must not move the session"
         );
     }
 
