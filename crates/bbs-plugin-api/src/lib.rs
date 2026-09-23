@@ -50,9 +50,9 @@ pub mod transport;
 // without spelunking the module tree for every type.
 
 pub use admin::{
-    AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminDailyVolume, AdminHourlyActivity,
-    AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStaleRoom,
-    AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups,
+    AdminAccessPolicy, AdminAuditArchive, AdminAuditEntry, AdminBackupRecord, AdminDailyVolume,
+    AdminHourlyActivity, AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo,
+    AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups,
     DeliverySampleRecord, MeshRadioParams, MeshtasticDeviceSnapshot, MeshtasticLoRaConfig,
     MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };

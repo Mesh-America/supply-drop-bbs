@@ -250,6 +250,13 @@ struct AppState {
     /// backup directory) where `main.rs`'s startup check will find it
     /// (issues #195 and #309).
     data_dir: std::sync::Mutex<Option<String>>,
+    /// Directory holding monthly audit log archives.
+    ///
+    /// Sourced from `[audit] directory` in the operator config and injected by
+    /// the host binary via [`WebPlugin::set_audit_archive_dir`]. When `None`
+    /// the archive endpoints return 400 (`audit archive directory not
+    /// configured`).
+    audit_archive_dir: std::sync::Mutex<Option<String>>,
     /// Serializes the whole validate-and-stage / confirm sequence for a
     /// restore so two concurrent uploads (or an upload racing a confirm)
     /// can't clobber the shared `pending_restore*.db` paths — an async
@@ -296,6 +303,7 @@ impl AppState {
             config,
             backup_dir: std::sync::Mutex::new(None),
             data_dir: std::sync::Mutex::new(None),
+            audit_archive_dir: std::sync::Mutex::new(None),
             restore_lock: tokio::sync::Mutex::new(()),
             restore_confirmed: AtomicBool::new(false),
             boot_id: Uuid::new_v4().to_string(),
@@ -323,6 +331,14 @@ impl AppState {
     /// Return the BBS's data directory, if injected.
     fn data_dir(&self) -> Option<String> {
         self.data_dir.lock().expect("data_dir poisoned").clone()
+    }
+
+    /// Return the audit archive directory, if any.
+    fn audit_archive_dir(&self) -> Option<String> {
+        self.audit_archive_dir
+            .lock()
+            .expect("audit_archive_dir poisoned")
+            .clone()
     }
 
     fn create_session(&self, username: String, permission_level: u8) -> String {
@@ -608,6 +624,17 @@ impl WebPlugin {
     pub fn set_data_dir(&self, dir: Option<String>) {
         *self.state.data_dir.lock().expect("data_dir poisoned") = dir;
     }
+
+    /// Set the directory holding monthly audit log archives, sourced from
+    /// `[audit] directory`. Safe to call at any time, including after
+    /// `start()`: request handlers read this value live from its `Mutex`.
+    pub fn set_audit_archive_dir(&self, dir: Option<String>) {
+        *self
+            .state
+            .audit_archive_dir
+            .lock()
+            .expect("audit_archive_dir poisoned") = dir;
+    }
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -718,6 +745,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api_download_backup).delete(api_delete_backup),
         )
         .route("/backups/:filename/restore", post(api_stage_backup_restore))
+        .route("/audit-archives", get(api_list_audit_archives))
+        .route(
+            "/audit-archives/:filename",
+            get(api_download_audit_archive).delete(api_delete_audit_archive),
+        )
         .route(
             "/backups/restore",
             post(api_upload_restore).layer(DefaultBodyLimit::max(RESTORE_UPLOAD_MAX_BYTES)),
@@ -1927,6 +1959,138 @@ async fn api_audit_log(
     }
 }
 
+// ── Audit log archives (#362) ─────────────────────────────────────────────────
+//
+// Sysop-only, all three: an archive is the full record of privileged actions
+// for a month, so reading one out of the system and removing one are both
+// held to the same bar as taking a database backup. Nothing here archives on
+// request or clears the live log — archiving happens on a schedule in the host
+// binary, and the live log has no endpoint that can empty it.
+
+async fn api_list_audit_archives(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    match state.host.admin_list_audit_archives(&dir).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_download_audit_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(filename): Path<String>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    // The archive directory can be shared with database backups and the
+    // restore's working files; this serves only this feature's own archives.
+    if !bbs_core::audit_archive::is_audit_archive(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("not an audit log archive")),
+        )
+            .into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    let path = std::path::Path::new(&dir).join(&filename);
+    // An archive is a regular file the BBS wrote. Anything else wearing the
+    // name — a link pointing out of the directory in particular — is not
+    // served, matching the O_NOFOLLOW the archive writer opens with.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("not an audit log archive")),
+            )
+                .into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => return server_error(&e.to_string()),
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/zip".to_owned()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_delete_audit_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(filename): Path<String>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    if !bbs_core::audit_archive::is_audit_archive(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("not an audit log archive")),
+        )
+            .into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    match state.host.admin_delete_audit_archive(&dir, &filename).await {
+        Ok(()) => {
+            // Deleting a month of audit history is itself worth recording.
+            let actor = format!("web:{}", caller.username);
+            if let Err(e) = state
+                .host
+                .admin_write_audit(&actor, "delete_audit_archive", Some(&filename), None)
+                .await
+            {
+                tracing::warn!("could not audit the audit-archive deletion: {e}");
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(HostError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 async fn api_stats(State(state): State<Arc<AppState>>) -> Response {
@@ -2023,11 +2187,13 @@ async fn api_metrics() -> Response {
 #[derive(Serialize)]
 struct SettingsResponse {
     backup_dir: Option<String>,
+    audit_archive_dir: Option<String>,
 }
 
 async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(SettingsResponse {
         backup_dir: state.backup_dir(),
+        audit_archive_dir: state.audit_archive_dir(),
     })
 }
 
@@ -6249,6 +6415,277 @@ mod tests {
         // at router build time on a route conflict, so building it is the test.
         #[tokio::test]
         async fn router_builds_with_the_new_route() {
+            let f = fixture().await;
+            let _router = build_router(Arc::clone(&f.state));
+        }
+    }
+
+    // Issue #362: the audit archive endpoints, against a real BbsHost and
+    // real archive files, so the gating and the file handling are the
+    // production paths.
+    mod audit_archive_tests {
+        use super::*;
+
+        struct Fixture {
+            state: Arc<AppState>,
+            archive_dir: tempfile::TempDir,
+            _live_db: tempfile::NamedTempFile,
+        }
+
+        async fn fixture() -> Fixture {
+            let live_db = tempfile::NamedTempFile::new().unwrap();
+            let db = bbs_core::Database::open(&live_db.path().to_string_lossy())
+                .await
+                .expect("open database");
+            let host: Arc<dyn Host> = Arc::new(bbs_core::BbsHost::new(db));
+            let state = Arc::new(AppState::new(host, WebConfig::default()));
+            let archive_dir = tempfile::tempdir().unwrap();
+            *state.audit_archive_dir.lock().unwrap() =
+                Some(archive_dir.path().to_string_lossy().into());
+            Fixture {
+                state,
+                archive_dir,
+                _live_db: live_db,
+            }
+        }
+
+        /// Put a real archive in place, the way the scheduler would.
+        async fn make_archive(f: &Fixture) -> String {
+            f.state
+                .host
+                .admin_write_audit("sysop", "ban", Some("bob"), None)
+                .await
+                .expect("write an audit entry");
+            f.state
+                .host
+                .admin_archive_audit_log(&f.archive_dir.path().to_string_lossy(), 2026, 9)
+                .await
+                .expect("archive")
+                .expect("something to archive")
+                .filename
+        }
+
+        #[tokio::test]
+        async fn listing_needs_a_sysop() {
+            let f = fixture().await;
+            for caller in [aide(), regular_user()] {
+                let name = caller.username.clone();
+                let resp =
+                    api_list_audit_archives(State(Arc::clone(&f.state)), Extension(caller)).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "{name} should not list audit archives"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_sysop_sees_the_archives() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let resp =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            let list = body.as_array().expect("an array of archives");
+            assert_eq!(list.len(), 1, "expected one archive: {body}");
+            assert_eq!(list[0]["filename"], name);
+        }
+
+        #[tokio::test]
+        async fn downloading_needs_a_sysop_and_serves_the_zip() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let denied = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(aide()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/zip"
+            );
+            let disposition = resp
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                disposition.contains(&name),
+                "the download should be named after the archive: {disposition}"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..2], b"PK", "the body should be a zip");
+        }
+
+        #[tokio::test]
+        async fn only_archives_can_be_downloaded() {
+            let f = fixture().await;
+            // A database backup sharing the directory, and traversals.
+            std::fs::write(f.archive_dir.path().join("backup_2026-09-01.zip"), b"x").unwrap();
+            for name in [
+                "backup_2026-09-01.zip",
+                "../../etc/passwd",
+                "audit-2026-09.zip/../secret",
+            ] {
+                let resp = api_download_audit_archive(
+                    State(Arc::clone(&f.state)),
+                    Extension(sysop()),
+                    Path(name.to_owned()),
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{name} should not be downloadable"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_missing_archive_is_a_404_not_a_500() {
+            let f = fixture().await;
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-1999-01.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn deleting_needs_a_sysop_and_records_itself() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let denied = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(aide()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            assert!(
+                f.archive_dir.path().join(&name).exists(),
+                "a refused delete must leave the archive alone"
+            );
+
+            let resp = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            assert!(!f.archive_dir.path().join(&name).exists());
+
+            // Removing a month of history is itself a privileged action.
+            let log = f.state.host.admin_audit_log(50, 0, None).await.unwrap();
+            assert!(
+                log.iter().any(|e| e.action == "delete_audit_archive"
+                    && e.target.as_deref() == Some(name.as_str())),
+                "the deletion should be in the audit log: {log:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn only_archives_can_be_deleted() {
+            let f = fixture().await;
+            let backup = f.archive_dir.path().join("backup_2026-09-01.zip");
+            std::fs::write(&backup, b"x").unwrap();
+
+            let resp = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("backup_2026-09-01.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(backup.exists(), "a database backup must survive this");
+        }
+
+        #[tokio::test]
+        async fn the_endpoints_say_so_when_no_directory_is_configured() {
+            let f = fixture().await;
+            *f.state.audit_archive_dir.lock().unwrap() = None;
+
+            let listed =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(listed.status(), StatusCode::BAD_REQUEST);
+
+            let downloaded = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(downloaded.status(), StatusCode::BAD_REQUEST);
+
+            let deleted = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(deleted.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// An archive is a regular file. A link wearing the name is not
+        /// served, even though the name itself is a valid archive name —
+        /// the writer opens with O_NOFOLLOW and reading has to match.
+        #[tokio::test]
+        async fn a_link_wearing_an_archive_name_is_not_served() {
+            let f = fixture().await;
+            let secret = f.archive_dir.path().join("secret.txt");
+            std::fs::write(&secret, b"not for serving").unwrap();
+            let link = f.archive_dir.path().join("audit-2026-09.zip");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "a symlink must not be served as an archive"
+            );
+
+            // Nor listed as one.
+            let listed =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            let body = body_json(listed).await;
+            assert_eq!(
+                body.as_array().map(Vec::len),
+                Some(0),
+                "a symlink must not be listed as an archive: {body}"
+            );
+        }
+
+        /// The archive routes sit beside `/audit-log`; axum panics at router
+        /// build time on a conflict, so building the router is the test.
+        #[tokio::test]
+        async fn router_builds_with_the_archive_routes() {
             let f = fixture().await;
             let _router = build_router(Arc::clone(&f.state));
         }
