@@ -75,6 +75,12 @@ const REPLY_ACK_MIN_WAIT: Duration = Duration::from_secs(4);
 const REPLY_ACK_MAX_WAIT: Duration = Duration::from_secs(30);
 /// How often the event loop checks for replies that timed out awaiting an ACK.
 const RETRY_TICK: Duration = Duration::from_millis(500);
+/// How long `pending_autoadd` may sit unanswered before the event loop gives
+/// up on it (see `PendingAutoadd`). A bare Ok/Err or the `AutoaddConfig`
+/// frame should come back over the same connection almost immediately; a
+/// wait this long past sending means the reply is lost, not just slow, and
+/// a lost reply must not block every key op for the rest of the connection.
+const AUTOADD_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the event loop appends a delivery-history sample for trend display.
 const SAMPLE_TICK: Duration = Duration::from_secs(60);
 /// How far back to seed the in-memory trend from persisted samples on startup
@@ -848,6 +854,11 @@ async fn push_domain_notification(
 }
 
 /// Pending one-shot key operation in the event loop.
+///
+/// Kept mutually exclusive with [`PendingAutoadd`] — see that type's doc
+/// comment for why, and its callers' `pending_autoadd.is_some()` checks for
+/// the list of busy-check sites to extend alongside any new variant added
+/// here.
 enum PendingKeyOp {
     Export {
         reply: tokio::sync::oneshot::Sender<Result<String, String>>,
@@ -861,6 +872,46 @@ enum PendingKeyOp {
         waiting_for_params: bool,
         /// tx_power to send after params Ok arrives
         tx_power_dbm: i8,
+    },
+}
+
+/// A connect-time contact-autoadd probe or write awaiting a reply, tracked
+/// separately from [`PendingKeyOp`] (see supply-drop-bbs-6tw / GH #397).
+///
+/// `Get`'s success path is the distinct `InboundFrame::AutoaddConfig`
+/// response, never a bare Ok, so only its rejection (`Err`) needs this slot.
+/// `Set` only ever gets a bare Ok/Err, and is sent reactively well after the
+/// connect-time burst (SyncNextMessage, GetContacts, GetAutoaddConfig — all
+/// fired before any of their replies can have arrived) has resolved, so its
+/// tracking is unambiguous.
+///
+/// Kept mutually exclusive with `pending_key_op` (each op's send site checks
+/// the other is `None` first, and the `MeshKeyRequest` busy-checks treat this
+/// slot as busy too — grep for `pending_autoadd.is_some()` if adding a new
+/// busy-check site, e.g. for a new `PendingKeyOp` variant, and keep it in the
+/// same list): a bare Ok/Err is otherwise no more attributable to one
+/// in-flight command than another, since the wire carries no correlation id.
+///
+/// `AUTOADD_REPLY_TIMEOUT` bounds how long either variant may sit unanswered
+/// before `retry_tick` gives up on it — without that, a lost reply would
+/// hold this slot (and so `pending_key_op`'s busy-check) for the rest of the
+/// connection.
+///
+/// Known residual gap, not fully closed by this design: `RemoveContact`
+/// (proactive contact-table eviction) also gets a bare Ok/Err from the
+/// device but, being genuinely fire-and-forget with no reply channel to
+/// fill, isn't tracked in any slot at all. If its own device reply happens
+/// to land while a `Set` here is also outstanding, it can be misattributed
+/// as this slot's answer (a wrong log line — "confirmed"/"rejected" the
+/// write when it was actually RemoveContact's reply — not a crash or data
+/// loss, since RemoveContact's caller never awaits the wire reply either).
+enum PendingAutoadd {
+    Get,
+    /// The raw already-OR'd `autoadd_config` device byte the SET is writing,
+    /// i.e. exactly what `OutboundFrame::SetAutoaddConfig { config }` sent —
+    /// not any higher-level BBS setting.
+    Set {
+        config: u8,
     },
 }
 
@@ -933,6 +984,29 @@ async fn sync_radio_params_if_configured(
     }
 }
 
+/// Send `CMD_GET_AUTOADD_CONFIG` and claim `pending_autoadd`, unless a key op
+/// or an already-outstanding autoadd probe makes that unsafe right now (see
+/// `PendingAutoadd`). Called right after connecting; given `Connected` always
+/// follows a `Disconnected` that clears `pending_key_op`, and nothing else
+/// can run between that check and this send within the same event-loop
+/// iteration, `pending_key_op` is always `None` here in practice — this is
+/// defensive, not dead code removed on that basis, in case a future change
+/// to the connect sequence adds a yield point before this call.
+async fn try_start_autoadd_probe(
+    cmd_tx: &mpsc::Sender<OutboundFrame>,
+    pending_key_op: &Option<PendingKeyOp>,
+    pending_autoadd: &mut Option<PendingAutoadd>,
+    pending_autoadd_since: &mut Option<Instant>,
+) -> bool {
+    if pending_key_op.is_some() || pending_autoadd.is_some() {
+        return false;
+    }
+    let _ = cmd_tx.send(OutboundFrame::GetAutoaddConfig).await;
+    *pending_autoadd = Some(PendingAutoadd::Get);
+    *pending_autoadd_since = Some(Instant::now());
+    true
+}
+
 /// Background task: receive [`ClientEvent`]s and dispatch them.
 ///
 /// Runs until the shutdown watch fires or the companion client channel closes.
@@ -959,6 +1033,13 @@ async fn event_loop(
 ) {
     // Pending one-shot key operation. At most one at a time.
     let mut pending_key_op: Option<PendingKeyOp> = None;
+    // Pending connect-time autoadd probe/write. Mutually exclusive with
+    // `pending_key_op` — see `PendingAutoadd`'s doc comment.
+    let mut pending_autoadd: Option<PendingAutoadd> = None;
+    // When `pending_autoadd` was last set, so `retry_tick` can give up on a
+    // lost reply (see `AUTOADD_REPLY_TIMEOUT`) instead of blocking every key
+    // op for the rest of the connection.
+    let mut pending_autoadd_since: Option<Instant> = None;
 
     // When the last automatic self-advert (on-connect or periodic) was sent, used
     // to rate-limit a flapping link's reconnect bursts (see MIN_ADVERT_SPACING).
@@ -1222,10 +1303,30 @@ async fn event_loop(
                         let _ = cmd_tx.send(OutboundFrame::GetContacts { since: 0 }).await;
 
                         // Query the radio's autoadd config so new users can reach
-                        // the BBS.  The rationale and the bits we set are
-                        // documented on the InboundFrame::AutoaddConfig arm in
-                        // handle_frame, which handles the response.
-                        let _ = cmd_tx.send(OutboundFrame::GetAutoaddConfig).await;
+                        // the BBS.  The rationale and the bits we set are handled
+                        // by the InboundFrame::AutoaddConfig arm in the reply
+                        // interceptor below, on receipt of the response. Skipped
+                        // if a key op happens to be in flight, so its reply can
+                        // never be mistaken for one — see `PendingAutoadd` and
+                        // `try_start_autoadd_probe`. In practice this can't
+                        // happen at connect time (see that function's doc
+                        // comment); if it somehow did, nothing retries this
+                        // connection's read, but `AUTOADD_REPLY_TIMEOUT` still
+                        // bounds how long any *sent* probe can block key ops.
+                        if !try_start_autoadd_probe(
+                            &cmd_tx,
+                            &pending_key_op,
+                            &mut pending_autoadd,
+                            &mut pending_autoadd_since,
+                        )
+                        .await
+                        {
+                            debug!(
+                                "mesh: skipping the autoadd_config read this \
+                                 connection — a device operation is already in \
+                                 progress; will retry on the next reconnect"
+                            );
+                        }
                     }
                     Some(ClientEvent::Disconnected { will_retry }) => {
                         // If a key operation is in flight, fail it immediately so
@@ -1239,6 +1340,11 @@ async fn event_loop(
                                 PendingKeyOp::ApplyRadio { reply, .. } => { let _ = reply.send(Err(err)); }
                             }
                         }
+                        // No reply channel to fail (autoadd is fire-and-forget),
+                        // but drop any stale probe so it can't be mistaken for a
+                        // reply on the next connection.
+                        pending_autoadd = None;
+                        pending_autoadd_since = None;
                         if will_retry {
                             info!("mesh: radio bridge disconnected, will retry");
                         } else {
@@ -1248,7 +1354,14 @@ async fn event_loop(
                     }
                     Some(ClientEvent::Frame(frame)) => {
                         use meshcore_companion::frame::InboundFrame;
-                        // Intercept key op responses before general frame dispatch.
+                        // Intercept key op and autoadd-config responses before
+                        // general frame dispatch (`handle_frame` below): both
+                        // need mutable access to `pending_key_op`/
+                        // `pending_autoadd`, which only this function has.
+                        // The `InboundFrame::AutoaddConfig` arm owns full
+                        // business logic (deciding which bits to write, and
+                        // sending the write), not just reply correlation —
+                        // see supply-drop-bbs-6tw.
                         let consumed = match &frame {
                             InboundFrame::PrivateKey { key } => {
                                 if let Some(PendingKeyOp::Export { reply }) = pending_key_op.take() {
@@ -1282,7 +1395,31 @@ async fn event_loop(
                                     }
                                     other => {
                                         pending_key_op = other;
-                                        false
+                                        // No key op claims this Ok — attribute it to
+                                        // the autoadd write if that's what's
+                                        // actually outstanding. Unambiguous: `Set`
+                                        // is only ever sent once `pending_key_op`
+                                        // is confirmed `None` (see the
+                                        // `AutoaddConfig` arm below), and the two
+                                        // slots are kept mutually exclusive.
+                                        // `Get`'s success is the distinct
+                                        // `AutoaddConfig` frame, never a bare Ok,
+                                        // so it is left in place here.
+                                        match pending_autoadd.take() {
+                                            Some(PendingAutoadd::Set { config }) => {
+                                                pending_autoadd_since = None;
+                                                info!(
+                                                    config,
+                                                    "mesh: radio confirmed the \
+                                                     autoadd_config write"
+                                                );
+                                                true
+                                            }
+                                            other @ (Some(PendingAutoadd::Get) | None) => {
+                                                pending_autoadd = other;
+                                                false
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1298,7 +1435,151 @@ async fn event_loop(
                                     }
                                     true
                                 } else {
+                                    match pending_autoadd.take() {
+                                        // Unambiguous, same reasoning as the Ok arm
+                                        // above: fully claims the frame.
+                                        Some(PendingAutoadd::Set { config }) => {
+                                            pending_autoadd_since = None;
+                                            warn!(
+                                                config,
+                                                error_code,
+                                                "mesh: radio rejected the \
+                                                 autoadd_config write — new users \
+                                                 may not be able to reach the BBS \
+                                                 until this is resolved"
+                                            );
+                                            true
+                                        }
+                                        // Not unambiguous: `Get` is sent as part of
+                                        // the connect-time burst (SyncNextMessage,
+                                        // GetContacts, GetAutoaddConfig, fired
+                                        // before any of their replies can have
+                                        // arrived), so this Err could equally be
+                                        // one of the other two's — that ambiguity
+                                        // is pre-existing and out of scope here
+                                        // (supply-drop-bbs-6tw). Log the
+                                        // autoadd-specific attribution in addition
+                                        // to, not instead of, whatever the
+                                        // existing drain/generic handling below
+                                        // does with it — do not claim `consumed`.
+                                        Some(PendingAutoadd::Get) => {
+                                            warn!(
+                                                error_code,
+                                                "mesh: radio rejected the \
+                                                 autoadd_config read — new users \
+                                                 may not be able to reach the BBS \
+                                                 until this is resolved (older \
+                                                 firmware or an unsupported \
+                                                 command)"
+                                            );
+                                            pending_autoadd_since = None;
+                                            false
+                                        }
+                                        None => false,
+                                    }
+                                }
+                            }
+                            // Response to CMD_GET_AUTOADD_CONFIG sent at startup:
+                            // [autoadd_config][autoadd_max_hops]. The BBS supports
+                            // firmware 1.14.0 or newer; the autoadd commands date
+                            // from 1.12.0 and the hop limit byte from 1.14.0.
+                            //
+                            // Whether a newly-heard node is stored as a contact is
+                            // decided by MyMesh::shouldAutoAddContactType: with
+                            // `manual_add_contacts` bit 0 clear every type is
+                            // added, otherwise only the types enabled in
+                            // autoadd_config (see the AUTO_ADD_* constants). A
+                            // radio left in the second mode without the Chat bit
+                            // never stores new users, so it cannot DM them and the
+                            // firmware drops their DMs (issue #305). A full table
+                            // refuses new contacts unless AUTO_ADD_OVERWRITE_OLDEST
+                            // is set (MyMesh::shouldOverwriteWhenFull).
+                            //
+                            // Set both bits. A one-byte SET leaves autoadd_max_hops
+                            // and the other type bits as the operator configured
+                            // them. On a radio that already auto-adds every type
+                            // the Chat bit changes nothing, but the write is still
+                            // made when it is missing.
+                            InboundFrame::AutoaddConfig { config, max_hops } => {
+                                // Matched against `&frame` (see `match &frame`
+                                // above), so copy the fields out to plain values.
+                                let config = *config;
+                                let max_hops = *max_hops;
+                                // Only the connect-time probe's own reply is
+                                // handled here. A duplicate or otherwise
+                                // unsolicited frame — nothing pending, or (should
+                                // the mutual-exclusion invariant ever be violated)
+                                // a `Set` genuinely still outstanding — is left
+                                // alone rather than clobbering real state or
+                                // triggering an unguarded repeat write; it falls
+                                // through to the generic "ignoring frame" log.
+                                if !matches!(pending_autoadd, Some(PendingAutoadd::Get)) {
                                     false
+                                } else {
+                                    pending_autoadd = None;
+                                    pending_autoadd_since = None;
+                                    match autoadd_config_needed(config) {
+                                        Some(wanted) => {
+                                            // Skipped rather than risking its
+                                            // own reply being mistaken for a
+                                            // key op's — see `PendingAutoadd`.
+                                            // In practice unreachable (see
+                                            // `try_start_autoadd_probe`'s doc
+                                            // comment: nothing can make
+                                            // `pending_key_op` non-`None`
+                                            // between this frame arriving and
+                                            // this check); kept as a defensive
+                                            // guard. Not retried until the
+                                            // next reconnect if it ever does
+                                            // trigger.
+                                            if pending_key_op.is_some() {
+                                                warn!(
+                                                    config,
+                                                    wanted,
+                                                    "mesh: skipping the \
+                                                     autoadd_config write this \
+                                                     connection — a device \
+                                                     operation is already in \
+                                                     progress; will retry on \
+                                                     the next reconnect"
+                                                );
+                                            } else {
+                                                info!(
+                                                    config,
+                                                    wanted,
+                                                    "mesh: setting radio \
+                                                     autoadd_config to enable \
+                                                     Chat auto-add and \
+                                                     overwrite-oldest so new \
+                                                     users can reach the BBS"
+                                                );
+                                                let _ = cmd_tx
+                                                    .send(OutboundFrame::SetAutoaddConfig { config: wanted })
+                                                    .await;
+                                                pending_autoadd = Some(PendingAutoadd::Set { config: wanted });
+                                                pending_autoadd_since = Some(Instant::now());
+                                            }
+                                        }
+                                        None => debug!(config, "mesh: contact auto-add already configured"),
+                                    }
+                                    // autoadd_max_hops is a second gate.  A
+                                    // non-zero N makes the radio store only
+                                    // nodes heard across fewer than N hops (1 =
+                                    // direct only).  Left alone; it is the
+                                    // operator's policy to set.
+                                    if let Some(hops @ 1..) = max_hops {
+                                        warn!(
+                                            max_hops = hops,
+                                            "mesh: radio limits contact auto-add \
+                                             by hop count (autoadd_max_hops); new \
+                                             users heard across that many hops or \
+                                             more are not stored, so they cannot \
+                                             reach the BBS until the limit is \
+                                             raised or removed in the MeshCore \
+                                             app"
+                                        );
+                                    }
+                                    true
                                 }
                             }
                             _ => false,
@@ -1311,6 +1592,19 @@ async fn event_loop(
             }
             _ = retry_tick.tick() => {
                 retransmit_due_replies(&cmd_tx, &state, &send_tracker, &delivery_stats, flood_after_send).await;
+                // A lost reply (the device never answers the GET or the SET)
+                // would otherwise leave `pending_autoadd` occupied — and, via
+                // the `MeshKeyRequest` busy-checks, every key op rejected as
+                // "busy" — for the rest of the connection, with nothing to
+                // ever clear it short of a disconnect. Bound that.
+                if pending_autoadd_since.is_some_and(|since| since.elapsed() >= AUTOADD_REPLY_TIMEOUT) {
+                    warn!(
+                        "mesh: autoadd_config probe/write got no reply within {AUTOADD_REPLY_TIMEOUT:?} \
+                         — giving up on it so key operations aren't blocked for the rest of this connection"
+                    );
+                    pending_autoadd = None;
+                    pending_autoadd_since = None;
+                }
             }
             _ = sample_tick.tick() => {
                 let s = delivery_stats.sample(now_unix_secs() as u64);
@@ -1329,7 +1623,12 @@ async fn event_loop(
                 use bbs_plugin_api::MeshKeyRequest;
                 match req {
                     MeshKeyRequest::ExportKey { reply } => {
-                        if pending_key_op.is_some() {
+                        // Busy on a pending autoadd probe/write too: a bare
+                        // Ok/Err carries no correlation id, so an Export sent
+                        // while one is outstanding could have its reply stolen
+                        // by (or steal the reply meant for) that autoadd op —
+                        // see `PendingAutoadd`.
+                        if pending_key_op.is_some() || pending_autoadd.is_some() {
                             let _ = reply.send(Err("another key operation is already in progress".into()));
                         } else {
                             let _ = cmd_tx.send(OutboundFrame::ExportPrivateKey).await;
@@ -1337,7 +1636,7 @@ async fn event_loop(
                         }
                     }
                     MeshKeyRequest::ImportKey { key, reply } => {
-                        if pending_key_op.is_some() {
+                        if pending_key_op.is_some() || pending_autoadd.is_some() {
                             let _ = reply.send(Err("another key operation is already in progress".into()));
                         } else {
                             let _ = cmd_tx.send(OutboundFrame::ImportPrivateKey { key }).await;
@@ -1345,7 +1644,7 @@ async fn event_loop(
                         }
                     }
                     MeshKeyRequest::ApplyRadio { params, reply } => {
-                        if pending_key_op.is_some() {
+                        if pending_key_op.is_some() || pending_autoadd.is_some() {
                             let _ = reply.send(Err("another device operation is already in progress".into()));
                         } else {
                             let _ = cmd_tx.send(OutboundFrame::SetRadioParams {
@@ -1771,51 +2070,12 @@ async fn handle_frame(
         }
 
         // ── Contact auto-add config ───────────────────────────────────────────
-        // Response to CMD_GET_AUTOADD_CONFIG sent at startup: [autoadd_config]
-        // [autoadd_max_hops].  The BBS supports firmware 1.14.0 or newer; the
-        // autoadd commands date from 1.12.0 and the hop limit byte from 1.14.0.
-        //
-        // Whether a newly-heard node is stored as a contact is decided by
-        // MyMesh::shouldAutoAddContactType: with `manual_add_contacts` bit 0
-        // clear every type is added, otherwise only the types enabled in
-        // autoadd_config (see the AUTO_ADD_* constants).  A radio left in the
-        // second mode without the Chat bit never stores new users, so it cannot
-        // DM them and the firmware drops their DMs (issue #305).  A full table
-        // refuses new contacts unless AUTO_ADD_OVERWRITE_OLDEST is set
-        // (MyMesh::shouldOverwriteWhenFull).
-        //
-        // Set both bits.  A one-byte SET leaves autoadd_max_hops and the
-        // other type bits as the operator configured them.  On a radio that
-        // already auto-adds every type the Chat bit changes nothing, but the
-        // write is still made when it is missing.
-        InboundFrame::AutoaddConfig { config, max_hops } => {
-            match autoadd_config_needed(config) {
-                Some(wanted) => {
-                    info!(
-                        config,
-                        wanted,
-                        "mesh: setting radio autoadd_config to enable Chat auto-add \
-                         and overwrite-oldest so new users can reach the BBS"
-                    );
-                    let _ = cmd_tx
-                        .send(OutboundFrame::SetAutoaddConfig { config: wanted })
-                        .await;
-                }
-                None => debug!(config, "mesh: contact auto-add already configured"),
-            }
-            // autoadd_max_hops is a second gate.  A non-zero N makes the radio
-            // store only nodes heard across fewer than N hops (1 = direct
-            // only).  Left alone; it is the operator's policy to set.
-            if let Some(hops @ 1..) = max_hops {
-                warn!(
-                    max_hops = hops,
-                    "mesh: radio limits contact auto-add by hop count \
-                     (autoadd_max_hops); new users heard across that many hops \
-                     or more are not stored, so they cannot reach the BBS until \
-                     the limit is raised or removed in the MeshCore app"
-                );
-            }
-        }
+        // Response to CMD_GET_AUTOADD_CONFIG sent at startup, handled by the
+        // `InboundFrame::AutoaddConfig` arm in `event_loop`'s reply
+        // interceptor (it needs mutable access to `pending_autoadd` and
+        // `pending_key_op`, which this function doesn't have — see
+        // supply-drop-bbs-6tw). Never reaches here: the interceptor always
+        // claims it.
 
         // ── Contact table full — proactive eviction ───────────────────────────
         // The firmware could not store a new contact because the table is at

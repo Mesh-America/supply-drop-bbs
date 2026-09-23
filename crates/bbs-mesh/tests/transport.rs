@@ -3173,3 +3173,309 @@ async fn connect_autoadd_already_correct_sends_no_write() {
         transport.stop().await.unwrap();
     }
 }
+
+/// Send `MeshKeyRequest::ExportKey` through the host's key channel and return
+/// the reply it gets back within 2s — the same channel `admin_export_key`-style
+/// callers use in production (see `RemoveContact`'s use of this pattern above).
+async fn export_key(host: &MockHost) -> Result<String, String> {
+    let key_tx = host
+        .mesh_key_tx()
+        .expect("MeshTransport::start must have registered its key_tx by now");
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    key_tx
+        .send(MeshKeyRequest::ExportKey { reply: reply_tx })
+        .await
+        .expect("transport's key_rx must still be alive");
+    tokio::time::timeout(Duration::from_secs(2), reply_rx)
+        .await
+        .expect("transport must reply to ExportKey within 2s")
+        .expect("reply sender must not be dropped without a value")
+}
+
+/// supply-drop-bbs-6tw: a bare Ok replying to the connect-time
+/// `CMD_SET_AUTOADD_CONFIG` write must be attributed to that write, not left
+/// for a pending key op to swallow (or left unclaimed forever) — clearing the
+/// slot so a key op sent afterward is not wrongly rejected as "busy".
+#[tokio::test]
+async fn connect_autoadd_write_ok_clears_the_pending_slot_for_a_later_key_op() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge
+        .complete_handshake_with_autoadd("TestNode", [0x00, 0])
+        .await;
+
+    let set = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_AUTOADD_CONFIG),
+    )
+    .await
+    .expect("transport never sent CMD_SET_AUTOADD_CONFIG");
+    assert_eq!(set[0], CMD_SET_AUTOADD_CONFIG);
+    bridge.send(&radio_frame(&[RESP_CODE_OK])).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // A key op sent afterward must actually reach the wire, not be rejected
+    // as "busy" by a slot the write's own Ok failed to clear.
+    let key_task = tokio::spawn({
+        let host = Arc::clone(&host);
+        async move { export_key(&host).await }
+    });
+    let export_cmd = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_EXPORT_PRIVATE_KEY),
+    )
+    .await
+    .expect("ExportKey must not be rejected as busy once the autoadd write is confirmed");
+    assert_eq!(export_cmd[0], CMD_EXPORT_PRIVATE_KEY);
+    let key = [0xABu8; 32];
+    let mut payload = vec![RESP_CODE_PRIVATE_KEY];
+    payload.extend_from_slice(&key);
+    bridge.send(&radio_frame(&payload)).await;
+    let hex = key_task
+        .await
+        .unwrap()
+        .expect("export must succeed once the device replies");
+    assert_eq!(hex, "ab".repeat(32));
+
+    transport.stop().await.unwrap();
+}
+
+/// supply-drop-bbs-6tw: a device error rejecting the connect-time
+/// `CMD_SET_AUTOADD_CONFIG` write must not leave the pending slot occupied
+/// forever — a key op sent afterward must still go through.
+#[tokio::test]
+async fn connect_autoadd_write_err_does_not_leave_the_pending_slot_busy() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge
+        .complete_handshake_with_autoadd("TestNode", [0x00, 0])
+        .await;
+
+    let set = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_AUTOADD_CONFIG),
+    )
+    .await
+    .expect("transport never sent CMD_SET_AUTOADD_CONFIG");
+    assert_eq!(set[0], CMD_SET_AUTOADD_CONFIG);
+    bridge.send(&err_frame(ERR_CODE_UNSUPPORTED_CMD)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let key_task = tokio::spawn({
+        let host = Arc::clone(&host);
+        async move { export_key(&host).await }
+    });
+    let export_cmd = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_EXPORT_PRIVATE_KEY),
+    )
+    .await
+    .expect("ExportKey must not be rejected as busy after the autoadd write was rejected");
+    assert_eq!(export_cmd[0], CMD_EXPORT_PRIVATE_KEY);
+    let key = [0xCDu8; 32];
+    let mut payload = vec![RESP_CODE_PRIVATE_KEY];
+    payload.extend_from_slice(&key);
+    bridge.send(&radio_frame(&payload)).await;
+    key_task
+        .await
+        .unwrap()
+        .expect("export must still succeed after the unrelated autoadd rejection");
+
+    transport.stop().await.unwrap();
+}
+
+/// supply-drop-bbs-6tw, "no reply yet" case: while the connect-time autoadd
+/// write is outstanding (sent, not yet replied to), a key op must be rejected
+/// as busy rather than risk its reply being swallowed by — or swallowing —
+/// the write's. Once the write resolves, a later key op must go through.
+#[tokio::test]
+async fn a_key_op_is_rejected_while_the_autoadd_write_is_outstanding() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge
+        .complete_handshake_with_autoadd("TestNode", [0x00, 0])
+        .await;
+
+    let set = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_AUTOADD_CONFIG),
+    )
+    .await
+    .expect("transport never sent CMD_SET_AUTOADD_CONFIG");
+    assert_eq!(set[0], CMD_SET_AUTOADD_CONFIG);
+
+    // No reply sent yet — the write is genuinely still outstanding.
+    let busy = export_key(&host)
+        .await
+        .expect_err("a key op must be rejected while the autoadd write is outstanding");
+    assert!(busy.contains("already in progress"), "{busy}");
+    let seen = drain_command_types(&mut bridge, Duration::from_millis(300)).await;
+    assert!(
+        !seen.contains(&CMD_EXPORT_PRIVATE_KEY),
+        "a busy-rejected key op must never reach the wire: {seen:?}"
+    );
+
+    // Resolve the write, then a fresh key op must succeed.
+    bridge.send(&radio_frame(&[RESP_CODE_OK])).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let key_task = tokio::spawn({
+        let host = Arc::clone(&host);
+        async move { export_key(&host).await }
+    });
+    let export_cmd = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_EXPORT_PRIVATE_KEY),
+    )
+    .await
+    .expect("ExportKey must go through once the autoadd write resolves");
+    assert_eq!(export_cmd[0], CMD_EXPORT_PRIVATE_KEY);
+    let key = [0xEFu8; 32];
+    let mut payload = vec![RESP_CODE_PRIVATE_KEY];
+    payload.extend_from_slice(&key);
+    bridge.send(&radio_frame(&payload)).await;
+    key_task.await.unwrap().expect("export must now succeed");
+
+    transport.stop().await.unwrap();
+}
+
+/// supply-drop-bbs-6tw, "no reply yet" case on the read side: while the
+/// connect-time `CMD_GET_AUTOADD_CONFIG` is outstanding, a key op must be
+/// rejected as busy; once the read resolves (here, with a config that needs
+/// no write), a later key op must go through.
+#[tokio::test]
+async fn a_key_op_is_rejected_while_the_autoadd_read_is_outstanding() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+
+    // Manual handshake so the test can hold off replying to
+    // CMD_GET_AUTOADD_CONFIG, unlike `complete_handshake_with_autoadd`.
+    let app_start = bridge.recv_n(11).await;
+    assert_eq!(app_start[3], CMD_APP_START);
+    bridge.send(&self_info_frame("TestNode")).await;
+    let set_path = bridge.read_command().await;
+    assert_eq!(set_path[0], CMD_SET_PATH_HASH_MODE);
+    let drain_cmd = bridge.read_command().await;
+    assert_eq!(drain_cmd[0], CMD_SYNC_NEXT_MESSAGE);
+    bridge
+        .send(&radio_frame(&[RESP_CODE_NO_MORE_MESSAGES]))
+        .await;
+    let get_contacts = bridge.read_command().await;
+    assert_eq!(get_contacts[0], CMD_GET_CONTACTS);
+    let get_autoadd = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_GET_AUTOADD_CONFIG),
+    )
+    .await
+    .expect("transport never sent CMD_GET_AUTOADD_CONFIG");
+    assert_eq!(get_autoadd[0], CMD_GET_AUTOADD_CONFIG);
+
+    // No reply sent yet — the read is genuinely still outstanding.
+    let busy = export_key(&host)
+        .await
+        .expect_err("a key op must be rejected while the autoadd read is outstanding");
+    assert!(busy.contains("already in progress"), "{busy}");
+    let seen = drain_command_types(&mut bridge, Duration::from_millis(300)).await;
+    assert!(
+        !seen.contains(&CMD_EXPORT_PRIVATE_KEY),
+        "a busy-rejected key op must never reach the wire: {seen:?}"
+    );
+
+    // Resolve the read (config already correct — no SET follows), then a
+    // fresh key op must succeed.
+    bridge
+        .send(&radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 0x03, 0]))
+        .await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let key_task = tokio::spawn({
+        let host = Arc::clone(&host);
+        async move { export_key(&host).await }
+    });
+    let export_cmd = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_EXPORT_PRIVATE_KEY),
+    )
+    .await
+    .expect("ExportKey must go through once the autoadd read resolves");
+    assert_eq!(export_cmd[0], CMD_EXPORT_PRIVATE_KEY);
+    let key = [0x12u8; 32];
+    let mut payload = vec![RESP_CODE_PRIVATE_KEY];
+    payload.extend_from_slice(&key);
+    bridge.send(&radio_frame(&payload)).await;
+    key_task.await.unwrap().expect("export must now succeed");
+
+    transport.stop().await.unwrap();
+}
+
+/// supply-drop-bbs-6tw / GH #398 interaction: a lost reply to the autoadd
+/// write (the device never answers) must not block every key op for the
+/// rest of the connection — `AUTOADD_REPLY_TIMEOUT` bounds how long
+/// `pending_autoadd` can stay occupied waiting for one.
+#[tokio::test]
+async fn a_lost_autoadd_write_reply_times_out_and_stops_blocking_key_ops() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    bridge
+        .complete_handshake_with_autoadd("TestNode", [0x00, 0])
+        .await;
+
+    let set = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_SET_AUTOADD_CONFIG),
+    )
+    .await
+    .expect("transport never sent CMD_SET_AUTOADD_CONFIG");
+    assert_eq!(set[0], CMD_SET_AUTOADD_CONFIG);
+
+    // Never reply. A key op sent now must be rejected as busy...
+    let busy = export_key(&host)
+        .await
+        .expect_err("a key op must be rejected while the write is outstanding");
+    assert!(busy.contains("already in progress"), "{busy}");
+
+    // ...but once the reply is lost for longer than AUTOADD_REPLY_TIMEOUT,
+    // the slot must free itself without a reconnect.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let key_task = tokio::spawn({
+        let host = Arc::clone(&host);
+        async move { export_key(&host).await }
+    });
+    let export_cmd = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_EXPORT_PRIVATE_KEY),
+    )
+    .await
+    .expect("a key op must go through once the lost autoadd reply times out");
+    assert_eq!(export_cmd[0], CMD_EXPORT_PRIVATE_KEY);
+    let key = [0x99u8; 32];
+    let mut payload = vec![RESP_CODE_PRIVATE_KEY];
+    payload.extend_from_slice(&key);
+    bridge.send(&radio_frame(&payload)).await;
+    key_task.await.unwrap().expect("export must succeed");
+
+    transport.stop().await.unwrap();
+}
+
+/// supply-drop-bbs-6tw: an unsolicited/duplicate `AutoaddConfig` response —
+/// no read was actually pending — must be ignored rather than triggering a
+/// write or clobbering unrelated state.
+#[tokio::test]
+async fn a_duplicate_autoadd_config_frame_with_no_pending_read_is_ignored() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    // Already correct (0x03): the connect-time read gets its answer and
+    // settles with no write, so nothing is pending afterward.
+    bridge
+        .complete_handshake_with_autoadd("TestNode", [0x03, 0])
+        .await;
+
+    bridge
+        .send(&radio_frame(&[RESP_CODE_AUTOADD_CONFIG, 0x00, 0]))
+        .await;
+    let seen = drain_command_types(&mut bridge, Duration::from_millis(300)).await;
+    assert!(
+        !seen.contains(&CMD_SET_AUTOADD_CONFIG),
+        "an unsolicited AutoaddConfig frame must not trigger a write: {seen:?}"
+    );
+
+    transport.stop().await.unwrap();
+}
