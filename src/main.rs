@@ -311,8 +311,8 @@ enum UserAction {
         /// BBS username whose password will be reset.
         username: String,
     },
-    /// Disable a user account: login is rejected and any live session is
-    /// ended immediately, but the account and its authored messages are
+    /// Disable a user account: login is rejected and a live session ends on
+    /// its next command, but the account and its authored messages are
     /// preserved (this is a softer action than deletion — deleting a user
     /// additionally reserves the username so no-one else can register it,
     /// and is not currently exposed as a CLI command).
@@ -332,8 +332,8 @@ enum UserAction {
         username: String,
     },
     /// Suspend a user account for a fixed number of days, distinct from a
-    /// permanent `ban`: login is rejected and any live session is ended
-    /// immediately, same as `ban`, but the account reactivates
+    /// permanent `ban`: login is rejected and a live session ends on its
+    /// next command, same as `ban`, but the account reactivates
     /// automatically once the timeout elapses rather than staying disabled
     /// until an explicit `unban`.
     ///
@@ -470,6 +470,23 @@ enum ConfigAction {
         /// `on` to broadcast coordinates (default), `off` to keep the BBS
         /// aware of its own location without publishing it.
         enabled: String,
+    },
+
+    /// Show, set or clear the MeshCore region the BBS's adverts are scoped to.
+    ///
+    /// With no argument, prints the current setting. With a region name
+    /// (`usa`, or `#usa`), writes `advert_scope` to the `[plugins.mesh]`
+    /// section: at connect the BBS sets the radio's default flood scope to it,
+    /// before the on-connect advert. The scope also applies to the floods the
+    /// radio starts when it has no path to someone (the first reply to a new
+    /// user, logins), and a scoped flood is only passed on by repeaters that
+    /// carry that exact region. `off` removes the setting, which does NOT clear
+    /// a scope already on the radio (use the MeshCore app for that).
+    /// Changes take effect on the next BBS restart.
+    #[cfg(feature = "transport-mesh")]
+    AdvertScope {
+        /// Region name, or `off` to stop managing the scope. Omit to show.
+        value: Option<String>,
     },
 }
 
@@ -1277,6 +1294,60 @@ async fn cmd_run(cli: &Cli) {
         }
     }
 
+    // ── 7. Audit log archive task ────────────────────────────────────────────
+    //
+    // The audit log is archived at the turn of each month and starts fresh
+    // (#362). Whether a month has been archived is decided by whether its
+    // archive file exists, not by a timestamp we'd have to keep: a server
+    // that was off over the turn of the month catches up on its next check,
+    // and one that restarts repeatedly can't archive the same month twice.
+    //
+    // Nothing here removes an archive. Archives are the record of every
+    // privileged action taken, so a sysop deletes them by hand or not at all.
+    if cfg.audit.archive_enabled {
+        if let Some(archive_dir) = cfg.audit.directory.clone() {
+            let host_audit = Arc::clone(&host);
+            info!(dir = %archive_dir.display(), "starting monthly audit log archive task");
+            tokio::spawn(async move {
+                // interval's first tick completes immediately, so the first
+                // check happens at startup — which is what's wanted here: a
+                // BBS that was off across the turn of the month catches up as
+                // soon as it comes back rather than waiting an hour. Hourly
+                // after that, so a long-running one crosses the boundary
+                // promptly.
+                let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(60 * 60));
+                loop {
+                    ticker.tick().await;
+                    let dir = archive_dir.to_string_lossy().into_owned();
+                    let now = time::OffsetDateTime::now_utc();
+                    // Everything up to, but not including, the month in
+                    // progress: that one isn't over yet. However many
+                    // complete months are outstanding, each gets its own
+                    // archive under its own name.
+                    match host_audit
+                        .admin_archive_due_audit_months(
+                            &dir,
+                            now.year(),
+                            u32::from(now.month() as u8),
+                        )
+                        .await
+                    {
+                        Ok(written) => {
+                            for rec in written {
+                                info!(
+                                    file = %rec.filename,
+                                    entries = rec.entry_count.unwrap_or(0),
+                                    "archived a month of the audit log"
+                                );
+                            }
+                        }
+                        Err(e) => warn!("audit log archive failed: {e}"),
+                    }
+                }
+            });
+        }
+    }
+
     // ── 8. Plugins ────────────────────────────────────────────────────────────
     //
     // Each plugin is init'd then start'd.  Errors at init abort startup;
@@ -1366,6 +1437,14 @@ async fn cmd_run(cli: &Cli) {
                 .map(|d| d.to_string_lossy().into_owned());
             plugin.set_backup_dir(backup_dir);
             plugin.set_data_dir(Some(data_dir.to_string_lossy().into_owned()));
+            // Same arrangement for audit archives: [audit] directory is the
+            // single source of truth, and the archive page reads it from here.
+            let audit_archive_dir = cfg
+                .audit
+                .directory
+                .as_ref()
+                .map(|d| d.to_string_lossy().into_owned());
+            plugin.set_audit_archive_dir(audit_archive_dir);
         }
         #[cfg(feature = "transport-process")]
         if let Some(ref plugin) = wp {
@@ -1829,6 +1908,44 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
             config_edit_location_bool(config_path, "share_in_advert", value);
             println!("share_in_advert = {value}. Restart the BBS for the change to take effect.");
         }
+        #[cfg(feature = "transport-mesh")]
+        ConfigAction::AdvertScope { value } => match value {
+            None => match cfg.plugins.mesh.flood_scope() {
+                Some(scope) => {
+                    let key: String = scope.key.iter().map(|b| format!("{b:02x}")).collect();
+                    println!("advert_scope = \"{}\"", scope.name);
+                    println!("  region key: {key}");
+                    println!("  (set on the radio at connect; scopes its adverts and its floods to new contacts)");
+                }
+                None => println!(
+                    "advert_scope is not set: the BBS leaves the radio's flood scope alone."
+                ),
+            },
+            Some(v) if v.trim().eq_ignore_ascii_case("off") => {
+                config_remove_mesh_key(config_path, "advert_scope");
+                println!(
+                    "advert_scope cleared. A scope already on the radio stays until you clear \
+                     it in the MeshCore app. Restart the BBS for the change to take effect."
+                );
+            }
+            Some(v) => {
+                let name = match meshcore_companion::normalize_region_name(&v) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                };
+                config_edit_mesh_string(config_path, "advert_scope", &name);
+                println!(
+                    "advert_scope = \"{name}\". Restart the BBS for the change to take effect. \
+                     Floods the radio starts to reach someone it has no path to are scoped to it \
+                     too, not only adverts, and a repeater passes a scoped flood on only if it \
+                     carries this exact region: pick one that every repeater between the BBS \
+                     and your users carries."
+                );
+            }
+        },
     }
 }
 
@@ -1943,6 +2060,40 @@ fn config_remove_bbs_key(config_path: Option<&std::path::Path>, key: &str) {
     with_locked_config_edit(config_path, |doc| {
         if let Some(bbs) = doc.get_mut("bbs").and_then(|t| t.as_table_mut()) {
             bbs.remove(key);
+        }
+        Ok(())
+    });
+}
+
+/// `[plugins.mesh]`, created if absent. `[plugins]` itself is left implicit so
+/// no empty header is written for a table that only holds a subtable.
+#[cfg(feature = "transport-mesh")]
+fn ensure_mesh_table(doc: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Table, String> {
+    let plugins = bbs_core::toml_util::ensure_table(doc, "plugins")?;
+    if plugins.is_empty() {
+        plugins.set_implicit(true);
+    }
+    bbs_core::toml_util::ensure_subtable(plugins, "mesh")
+}
+
+#[cfg(feature = "transport-mesh")]
+fn config_edit_mesh_string(config_path: Option<&std::path::Path>, key: &str, value: &str) {
+    with_locked_config_edit(config_path, |doc| {
+        bbs_core::toml_util::set_string_keeping_comments(ensure_mesh_table(doc)?, key, value);
+        Ok(())
+    });
+}
+
+#[cfg(feature = "transport-mesh")]
+fn config_remove_mesh_key(config_path: Option<&std::path::Path>, key: &str) {
+    with_locked_config_edit(config_path, |doc| {
+        if let Some(mesh) = doc
+            .get_mut("plugins")
+            .and_then(|p| p.as_table_mut())
+            .and_then(|p| p.get_mut("mesh"))
+            .and_then(|m| m.as_table_mut())
+        {
+            mesh.remove(key);
         }
         Ok(())
     });
@@ -2671,7 +2822,9 @@ async fn cmd_user(cli: &Cli, action: &UserAction) {
 
         UserAction::Ban { username } => {
             match host.admin_update_user(username, Some(1), None).await {
-                Ok(()) => println!("disabled: {username} (login rejected, session ended)"),
+                Ok(()) => println!(
+                    "disabled: {username} (login rejected; a live session ends on its next command)"
+                ),
                 Err(bbs_plugin_api::HostError::NotFound(_)) => {
                     eprintln!("error: user '{username}' not found");
                     std::process::exit(1);
@@ -3262,6 +3415,7 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
             // Don't retry on CLI — if the port is unavailable, fail fast.
             reconnect_delay_initial: Duration::from_secs(60),
             reconnect_delay_max: Duration::from_secs(60),
+            default_flood_scope: None,
         };
 
         let mut client = CompanionClient::connect_serial(serial_cfg);
@@ -3846,6 +4000,33 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
+mod audit_archive_tests {
+
+    #[test]
+    fn the_current_month_is_what_the_catch_up_stops_before() {
+        // The scheduler hands the month in progress as an exclusive bound,
+        // so what it passes has to be a real month for every clock reading.
+        let now = time::OffsetDateTime::now_utc();
+        let month = u32::from(now.month() as u8);
+        assert!((1..=12).contains(&month), "month out of range: {month}");
+    }
+
+    #[test]
+    fn an_archive_name_is_built_from_a_month() {
+        // The name carries the month an archive holds, so the padding has to
+        // be stable — the page parses the month back out of it.
+        assert_eq!(
+            bbs_core::audit_archive::archive_name(2026, 1),
+            "audit-2026-01.zip"
+        );
+        assert_eq!(
+            bbs_core::audit_archive::archive_name(2025, 12),
+            "audit-2025-12.zip"
+        );
+    }
+}
+
+#[cfg(test)]
 mod contacts_tests {
     use super::*;
 
@@ -4386,5 +4567,47 @@ mod backup_cli_tests {
                 "{arg:?}"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "transport-mesh"))]
+mod advert_scope_cli_tests {
+    use super::{config_edit_mesh_string, config_remove_mesh_key, Cli};
+    use clap::Parser as _;
+
+    #[test]
+    fn the_command_parses_with_and_without_a_value() {
+        assert!(Cli::try_parse_from(["x", "config", "advert-scope"]).is_ok());
+        assert!(Cli::try_parse_from(["x", "config", "advert-scope", "usa"]).is_ok());
+        assert!(Cli::try_parse_from(["x", "config", "advert-scope", "off"]).is_ok());
+    }
+
+    #[test]
+    fn setting_and_clearing_round_trips_through_the_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[bbs]\nname = \"Test\"\n").unwrap();
+
+        config_edit_mesh_string(Some(&path), "advert_scope", "usa");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[plugins.mesh]"), "{text}");
+        assert!(
+            !text.contains("[plugins]\n"),
+            "no empty [plugins] header: {text}"
+        );
+        let cfg = crate::config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.plugins.mesh.advert_scope.as_deref(), Some("usa"));
+
+        // The rest of the file is untouched, and the key can be changed.
+        assert!(text.contains("name = \"Test\""));
+        config_edit_mesh_string(Some(&path), "advert_scope", "west");
+        let cfg = crate::config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.plugins.mesh.advert_scope.as_deref(), Some("west"));
+
+        config_remove_mesh_key(Some(&path), "advert_scope");
+        let cfg = crate::config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.plugins.mesh.advert_scope, None);
+        // Clearing something that is not there is not an error.
+        config_remove_mesh_key(Some(&path), "advert_scope");
     }
 }

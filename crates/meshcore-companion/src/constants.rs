@@ -78,6 +78,11 @@ pub const CMD_SEND_BINARY_REQ: u8 = 50;
 pub const CMD_FACTORY_RESET: u8 = 51;
 pub const CMD_SEND_PATH_DISCOVERY_REQ: u8 = 52;
 pub const CMD_SET_FLOOD_SCOPE: u8 = 54;
+/// Sets the radio's persistent default flood scope (name and key). The
+/// self-advert uses it, and so do the floods the radio starts to reach a
+/// contact it has no path to (a channel with its own scope overrides it).
+pub const CMD_SET_DEFAULT_FLOOD_SCOPE: u8 = 63;
+pub const CMD_GET_DEFAULT_FLOOD_SCOPE: u8 = 64;
 pub const CMD_SEND_CONTROL_DATA: u8 = 55;
 pub const CMD_GET_STATS: u8 = 56;
 pub const CMD_SEND_ANON_REQ: u8 = 57;
@@ -112,6 +117,7 @@ pub const RESP_CODE_ADVERT_PATH: u8 = 22;
 pub const RESP_CODE_TUNING_PARAMS: u8 = 23;
 pub const RESP_CODE_STATS: u8 = 24;
 pub const RESP_CODE_AUTOADD_CONFIG: u8 = 25;
+pub const RESP_CODE_DEFAULT_FLOOD_SCOPE: u8 = 28;
 
 // ── Push codes (radio → app, unsolicited) ───────────────────────────────────
 pub const PUSH_CODE_ADVERT: u8 = 0x80;

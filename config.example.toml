@@ -146,6 +146,25 @@
 # keep_weekly = 4
 
 
+# ─── Audit log ────────────────────────────────────────────────────
+
+[audit]
+# Archive the audit log at the turn of each month, starting the live log
+# fresh. The archive is a zip holding that month's entries as text, listed
+# for download on the admin UI's "audit archives" page.
+#
+# With this off, the audit log simply keeps growing. Nothing is deleted
+# either way.
+# archive_enabled = true
+
+# Where archives go. Defaults to <data_dir>/audit-archives.
+# directory = "/var/lib/supply-drop-bbs/audit-archives"
+
+# There is deliberately no retention setting. The audit log is the record of
+# every privileged action taken on the BBS, so archives are never removed
+# automatically — a sysop deletes one by hand from the admin UI, or not at all.
+
+
 # ─── Plugin: CLI transport ────────────────────────────────────────
 
 [plugins.cli]
@@ -230,6 +249,13 @@
 # firmware's own advert schedule. Default true. (A periodic flood advert also
 # goes out once every 24h on a fixed schedule — not configurable.)
 # advert_on_connect = true
+# Keep the BBS's adverts (and everything else the radio floods, replies to users
+# included) inside a MeshCore region. The name is hashed as written, with or
+# without a leading '#'. Set on the radio at connect, before the on-connect
+# advert. Repeaters between the BBS and your users must know the region, or
+# scoped floods stop at the first one that doesn't. Unset leaves the radio's
+# scope alone. See docs/CONFIG.md, "Advert scope".
+# advert_scope = "usa"
 
 
 # ─── Plugin: Meshtastic transport ─────────────────────────────────

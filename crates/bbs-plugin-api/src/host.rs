@@ -119,9 +119,10 @@ pub enum MeshtasticAdminRequest {
 }
 
 use crate::admin::{
-    AdminAccessPolicy, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord, AdminReports,
-    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, DeliverySampleRecord,
-    MeshRadioParams, MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
+    AdminAccessPolicy, AdminAuditArchive, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord,
+    AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo,
+    DeliverySampleRecord, MeshRadioParams, MeshtasticLoRaConfig, MeshtasticOwnerInfo,
+    MeshtasticSecurityInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -226,6 +227,25 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_verify_credentials".into()))
     }
 
+    /// The permission level `username` holds now, if the account may be
+    /// logged in at all.
+    ///
+    /// Returns `None` when the account doesn't exist, is deleted, is
+    /// permanently banned, or is in a suspension that hasn't run out. A
+    /// suspension that has run out is lifted as a side effect and the level
+    /// returned, the same as at login.
+    ///
+    /// The web admin calls this on every request, so a change made from
+    /// anywhere else (the CLI, the BBS's own commands, the database) reaches
+    /// a web session it has already issued.
+    async fn admin_account_level(
+        &self,
+        username: &str,
+    ) -> Result<Option<PermissionLevel>, HostError> {
+        let _ = username;
+        Err(HostError::NotSupported("admin_account_level".into()))
+    }
+
     /// Return info about every currently-live BBS session.
     async fn admin_list_sessions(&self) -> Result<Vec<AdminSessionInfo>, HostError> {
         Err(HostError::NotSupported("admin_list_sessions".into()))
@@ -268,6 +288,10 @@ pub trait Host: Send + Sync {
     /// Update a user's status and/or permission level.
     ///
     /// Pass `None` for either field to leave it unchanged.
+    ///
+    /// A ban or deletion ends the user's live sessions in this process. A
+    /// caller in another process (the CLI) has no sessions to end; the
+    /// running server catches up on the user's next command.
     async fn admin_update_user(
         &self,
         username: &str,
@@ -280,7 +304,8 @@ pub trait Host: Send + Sync {
 
     /// Put a user into a time-limited suspension ("timeout"): rejects login
     /// with a message stating how many days remain, and terminates any
-    /// existing sessions immediately, the same as a permanent ban — but
+    /// existing sessions in this process, the same as a permanent ban (from
+    /// another process, the server catches up on the user's next command) — but
     /// automatically lifts once `days` have elapsed rather than staying in
     /// effect until an explicit unban (supply-drop-bbs-ax3 / #280).
     ///
@@ -399,6 +424,67 @@ pub trait Host: Send + Sync {
     async fn admin_delete_backup(&self, backup_dir: &str, filename: &str) -> Result<(), HostError> {
         let _ = (backup_dir, filename);
         Err(HostError::NotSupported("admin_delete_backup".into()))
+    }
+
+    /// Move the audit log into a dated archive in `archive_dir` and clear the
+    /// entries it took, leaving the live log fresh.
+    ///
+    /// `year`/`month` name the archive. Entries written while the archive is
+    /// being built stay in the live log. The log is only cleared once the
+    /// archive file is complete and in place, so a failure loses the archive
+    /// rather than the entries. Returns `None` when the log is empty, having
+    /// written nothing.
+    async fn admin_archive_audit_log(
+        &self,
+        archive_dir: &str,
+        year: i32,
+        month: u32,
+    ) -> Result<Option<AdminAuditArchive>, HostError> {
+        let _ = (archive_dir, year, month);
+        Err(HostError::NotSupported("admin_archive_audit_log".into()))
+    }
+
+    /// Archive every complete month still sitting in the audit log, oldest
+    /// first, stopping before `before_year`/`before_month` (the month in
+    /// progress, which isn't finished and so isn't archived).
+    ///
+    /// One archive per month, each named for the month it holds. A BBS that
+    /// was switched off for a while catches up a month at a time rather than
+    /// sweeping everything into one misleading file. Returns what it wrote,
+    /// which is empty when there's nothing complete to archive.
+    async fn admin_archive_due_audit_months(
+        &self,
+        archive_dir: &str,
+        before_year: i32,
+        before_month: u32,
+    ) -> Result<Vec<AdminAuditArchive>, HostError> {
+        let _ = (archive_dir, before_year, before_month);
+        Err(HostError::NotSupported(
+            "admin_archive_due_audit_months".into(),
+        ))
+    }
+
+    /// List audit log archives found in `archive_dir`, newest first.
+    async fn admin_list_audit_archives(
+        &self,
+        archive_dir: &str,
+    ) -> Result<Vec<AdminAuditArchive>, HostError> {
+        let _ = archive_dir;
+        Err(HostError::NotSupported("admin_list_audit_archives".into()))
+    }
+
+    /// Delete one audit log archive from `archive_dir`.
+    ///
+    /// Only ever called for a sysop who asked for it by name: nothing removes
+    /// an archive on a schedule. Returns `HostError::NotFound` if the file
+    /// does not exist.
+    async fn admin_delete_audit_archive(
+        &self,
+        archive_dir: &str,
+        filename: &str,
+    ) -> Result<(), HostError> {
+        let _ = (archive_dir, filename);
+        Err(HostError::NotSupported("admin_delete_audit_archive".into()))
     }
 
     /// Validate `uploaded_path` as a restorable database WITHOUT touching

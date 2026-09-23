@@ -37,6 +37,7 @@ struct Existing {
     mesh_baud_rate: u32,
     mesh_addr: Option<String>,
     mesh_path_bytes: u8,
+    mesh_advert_scope: Option<String>,
     // Meshtastic
     meshtastic_enabled: bool,
     meshtastic_connection_type: String,
@@ -162,6 +163,15 @@ fn load_existing(out_path: &Path) -> Existing {
         .and_then(|v| v.as_integer())
         .map(|v| v as u8)
         .unwrap_or(3);
+    let mesh_advert_scope = mesh
+        .and_then(|m| m.get("advert_scope"))
+        // A bare number or boolean is a valid region name to the config loader.
+        .and_then(|v| match v {
+            toml::Value::String(s) => Some(s.clone()),
+            toml::Value::Integer(i) => Some(i.to_string()),
+            toml::Value::Boolean(b) => Some(b.to_string()),
+            _ => None,
+        });
 
     // Meshtastic existing values
     let meshtastic_enabled = meshtastic
@@ -301,6 +311,7 @@ fn load_existing(out_path: &Path) -> Existing {
         mesh_baud_rate,
         mesh_addr,
         mesh_path_bytes,
+        mesh_advert_scope,
         meshtastic_enabled,
         meshtastic_connection_type,
         meshtastic_serial_port,
@@ -650,6 +661,13 @@ pub fn run_wizard(config_out: Option<&Path>) {
         }
     } else {
         ex.mesh_path_bytes
+    };
+
+    // ── MeshCore advert scope (optional) ──────────────────────────────────────
+    let mesh_advert_scope: Option<String> = if use_mesh {
+        prompt_advert_scope(&theme, ex.mesh_advert_scope.as_deref())
+    } else {
+        ex.mesh_advert_scope.clone()
     };
 
     // ── MeshCore radio parameters (all connection types) ──────────────────────
@@ -1233,6 +1251,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
         mesh_baud_rate,
         mesh_addr: mesh_addr.as_deref(),
         mesh_path_bytes,
+        mesh_advert_scope: mesh_advert_scope.as_deref(),
         use_meshtastic,
         meshtastic_connection_type: meshtastic_conn_type,
         meshtastic_serial_port: meshtastic_serial_port.as_deref(),
@@ -1370,6 +1389,67 @@ pub fn run_wizard(config_out: Option<&Path>) {
         &out_path,
         config_chown_ok,
     );
+}
+
+// ── MeshCore advert scope ─────────────────────────────────────────────────────
+
+/// Ask for the MeshCore region the BBS's adverts are scoped to. `None` leaves
+/// the radio's scope alone. With a region already set, an empty answer keeps it
+/// and `off` removes it (an input prompt returns its default on an empty
+/// answer, so a blank cannot mean "clear" there).
+#[cfg(feature = "transport-mesh")]
+fn prompt_advert_scope(theme: &ColorfulTheme, existing: Option<&str>) -> Option<String> {
+    section("MeshCore advert scope (optional)");
+
+    println!("A MeshCore region name keeps the BBS's adverts inside that region, which");
+    println!("cuts noise on a large mesh. Leave it unset to change nothing.");
+    println!();
+    println!("It also scopes the floods the radio starts when it has no path to someone");
+    println!("(the first reply to a new user, logins). A repeater passes a scoped flood on");
+    println!("only if it carries that exact region, so pick one every repeater between the");
+    println!("BBS and your users carries: a region your communities share, not the");
+    println!("narrowest one.");
+    println!();
+
+    let prompt = match existing {
+        Some(name) => format!("Region name (Enter keeps \"{name}\", \"off\" removes it)"),
+        None => "Region name (Enter for none)".to_owned(),
+    };
+    let entered: String = Input::with_theme(theme)
+        .with_prompt(prompt)
+        .allow_empty(true)
+        .validate_with(|s: &String| -> Result<(), String> {
+            let s = s.trim();
+            if s.is_empty() || s.eq_ignore_ascii_case("off") {
+                return Ok(());
+            }
+            meshcore_companion::normalize_region_name(s)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        })
+        .interact_text()
+        .unwrap_or_else(|_| cancelled());
+    advert_scope_from_answer(&entered, existing)
+}
+
+/// What an answer to the region prompt means, given the value already set.
+#[cfg(feature = "transport-mesh")]
+fn advert_scope_from_answer(answer: &str, existing: Option<&str>) -> Option<String> {
+    let answer = answer.trim();
+    if answer.is_empty() {
+        return existing.map(str::to_owned);
+    }
+    if answer.eq_ignore_ascii_case("off") {
+        return None;
+    }
+    meshcore_companion::normalize_region_name(answer).ok()
+}
+
+/// Without the MeshCore transport nothing is asked and what the config already
+/// has is kept.
+#[cfg(not(feature = "transport-mesh"))]
+fn prompt_advert_scope(_theme: &ColorfulTheme, existing: Option<&str>) -> Option<String> {
+    existing.map(str::to_owned)
 }
 
 // ── Connection type configuration ─────────────────────────────────────────────
@@ -1988,6 +2068,7 @@ struct TomlParams<'a> {
     mesh_baud_rate: Option<u32>,
     mesh_addr: Option<&'a str>,
     mesh_path_bytes: u8,
+    mesh_advert_scope: Option<&'a str>,
     // Meshtastic
     use_meshtastic: bool,
     meshtastic_connection_type: &'a str,
@@ -2049,6 +2130,10 @@ fn build_toml(p: &TomlParams<'_>) -> String {
     // [plugins.mesh]
     writeln!(s, "\n[plugins.mesh]").unwrap();
     writeln!(s, "enabled = {}", p.use_mesh).unwrap();
+    // Kept while MeshCore is switched off, so turning it back on finds it.
+    if let Some(scope) = p.mesh_advert_scope {
+        writeln!(s, "advert_scope = {}", toml_str(scope)).unwrap();
+    }
     if p.use_mesh {
         writeln!(s, "connection_type = {}", toml_str(p.mesh_connection_type)).unwrap();
         match p.mesh_connection_type {
@@ -2690,6 +2775,7 @@ mod build_toml_tests {
             mesh_baud_rate: None,
             mesh_addr: None,
             mesh_path_bytes: 3,
+            mesh_advert_scope: None,
             use_meshtastic: false,
             meshtastic_connection_type: "serial",
             meshtastic_serial_port: None,
@@ -2708,6 +2794,61 @@ mod build_toml_tests {
             process_plugins_toml: None,
             mesh_radio,
         }
+    }
+
+    #[cfg(feature = "transport-mesh")]
+    #[cfg(feature = "transport-mesh")]
+    #[test]
+    fn the_region_prompt_keeps_sets_and_clears() {
+        // Nothing set yet.
+        assert_eq!(advert_scope_from_answer("", None), None);
+        assert_eq!(
+            advert_scope_from_answer("#usa", None).as_deref(),
+            Some("usa")
+        );
+        assert_eq!(
+            advert_scope_from_answer("  west ", None).as_deref(),
+            Some("west")
+        );
+        // Already set: Enter keeps it, another name replaces it, `off` clears it.
+        assert_eq!(
+            advert_scope_from_answer("", Some("usa")).as_deref(),
+            Some("usa")
+        );
+        assert_eq!(
+            advert_scope_from_answer("eu", Some("usa")).as_deref(),
+            Some("eu")
+        );
+        assert_eq!(advert_scope_from_answer("off", Some("usa")), None);
+        assert_eq!(advert_scope_from_answer(" OFF ", Some("usa")), None);
+    }
+
+    #[test]
+    fn advert_scope_is_kept_while_meshcore_is_switched_off() {
+        let mut p = base_params("serial", None);
+        p.use_mesh = false;
+        p.mesh_advert_scope = Some("usa");
+        let toml = build_toml(&p);
+        assert!(toml.contains("enabled = false"), "{toml}");
+        assert!(toml.contains("advert_scope = \"usa\""), "{toml}");
+    }
+
+    #[test]
+    fn advert_scope_is_written_only_when_set_and_loads_back() {
+        let none = build_toml(&base_params("serial", None));
+        assert!(!none.contains("advert_scope"), "{none}");
+
+        let mut p = base_params("serial", None);
+        p.mesh_advert_scope = Some("usa");
+        let toml = build_toml(&p);
+        assert!(toml.contains("advert_scope = \"usa\""), "{toml}");
+
+        // It lands in [plugins.mesh] and the config it produces loads.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &toml).unwrap();
+        let cfg = crate::config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.plugins.mesh.advert_scope.as_deref(), Some("usa"));
     }
 
     #[test]
