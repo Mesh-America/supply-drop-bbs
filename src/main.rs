@@ -1277,6 +1277,60 @@ async fn cmd_run(cli: &Cli) {
         }
     }
 
+    // ── 7. Audit log archive task ────────────────────────────────────────────
+    //
+    // The audit log is archived at the turn of each month and starts fresh
+    // (#362). Whether a month has been archived is decided by whether its
+    // archive file exists, not by a timestamp we'd have to keep: a server
+    // that was off over the turn of the month catches up on its next check,
+    // and one that restarts repeatedly can't archive the same month twice.
+    //
+    // Nothing here removes an archive. Archives are the record of every
+    // privileged action taken, so a sysop deletes them by hand or not at all.
+    if cfg.audit.archive_enabled {
+        if let Some(archive_dir) = cfg.audit.directory.clone() {
+            let host_audit = Arc::clone(&host);
+            info!(dir = %archive_dir.display(), "starting monthly audit log archive task");
+            tokio::spawn(async move {
+                // interval's first tick completes immediately, so the first
+                // check happens at startup — which is what's wanted here: a
+                // BBS that was off across the turn of the month catches up as
+                // soon as it comes back rather than waiting an hour. Hourly
+                // after that, so a long-running one crosses the boundary
+                // promptly.
+                let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(60 * 60));
+                loop {
+                    ticker.tick().await;
+                    let dir = archive_dir.to_string_lossy().into_owned();
+                    let now = time::OffsetDateTime::now_utc();
+                    // Everything up to, but not including, the month in
+                    // progress: that one isn't over yet. However many
+                    // complete months are outstanding, each gets its own
+                    // archive under its own name.
+                    match host_audit
+                        .admin_archive_due_audit_months(
+                            &dir,
+                            now.year(),
+                            u32::from(now.month() as u8),
+                        )
+                        .await
+                    {
+                        Ok(written) => {
+                            for rec in written {
+                                info!(
+                                    file = %rec.filename,
+                                    entries = rec.entry_count.unwrap_or(0),
+                                    "archived a month of the audit log"
+                                );
+                            }
+                        }
+                        Err(e) => warn!("audit log archive failed: {e}"),
+                    }
+                }
+            });
+        }
+    }
+
     // ── 8. Plugins ────────────────────────────────────────────────────────────
     //
     // Each plugin is init'd then start'd.  Errors at init abort startup;
@@ -1366,6 +1420,14 @@ async fn cmd_run(cli: &Cli) {
                 .map(|d| d.to_string_lossy().into_owned());
             plugin.set_backup_dir(backup_dir);
             plugin.set_data_dir(Some(data_dir.to_string_lossy().into_owned()));
+            // Same arrangement for audit archives: [audit] directory is the
+            // single source of truth, and the archive page reads it from here.
+            let audit_archive_dir = cfg
+                .audit
+                .directory
+                .as_ref()
+                .map(|d| d.to_string_lossy().into_owned());
+            plugin.set_audit_archive_dir(audit_archive_dir);
         }
         #[cfg(feature = "transport-process")]
         if let Some(ref plugin) = wp {
@@ -3842,6 +3904,33 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_owned()
     } else {
         s.chars().take(max - 1).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod audit_archive_tests {
+
+    #[test]
+    fn the_current_month_is_what_the_catch_up_stops_before() {
+        // The scheduler hands the month in progress as an exclusive bound,
+        // so what it passes has to be a real month for every clock reading.
+        let now = time::OffsetDateTime::now_utc();
+        let month = u32::from(now.month() as u8);
+        assert!((1..=12).contains(&month), "month out of range: {month}");
+    }
+
+    #[test]
+    fn an_archive_name_is_built_from_a_month() {
+        // The name carries the month an archive holds, so the padding has to
+        // be stable — the page parses the month back out of it.
+        assert_eq!(
+            bbs_core::audit_archive::archive_name(2026, 1),
+            "audit-2026-01.zip"
+        );
+        assert_eq!(
+            bbs_core::audit_archive::archive_name(2025, 12),
+            "audit-2025-12.zip"
+        );
     }
 }
 
