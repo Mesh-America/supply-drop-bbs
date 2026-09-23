@@ -16,19 +16,39 @@ use bbs_plugin_api::AdminAuditEntry;
 /// Filename prefix every archive shares.
 pub const ARCHIVE_PREFIX: &str = "audit-";
 
-/// Whether `filename` looks like one of this module's archives.
+/// Whether `filename` is exactly one of this module's archive names:
+/// `audit-YYYY-MM.zip`, nothing else.
 ///
 /// Used by the listing and by the download and delete endpoints, so a sysop
 /// can't be handed — or asked to delete — some unrelated file that happens to
 /// share the directory.
+///
+/// Deliberately an exact shape rather than a prefix-and-suffix test with
+/// separators subtracted. Matching the whole name leaves no room for a
+/// traversal, a separator, a NUL, an odd Unicode form or a degenerate
+/// `audit-.zip` to satisfy it: anything that isn't four digits, a hyphen and
+/// two digits between the fixed parts is simply not a name this produces.
 #[must_use]
 pub fn is_audit_archive(filename: &str) -> bool {
-    filename.starts_with(ARCHIVE_PREFIX)
-        && filename.ends_with(".zip")
-        && !filename.contains('/')
-        && !filename.contains('\\')
-        && !filename.contains("..")
-        && !filename.contains('\0')
+    let Some(rest) = filename.strip_prefix(ARCHIVE_PREFIX) else {
+        return false;
+    };
+    let Some(stem) = rest.strip_suffix(".zip") else {
+        return false;
+    };
+    // YYYY-MM, and a month that could be a month.
+    let bytes = stem.as_bytes();
+    if bytes.len() != 7 || bytes[4] != b'-' {
+        return false;
+    }
+    if !bytes
+        .iter()
+        .enumerate()
+        .all(|(i, b)| if i == 4 { true } else { b.is_ascii_digit() })
+    {
+        return false;
+    }
+    matches!(stem[5..].parse::<u32>(), Ok(1..=12))
 }
 
 /// The archive file name covering `year`/`month`, e.g. `audit-2026-09.zip`.
@@ -168,6 +188,48 @@ impl ArchiveWriter {
     }
 }
 
+/// The highest audit id an existing archive holds, read back from its own
+/// header.
+///
+/// Archiving renames the finished zip into place and only then clears the
+/// entries it took. A crash in that gap leaves the archive complete and the
+/// entries still live, and since a month whose archive exists is not archived
+/// again, they would otherwise sit in the live log until the next month swept
+/// them into a differently-named archive. Reading the range back out of the
+/// archive lets that interrupted clear be finished exactly, without keeping a
+/// high-water mark anywhere else.
+///
+/// `None` if the archive holds no readable header — better to leave the live
+/// log alone than to guess at what was archived.
+///
+/// # Errors
+///
+/// If the file can't be opened or isn't a readable zip.
+pub fn archived_through(zip_path: &Path) -> std::io::Result<Option<i64>> {
+    use std::io::{BufRead as _, BufReader};
+
+    let file = std::fs::File::open(zip_path)?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| std::io::Error::other(format!("{e}")))?;
+    let entry = zip
+        .by_index(0)
+        .map_err(|e| std::io::Error::other(format!("{e}")))?;
+
+    for line in BufReader::new(entry).lines() {
+        let line = line?;
+        if !line.starts_with('#') {
+            break; // Past the header; the range isn't here.
+        }
+        if let Some(range) = line.split("(ids ").nth(1) {
+            if let Some(last) = range.trim_end_matches(')').split('-').nth(1) {
+                if let Ok(id) = last.trim().parse::<i64>() {
+                    return Ok(Some(id));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// The header written at the top of an archive's text entry.
 #[must_use]
 pub fn header(count: u64, first_id: i64, last_id: i64, taken_at: &str) -> String {
@@ -226,18 +288,71 @@ mod tests {
             "audit.zip",
             "",
             "audit-2026-09.zip.tmp",
+            // Degenerate: the fixed parts with nothing in between.
+            "audit-.zip",
+            "audit-2026-9.zip",
+            "audit-202-09.zip",
+            "audit-20266-09.zip",
+            // A month that isn't one.
+            "audit-2026-00.zip",
+            "audit-2026-13.zip",
+            "audit-2026-1a.zip",
+            // Non-ASCII digits that some parsers would take.
+            "audit-٢٠٢٦-٠٩.zip",
         ] {
             assert!(!is_audit_archive(name), "{name} should not be an archive");
         }
-        // And no traversal or separators, however the rest looks.
+        // And no traversal, separators or NULs, however the rest looks.
         for name in [
             "../audit-2026-09.zip",
             "audit-..-09.zip",
             "sub/audit-2026-09.zip",
             "audit-2026-09.zip/x",
+            "audit-2026-09.zip\0",
+            "..\\audit-2026-09.zip",
+            "/etc/audit-2026-09.zip",
         ] {
             assert!(!is_audit_archive(name), "{name} should not be an archive");
         }
+        // The real thing still passes, at both ends of the year.
+        for name in [
+            "audit-2026-01.zip",
+            "audit-2026-12.zip",
+            "audit-0001-06.zip",
+        ] {
+            assert!(is_audit_archive(name), "{name} should be an archive");
+        }
+    }
+
+    #[test]
+    fn an_archive_reports_the_range_it_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(archive_name(2026, 9));
+        let mut w = ArchiveWriter::create(
+            &target,
+            &entry_name(2026, 9),
+            &header(3, 11, 42, "2026-10-01T00:00:00Z"),
+        )
+        .unwrap();
+        w.write_batch(&[entry(11, "a", "ban")]).unwrap();
+        w.finish().unwrap();
+
+        // This is what lets an interrupted clear be finished exactly.
+        assert_eq!(archived_through(&target).unwrap(), Some(42));
+    }
+
+    #[test]
+    fn an_archive_without_a_readable_range_reports_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(archive_name(2026, 9));
+        // A header-shaped file that doesn't carry a range: better to say so
+        // than to have a caller guess at what was archived.
+        let mut w =
+            ArchiveWriter::create(&target, &entry_name(2026, 9), "# no range here\n").unwrap();
+        w.write_batch(&[entry(1, "a", "ban")]).unwrap();
+        w.finish().unwrap();
+
+        assert_eq!(archived_through(&target).unwrap(), None);
     }
 
     #[test]

@@ -740,21 +740,30 @@ and `\n`, so one entry is always one line and the file stays greppable:
 unzip -p audit-2026-09.zip | grep -P '\tban\t'
 ```
 
-The archive is named for the month it covers, so the one taken on 1 October is
-`audit-2026-09.zip`. Archiving itself is recorded as `archive_audit_log` in the
-now-fresh log, so there's no unexplained gap.
+An archive holds the month it is named for and nothing else, so the one taken
+on 1 October is `audit-2026-09.zip` and contains September. Entries from 1
+October itself stay in the live log — that month isn't over. Archiving is
+recorded as `archive_audit_log` in the now-fresh log, so there's no
+unexplained gap.
 
-Whether a month has been archived is decided by whether its archive file
-exists, not by a stored timestamp. A BBS that was switched off across the turn
-of the month archives on its next hourly check rather than skipping the month,
-and one that restarts repeatedly can't archive the same month twice. If an
-archive for that month already exists, archiving is refused and the live log is
-left alone — so removing an archive by hand and expecting it to be rebuilt
-won't work; the entries are gone from the live log.
+Each complete month is archived separately, however many are outstanding. A
+BBS that was switched off from July to October writes `audit-2026-07.zip`,
+`audit-2026-08.zip` and `audit-2026-09.zip` when it comes back, each holding
+its own month, rather than putting three months into one file. Months with no
+entries get no file. The check runs at startup and hourly after that, so a
+BBS that missed the turn of the month catches up as soon as it's running
+again.
+
+A month that already has an archive is never archived again or overwritten. So
+deleting an archive by hand does not cause it to be rebuilt — its entries have
+already left the live log.
 
 The live log is cleared only once the archive file is complete and renamed into
-place. If archiving fails part-way, you lose the archive and keep the entries,
-not the other way round.
+place. If archiving fails part-way you lose the archive and keep the entries,
+not the other way round. Should the BBS stop in the gap between those two
+steps, the next run notices the archive already holds those entries — it reads
+the id range back out of the archive itself — and finishes clearing exactly
+them, so they are neither stranded in the live log nor archived twice.
 
 ### Archives are never deleted automatically
 

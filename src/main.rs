@@ -1292,35 +1292,38 @@ async fn cmd_run(cli: &Cli) {
             let host_audit = Arc::clone(&host);
             info!(dir = %archive_dir.display(), "starting monthly audit log archive task");
             tokio::spawn(async move {
-                // Checked hourly rather than daily so a server started part
-                // way through the first of the month doesn't wait a full day,
-                // and so a long-running one crosses the boundary promptly.
+                // interval's first tick completes immediately, so the first
+                // check happens at startup — which is what's wanted here: a
+                // BBS that was off across the turn of the month catches up as
+                // soon as it comes back rather than waiting an hour. Hourly
+                // after that, so a long-running one crosses the boundary
+                // promptly.
                 let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(60 * 60));
                 loop {
                     ticker.tick().await;
                     let dir = archive_dir.to_string_lossy().into_owned();
-                    let (year, month) = match previous_month_utc() {
-                        Some(ym) => ym,
-                        None => {
-                            warn!("audit archive: could not read the current date");
-                            continue;
+                    let now = time::OffsetDateTime::now_utc();
+                    // Everything up to, but not including, the month in
+                    // progress: that one isn't over yet. However many
+                    // complete months are outstanding, each gets its own
+                    // archive under its own name.
+                    match host_audit
+                        .admin_archive_due_audit_months(
+                            &dir,
+                            now.year(),
+                            u32::from(now.month() as u8),
+                        )
+                        .await
+                    {
+                        Ok(written) => {
+                            for rec in written {
+                                info!(
+                                    file = %rec.filename,
+                                    entries = rec.entry_count.unwrap_or(0),
+                                    "archived a month of the audit log"
+                                );
+                            }
                         }
-                    };
-                    // Already archived, so there's nothing to do until the
-                    // next turn of the month.
-                    let target =
-                        archive_dir.join(bbs_core::audit_archive::archive_name(year, month));
-                    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
-                        continue;
-                    }
-                    match host_audit.admin_archive_audit_log(&dir, year, month).await {
-                        Ok(Some(rec)) => info!(
-                            file = %rec.filename,
-                            entries = rec.entry_count.unwrap_or(0),
-                            "archived the audit log"
-                        ),
-                        // An empty log is the ordinary case on a quiet BBS.
-                        Ok(None) => {}
                         Err(e) => warn!("audit log archive failed: {e}"),
                     }
                 }
@@ -3470,22 +3473,6 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
     }
 }
 
-// ── Audit archive helpers ─────────────────────────────────────────────────────
-
-/// The calendar month before the current UTC month, as `(year, month)`.
-///
-/// The archive taken during October covers September, so this is what names
-/// it. `None` only if the clock can't be read at all.
-fn previous_month_utc() -> Option<(i32, u32)> {
-    let now = time::OffsetDateTime::now_utc();
-    let (year, month) = (now.year(), now.month() as u8);
-    Some(if month == 1 {
-        (year - 1, 12)
-    } else {
-        (year, u32::from(month - 1))
-    })
-}
-
 // ── Backup helpers ────────────────────────────────────────────────────────────
 
 /// Delete backups that fall outside the daily/weekly retention window.
@@ -3925,28 +3912,18 @@ mod audit_archive_tests {
     use super::*;
 
     #[test]
-    fn the_previous_month_is_the_one_the_archive_covers() {
-        let (year, month) = previous_month_utc().expect("a readable clock");
+    fn the_current_month_is_what_the_catch_up_stops_before() {
+        // The scheduler hands the month in progress as an exclusive bound,
+        // so what it passes has to be a real month for every clock reading.
         let now = time::OffsetDateTime::now_utc();
-        if now.month() as u8 == 1 {
-            assert_eq!(
-                (year, month),
-                (now.year() - 1, 12),
-                "January looks back to December"
-            );
-        } else {
-            assert_eq!(
-                (year, month),
-                (now.year(), u32::from(now.month() as u8 - 1))
-            );
-        }
+        let month = u32::from(now.month() as u8);
         assert!((1..=12).contains(&month), "month out of range: {month}");
     }
 
     #[test]
-    fn an_archive_name_is_built_from_that_month() {
-        // The scheduler decides "already archived?" purely by this name, so
-        // the padding has to be stable.
+    fn an_archive_name_is_built_from_a_month() {
+        // The name carries the month an archive holds, so the padding has to
+        // be stable — the page parses the month back out of it.
         assert_eq!(
             bbs_core::audit_archive::archive_name(2026, 1),
             "audit-2026-01.zip"

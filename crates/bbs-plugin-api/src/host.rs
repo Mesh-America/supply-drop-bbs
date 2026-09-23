@@ -420,6 +420,26 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_archive_audit_log".into()))
     }
 
+    /// Archive every complete month still sitting in the audit log, oldest
+    /// first, stopping before `before_year`/`before_month` (the month in
+    /// progress, which isn't finished and so isn't archived).
+    ///
+    /// One archive per month, each named for the month it holds. A BBS that
+    /// was switched off for a while catches up a month at a time rather than
+    /// sweeping everything into one misleading file. Returns what it wrote,
+    /// which is empty when there's nothing complete to archive.
+    async fn admin_archive_due_audit_months(
+        &self,
+        archive_dir: &str,
+        before_year: i32,
+        before_month: u32,
+    ) -> Result<Vec<AdminAuditArchive>, HostError> {
+        let _ = (archive_dir, before_year, before_month);
+        Err(HostError::NotSupported(
+            "admin_archive_due_audit_months".into(),
+        ))
+    }
+
     /// List audit log archives found in `archive_dir`, newest first.
     async fn admin_list_audit_archives(
         &self,
