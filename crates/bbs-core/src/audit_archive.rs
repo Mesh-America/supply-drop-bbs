@@ -205,29 +205,61 @@ impl ArchiveWriter {
 /// # Errors
 ///
 /// If the file can't be opened or isn't a readable zip.
-pub fn archived_through(zip_path: &Path) -> std::io::Result<Option<i64>> {
-    use std::io::{BufRead as _, BufReader};
+pub fn archived_through(zip_path: &Path, expected_entry: &str) -> std::io::Result<Option<i64>> {
+    use std::io::Read as _;
 
+    // What the caller does with this is delete live audit rows at or below
+    // it, so nothing here is permissive. The entry has to be the one this
+    // module writes, under the name it writes it as; the line has to be the
+    // exact header line, not merely a line mentioning ids; and the range has
+    // to make sense. Anything else reports None, which the caller treats as
+    // "this file can't tell me what it holds" rather than as a range.
     let file = std::fs::File::open(zip_path)?;
     let mut zip = zip::ZipArchive::new(file).map_err(|e| std::io::Error::other(format!("{e}")))?;
-    let entry = zip
-        .by_index(0)
+    let Ok(mut entry) = zip.by_name(expected_entry) else {
+        return Ok(None); // Not the entry this module writes.
+    };
+
+    // The header is a handful of short lines. Read a bounded prefix rather
+    // than however much a pathological file offers.
+    const HEADER_LIMIT: u64 = 8 * 1024;
+    let mut head = String::new();
+    entry
+        .by_ref()
+        .take(HEADER_LIMIT)
+        .read_to_string(&mut head)
         .map_err(|e| std::io::Error::other(format!("{e}")))?;
 
-    for line in BufReader::new(entry).lines() {
-        let line = line?;
+    for line in head.lines() {
         if !line.starts_with('#') {
             break; // Past the header; the range isn't here.
         }
-        if let Some(range) = line.split("(ids ").nth(1) {
-            if let Some(last) = range.trim_end_matches(')').split('-').nth(1) {
-                if let Ok(id) = last.trim().parse::<i64>() {
-                    return Ok(Some(id));
-                }
-            }
+        if let Some(range) = parse_header_range(line) {
+            return Ok(Some(range));
         }
     }
     Ok(None)
+}
+
+/// The last id out of an exact `# entries: N (ids A-B)` line.
+///
+/// `None` for anything else, including a line that merely contains those
+/// words, a range that runs backwards, and negative ids — none of which this
+/// module ever writes, and all of which would otherwise widen a delete.
+fn parse_header_range(line: &str) -> Option<i64> {
+    let rest = line.strip_prefix("# entries: ")?;
+    let (count, rest) = rest.split_once(" (ids ")?;
+    count.parse::<u64>().ok()?;
+    let range = rest.strip_suffix(')')?;
+    if !range.is_empty() && range.contains('-') && !range.starts_with('-') {
+        let (first, last) = range.split_once('-')?;
+        let first: i64 = first.parse().ok()?;
+        let last: i64 = last.parse().ok()?;
+        if first >= 0 && last >= first {
+            return Some(last);
+        }
+    }
+    None
 }
 
 /// The header written at the top of an archive's text entry.
@@ -338,7 +370,63 @@ mod tests {
         w.finish().unwrap();
 
         // This is what lets an interrupted clear be finished exactly.
-        assert_eq!(archived_through(&target).unwrap(), Some(42));
+        assert_eq!(
+            archived_through(&target, &entry_name(2026, 9)).unwrap(),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn a_crafted_header_is_not_trusted_to_bound_a_delete() {
+        // What the caller does with this value is delete live audit rows at
+        // or below it, so only the exact line this module writes counts.
+        // Each of these was accepted by an earlier, looser parse.
+        for line in [
+            "# a note mentioning (ids 1-99999999)",
+            "# entries: 2 (ids 1-5) and also (ids 1-999)",
+            "# entries: notanumber (ids 1-5)",
+            "# entries: 2 (ids 5-1)",    // backwards
+            "# entries: 2 (ids -10--1)", // negative
+            "# entries: 2 (ids 1-5",     // unterminated
+            "# entries: 2 (ids )",
+            "# entries: 2 (ids 1-)",
+            "#entries: 2 (ids 1-5)", // not the written prefix
+        ] {
+            assert_eq!(
+                parse_header_range(line),
+                None,
+                "should not be read as a range: {line}"
+            );
+        }
+        // And the real thing still parses.
+        assert_eq!(parse_header_range("# entries: 3 (ids 11-42)"), Some(42));
+        assert_eq!(parse_header_range("# entries: 1 (ids 0-0)"), Some(0));
+    }
+
+    #[test]
+    fn a_zip_whose_entry_is_not_ours_reports_none() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(archive_name(2026, 9));
+
+        // A zip at the archive's name, but its entry is something else
+        // carrying a header-shaped line. Reading index 0 blindly would have
+        // taken its range.
+        let file = std::fs::File::create(&target).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "somebody-elses.txt",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"# entries: 9 (ids 1-999999)\n").unwrap();
+        zip.finish().unwrap();
+
+        assert_eq!(
+            archived_through(&target, &entry_name(2026, 9)).unwrap(),
+            None,
+            "an entry this module didn't write must not bound a delete"
+        );
     }
 
     #[test]
@@ -352,7 +440,10 @@ mod tests {
         w.write_batch(&[entry(1, "a", "ban")]).unwrap();
         w.finish().unwrap();
 
-        assert_eq!(archived_through(&target).unwrap(), None);
+        assert_eq!(
+            archived_through(&target, &entry_name(2026, 9)).unwrap(),
+            None
+        );
     }
 
     #[test]

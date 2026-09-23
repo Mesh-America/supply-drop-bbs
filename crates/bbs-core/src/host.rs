@@ -1657,22 +1657,33 @@ impl Host for BbsHost {
 
         let storage = |e: crate::db::StoreError| HostError::Storage(format!("{e}"));
 
-        // An archive holds the month it is named for, and nothing else. The
-        // bound is the last entry written before the month ended, so a run
-        // on the first of the month doesn't sweep that morning's entries in
-        // under last month's name, and a BBS that was off for several months
-        // gets one correctly-named archive per month rather than everything
-        // in one misleading file.
+        // An archive holds the month it is named for, and nothing else, so
+        // this works on a half-open date range. A run on the first of the
+        // month doesn't sweep that morning's entries in under last month's
+        // name, and a month is archived correctly whether or not the caller
+        // happens to be working forward from the oldest one — bounding by id
+        // alone would quietly fold every older entry into whichever month
+        // was asked for first.
+        //
+        // `created_at` is stored as `YYYY-MM-DDTHH:MM:SSZ` by the column's
+        // own default, fixed width and UTC, so these string comparisons are
+        // date comparisons.
+        if !(1..=12).contains(&month) {
+            return Err(HostError::PreconditionFailed(format!(
+                "{month} is not a month"
+            )));
+        }
         let (next_year, next_month) = if month == 12 {
             (year + 1, 1)
         } else {
             (year, month + 1)
         };
+        let month_start = format!("{year:04}-{month:02}-01T00:00:00Z");
         let month_end = format!("{next_year:04}-{next_month:02}-01T00:00:00Z");
 
-        // Anything written from here on gets a higher id, stays in the live
-        // log, and is neither archived twice nor dropped when the archived
-        // range is cleared.
+        // The id ceiling holds the upper edge still: anything written from
+        // here on gets a higher id, stays in the live log, and is neither
+        // archived twice nor dropped when the archived range is cleared.
         let Some(through) = self
             .db
             .audit_max_id_before(&month_end)
@@ -1683,11 +1694,11 @@ impl Host for BbsHost {
         };
         let count = self
             .db
-            .audit_count_through(through)
+            .audit_count_in_range(through, &month_start, &month_end)
             .await
             .map_err(storage)?;
         if count == 0 {
-            return Ok(None);
+            return Ok(None); // Nothing from this month in particular.
         }
 
         tokio::fs::create_dir_all(archive_dir)
@@ -1704,36 +1715,70 @@ impl Host for BbsHost {
             // leaving them to be swept into next month's archive under the
             // wrong name.
             let path = target.clone();
-            let archived =
-                tokio::task::spawn_blocking(move || crate::audit_archive::archived_through(&path))
-                    .await
-                    .map_err(|e| HostError::Internal(format!("{e}")))?
-                    .map_err(|e| HostError::Storage(format!("read audit archive: {e}")))?;
+            let expected = entry_name(year, month);
+            // A file that can't be opened, isn't a zip, or won't produce a
+            // range is all the same answer here: it can't tell us what it
+            // holds. Only a file that does is allowed to bound a delete.
+            let archived = tokio::task::spawn_blocking(move || {
+                crate::audit_archive::archived_through(&path, &expected)
+            })
+            .await
+            .map_err(|e| HostError::Internal(format!("{e}")))?
+            .unwrap_or(None);
 
-            let Some(archived_through) = archived else {
-                return Err(HostError::PreconditionFailed(format!(
-                    "an audit archive for {year:04}-{month:02} already exists, and its \
-                     contents could not be read to tell what it holds"
-                )));
-            };
-            let stranded = self
-                .db
-                .audit_count_through(archived_through)
-                .await
-                .map_err(storage)?;
-            if stranded > 0 {
-                let removed = self
-                    .db
-                    .audit_delete_through(archived_through)
-                    .await
-                    .map_err(storage)?;
-                tracing::warn!(
-                    "audit archive {}: finished an interrupted clear, removing {removed} \
-                     entries already held in it",
-                    archive_name(year, month)
-                );
+            match archived {
+                Some(archived_through) => {
+                    let stranded = self
+                        .db
+                        .audit_count_through(archived_through)
+                        .await
+                        .map_err(storage)?;
+                    if stranded > 0 {
+                        let removed = self
+                            .db
+                            .audit_delete_through(archived_through)
+                            .await
+                            .map_err(storage)?;
+                        tracing::warn!(
+                            "audit archive {}: finished an interrupted clear, removing \
+                             {removed} entries already held in it",
+                            archive_name(year, month)
+                        );
+                    }
+                    return Ok(None);
+                }
+                None => {
+                    // A file is sitting at the name but won't say what it
+                    // holds, so it can't be used to finish a clear. Refusing
+                    // would refuse again every hour and that month would
+                    // never archive, its entries growing in the live log for
+                    // good, behind nothing but a warning. Move the file aside
+                    // and archive afresh: it is never deleted, so whatever it
+                    // held is still there to look at, and the month stops
+                    // being stuck.
+                    //
+                    // The new name is deliberately not one a listing will
+                    // show or the delete endpoint will accept — it isn't a
+                    // valid archive, and shouldn't pose as one.
+                    let aside = std::path::Path::new(archive_dir).join(format!(
+                        "{}.unreadable-{}",
+                        archive_name(year, month),
+                        Timestamp::now().as_offset_datetime().unix_timestamp()
+                    ));
+                    tokio::fs::rename(&target, &aside).await.map_err(|e| {
+                        HostError::Storage(format!(
+                            "an audit archive for {year:04}-{month:02} exists but won't say \
+                             what it holds, and could not be moved aside: {e}"
+                        ))
+                    })?;
+                    tracing::warn!(
+                        "audit archive {}: the existing file could not be read, so it has \
+                         been moved to {} and the month archived afresh",
+                        archive_name(year, month),
+                        aside.display()
+                    );
+                }
             }
-            return Ok(None);
         }
 
         // Read the first id for the header, then stream the rest in batches —
@@ -1741,7 +1786,7 @@ impl Host for BbsHost {
         const BATCH: u32 = 500;
         let first_id = self
             .db
-            .audit_page_through(0, through, 1)
+            .audit_page_in_range(0, through, &month_start, &month_end, 1)
             .await
             .map_err(storage)?
             .first()
@@ -1757,7 +1802,11 @@ impl Host for BbsHost {
 
         let mut after = 0i64;
         loop {
-            let batch = match self.db.audit_page_through(after, through, BATCH).await {
+            let batch = match self
+                .db
+                .audit_page_in_range(after, through, &month_start, &month_end, BATCH)
+                .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     writer.abandon();
@@ -1780,10 +1829,11 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("finish audit archive: {e}")))?;
 
         // Only now that the archive is complete and in place: clear what it
-        // holds. A failure above leaves the live log whole.
+        // holds — the same range it was written from, nothing wider. A
+        // failure above leaves the live log whole.
         let removed = self
             .db
-            .audit_delete_through(through)
+            .audit_delete_in_range(through, &month_start, &month_end)
             .await
             .map_err(storage)?;
         if removed != written {
@@ -10840,6 +10890,73 @@ mod tests {
         );
     }
 
+    /// Archiving one month must not drag older months in with it. Bounding
+    /// only by id made that happen and hid it, because the catch-up always
+    /// asks for the oldest month first — anything calling for a single month
+    /// directly would have folded every earlier entry into it.
+    #[tokio::test]
+    async fn archiving_one_month_leaves_older_months_alone() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write_at_for_test(1, "sysop", "ban", "july", "2026-07-14T09:00:00Z")
+            .await
+            .unwrap();
+        host.db
+            .audit_write_at_for_test(2, "sysop", "ban", "august", "2026-08-14T09:00:00Z")
+            .await
+            .unwrap();
+
+        // Ask for August alone, skipping July.
+        let rec = host
+            .admin_archive_audit_log(&dir_str, 2026, 8)
+            .await
+            .unwrap()
+            .expect("August has an entry");
+        assert_eq!(rec.entry_count, Some(1), "August holds one entry, not two");
+
+        let august = read_archive_text(dir.path(), "audit-2026-08.zip", "audit-2026-08.txt");
+        assert!(august.contains("august"));
+        assert!(
+            !august.contains("july"),
+            "July's entry must not be in August's archive: {august}"
+        );
+
+        // And July is still live, waiting for its own archive.
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert!(
+            left.iter().any(|e| e.target.as_deref() == Some("july")),
+            "July's entry must stay in the live log: {left:?}"
+        );
+    }
+
+    /// A month number that isn't a month is refused rather than producing a
+    /// file no listing would ever show.
+    #[tokio::test]
+    async fn a_month_outside_one_to_twelve_is_refused() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write("sysop", "ban", Some("bob"), None)
+            .await
+            .unwrap();
+
+        for bad in [0, 13, 99] {
+            assert!(
+                host.admin_archive_audit_log(&dir_str, 2026, bad)
+                    .await
+                    .is_err(),
+                "month {bad} should be refused"
+            );
+        }
+        // Nothing was written, and nothing was cleared.
+        assert_eq!(host.admin_audit_log(50, 0, None).await.unwrap().len(), 1);
+    }
+
     /// The month in progress isn't over, so it isn't archived.
     #[tokio::test]
     async fn the_current_month_is_left_alone() {
@@ -10892,10 +11009,12 @@ mod tests {
 
         // Stand in for the crash: the archive is on disk, and the entries it
         // holds are back in the live log with their original ids.
-        let archived_through =
-            crate::audit_archive::archived_through(&dir.path().join("audit-2026-09.zip"))
-                .unwrap()
-                .expect("the archive records its range");
+        let archived_through = crate::audit_archive::archived_through(
+            &dir.path().join("audit-2026-09.zip"),
+            &crate::audit_archive::entry_name(2026, 9),
+        )
+        .unwrap()
+        .expect("the archive records its range");
         host.db
             .audit_restore_for_test(archived_through, "sysop", "ban", "bob")
             .await
@@ -10937,16 +11056,77 @@ mod tests {
             .await
             .unwrap();
 
-        let err = host
+        // It can't be read, so it can't be used to finish a clear. Refusing
+        // for good would leave this month un-archived for ever behind a log
+        // line, so the file is moved aside and the month archived afresh.
+        let rec = host
             .admin_archive_audit_log(&dir_str, 2026, 9)
             .await
-            .expect_err("an unreadable archive should be an error");
-        let _ = err;
+            .expect("archiving should not be stuck behind an unreadable file")
+            .expect("there was an entry to archive");
+        assert_eq!(rec.filename, "audit-2026-09.zip");
+
+        // The unreadable file still exists, under a name that isn't an
+        // archive — nothing deletes audit data, and it mustn't pose as a
+        // valid archive either.
+        let aside: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".unreadable-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "the old file should be kept: {aside:?}");
         assert_eq!(
-            host.admin_audit_log(50, 0, None).await.unwrap().len(),
-            1,
-            "the live log must be left alone"
+            std::fs::read(dir.path().join(&aside[0])).unwrap(),
+            b"not a zip",
+            "its contents should be untouched"
         );
+        assert!(
+            !crate::audit_archive::is_audit_archive(&aside[0]),
+            "the moved-aside file must not pass as an archive: {}",
+            aside[0]
+        );
+
+        // And the fresh archive is the real one, holding the entry.
+        let listed = host.admin_list_audit_archives(&dir_str).await.unwrap();
+        assert_eq!(listed.len(), 1, "only the fresh archive lists: {listed:?}");
+        let body = read_archive_text(dir.path(), "audit-2026-09.zip", "audit-2026-09.txt");
+        assert!(body.contains("bob"), "the entry should be archived: {body}");
+    }
+
+    /// The catch-up crosses a year boundary — December to January is where
+    /// the month arithmetic is easiest to get wrong.
+    #[tokio::test]
+    async fn the_catch_up_crosses_a_year_boundary() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write_at_for_test(1, "sysop", "ban", "december", "2025-12-20T09:00:00Z")
+            .await
+            .unwrap();
+        host.db
+            .audit_write_at_for_test(2, "sysop", "ban", "january", "2026-01-05T09:00:00Z")
+            .await
+            .unwrap();
+
+        let written = host
+            .admin_archive_due_audit_months(&dir_str, 2026, 2)
+            .await
+            .unwrap();
+        let names: Vec<_> = written.iter().map(|r| r.filename.clone()).collect();
+        assert!(
+            names.iter().any(|n| n == "audit-2025-12.zip"),
+            "December 2025 should get its own archive: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "audit-2026-01.zip"),
+            "January 2026 should get its own archive: {names:?}"
+        );
+
+        let dec = read_archive_text(dir.path(), "audit-2025-12.zip", "audit-2025-12.txt");
+        assert!(dec.contains("december") && !dec.contains("january"));
     }
 
     /// Archives list newest first, and only this feature's own files are

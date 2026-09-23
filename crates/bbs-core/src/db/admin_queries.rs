@@ -533,9 +533,16 @@ impl Database {
             if !crate::audit_archive::is_audit_archive(&name) {
                 continue;
             }
-            let Ok(meta) = tokio::fs::metadata(&path).await else {
+            // symlink_metadata, not metadata: an archive is a regular file
+            // this code wrote. A link wearing an archive's name would
+            // otherwise be listed — and then served — as one, which is the
+            // opposite of the O_NOFOLLOW the writer opens with.
+            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
                 continue;
             };
+            if !meta.is_file() {
+                continue;
+            }
             let modified = meta
                 .modified()
                 .unwrap_or(SystemTime::UNIX_EPOCH)

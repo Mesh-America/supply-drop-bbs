@@ -2012,6 +2012,23 @@ async fn api_download_audit_archive(
             .into_response();
     };
     let path = std::path::Path::new(&dir).join(&filename);
+    // An archive is a regular file the BBS wrote. Anything else wearing the
+    // name — a link pointing out of the directory in particular — is not
+    // served, matching the O_NOFOLLOW the archive writer opens with.
+    match tokio::fs::symlink_metadata(&path).await {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("not an audit log archive")),
+            )
+                .into_response()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => return server_error(&e.to_string()),
+    }
     match tokio::fs::read(&path).await {
         Ok(bytes) => (
             StatusCode::OK,
@@ -6621,6 +6638,48 @@ mod tests {
             )
             .await;
             assert_eq!(downloaded.status(), StatusCode::BAD_REQUEST);
+
+            let deleted = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(deleted.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// An archive is a regular file. A link wearing the name is not
+        /// served, even though the name itself is a valid archive name —
+        /// the writer opens with O_NOFOLLOW and reading has to match.
+        #[tokio::test]
+        async fn a_link_wearing_an_archive_name_is_not_served() {
+            let f = fixture().await;
+            let secret = f.archive_dir.path().join("secret.txt");
+            std::fs::write(&secret, b"not for serving").unwrap();
+            let link = f.archive_dir.path().join("audit-2026-09.zip");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "a symlink must not be served as an archive"
+            );
+
+            // Nor listed as one.
+            let listed =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            let body = body_json(listed).await;
+            assert_eq!(
+                body.as_array().map(Vec::len),
+                Some(0),
+                "a symlink must not be listed as an archive: {body}"
+            );
         }
 
         /// The archive routes sit beside `/audit-log`; axum panics at router

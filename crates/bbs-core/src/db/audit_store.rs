@@ -125,6 +125,95 @@ impl Database {
         })
     }
 
+    /// Entries created in `[from, until)` with `id > after` and
+    /// `id <= through`, oldest first, at most `limit` of them.
+    ///
+    /// The date bounds are what keep a month's archive to that month. The id
+    /// bounds do the batching and hold the upper edge still while the archive
+    /// is being written. Both are needed: without the dates, archiving a
+    /// month would sweep in every older entry too, which is only invisible
+    /// when the caller happens to work forward from the oldest month.
+    pub(crate) async fn audit_page_in_range(
+        &self,
+        after: i64,
+        through: i64,
+        from: &str,
+        until: &str,
+        limit: u32,
+    ) -> Result<Vec<AdminAuditEntry>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT id, actor, action, target, detail, created_at \
+             FROM audit_log \
+             WHERE id > ? AND id <= ? AND created_at >= ? AND created_at < ? \
+             ORDER BY id ASC \
+             LIMIT ?",
+        )
+        .bind(after)
+        .bind(through)
+        .bind(from)
+        .bind(until)
+        .bind(limit)
+        .fetch_all(&self.read_pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(AdminAuditEntry {
+                    id: r.try_get("id")?,
+                    actor: r.try_get("actor")?,
+                    action: r.try_get("action")?,
+                    target: r.try_get("target")?,
+                    detail: r.try_get("detail")?,
+                    created_at: r.try_get("created_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Db)
+    }
+
+    /// How many entries were created in `[from, until)` at or below
+    /// `through`.
+    pub(crate) async fn audit_count_in_range(
+        &self,
+        through: i64,
+        from: &str,
+        until: &str,
+    ) -> Result<u64, StoreError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_log \
+             WHERE id <= ? AND created_at >= ? AND created_at < ?",
+        )
+        .bind(through)
+        .bind(from)
+        .bind(until)
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(count as u64)
+    }
+
+    /// Delete entries created in `[from, until)` at or below `through`,
+    /// returning how many went.
+    ///
+    /// Only ever called once an archive holding exactly that range is
+    /// complete and renamed into place.
+    pub(crate) async fn audit_delete_in_range(
+        &self,
+        through: i64,
+        from: &str,
+        until: &str,
+    ) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            "DELETE FROM audit_log \
+             WHERE id <= ? AND created_at >= ? AND created_at < ?",
+        )
+        .bind(through)
+        .bind(from)
+        .bind(until)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Entries with `id > after` and `id <= through`, oldest first, at most
     /// `limit` of them.
     ///
