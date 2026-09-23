@@ -61,10 +61,17 @@ function actorUsername(actor: string): string | null {
   return actor.startsWith('web:') ? actor.slice(4) : actor
 }
 
-// A target is a username reference when it doesn't start with # (message id) or contain =
-function targetUsername(target: string | null): string | null {
-  if (!target) return null
-  if (target.startsWith('#') || target.includes('=') || target.includes('id=')) return null
+// Actions whose target is a username, not a room name, an archive filename,
+// a message id, or anything else. An allowlist rather than guessing from the
+// string's shape: a room name or an audit-archive filename ("audit-2026-08.zip")
+// has no distinguishing punctuation, so a shape-based guess linked them to the
+// Users page too (supply-drop-bbs-e2h).
+const USER_TARGET_ACTIONS = new Set([
+  'ban', 'unban', 'delete_user', 'validate', 'set_level', 'timeout', 'set_user_password',
+])
+
+function targetUsername(action: string, target: string | null): string | null {
+  if (!target || !USER_TARGET_ACTIONS.has(action)) return null
   return target
 }
 
@@ -152,8 +159,8 @@ onMounted(() => load())
             </td>
             <td class="col-target mono">
               <router-link
-                v-if="targetUsername(e.target)"
-                :to="{ path: '/users', query: { search: targetUsername(e.target)! } }"
+                v-if="targetUsername(e.action, e.target)"
+                :to="{ path: '/users', query: { search: targetUsername(e.action, e.target)! } }"
                 class="link"
               >{{ e.target }}</router-link>
               <span v-else>{{ e.target ?? '' }}</span>
