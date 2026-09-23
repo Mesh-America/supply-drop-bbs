@@ -3879,9 +3879,6 @@ impl BbsHost {
             Err(r) => return Ok(r),
         };
 
-        let is_guest = level < PermissionLevel::User;
-        let guest_rid = self.guest_room_id();
-
         // Try by name first; then by numeric ID.
         let room = if let Ok(id) = target.parse::<i64>() {
             RoomStore::get_by_id(&self.db, RoomId::new(id))
@@ -3899,6 +3896,57 @@ impl BbsHost {
             Some(r) => r,
         };
 
+        self.enter_room(session, &room, &username, user_id, level)
+            .await
+    }
+
+    async fn handle_change_to_room(
+        &self,
+        session: SessionId,
+        room_id: RoomId,
+    ) -> Result<Response, HostError> {
+        // `session_auth_or_guest`, so a guest asking for Mail is turned away
+        // by the room rule below with the same wording every other room path
+        // uses, rather than by the generic pending-validation message. (#372)
+        let (username, user_id, level, _) = match self.session_auth_or_guest(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+
+        let room = match RoomStore::get_by_id(&self.db, room_id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+        {
+            Some(r) => r,
+            // Was an Err(HostError::NotFound), which every transport renders
+            // through Display as "not found: room room:2" — an internal
+            // string, doubled, shown to a user. Say what the other paths say.
+            None => {
+                return Ok(Response::Error(format!(
+                    "Room '{}' not found.",
+                    room_id.as_i64()
+                )))
+            }
+        };
+
+        self.enter_room(session, &room, &username, user_id, level)
+            .await
+    }
+
+    /// Put `session` in `room` and report what's waiting there.
+    ///
+    /// The permission rule, the guest rule, and the wording of both the
+    /// refusals and the confirmation live here only. They used to be written
+    /// out separately in each room-entry handler, which is how `M` came to
+    /// answer a guest differently from `C` for the same reason. (#372)
+    async fn enter_room(
+        &self,
+        session: SessionId,
+        room: &crate::room::Room,
+        username: &Username,
+        user_id: UserId,
+        level: PermissionLevel,
+    ) -> Result<Response, HostError> {
         if level < room.min_permission_level {
             return Ok(Response::Error(format!(
                 "You don't have permission to enter '{}'.",
@@ -3907,47 +3955,14 @@ impl BbsHost {
         }
 
         // Guests may only navigate to the guest room.
-        if is_guest && Some(room.id) != guest_rid {
+        if level < PermissionLevel::User && Some(room.id) != self.guest_room_id() {
             return Ok(Response::Text(
                 "You must be verified to access that room.".into(),
             ));
         }
 
         self.set_current_room(session, room.id).await;
-        let unread = self.unread_in(&username, user_id, room.id).await?;
-
-        let msg = if unread > 0 {
-            format!("Now in: {} ({unread} new). Type N to read.", room.name)
-        } else {
-            format!("Now in: {} (no new messages).", room.name)
-        };
-        Ok(Response::Text(msg))
-    }
-
-    async fn handle_change_to_room(
-        &self,
-        session: SessionId,
-        room_id: RoomId,
-    ) -> Result<Response, HostError> {
-        let (username, user_id, level, _) = match self.session_auth_user(session).await {
-            Ok(t) => t,
-            Err(r) => return Ok(r),
-        };
-
-        let room = RoomStore::get_by_id(&self.db, room_id)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?
-            .ok_or_else(|| HostError::NotFound(format!("room {room_id}")))?;
-
-        if level < room.min_permission_level {
-            return Ok(Response::Error(format!(
-                "You don't have permission to enter '{}'.",
-                room.name
-            )));
-        }
-
-        self.set_current_room(session, room.id).await;
-        let unread = self.unread_in(&username, user_id, room.id).await?;
+        let unread = self.unread_in(username, user_id, room.id).await?;
 
         let msg = if unread > 0 {
             format!("Now in: {} ({unread} new). Type N to read.", room.name)
@@ -8365,6 +8380,105 @@ mod tests {
             }
             other => panic!("expected Prompt, got: {other:?}"),
         }
+    }
+
+    /// `M` for a room that has gone missing used to answer with a raw
+    /// internal string — `HostError::NotFound`'s Display wrapped around
+    /// `RoomId`'s, giving "not found: room room:2". Every other room path
+    /// says "Room 'N' not found." (#372)
+    #[tokio::test]
+    async fn a_missing_room_reads_the_same_on_every_path() {
+        let (host, _db) = make_host().await;
+
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("sysop").unwrap(), "pass1234").await;
+
+        // A room id that was never created.
+        let resp = host
+            .handle_change_to_room(sid, RoomId::new(4242))
+            .await
+            .expect("a missing room is an answer, not an error");
+        let text = match resp {
+            Response::Error(t) | Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(text, "Room '4242' not found.");
+        assert!(
+            !text.contains("not found: room"),
+            "the internal Display form must not reach the user: {text:?}"
+        );
+
+        // And `C 4242` says the same thing.
+        let via_c = host
+            .process_command(
+                sid,
+                Command::ChangeRoom {
+                    target: "4242".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let c_text = match via_c {
+            Response::Error(t) | Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(c_text, text, "both paths should word it the same way");
+    }
+
+    /// A guest sent `M` used to get the generic pending-validation message,
+    /// where every other room path tells them it's the room they can't reach.
+    /// Same reason, same wording now. (#372)
+    #[tokio::test]
+    async fn a_guest_is_refused_mail_the_same_way_as_any_other_room() {
+        let policy = AccessPolicy {
+            require_verify: true,
+            guest_room_name: Some("Guests".to_owned()),
+        };
+        let (host, _db) = make_host_with_policy(policy).await;
+
+        let s1 = host.create_session("test").await.unwrap();
+        do_register(&host, s1, "admin", "s3cr3t!!").await;
+
+        let s2 = host.create_session("test").await.unwrap();
+        do_register(&host, s2, "alice", "alice123!!").await;
+
+        let via_m = host.process_command(s2, Command::GoMail).await.unwrap();
+        let m_text = match via_m {
+            Response::Error(t) | Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        // Mail requires User, so this is the permission refusal rather than
+        // the guest-room one — either is fine, the point is that it's a
+        // refusal about the room and not the generic account message.
+        assert_eq!(m_text, "You don't have permission to enter 'Mail'.");
+        assert!(
+            !m_text.contains("pending validation"),
+            "M should refuse by room, not by account state: {m_text:?}"
+        );
+
+        // Naming the same room by hand says exactly the same thing.
+        let via_c = host
+            .process_command(
+                s2,
+                Command::ChangeRoom {
+                    target: "Mail".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let c_text = match via_c {
+            Response::Error(t) | Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(c_text, m_text, "both refusals should read the same");
+
+        // And the guest is still in their own room, not moved into Mail.
+        let sessions = host.sessions.read().await;
+        assert_eq!(
+            sessions[&s2].current_room,
+            host.guest_room_id().expect("guest room configured"),
+            "a refused M must not move the guest"
+        );
     }
 
     /// guest_room configured: guest cannot navigate to Lobby.
