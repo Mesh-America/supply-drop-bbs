@@ -108,6 +108,8 @@ bd close <id>         # Complete work
 
 **Architecture in one line:** issues live in a local Dolt DB; sync uses `refs/dolt/data` on your git remote; `.beads/issues.jsonl` is a passive export. See https://github.com/gastownhall/beads/blob/main/docs/SYNC_CONCEPTS.md for details and anti-patterns.
 
+**bd version is pinned** to `.beads/PINNED_BD_VERSION` -- run `scripts/beads-version-guard.sh` before any `bd` command that talks to the remote (push/pull/bootstrap/migrate) and follow what it says on a mismatch. The generic beads install script always fetches latest and has already caused one incident here (2026-09-23): a machine silently upgraded past the pin and its embedded-mode auto-migrate pushed a newer schema to the shared remote with no warning. Never reinstall bd except from a verified-checksum GitHub release matching the pin.
+
 ## Agent Context Profiles
 
 The managed Beads block is task-tracking guidance, not permission to override repository, user, or orchestrator instructions.
