@@ -1277,6 +1277,57 @@ async fn cmd_run(cli: &Cli) {
         }
     }
 
+    // ── 7. Audit log archive task ────────────────────────────────────────────
+    //
+    // The audit log is archived at the turn of each month and starts fresh
+    // (#362). Whether a month has been archived is decided by whether its
+    // archive file exists, not by a timestamp we'd have to keep: a server
+    // that was off over the turn of the month catches up on its next check,
+    // and one that restarts repeatedly can't archive the same month twice.
+    //
+    // Nothing here removes an archive. Archives are the record of every
+    // privileged action taken, so a sysop deletes them by hand or not at all.
+    if cfg.audit.archive_enabled {
+        if let Some(archive_dir) = cfg.audit.directory.clone() {
+            let host_audit = Arc::clone(&host);
+            info!(dir = %archive_dir.display(), "starting monthly audit log archive task");
+            tokio::spawn(async move {
+                // Checked hourly rather than daily so a server started part
+                // way through the first of the month doesn't wait a full day,
+                // and so a long-running one crosses the boundary promptly.
+                let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(60 * 60));
+                loop {
+                    ticker.tick().await;
+                    let dir = archive_dir.to_string_lossy().into_owned();
+                    let (year, month) = match previous_month_utc() {
+                        Some(ym) => ym,
+                        None => {
+                            warn!("audit archive: could not read the current date");
+                            continue;
+                        }
+                    };
+                    // Already archived, so there's nothing to do until the
+                    // next turn of the month.
+                    let target =
+                        archive_dir.join(bbs_core::audit_archive::archive_name(year, month));
+                    if tokio::fs::try_exists(&target).await.unwrap_or(false) {
+                        continue;
+                    }
+                    match host_audit.admin_archive_audit_log(&dir, year, month).await {
+                        Ok(Some(rec)) => info!(
+                            file = %rec.filename,
+                            entries = rec.entry_count.unwrap_or(0),
+                            "archived the audit log"
+                        ),
+                        // An empty log is the ordinary case on a quiet BBS.
+                        Ok(None) => {}
+                        Err(e) => warn!("audit log archive failed: {e}"),
+                    }
+                }
+            });
+        }
+    }
+
     // ── 8. Plugins ────────────────────────────────────────────────────────────
     //
     // Each plugin is init'd then start'd.  Errors at init abort startup;
@@ -1366,6 +1417,14 @@ async fn cmd_run(cli: &Cli) {
                 .map(|d| d.to_string_lossy().into_owned());
             plugin.set_backup_dir(backup_dir);
             plugin.set_data_dir(Some(data_dir.to_string_lossy().into_owned()));
+            // Same arrangement for audit archives: [audit] directory is the
+            // single source of truth, and the archive page reads it from here.
+            let audit_archive_dir = cfg
+                .audit
+                .directory
+                .as_ref()
+                .map(|d| d.to_string_lossy().into_owned());
+            plugin.set_audit_archive_dir(audit_archive_dir);
         }
         #[cfg(feature = "transport-process")]
         if let Some(ref plugin) = wp {
@@ -3411,6 +3470,22 @@ async fn cmd_node(config_path: Option<&std::path::Path>, action: NodeAction) {
     }
 }
 
+// ── Audit archive helpers ─────────────────────────────────────────────────────
+
+/// The calendar month before the current UTC month, as `(year, month)`.
+///
+/// The archive taken during October covers September, so this is what names
+/// it. `None` only if the clock can't be read at all.
+fn previous_month_utc() -> Option<(i32, u32)> {
+    let now = time::OffsetDateTime::now_utc();
+    let (year, month) = (now.year(), now.month() as u8);
+    Some(if month == 1 {
+        (year - 1, 12)
+    } else {
+        (year, u32::from(month - 1))
+    })
+}
+
 // ── Backup helpers ────────────────────────────────────────────────────────────
 
 /// Delete backups that fall outside the daily/weekly retention window.
@@ -3842,6 +3917,44 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_owned()
     } else {
         s.chars().take(max - 1).collect::<String>() + "…"
+    }
+}
+
+#[cfg(test)]
+mod audit_archive_tests {
+    use super::*;
+
+    #[test]
+    fn the_previous_month_is_the_one_the_archive_covers() {
+        let (year, month) = previous_month_utc().expect("a readable clock");
+        let now = time::OffsetDateTime::now_utc();
+        if now.month() as u8 == 1 {
+            assert_eq!(
+                (year, month),
+                (now.year() - 1, 12),
+                "January looks back to December"
+            );
+        } else {
+            assert_eq!(
+                (year, month),
+                (now.year(), u32::from(now.month() as u8 - 1))
+            );
+        }
+        assert!((1..=12).contains(&month), "month out of range: {month}");
+    }
+
+    #[test]
+    fn an_archive_name_is_built_from_that_month() {
+        // The scheduler decides "already archived?" purely by this name, so
+        // the padding has to be stable.
+        assert_eq!(
+            bbs_core::audit_archive::archive_name(2026, 1),
+            "audit-2026-01.zip"
+        );
+        assert_eq!(
+            bbs_core::audit_archive::archive_name(2025, 12),
+            "audit-2025-12.zip"
+        );
     }
 }
 

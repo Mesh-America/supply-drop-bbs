@@ -66,6 +66,8 @@ pub struct Config {
     #[serde(default)]
     pub backup: BackupConfig,
     #[serde(default)]
+    pub audit: AuditConfig,
+    #[serde(default)]
     pub location: LocationConfig,
     #[serde(default)]
     pub plugins: PluginsConfig,
@@ -92,6 +94,9 @@ impl Config {
         }
         if self.backup.directory.is_none() {
             self.backup.directory = Some(data_dir.join("backups"));
+        }
+        if self.audit.directory.is_none() {
+            self.audit.directory = Some(data_dir.join("audit-archives"));
         }
         // Resolve CLI socket path the same way.
         #[cfg(feature = "transport-cli")]
@@ -551,6 +556,39 @@ fn default_keep_daily() -> u32 {
 }
 fn default_keep_weekly() -> u32 {
     4
+}
+
+// ── [audit] ───────────────────────────────────────────────────────────────────
+
+/// Monthly archiving of the audit log (#362).
+///
+/// Nothing here sets a retention: archives are the record of every privileged
+/// action taken on the BBS and are only ever removed by a sysop, by hand.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditConfig {
+    /// Whether to archive the audit log at the turn of each month.
+    ///
+    /// With this off the log simply keeps growing; nothing is deleted.
+    #[serde(default = "default_audit_archive_enabled")]
+    pub archive_enabled: bool,
+
+    /// Archive directory. `None` is resolved to `<data_dir>/audit-archives`.
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self {
+            archive_enabled: default_audit_archive_enabled(),
+            directory: None,
+        }
+    }
+}
+
+fn default_audit_archive_enabled() -> bool {
+    true
 }
 
 // ── [plugins] ─────────────────────────────────────────────────────────────────

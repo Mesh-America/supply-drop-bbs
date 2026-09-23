@@ -17,6 +17,11 @@ const router = createRouter({
     { path: '/metrics', name: 'metrics', component: () => import('./pages/MetricsPage.vue') },
     { path: '/logs', name: 'logs', component: () => import('./pages/LogsPage.vue') },
     { path: '/audit', name: 'audit', component: () => import('./pages/AuditPage.vue') },
+    {
+      path: '/audit-archives',
+      name: 'audit-archives',
+      component: () => import('./pages/AuditArchivesPage.vue'),
+    },
     { path: '/plugins', name: 'plugins', component: () => import('./pages/PluginsPage.vue') },
     { path: '/settings', name: 'settings', component: () => import('./pages/SettingsPage.vue') },
     { path: '/:pathMatch(.*)*', redirect: { name: 'dashboard' } },

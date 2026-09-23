@@ -250,6 +250,13 @@ struct AppState {
     /// backup directory) where `main.rs`'s startup check will find it
     /// (issues #195 and #309).
     data_dir: std::sync::Mutex<Option<String>>,
+    /// Directory holding monthly audit log archives.
+    ///
+    /// Sourced from `[audit] directory` in the operator config and injected by
+    /// the host binary via [`WebPlugin::set_audit_archive_dir`]. When `None`
+    /// the archive endpoints return 400 (`audit archive directory not
+    /// configured`).
+    audit_archive_dir: std::sync::Mutex<Option<String>>,
     /// Serializes the whole validate-and-stage / confirm sequence for a
     /// restore so two concurrent uploads (or an upload racing a confirm)
     /// can't clobber the shared `pending_restore*.db` paths — an async
@@ -296,6 +303,7 @@ impl AppState {
             config,
             backup_dir: std::sync::Mutex::new(None),
             data_dir: std::sync::Mutex::new(None),
+            audit_archive_dir: std::sync::Mutex::new(None),
             restore_lock: tokio::sync::Mutex::new(()),
             restore_confirmed: AtomicBool::new(false),
             boot_id: Uuid::new_v4().to_string(),
@@ -323,6 +331,14 @@ impl AppState {
     /// Return the BBS's data directory, if injected.
     fn data_dir(&self) -> Option<String> {
         self.data_dir.lock().expect("data_dir poisoned").clone()
+    }
+
+    /// Return the audit archive directory, if any.
+    fn audit_archive_dir(&self) -> Option<String> {
+        self.audit_archive_dir
+            .lock()
+            .expect("audit_archive_dir poisoned")
+            .clone()
     }
 
     fn create_session(&self, username: String, permission_level: u8) -> String {
@@ -608,6 +624,17 @@ impl WebPlugin {
     pub fn set_data_dir(&self, dir: Option<String>) {
         *self.state.data_dir.lock().expect("data_dir poisoned") = dir;
     }
+
+    /// Set the directory holding monthly audit log archives, sourced from
+    /// `[audit] directory`. Safe to call at any time, including after
+    /// `start()`: request handlers read this value live from its `Mutex`.
+    pub fn set_audit_archive_dir(&self, dir: Option<String>) {
+        *self
+            .state
+            .audit_archive_dir
+            .lock()
+            .expect("audit_archive_dir poisoned") = dir;
+    }
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -718,6 +745,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api_download_backup).delete(api_delete_backup),
         )
         .route("/backups/:filename/restore", post(api_stage_backup_restore))
+        .route("/audit-archives", get(api_list_audit_archives))
+        .route(
+            "/audit-archives/:filename",
+            get(api_download_audit_archive).delete(api_delete_audit_archive),
+        )
         .route(
             "/backups/restore",
             post(api_upload_restore).layer(DefaultBodyLimit::max(RESTORE_UPLOAD_MAX_BYTES)),
@@ -1927,6 +1959,121 @@ async fn api_audit_log(
     }
 }
 
+// ── Audit log archives (#362) ─────────────────────────────────────────────────
+//
+// Sysop-only, all three: an archive is the full record of privileged actions
+// for a month, so reading one out of the system and removing one are both
+// held to the same bar as taking a database backup. Nothing here archives on
+// request or clears the live log — archiving happens on a schedule in the host
+// binary, and the live log has no endpoint that can empty it.
+
+async fn api_list_audit_archives(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    match state.host.admin_list_audit_archives(&dir).await {
+        Ok(list) => Json(list).into_response(),
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_download_audit_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(filename): Path<String>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    // The archive directory can be shared with database backups and the
+    // restore's working files; this serves only this feature's own archives.
+    if !bbs_core::audit_archive::is_audit_archive(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("not an audit log archive")),
+        )
+            .into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    let path = std::path::Path::new(&dir).join(&filename);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/zip".to_owned()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{filename}\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
+async fn api_delete_audit_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(caller): Extension<CurrentUser>,
+    Path(filename): Path<String>,
+) -> Response {
+    if caller.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    if !bbs_core::audit_archive::is_audit_archive(&filename) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("not an audit log archive")),
+        )
+            .into_response();
+    }
+    let Some(dir) = state.audit_archive_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("audit archive directory not configured")),
+        )
+            .into_response();
+    };
+    match state.host.admin_delete_audit_archive(&dir, &filename).await {
+        Ok(()) => {
+            // Deleting a month of audit history is itself worth recording.
+            let actor = format!("web:{}", caller.username);
+            if let Err(e) = state
+                .host
+                .admin_write_audit(&actor, "delete_audit_archive", Some(&filename), None)
+                .await
+            {
+                tracing::warn!("could not audit the audit-archive deletion: {e}");
+            }
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(HostError::NotFound(_)) => {
+            (StatusCode::NOT_FOUND, Json(json_error("archive not found"))).into_response()
+        }
+        Err(e) => server_error(&e.to_string()),
+    }
+}
+
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 async fn api_stats(State(state): State<Arc<AppState>>) -> Response {
@@ -2023,11 +2170,13 @@ async fn api_metrics() -> Response {
 #[derive(Serialize)]
 struct SettingsResponse {
     backup_dir: Option<String>,
+    audit_archive_dir: Option<String>,
 }
 
 async fn api_settings(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     Json(SettingsResponse {
         backup_dir: state.backup_dir(),
+        audit_archive_dir: state.audit_archive_dir(),
     })
 }
 
