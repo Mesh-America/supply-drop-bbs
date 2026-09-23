@@ -350,15 +350,17 @@ C 3
 
 Room names are **case-insensitive**.
 
-### Jump to next room with unread messages
+### Read unread messages, here or in the next room that has them
 
 ```
 G
 ```
 
-Moves you to the next room (in list order) that has messages you haven't
-read. Wraps around. Useful for quickly working through activity across all
-rooms.
+If the room you're currently in has messages you haven't read, shows those
+first — the same messages `N` would show, a page at a time, so press `G`
+again to continue through a busy room. Otherwise moves you to the next room
+(in list order) that has messages you haven't read. Wraps around. Useful for
+quickly working through activity across all rooms.
 
 ### Skip past unread messages without reading them
 
@@ -1094,7 +1096,7 @@ account and you can re-register with the same username.
 | `K` | List rooms |
 | `C <name>` | Change to room by name (case-insensitive) |
 | `C <number>` | Change to room by number |
-| `G` | Jump to next room with unread messages |
+| `G` | Read unread here, else jump to the next room with unread |
 | `M` | Go to Mail (private messages) |
 
 ### Logged in — reading
