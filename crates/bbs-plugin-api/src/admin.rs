@@ -229,6 +229,24 @@ pub struct AdminBackupRecord {
     pub config_size_bytes: Option<u64>,
 }
 
+/// An archived month of the audit log: a zip holding the entries as text.
+///
+/// Archives are never removed automatically — the audit log is a record of
+/// every privileged action, so deleting one is a sysop's decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminAuditArchive {
+    /// File name only (not a full path), e.g. `audit-2026-09.zip`.
+    pub filename: String,
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// RFC 3339 file modification timestamp.
+    pub created_at: String,
+    /// How many audit entries the archive holds, when it could be read from
+    /// the archive itself. `None` if the count isn't available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_count: Option<u64>,
+}
+
 /// The current access policy for the BBS.
 ///
 /// Returned by [`crate::host::Host::admin_get_access_policy`] and consumed by
