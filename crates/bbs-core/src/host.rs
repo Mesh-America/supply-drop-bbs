@@ -1155,18 +1155,10 @@ impl Host for BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("user {username:?}")))?;
 
-        if !user.is_active() {
-            return Err(HostError::PermissionDenied {
-                required: PermissionLevel::Aide,
-            });
-        }
-
-        if user.permission_level < PermissionLevel::Aide {
-            return Err(HostError::PermissionDenied {
-                required: PermissionLevel::Aide,
-            });
-        }
-
+        // Password first, as at the BBS login prompt: the standing check
+        // below can lift an elapsed suspension, and nothing about an account
+        // should change, or be hinted at, for a caller who doesn't know its
+        // password. See resolve_suspension's doc comment.
         let ok = self
             .db
             .credentials()
@@ -1180,7 +1172,57 @@ impl Host for BbsHost {
             });
         }
 
+        // The same standing rule as the per-request re-check in the web admin
+        // (`admin_account_level`): an elapsed suspension is lifted here too,
+        // so the two can't disagree about the same account.
+        let user = match user.status {
+            UserStatus::Active => user,
+            UserStatus::Banned => match self.resolve_suspension(user).await? {
+                LoginSuspensionCheck::Allowed(u) => u,
+                _ => {
+                    return Err(HostError::PermissionDenied {
+                        required: PermissionLevel::Aide,
+                    })
+                }
+            },
+            _ => {
+                return Err(HostError::PermissionDenied {
+                    required: PermissionLevel::Aide,
+                })
+            }
+        };
+
+        if user.permission_level < PermissionLevel::Aide {
+            return Err(HostError::PermissionDenied {
+                required: PermissionLevel::Aide,
+            });
+        }
+
         Ok(user.permission_level)
+    }
+
+    async fn admin_account_level(
+        &self,
+        username: &str,
+    ) -> Result<Option<PermissionLevel>, HostError> {
+        let Ok(uname) = Username::new(username) else {
+            return Ok(None);
+        };
+        let Some(user) = UserStore::get_by_username(&self.db, &uname)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+        else {
+            return Ok(None);
+        };
+        Ok(match user.status {
+            UserStatus::Active => Some(user.permission_level),
+            UserStatus::Banned => match self.resolve_suspension(user).await? {
+                LoginSuspensionCheck::Allowed(u) => Some(u.permission_level),
+                LoginSuspensionCheck::Suspended { .. }
+                | LoginSuspensionCheck::PermanentlyBanned => None,
+            },
+            _ => None,
+        })
     }
 
     async fn admin_list_sessions(&self) -> Result<Vec<AdminSessionInfo>, HostError> {

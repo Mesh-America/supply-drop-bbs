@@ -102,6 +102,7 @@ use bbs_plugin_api::host::Host;
 use bbs_plugin_api::plugin::Plugin;
 use bbs_plugin_api::registry::{PluginRegistryApi, ProcessPluginConfig, RegistryError};
 use bbs_plugin_api::transport::TransportStats;
+use bbs_plugin_api::PermissionLevel;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::net::TcpListener;
@@ -208,6 +209,26 @@ struct CurrentUser {
     username: String,
     permission_level: u8,
 }
+
+/// The session token a request was authorised with, injected alongside
+/// [`CurrentUser`] so a long-lived response (an SSE stream) can re-check it.
+#[derive(Debug, Clone)]
+struct SessionToken(String);
+
+/// What [`AppState::authorize`] decided about a request.
+enum Authorized {
+    /// Proceed as this user.
+    Yes(CurrentUser),
+    /// No session, or the account may no longer hold one: 401.
+    No,
+    /// The account could not be checked. The session is kept, the request
+    /// is not served: 503, try again.
+    Unavailable,
+}
+
+/// How often a live SSE stream re-checks the session that opened it. Quoted
+/// in docs/USER_GUIDE.md and docs/ARCHITECTURE.md.
+const SSE_REAUTH_SECS: u64 = 15;
 
 // ── Transport flags ───────────────────────────────────────────────────────────
 
@@ -355,7 +376,11 @@ impl AppState {
         token
     }
 
-    fn validate_session(&self, token: &str) -> Option<CurrentUser> {
+    /// The session as cached at login, if `token` names one that hasn't
+    /// expired. This is a cache lookup, not an authorisation check: nothing
+    /// that serves a request may call it directly. [`Self::authorize`] is the
+    /// check, and checks the account behind the cache.
+    fn cached_session(&self, token: &str) -> Option<CurrentUser> {
         let mut sessions = self.sessions.lock().expect("sessions poisoned");
         match sessions.get(token) {
             Some(s) if s.expires_at > Instant::now() => Some(CurrentUser {
@@ -369,6 +394,64 @@ impl AppState {
         }
     }
 
+    /// Authorise a request carrying `token`, checking the account behind the
+    /// session against the host rather than trusting what was cached at login.
+    ///
+    /// The cached level and the 12-hour expiry used to be the whole check, so
+    /// a sysop demoted or banned from anywhere but this web process (the CLI,
+    /// the BBS's `.USER`/`BAN` commands, the database) kept full admin access
+    /// until the session expired (#380). Now an account that is gone, banned,
+    /// suspended or below Aide (the floor web login applies) loses every
+    /// session it holds here, and a level change is picked up on the next
+    /// request.
+    ///
+    /// If the account can't be read, or the host doesn't implement the
+    /// check, the request is refused as unavailable and the session kept: a
+    /// transient storage error neither serves a possibly-revoked session nor
+    /// signs a sysop out, and a host without the check never gets to trade
+    /// on a cached level.
+    async fn authorize(&self, token: &str) -> Authorized {
+        let Some(cached) = self.cached_session(token) else {
+            return Authorized::No;
+        };
+        match self.host.admin_account_level(&cached.username).await {
+            Ok(Some(level)) if level >= PermissionLevel::Aide => {
+                let level = level as u8;
+                // The session may have been logged out or invalidated while
+                // the account was being read; a request is only served on a
+                // session that still exists.
+                match self
+                    .sessions
+                    .lock()
+                    .expect("sessions poisoned")
+                    .get_mut(token)
+                {
+                    Some(s) => s.permission_level = level,
+                    None => return Authorized::No,
+                }
+                Authorized::Yes(CurrentUser {
+                    username: cached.username,
+                    permission_level: level,
+                })
+            }
+            Ok(_) => {
+                info!(
+                    username = %cached.username,
+                    "web: ending admin sessions for an account that may no longer use them"
+                );
+                self.invalidate_sessions_for(&cached.username);
+                Authorized::No
+            }
+            Err(e) => {
+                warn!(
+                    username = %cached.username,
+                    "web: could not re-check the account behind a session, refusing the request: {e}"
+                );
+                Authorized::Unavailable
+            }
+        }
+    }
+
     fn remove_session(&self, token: &str) {
         self.sessions
             .lock()
@@ -376,8 +459,9 @@ impl AppState {
             .remove(token);
     }
 
-    /// Remove all web sessions for `username` — called after ban or permission change
-    /// so stale cached `permission_level` values cannot be exploited.
+    /// Remove all web sessions for `username`: after a ban or level change
+    /// made through this API, and from [`Self::authorize`] when a request
+    /// finds the account changed from elsewhere.
     fn invalidate_sessions_for(&self, username: &str) {
         self.sessions
             .lock()
@@ -818,14 +902,20 @@ async fn auth_middleware(
         .map(|c| c.value().to_owned())
         .unwrap_or_default();
 
-    match state.validate_session(&token) {
-        Some(user) => {
+    match state.authorize(&token).await {
+        Authorized::Yes(user) => {
             req.extensions_mut().insert(user);
+            req.extensions_mut().insert(SessionToken(token));
             next.run(req).await
         }
-        None => (
+        Authorized::No => (
             StatusCode::UNAUTHORIZED,
             Json(json_error("not authenticated")),
+        )
+            .into_response(),
+        Authorized::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("could not check the session; try again")),
         )
             .into_response(),
     }
@@ -2123,6 +2213,7 @@ async fn api_errors(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
 async fn api_sse_errors(
     State(state): State<Arc<AppState>>,
+    Extension(token): Extension<SessionToken>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx_opt = state
         .error_tx
@@ -2144,11 +2235,13 @@ async fn api_sse_errors(
             None => Box::new(tokio_stream::empty()),
         };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(end_when_revoked(state, token, stream))
+        .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 async fn api_sse_rss_alert(
     State(state): State<Arc<AppState>>,
+    Extension(token): Extension<SessionToken>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx_opt = state
         .rss_alert_tx
@@ -2170,7 +2263,8 @@ async fn api_sse_rss_alert(
             None => Box::new(tokio_stream::empty()),
         };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(end_when_revoked(state, token, stream))
+        .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── System metrics ───────────────────────────────────────────────────────────
@@ -4019,8 +4113,70 @@ async fn api_logs(
 
 // ── SSE log stream ────────────────────────────────────────────────────────────
 
+/// End `events` once the session that opened it stops authorising.
+///
+/// The middleware checks a session when the stream opens, and an SSE stream
+/// then stays open indefinitely, so without this a revoked session kept
+/// receiving the live log after logout, a ban or a demotion. The session is
+/// re-checked every [`SSE_REAUTH_SECS`] seconds; the user guide and
+/// architecture doc quote that figure, so change them together.
+fn end_when_revoked<S>(
+    state: Arc<AppState>,
+    token: SessionToken,
+    events: S,
+) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static
+where
+    S: tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    end_when_revoked_every(
+        state,
+        token,
+        events,
+        std::time::Duration::from_secs(SSE_REAUTH_SECS),
+    )
+}
+
+/// [`end_when_revoked`] with the re-check period as a parameter, for tests.
+fn end_when_revoked_every<S>(
+    state: Arc<AppState>,
+    token: SessionToken,
+    events: S,
+    period: std::time::Duration,
+) -> impl tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static
+where
+    S: tokio_stream::Stream<Item = Result<Event, Infallible>> + Send + 'static,
+{
+    enum Tick {
+        Event(Result<Event, Infallible>),
+        StillAuthorized,
+        End,
+    }
+    let checks = tokio_stream::iter(std::iter::repeat(())).then(move |()| {
+        let state = Arc::clone(&state);
+        let token = token.0.clone();
+        async move {
+            tokio::time::sleep(period).await;
+            // Anything but a yes ends the stream, including "couldn't check":
+            // the client reconnects and gets a plain answer.
+            match state.authorize(&token).await {
+                Authorized::Yes(_) => Tick::StillAuthorized,
+                Authorized::No | Authorized::Unavailable => Tick::End,
+            }
+        }
+    });
+    events
+        .map(Tick::Event)
+        .merge(checks)
+        .take_while(|t| !matches!(t, Tick::End))
+        .filter_map(|t| match t {
+            Tick::Event(e) => Some(e),
+            _ => None,
+        })
+}
+
 async fn api_sse_logs(
     State(state): State<Arc<AppState>>,
+    Extension(token): Extension<SessionToken>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.log_tx.subscribe();
 
@@ -4035,14 +4191,19 @@ async fn api_sse_logs(
         Err(_lagged) => None,
     });
 
-    Sse::new(tokio_stream::StreamExt::chain(init, live))
-        .keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(end_when_revoked(
+        state,
+        token,
+        tokio_stream::StreamExt::chain(init, live),
+    ))
+    .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── SSE domain events ─────────────────────────────────────────────────────────
 
 async fn api_sse_events(
     State(state): State<Arc<AppState>>,
+    Extension(token): Extension<SessionToken>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     let rx = state.host.events();
 
@@ -4058,7 +4219,8 @@ async fn api_sse_events(
         Err(_) => None,
     });
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(end_when_revoked(state, token, stream))
+        .keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 // ── Backups ───────────────────────────────────────────────────────────────────
@@ -5039,6 +5201,268 @@ mod tests {
         let mut k = [0u8; 32];
         k[0] = n;
         k
+    }
+
+    /// Web state over a real host and database, with two sysops, so an
+    /// account can be changed behind the web layer's back the way the CLI or
+    /// the BBS's own commands change it. (#380)
+    async fn real_host_state() -> (Arc<AppState>, tempfile::NamedTempFile) {
+        let (state, _db, file) = real_host_state_with_db().await;
+        (state, file)
+    }
+
+    /// As [`real_host_state`], keeping a handle on the database for a test
+    /// that has to write what the host's own admin methods won't.
+    async fn real_host_state_with_db(
+    ) -> (Arc<AppState>, bbs_core::Database, tempfile::NamedTempFile) {
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = bbs_core::Database::open(&db_file.path().to_string_lossy())
+            .await
+            .expect("open database");
+        let host: Arc<dyn Host> = Arc::new(bbs_core::BbsHost::new(db.clone()));
+        let state = Arc::new(AppState::new(host, WebConfig::default()));
+        for name in ["root", "other"] {
+            state
+                .host
+                .admin_create_user(name, "pass1234", 100)
+                .await
+                .unwrap();
+        }
+        (state, db, db_file)
+    }
+
+    async fn level_of(state: &AppState, token: &str) -> Option<u8> {
+        match state.authorize(token).await {
+            Authorized::Yes(u) => Some(u.permission_level),
+            Authorized::No => None,
+            Authorized::Unavailable => panic!("the host should have answered"),
+        }
+    }
+
+    /// A ban applied through the host directly, as the CLI does, ends the web
+    /// session on its next request. It used to last out the 12-hour TTL.
+    #[tokio::test]
+    async fn a_ban_made_elsewhere_ends_the_web_session() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+        assert_eq!(level_of(&state, &token).await, Some(100));
+
+        state
+            .host
+            .admin_update_user("root", Some(1), None)
+            .await
+            .unwrap();
+
+        assert_eq!(level_of(&state, &token).await, None);
+        assert!(
+            state.cached_session(&token).is_none(),
+            "the session should be gone, not just refused once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_suspension_made_elsewhere_ends_the_web_session() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+        state.host.admin_suspend_user("root", 2).await.unwrap();
+        assert_eq!(level_of(&state, &token).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_deletion_made_elsewhere_ends_the_web_session() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+        state
+            .host
+            .admin_update_user("root", Some(2), None)
+            .await
+            .unwrap();
+        assert_eq!(level_of(&state, &token).await, None);
+    }
+
+    /// A demotion made elsewhere is picked up on the next request: to Aide it
+    /// narrows the session, below Aide (which web login requires) it ends it.
+    #[tokio::test]
+    async fn a_demotion_made_elsewhere_reaches_the_web_session() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+
+        state
+            .host
+            .admin_update_user("root", None, Some(50))
+            .await
+            .unwrap();
+        assert_eq!(level_of(&state, &token).await, Some(50));
+        assert_eq!(
+            state.cached_session(&token).map(|u| u.permission_level),
+            Some(50),
+            "the cached level should be corrected, not just the answer"
+        );
+
+        state
+            .host
+            .admin_update_user("root", None, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(level_of(&state, &token).await, None);
+    }
+
+    /// An elapsed suspension is lifted by the re-check and by web login alike,
+    /// so an account can't be let through on one and refused on the other.
+    #[tokio::test]
+    async fn an_elapsed_suspension_is_lifted_for_web_login_and_re_check_alike() {
+        let (state, db, _file) = real_host_state_with_db().await;
+        let token = state.create_session("root".into(), 100);
+        let id = bbs_core::db::UserStore::get_by_username(
+            &db,
+            &bbs_plugin_api::Username::new("root").unwrap(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+        let past = bbs_core::timestamp::Timestamp::from_utc(
+            bbs_core::timestamp::Timestamp::now().as_offset_datetime() - time::Duration::hours(1),
+        );
+        bbs_core::db::UserStore::suspend(&db, id, past)
+            .await
+            .unwrap();
+
+        assert_eq!(level_of(&state, &token).await, Some(100));
+        assert_eq!(
+            state
+                .host
+                .admin_verify_credentials("root", "pass1234")
+                .await
+                .unwrap(),
+            PermissionLevel::Sysop
+        );
+    }
+
+    /// Only the changed account's sessions go.
+    #[tokio::test]
+    async fn banning_one_account_leaves_other_web_sessions_alone() {
+        let (state, _db) = real_host_state().await;
+        let root = state.create_session("root".into(), 100);
+        let other = state.create_session("other".into(), 100);
+        state
+            .host
+            .admin_update_user("root", Some(1), None)
+            .await
+            .unwrap();
+        assert_eq!(level_of(&state, &root).await, None);
+        assert_eq!(level_of(&state, &other).await, Some(100));
+    }
+
+    /// The cached level is never the answer on its own: an account the host
+    /// doesn't vouch for is refused, and one it does is served at the level
+    /// the host gives, not the cached one.
+    #[tokio::test]
+    async fn the_host_answer_decides_not_the_cache() {
+        let (state, mock) = test_state();
+        let token = state.create_session("sysop".into(), 100);
+        assert_eq!(level_of(&state, &token).await, None);
+
+        let token = state.create_session("sysop".into(), 100);
+        mock.set_account_level("sysop", Some(PermissionLevel::Aide));
+        assert_eq!(level_of(&state, &token).await, Some(50));
+    }
+
+    /// A host that can't answer refuses the request but keeps the session,
+    /// so a transient storage error neither serves a revoked session nor
+    /// signs a sysop out.
+    #[tokio::test]
+    async fn an_unavailable_host_refuses_without_signing_out() {
+        struct Silent(MockHost);
+        #[async_trait]
+        impl Host for Silent {
+            async fn create_session(
+                &self,
+                t: &'static str,
+            ) -> Result<bbs_plugin_api::SessionId, HostError> {
+                self.0.create_session(t).await
+            }
+            async fn end_session(&self, s: bbs_plugin_api::SessionId) -> Result<(), HostError> {
+                self.0.end_session(s).await
+            }
+            async fn permission_ctx(
+                &self,
+                s: bbs_plugin_api::SessionId,
+            ) -> Result<bbs_plugin_api::PermissionCtx, HostError> {
+                self.0.permission_ctx(s).await
+            }
+            async fn process_command(
+                &self,
+                s: bbs_plugin_api::SessionId,
+                c: bbs_plugin_api::Command,
+            ) -> Result<bbs_plugin_api::Response, HostError> {
+                self.0.process_command(s, c).await
+            }
+            fn events(&self) -> broadcast::Receiver<DomainEvent> {
+                self.0.events()
+            }
+            fn advert_bus(&self) -> Arc<bbs_plugin_api::advert::AdvertBus> {
+                self.0.advert_bus()
+            }
+            fn node_location(&self) -> Option<(f64, f64)> {
+                self.0.node_location()
+            }
+            async fn admin_account_level(
+                &self,
+                _: &str,
+            ) -> Result<Option<PermissionLevel>, HostError> {
+                Err(HostError::Storage("database is locked".into()))
+            }
+        }
+        let host: Arc<dyn Host> = Arc::new(Silent(MockHost::new()));
+        let state = Arc::new(AppState::new(host, WebConfig::default()));
+        let token = state.create_session("sysop".into(), 100);
+        assert!(matches!(
+            state.authorize(&token).await,
+            Authorized::Unavailable
+        ));
+        assert!(
+            state.cached_session(&token).is_some(),
+            "the session should survive a failed check"
+        );
+    }
+
+    /// An open SSE stream passes events through while its session is good and
+    /// ends once the session is revoked. Before, it stayed open indefinitely.
+    #[tokio::test]
+    async fn an_sse_stream_ends_when_its_session_is_revoked() {
+        let (state, _db) = real_host_state().await;
+        let token = state.create_session("root".into(), 100);
+        let events = tokio_stream::iter([Ok::<_, Infallible>(Event::default().data("hello"))])
+            .chain(tokio_stream::pending());
+        let stream = end_when_revoked_every(
+            Arc::clone(&state),
+            SessionToken(token.clone()),
+            events,
+            std::time::Duration::from_millis(20),
+        );
+        tokio::pin!(stream);
+
+        assert!(
+            stream.next().await.is_some(),
+            "an event should pass through"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                .await
+                .is_err(),
+            "the stream should stay open while the session is good"
+        );
+
+        state
+            .host
+            .admin_update_user("root", Some(1), None)
+            .await
+            .unwrap();
+        let end = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("the stream should end once the session is revoked");
+        assert!(end.is_none());
     }
 
     // Issue #194: PATCH bodies that need to distinguish "field omitted" from

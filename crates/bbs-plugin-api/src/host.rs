@@ -227,6 +227,25 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_verify_credentials".into()))
     }
 
+    /// The permission level `username` holds now, if the account may be
+    /// logged in at all.
+    ///
+    /// Returns `None` when the account doesn't exist, is deleted, is
+    /// permanently banned, or is in a suspension that hasn't run out. A
+    /// suspension that has run out is lifted as a side effect and the level
+    /// returned, the same as at login.
+    ///
+    /// The web admin calls this on every request, so a change made from
+    /// anywhere else (the CLI, the BBS's own commands, the database) reaches
+    /// a web session it has already issued.
+    async fn admin_account_level(
+        &self,
+        username: &str,
+    ) -> Result<Option<PermissionLevel>, HostError> {
+        let _ = username;
+        Err(HostError::NotSupported("admin_account_level".into()))
+    }
+
     /// Return info about every currently-live BBS session.
     async fn admin_list_sessions(&self) -> Result<Vec<AdminSessionInfo>, HostError> {
         Err(HostError::NotSupported("admin_list_sessions".into()))
