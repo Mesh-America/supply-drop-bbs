@@ -715,6 +715,70 @@ A restore that is confirmed but not yet applied (the BBS wasn't restarted)
 is a file named `pending_restore.db` in the data directory. Delete it before
 the next start to cancel the restore.
 
+## Audit log archives
+
+Every privileged action — bans, validations, permission changes, room and
+message deletions, password resets, service restarts — is written to the audit
+log, readable on the **audit** page of the web admin UI.
+
+### Monthly archiving
+
+With `[audit] archive_enabled = true` (default), the BBS archives the audit log
+at the turn of each month and the live log starts fresh. An archive is one
+`audit-YYYY-MM.zip` in `<data_dir>/audit-archives` (set `[audit] directory` to
+put them elsewhere), holding a single tab-separated `.txt` of that month's
+entries:
+
+```
+id	created_at	actor	action	target	detail
+```
+
+Empty fields read as `-`. Tabs and newlines inside a field are written as `\t`
+and `\n`, so one entry is always one line and the file stays greppable:
+
+```sh
+unzip -p audit-2026-09.zip | grep -P '\tban\t'
+```
+
+The archive is named for the month it covers, so the one taken on 1 October is
+`audit-2026-09.zip`. Archiving itself is recorded as `archive_audit_log` in the
+now-fresh log, so there's no unexplained gap.
+
+Whether a month has been archived is decided by whether its archive file
+exists, not by a stored timestamp. A BBS that was switched off across the turn
+of the month archives on its next hourly check rather than skipping the month,
+and one that restarts repeatedly can't archive the same month twice. If an
+archive for that month already exists, archiving is refused and the live log is
+left alone — so removing an archive by hand and expecting it to be rebuilt
+won't work; the entries are gone from the live log.
+
+The live log is cleared only once the archive file is complete and renamed into
+place. If archiving fails part-way, you lose the archive and keep the entries,
+not the other way round.
+
+### Archives are never deleted automatically
+
+There is deliberately no retention setting. The audit log is the record of who
+did what, so archives accumulate until a sysop removes one on purpose from the
+**audit archives** page. Nothing in the BBS deletes one, and no endpoint can
+clear the live log — archiving is the only thing that empties it.
+
+Downloading and deleting an archive are both sysop-only, the same bar as
+downloading a database backup, since an archive is a full month of privileged
+actions. Deleting one is itself recorded in the audit log as
+`delete_audit_archive`.
+
+Archives are plain files, so they belong in your off-host copy alongside the
+database backups:
+
+```sh
+0 4 * * *  rsync -a /var/lib/supply-drop-bbs/audit-archives/ \
+              backup-host:/srv/bbs-audit/$(hostname)/
+```
+
+Turning archiving off with `archive_enabled = false` leaves the log growing
+without bound; nothing is deleted either way.
+
 ## Rooms and access control
 
 ### Built-in rooms

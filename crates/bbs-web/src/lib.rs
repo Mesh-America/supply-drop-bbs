@@ -6402,4 +6402,233 @@ mod tests {
             let _router = build_router(Arc::clone(&f.state));
         }
     }
+
+    // Issue #362: the audit archive endpoints, against a real BbsHost and
+    // real archive files, so the gating and the file handling are the
+    // production paths.
+    mod audit_archive_tests {
+        use super::*;
+
+        struct Fixture {
+            state: Arc<AppState>,
+            archive_dir: tempfile::TempDir,
+            _live_db: tempfile::NamedTempFile,
+        }
+
+        async fn fixture() -> Fixture {
+            let live_db = tempfile::NamedTempFile::new().unwrap();
+            let db = bbs_core::Database::open(&live_db.path().to_string_lossy())
+                .await
+                .expect("open database");
+            let host: Arc<dyn Host> = Arc::new(bbs_core::BbsHost::new(db));
+            let state = Arc::new(AppState::new(host, WebConfig::default()));
+            let archive_dir = tempfile::tempdir().unwrap();
+            *state.audit_archive_dir.lock().unwrap() =
+                Some(archive_dir.path().to_string_lossy().into());
+            Fixture {
+                state,
+                archive_dir,
+                _live_db: live_db,
+            }
+        }
+
+        /// Put a real archive in place, the way the scheduler would.
+        async fn make_archive(f: &Fixture) -> String {
+            f.state
+                .host
+                .admin_write_audit("sysop", "ban", Some("bob"), None)
+                .await
+                .expect("write an audit entry");
+            f.state
+                .host
+                .admin_archive_audit_log(&f.archive_dir.path().to_string_lossy(), 2026, 9)
+                .await
+                .expect("archive")
+                .expect("something to archive")
+                .filename
+        }
+
+        #[tokio::test]
+        async fn listing_needs_a_sysop() {
+            let f = fixture().await;
+            for caller in [aide(), regular_user()] {
+                let name = caller.username.clone();
+                let resp =
+                    api_list_audit_archives(State(Arc::clone(&f.state)), Extension(caller)).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::FORBIDDEN,
+                    "{name} should not list audit archives"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_sysop_sees_the_archives() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let resp =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            let list = body.as_array().expect("an array of archives");
+            assert_eq!(list.len(), 1, "expected one archive: {body}");
+            assert_eq!(list[0]["filename"], name);
+        }
+
+        #[tokio::test]
+        async fn downloading_needs_a_sysop_and_serves_the_zip() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let denied = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(aide()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get(header::CONTENT_TYPE).unwrap(),
+                "application/zip"
+            );
+            let disposition = resp
+                .headers()
+                .get(header::CONTENT_DISPOSITION)
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            assert!(
+                disposition.contains(&name),
+                "the download should be named after the archive: {disposition}"
+            );
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&bytes[..2], b"PK", "the body should be a zip");
+        }
+
+        #[tokio::test]
+        async fn only_archives_can_be_downloaded() {
+            let f = fixture().await;
+            // A database backup sharing the directory, and traversals.
+            std::fs::write(f.archive_dir.path().join("backup_2026-09-01.zip"), b"x").unwrap();
+            for name in [
+                "backup_2026-09-01.zip",
+                "../../etc/passwd",
+                "audit-2026-09.zip/../secret",
+            ] {
+                let resp = api_download_audit_archive(
+                    State(Arc::clone(&f.state)),
+                    Extension(sysop()),
+                    Path(name.to_owned()),
+                )
+                .await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{name} should not be downloadable"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_missing_archive_is_a_404_not_a_500() {
+            let f = fixture().await;
+            let resp = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-1999-01.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn deleting_needs_a_sysop_and_records_itself() {
+            let f = fixture().await;
+            let name = make_archive(&f).await;
+
+            let denied = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(aide()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            assert!(
+                f.archive_dir.path().join(&name).exists(),
+                "a refused delete must leave the archive alone"
+            );
+
+            let resp = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path(name.clone()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+            assert!(!f.archive_dir.path().join(&name).exists());
+
+            // Removing a month of history is itself a privileged action.
+            let log = f.state.host.admin_audit_log(50, 0, None).await.unwrap();
+            assert!(
+                log.iter().any(|e| e.action == "delete_audit_archive"
+                    && e.target.as_deref() == Some(name.as_str())),
+                "the deletion should be in the audit log: {log:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn only_archives_can_be_deleted() {
+            let f = fixture().await;
+            let backup = f.archive_dir.path().join("backup_2026-09-01.zip");
+            std::fs::write(&backup, b"x").unwrap();
+
+            let resp = api_delete_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("backup_2026-09-01.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+            assert!(backup.exists(), "a database backup must survive this");
+        }
+
+        #[tokio::test]
+        async fn the_endpoints_say_so_when_no_directory_is_configured() {
+            let f = fixture().await;
+            *f.state.audit_archive_dir.lock().unwrap() = None;
+
+            let listed =
+                api_list_audit_archives(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(listed.status(), StatusCode::BAD_REQUEST);
+
+            let downloaded = api_download_audit_archive(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Path("audit-2026-09.zip".to_owned()),
+            )
+            .await;
+            assert_eq!(downloaded.status(), StatusCode::BAD_REQUEST);
+        }
+
+        /// The archive routes sit beside `/audit-log`; axum panics at router
+        /// build time on a conflict, so building the router is the test.
+        #[tokio::test]
+        async fn router_builds_with_the_archive_routes() {
+            let f = fixture().await;
+            let _router = build_router(Arc::clone(&f.state));
+        }
+    }
 }
