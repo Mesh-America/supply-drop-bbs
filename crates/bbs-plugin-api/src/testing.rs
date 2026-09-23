@@ -99,6 +99,10 @@ struct MockHostState {
     /// Every `admin_remove_meshtastic_favorite` call, in order — same
     /// rationale as `removed_meshcore_contacts`.
     removed_meshtastic_favorites: Vec<u32>,
+    /// What `admin_account_level` answers per username, set with
+    /// [`MockHost::set_account_level`]. An unscripted username answers
+    /// `None`, as a real host does for an account it doesn't have.
+    account_levels: std::collections::HashMap<String, Option<PermissionLevel>>,
     /// The MeshCore transport's key-ops channel, captured by
     /// `register_mesh_key_ops` when a real transport (e.g. `MeshTransport`)
     /// registers itself against this mock during a test. `None` until then.
@@ -162,6 +166,7 @@ impl MockHost {
                 process_delay: Duration::ZERO,
                 removed_meshcore_contacts: Vec::new(),
                 removed_meshtastic_favorites: Vec::new(),
+                account_levels: std::collections::HashMap::new(),
                 mesh_key_tx: None,
                 location: None,
                 share_location_in_advert: true,
@@ -212,6 +217,17 @@ impl MockHost {
             alive: true,
         });
         id
+    }
+
+    /// Script what [`Host::admin_account_level`] answers for `username`:
+    /// `Some(level)` for an account in good standing, `None` for one that
+    /// may not hold a session.
+    pub fn set_account_level(&self, username: &str, level: Option<PermissionLevel>) {
+        self.state
+            .lock()
+            .expect("mock poisoned")
+            .account_levels
+            .insert(username.to_owned(), level);
     }
 
     /// Script a response for any command matching `matcher`.
@@ -487,6 +503,21 @@ impl Host for MockHost {
             .removed_meshtastic_favorites
             .push(node_num);
         Ok(())
+    }
+
+    /// Answers from [`MockHost::set_account_level`]; `None` when unscripted.
+    async fn admin_account_level(
+        &self,
+        username: &str,
+    ) -> Result<Option<PermissionLevel>, HostError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("mock poisoned")
+            .account_levels
+            .get(username)
+            .copied()
+            .flatten())
     }
 }
 

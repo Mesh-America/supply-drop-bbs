@@ -1050,6 +1050,15 @@ If the web admin is enabled, sysops can manage users, rooms, messages, and
 view audit logs through a browser interface. The URL is set by the operator
 (typically `http://<bbs-host>:8080`).
 
+Signing in needs an active Aide or Sysop account, and that is checked again on
+every request, not just at sign-in. If your account is banned, suspended,
+deleted or dropped below Aide from anywhere (the command line, the BBS, or
+another sysop's browser), your next click signs you out, and the live feeds
+behind the dashboard badges close within about 15 seconds. A change of level
+between Aide and Sysop applies on your next click. If the server can't read
+your account for a moment, the request fails with a "try again" rather than
+signing you out.
+
 From the **Users** page you can:
 
 - Filter to **"pending verification"** to see only unvalidated accounts
