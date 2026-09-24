@@ -190,6 +190,7 @@ sudo useradd --system --no-create-home --shell /sbin/nologin \
   --home-dir /var/lib/supply-drop-bbs supply-drop 2>/dev/null || true
 sudo mkdir -p /var/lib/supply-drop-bbs /etc/supply-drop-bbs
 sudo chown supply-drop:supply-drop /var/lib/supply-drop-bbs
+sudo chmod 700 /var/lib/supply-drop-bbs
 # Config dir ownership is set automatically by 'sudo supply-drop-bbs setup'.
 # If you create config.toml manually, fix ownership so the web admin can save changes:
 sudo chown supply-drop:supply-drop /etc/supply-drop-bbs /etc/supply-drop-bbs/config.toml

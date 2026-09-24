@@ -1772,6 +1772,7 @@ impl Host for BbsHost {
         tokio::fs::create_dir_all(archive_dir)
             .await
             .map_err(|e| HostError::Storage(format!("audit archive directory: {e}")))?;
+        crate::dir_perms::restrict_to_owner(std::path::Path::new(archive_dir));
 
         let target = std::path::Path::new(archive_dir).join(archive_name(year, month));
         if tokio::fs::try_exists(&target).await.unwrap_or(false) {

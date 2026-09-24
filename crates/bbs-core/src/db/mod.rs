@@ -68,6 +68,13 @@ impl Database {
             .after_connect(|conn, _meta| Box::pin(apply_pragmas(conn)))
             .connect_with(write_opts)
             .await?;
+        // sqlx/SQLite set no mode of their own on a newly created file, so it
+        // gets whatever the process's umask leaves — commonly world-readable.
+        // This file holds password hashes and message content; restrict it
+        // (and its WAL/SHM sidecars — `apply_pragmas` above just enabled WAL
+        // mode) on every open, not just first creation, so an existing
+        // install with a looser mode self-heals on next startup too.
+        restrict_db_files_to_owner(path);
 
         let read_opts = base_opts(path).read_only(true);
         let read_pool = SqlitePoolOptions::new()
@@ -147,4 +154,131 @@ fn base_opts(path: &str) -> SqliteConnectOptions {
         .expect("path must be a valid SQLite connection string")
         .create_if_missing(true)
         .foreign_keys(true)
+}
+
+/// Best-effort: restrict the live database file and its `-wal`/`-shm`
+/// sidecars to owner-only (0600). The sidecars may not exist yet (WAL only
+/// creates them once something writes), so a missing candidate is silently
+/// skipped; a failure restricting one that DOES exist is a `warn!`, since
+/// this is the sole enforcement of the file's confidentiality (not a
+/// convenience fallback) and should be visible if it doesn't work, same
+/// reasoning as `dir_perms::restrict_to_owner`. Uses the same
+/// open-then-`fchmod` (not chmod-by-path) pattern as that function, for the
+/// same symlink-race reason.
+///
+/// Also hands each file to `data_dir`'s owner first, the same way
+/// `restore_stage::hand_fd_to_dir_owner`'s own doc comment explains: this
+/// function runs on every `open`, including from short-lived CLI
+/// subcommands this project's own docs tell operators to run as root — a
+/// root-created (or root-`open`'d) database file must not end up
+/// root-owned *and* 0600, which would lock the actual service account out
+/// of its own database entirely rather than just leaving it too permissive.
+fn restrict_db_files_to_owner(path: &str) {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let data_dir = std::path::Path::new(path).parent();
+    for candidate in [
+        path.to_owned(),
+        format!("{path}-wal"),
+        format!("{path}-shm"),
+    ] {
+        let opened = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&candidate);
+        match opened {
+            Ok(f) => {
+                if let Some(dir) = data_dir {
+                    crate::restore_stage::hand_fd_to_dir_owner(dir, &f);
+                }
+                if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                    tracing::warn!(path = %candidate, "could not restrict database file to owner-only: {e}");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::warn!(path = %candidate, "could not open database file to restrict its permissions: {e}");
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::Database;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    #[tokio::test]
+    async fn opening_a_database_leaves_the_file_owner_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bbs.sqlite");
+        let db = Database::open(&path.to_string_lossy()).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        drop(db);
+    }
+
+    // Simulates a database created by an older version of this project
+    // (or by hand) under a looser umask: opening it must tighten the mode
+    // rather than leave the existing permissions alone.
+    #[tokio::test]
+    async fn opening_an_existing_world_readable_database_tightens_its_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bbs.sqlite");
+        {
+            let db = Database::open(&path.to_string_lossy()).await.unwrap();
+            drop(db);
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "test setup must actually loosen it first");
+
+        let db = Database::open(&path.to_string_lossy()).await.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+        drop(db);
+    }
+
+    // The WAL/SHM sidecars are the flagship reason `restrict_db_files_to_owner`
+    // exists (the main file alone isn't the whole story under WAL mode).
+    // Exercised directly on plain files rather than through `Database::open`:
+    // SQLite memory-maps a real `-shm`, so planting fake content in one and
+    // reopening the database reads past the end of the mapping (SIGBUS),
+    // which took down the whole test binary in CI.
+    #[test]
+    fn loosely_permissioned_wal_and_shm_sidecars_are_tightened_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bbs.sqlite");
+        let path_str = path.to_string_lossy().into_owned();
+        let files = [
+            path_str.clone(),
+            format!("{path_str}-wal"),
+            format!("{path_str}-shm"),
+        ];
+        for f in &files {
+            std::fs::write(f, b"x").unwrap();
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+
+        super::restrict_db_files_to_owner(&path_str);
+
+        for f in &files {
+            let mode = std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{f}: {mode:o}");
+        }
+    }
+
+    // A missing sidecar (the common case: WAL only creates them once
+    // something writes) is skipped, not treated as an error.
+    #[test]
+    fn missing_sidecars_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bbs.sqlite");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::restrict_db_files_to_owner(&path.to_string_lossy());
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+    }
 }

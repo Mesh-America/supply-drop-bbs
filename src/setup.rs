@@ -1336,6 +1336,9 @@ pub fn run_wizard(config_out: Option<&Path>) {
             match fs::create_dir_all(dir) {
                 Ok(()) => {
                     println!("Backup directory created: {dir}");
+                    // Backups are full copies of the live database — as
+                    // sensitive as it is. See bbs_core::dir_perms.
+                    bbs_core::dir_perms::restrict_to_owner(std::path::Path::new(dir));
                     #[cfg(target_os = "linux")]
                     {
                         let status = std::process::Command::new("chown")
