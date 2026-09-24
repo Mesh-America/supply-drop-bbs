@@ -1671,11 +1671,7 @@ name = \"X\"
         let data = tempfile::tempdir().unwrap();
         let d = data.path().to_path_buf();
         // Large enough that many chunks are needed, so the copy is still
-        // running well past the sleep below on any realistic disk/scheduler
-        // and the abort lands genuinely mid-copy rather than racing a copy
-        // that already finished. If `!task.is_finished()` below ever trips,
-        // that's this margin being too small for a given environment, not a
-        // silent pass — it fails loudly rather than proving nothing.
+        // running when the abort below lands.
         let src = d.join("src.db");
         std::fs::write(&src, vec![0u8; 512 * 1024 * 1024]).unwrap();
         let staged = d.join("pending_restore.staged.db");
@@ -1684,7 +1680,27 @@ name = \"X\"
             let (src, staged, d) = (src.clone(), staged.clone(), d.clone());
             async move { copy_via_private_temp(&src, &staged, &d).await }
         });
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Abort only once the copy has observably started: the private temp
+        // exists and has data in it. A fixed sleep isn't enough. On a slow
+        // runner it can land while `new_private_temp`'s blocking open is still
+        // in flight, before the `TempFile` guard exists, and an open orphaned
+        // that way leaves its file behind for the startup sweep to collect
+        // (the accepted behaviour `TempFile`'s doc comment describes), which
+        // this test would misread as the guard failing to clean up.
+        let started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let copying = std::fs::read_dir(&d).unwrap().flatten().any(|e| {
+                    e.file_name().to_string_lossy().starts_with("restore_upload_")
+                        && e.metadata().is_ok_and(|m| m.len() > 0)
+                });
+                if copying {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "the copy never visibly started");
         assert!(
             !task.is_finished(),
             "the copy must still be running for this test to actually catch it mid-flight \
