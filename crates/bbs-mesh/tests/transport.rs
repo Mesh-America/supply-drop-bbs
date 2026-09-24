@@ -3432,9 +3432,11 @@ async fn a_lost_autoadd_write_reply_times_out_and_stops_blocking_key_ops() {
         .expect_err("a key op must be rejected while the write is outstanding");
     assert!(busy.contains("already in progress"), "{busy}");
 
-    // ...but once the reply is lost for longer than AUTOADD_REPLY_TIMEOUT,
-    // the slot must free itself without a reconnect.
-    tokio::time::sleep(Duration::from_secs(6)).await;
+    // ...but once the reply is lost for longer than AUTOADD_REPLY_TIMEOUT (5s,
+    // plus up to one 500ms retry_tick), the slot must free itself without a
+    // reconnect. Generous margin so a loaded CI runner doesn't turn a slow
+    // but correct pass into a flaky failure.
+    tokio::time::sleep(Duration::from_secs(8)).await;
     let key_task = tokio::spawn({
         let host = Arc::clone(&host);
         async move { export_key(&host).await }
@@ -3476,6 +3478,89 @@ async fn a_duplicate_autoadd_config_frame_with_no_pending_read_is_ignored() {
         !seen.contains(&CMD_SET_AUTOADD_CONFIG),
         "an unsolicited AutoaddConfig frame must not trigger a write: {seen:?}"
     );
+
+    transport.stop().await.unwrap();
+}
+
+/// supply-drop-bbs-u0vv / GH #398: a lost reply to a sysop-triggered key op
+/// (export/import/apply-radio) must not block every future key op for the
+/// rest of the connection — `PENDING_KEY_OP_TIMEOUT` bounds how long
+/// `pending_key_op` can stay occupied waiting for one.
+#[tokio::test]
+async fn a_lost_key_op_reply_times_out_and_stops_blocking_future_key_ops() {
+    let host = Arc::new(MockHost::new());
+    let (transport, mut bridge) = make_transport(Arc::clone(&host), None).await;
+    // Already-correct autoadd config: settles immediately, so it can't
+    // interfere with this test's own busy-check assertions. The extra sleep
+    // (beyond the helper's own internal one) gives the event loop time to
+    // actually finish processing that reply before the key request below —
+    // unlike the file's other tests, nothing here reads a wire frame first
+    // to naturally serialize against that.
+    bridge.complete_handshake("TestNode").await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Send an ExportKey and never reply to it. Built inline rather than via
+    // `export_key` (which has its own 2s reply timeout that would panic
+    // before this test's own, much longer, timeout gets a chance to matter).
+    let stuck_task = tokio::spawn({
+        let host = Arc::clone(&host);
+        async move {
+            let key_tx = host
+                .mesh_key_tx()
+                .expect("MeshTransport::start must have registered its key_tx by now");
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            key_tx
+                .send(MeshKeyRequest::ExportKey { reply: reply_tx })
+                .await
+                .expect("transport's key_rx must still be alive");
+            reply_rx
+                .await
+                .expect("reply sender must not be dropped without a value")
+        }
+    });
+    let export_cmd = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_EXPORT_PRIVATE_KEY),
+    )
+    .await
+    .expect("transport never sent CMD_EXPORT_PRIVATE_KEY");
+    assert_eq!(export_cmd[0], CMD_EXPORT_PRIVATE_KEY);
+
+    // A second key op must be rejected as busy while the first is still
+    // outstanding.
+    let busy = export_key(&host)
+        .await
+        .expect_err("a key op must be rejected while another is outstanding");
+    assert!(busy.contains("already in progress"), "{busy}");
+
+    // The stuck export must eventually fail with a timeout error rather than
+    // hang forever. Generous margin over PENDING_KEY_OP_TIMEOUT (8s, plus up
+    // to one 500ms retry_tick) so a loaded CI runner doesn't turn a slow but
+    // correct pass into a flaky failure.
+    let timed_out = tokio::time::timeout(Duration::from_secs(15), stuck_task)
+        .await
+        .expect("the stuck export task itself must finish")
+        .unwrap()
+        .expect_err("a lost reply must eventually fail, not hang forever");
+    assert!(timed_out.contains("did not reply"), "{timed_out}");
+
+    // ...and a fresh key op must now go through, with no reconnect needed.
+    let key_task = tokio::spawn({
+        let host = Arc::clone(&host);
+        async move { export_key(&host).await }
+    });
+    let export_cmd2 = tokio::time::timeout(
+        Duration::from_secs(2),
+        bridge.read_until_cmd(CMD_EXPORT_PRIVATE_KEY),
+    )
+    .await
+    .expect("a fresh key op must go through once the timeout clears the slot");
+    assert_eq!(export_cmd2[0], CMD_EXPORT_PRIVATE_KEY);
+    let key = [0x55u8; 32];
+    let mut payload = vec![RESP_CODE_PRIVATE_KEY];
+    payload.extend_from_slice(&key);
+    bridge.send(&radio_frame(&payload)).await;
+    key_task.await.unwrap().expect("export must succeed");
 
     transport.stop().await.unwrap();
 }
