@@ -129,6 +129,7 @@ use crate::command::{Command, Response};
 use crate::error::HostError;
 use crate::event::DomainEvent;
 use crate::identity::SessionId;
+use crate::keymap::Keymap;
 use crate::permissions::{PermissionCtx, PermissionLevel};
 use async_trait::async_trait;
 use tokio::sync::broadcast;
@@ -156,6 +157,19 @@ pub trait Host: Send + Sync {
         session: SessionId,
         cmd: Command,
     ) -> Result<Response, HostError>;
+
+    /// The currently active command keymap. Transports fetch this
+    /// immediately before parsing each incoming message (not once at
+    /// connect time), so a sysop switching keymaps live
+    /// (GH #354 Phase 3) takes effect on the very next message, with
+    /// no reconnect required.
+    ///
+    /// Returns [`Keymap::native`] by default — hosts that don't
+    /// override this (e.g. tests, minimal implementations) parse with
+    /// Supply Drop's own bindings, unaffected by keymap machinery.
+    async fn active_keymap(&self) -> Keymap {
+        Keymap::native()
+    }
 
     // ── Sessions ────────────────────────────────────────────────
 

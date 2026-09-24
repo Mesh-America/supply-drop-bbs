@@ -474,9 +474,17 @@ impl Command {
         // A keymap override redirects the typed keyword to the action's own
         // native keyword before matching — Keymap::native() has no entries,
         // so this is always a no-op for existing callers of `parse`.
+        //
+        // A `Reading*` resolution is ignored here (treated the same as
+        // `None`): those seven actions belong to reading mode's own lookup
+        // (`bbs-core`'s `handle_workflow_reply`), not this top-level match.
+        // Without this check, a keymap binding some keyword to e.g.
+        // `KeymapAction::ReadingHelp` would translate it to `"h"` and
+        // silently trigger `Command::Help` here — the keyword's own literal
+        // text falls through to native matching instead (GH #354 Phase 2).
         let keyword = match keymap.action_for(&typed_keyword) {
-            Some(action) => action.native_keyword().to_owned(),
-            None => typed_keyword,
+            Some(action) if !action.is_reading_only() => action.native_keyword().to_owned(),
+            _ => typed_keyword,
         };
 
         match keyword.as_str() {
@@ -950,6 +958,29 @@ mod tests {
                 Command::parse_with_keymap("g", true, &km),
                 Command::WorkflowReply {
                     reply: "g".to_owned()
+                }
+            );
+        }
+
+        /// GH #354 Phase 2 hostile-audit fix: a keyword bound to a
+        /// `Reading*`-only action must not be reinterpreted by the
+        /// top-level parser. Before this fix, binding "z" to
+        /// `KeymapAction::ReadingHelp` translated to `ReadingHelp`'s native
+        /// keyword "h" here and silently triggered `Command::Help` — a
+        /// reading-mode-only binding taking effect outside reading mode.
+        #[test]
+        fn a_keyword_bound_to_a_reading_only_action_is_not_reinterpreted_at_the_top_level() {
+            let km = Keymap {
+                name: "test".to_owned(),
+                description: "test".to_owned(),
+                bindings: BTreeMap::from([("z".to_owned(), KeymapAction::ReadingHelp)]),
+            };
+            // "z" isn't a native top-level keyword either, so it falls all
+            // the way through to Unknown — not Help.
+            assert_eq!(
+                Command::parse_with_keymap("z", false, &km),
+                Command::Unknown {
+                    raw: "z".to_owned()
                 }
             );
         }

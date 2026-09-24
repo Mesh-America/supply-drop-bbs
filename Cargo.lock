@@ -276,6 +276,7 @@ dependencies = [
  "thiserror 1.0.69",
  "time",
  "tokio",
+ "toml",
  "toml_edit",
  "tracing",
  "unicode-properties",
@@ -335,6 +336,7 @@ dependencies = [
  "serde_json",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
 ]
 
 [[package]]

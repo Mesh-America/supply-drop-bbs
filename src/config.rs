@@ -161,6 +161,23 @@ pub struct BbsConfig {
     /// behaviour.
     #[serde(default)]
     pub guest_room: Option<String>,
+
+    /// Which command keymap to activate (GH #354): a built-in preset name
+    /// (`"native"`, `"maximus"`, `"packet-bbs"` — see
+    /// [`bbs_plugin_api::Keymap::BUILTIN_NAMES`]), or `"custom:<filename>"`
+    /// for a validated TOML file under `data_dir` (see
+    /// `docs/PROTOCOL.md`'s keymap section for the file format).
+    ///
+    /// An unrecognised built-in name, or a `custom:` file that fails to
+    /// load or validate, is a startup **warning**, not a fatal error — the
+    /// BBS falls back to `"native"` rather than refusing to start over a
+    /// keymap typo (a sysop's typing mistake here shouldn't take the whole
+    /// board down for every user).
+    ///
+    /// Default: `"native"` (Supply Drop's own commands, unaffected by
+    /// keymap machinery).
+    #[serde(default = "default_keymap")]
+    pub keymap: String,
 }
 
 impl Default for BbsConfig {
@@ -173,8 +190,13 @@ impl Default for BbsConfig {
             timezone: default_timezone(),
             require_verify: default_require_verify(),
             guest_room: None,
+            keymap: default_keymap(),
         }
     }
+}
+
+fn default_keymap() -> String {
+    "native".to_owned()
 }
 
 fn default_bbs_name() -> String {

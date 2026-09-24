@@ -206,6 +206,56 @@ sudo supply-drop-bbs config guest-room off \
 
 ---
 
+### `config set-keymap`
+
+```
+supply-drop-bbs config set-keymap <name> [OPTIONS]
+```
+
+Activate a command keymap (GH #354) — see [CONFIG.md's Command keymaps section](CONFIG.md#command-keymaps) for the full list of built-in presets and the custom keymap file format. Writes `keymap` in the `[bbs]` section. **Takes effect on the next BBS restart.**
+
+`<name>` is checked before anything is written: a built-in preset name must be one of `bbs_plugin_api::Keymap::BUILTIN_NAMES`, and a `custom:<filename>` name is fully loaded and validated from `data_dir` right here — a typo or a broken custom file is caught immediately, not silently ignored until the next restart.
+
+| Argument | Meaning |
+|----------|---------|
+| `<name>` | A built-in preset (`native`, `maximus`, `packet-bbs`, `pcboard`, `wwiv-family`, `synchronet`), or `custom:<filename>` for a file already placed under `data_dir` (see `config upload-keymap`) |
+
+```sh
+sudo supply-drop-bbs config set-keymap maximus \
+  --config /etc/supply-drop-bbs/config.toml
+
+sudo supply-drop-bbs config set-keymap custom:my-bbs.toml \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Revert to Supply Drop's own commands — always a clean, lossless revert.
+sudo supply-drop-bbs config set-keymap native \
+  --config /etc/supply-drop-bbs/config.toml
+```
+
+---
+
+### `config upload-keymap`
+
+```
+supply-drop-bbs config upload-keymap <path> [--as-filename <name>] [OPTIONS]
+```
+
+Copy a local custom keymap TOML file into `data_dir`, restricted to owner-only permissions (same trust tier as a backup). Validates the file — parses it, then checks every binding resolves and nothing is left unreachable — **before** copying; a broken file never reaches `data_dir`. Does **not** activate it — run `config set-keymap custom:<filename>` afterward.
+
+| Argument | Meaning |
+|----------|---------|
+| `<path>` | Local path to the TOML file to upload |
+| `--as-filename <name>` | Filename to give it under `data_dir` (defaults to `<path>`'s own filename) |
+
+```sh
+sudo supply-drop-bbs config upload-keymap ./my-bbs.toml \
+  --config /etc/supply-drop-bbs/config.toml
+sudo supply-drop-bbs config set-keymap custom:my-bbs.toml \
+  --config /etc/supply-drop-bbs/config.toml
+```
+
+---
+
 ### `config location`
 
 ```

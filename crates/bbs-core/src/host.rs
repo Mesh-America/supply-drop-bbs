@@ -29,8 +29,9 @@ use bbs_plugin_api::advert::AdvertBus;
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
     AdminAccessPolicy, AdminAuditArchive, AdminBackupRecord, AdminMessageRecord, AdminRoomSummary,
-    AdminSessionInfo, AdminStats, AdminUserInfo, Command, DomainEvent, HostError, MessageRecipient,
-    PermissionCtx, PermissionLevel, Response, Secret, SessionId, Username,
+    AdminSessionInfo, AdminStats, AdminUserInfo, Command, DomainEvent, HostError, Keymap,
+    KeymapAction, MessageRecipient, PermissionCtx, PermissionLevel, Response, Secret, SessionId,
+    Username,
 };
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -380,6 +381,17 @@ pub struct BbsHost {
     /// Access policy — controls verification and guest-room behaviour.
     /// Wrapped in a `RwLock` so in-BBS sysop commands can update it live.
     access_policy: RwLock<AccessPolicy>,
+    /// Active command keymap (GH #354). `RwLock` follows the
+    /// `access_policy` precedent so a future live-switch surface can reuse
+    /// the same mechanism (an in-memory swap under `.write()`, then a
+    /// `config_lock`-guarded persist like `persist_access_policy`'s), but
+    /// nothing currently writes to it: it's set once at construction time
+    /// (via [`Self::with_config`], from `[bbs] keymap`) and only ever read
+    /// — [`Self::active_keymap`](bbs_plugin_api::Host::active_keymap) and
+    /// `handle_workflow_reply`'s `Workflow::Reading` arm. A sysop changes
+    /// keymaps today via `config set-keymap` + a restart, not a live write
+    /// to this field (see `docs/CONFIG.md`'s "Command keymaps" section).
+    keymap: RwLock<Keymap>,
     /// Resolved guest room ID — populated by [`Self::ensure_guest_room`].
     /// `None` when the guest room feature is disabled or not yet initialised.
     guest_room_id: std::sync::RwLock<Option<RoomId>>,
@@ -410,20 +422,46 @@ impl BbsHost {
     /// Advert sharing defaults to `true` (matching `[location].share_in_advert`'s
     /// default) — use [`with_config`](Self::with_config) to override it.
     pub fn with_location(db: Database, location: Option<(f64, f64)>) -> Self {
-        Self::with_config(db, location, true, AccessPolicy::default(), None)
+        Self::with_config(
+            db,
+            location,
+            true,
+            AccessPolicy::default(),
+            None,
+            Keymap::native(),
+        )
     }
 
     /// Create a [`BbsHost`] with a full configuration.
     ///
     /// `config_path` should be the canonicalized path to `config.toml` so
     /// in-BBS sysop commands can persist policy changes to disk.
+    ///
+    /// `keymap` should already be validated (see [`Keymap::validate`]) —
+    /// `BbsHost` doesn't re-validate it in release builds, matching
+    /// `policy`'s treatment. A debug build panics immediately on an
+    /// invalid `keymap` instead: unlike `policy`, every real caller
+    /// obtains `keymap` from a source that's supposed to already
+    /// guarantee validity (`Keymap::native`, `Keymap::by_name`, or
+    /// `keymap_file::load_custom_keymap`, none of which call `validate()`
+    /// themselves except the last one) — this catches a future regression
+    /// in that chain (e.g. a new built-in preset added without updating
+    /// `every_builtin_preset_validates`) in tests/dev builds rather than
+    /// silently shipping a keymap with an unreachable action.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_config(
         db: Database,
         location: Option<(f64, f64)>,
         share_location_in_advert: bool,
         policy: AccessPolicy,
         config_path: Option<PathBuf>,
+        keymap: Keymap,
     ) -> Self {
+        debug_assert!(
+            keymap.validate().is_ok(),
+            "BbsHost::with_config called with an invalid Keymap: {:?}",
+            keymap.validate()
+        );
         let (events_tx, _) = broadcast::channel(256);
         Self {
             db,
@@ -438,6 +476,7 @@ impl BbsHost {
             }),
             node_name: std::sync::RwLock::new(None),
             access_policy: RwLock::new(policy),
+            keymap: RwLock::new(keymap),
             guest_room_id: std::sync::RwLock::new(None),
             config_path,
             node_pubkey: std::sync::RwLock::new(None),
@@ -575,10 +614,12 @@ impl Host for BbsHost {
                 // Some(Some(lvl)): logged in at lvl.
                 let auth_level = level.flatten();
                 let on_radio = self.session_on_radio(session).await;
+                let keymap = self.keymap.read().await;
                 Ok(Response::Text(help_text(
                     topic.as_deref(),
                     auth_level,
                     on_radio,
+                    &keymap,
                 )))
             }
 
@@ -697,6 +738,10 @@ impl Host for BbsHost {
             }
             _ => Ok(Response::Error("Command not yet supported.".into())),
         }
+    }
+
+    async fn active_keymap(&self) -> Keymap {
+        self.keymap.read().await.clone()
     }
 
     async fn create_session(&self, transport: &'static str) -> Result<SessionId, HostError> {
@@ -3616,7 +3661,45 @@ impl BbsHost {
 
             // ── Message reading ──────────────────────────────────────────────
             Workflow::Reading => {
-                let upper = reply.trim().to_uppercase();
+                let trimmed = reply.trim();
+                // Keymap-translate the leading keyword (GH #354 Phase 2,
+                // P2.3): a preset can rebind the seven Reading* actions
+                // (five distinct letters — ReadingForward/ReadingJump both
+                // translate to "F", ReadingDeleteCurrent/ReadingDeleteSpecific
+                // both to "D") to different letters. Translation only ever
+                // changes which single letter this block matches on next —
+                // the bare-vs-"<letter> <id>" argument logic below is
+                // unchanged, and it keeps disambiguating solely by whether
+                // an id argument follows, exactly as it always has. A
+                // binding to any non-Reading* action falls to the `_`
+                // arm below and is treated as untranslated (unlike
+                // Command::parse_with_keymap's opposite-direction guard,
+                // this match's own arms are the filter — it doesn't call
+                // KeymapAction::is_reading_only itself, since matching on
+                // the five concrete Reading* patterns already excludes
+                // every top-level action by construction).
+                let (leading, reading_rest) = trimmed
+                    .split_once(|c: char| c.is_ascii_whitespace())
+                    .map_or((trimmed, None), |(w, r)| (w, Some(r.trim_start())));
+                let translated = match self
+                    .keymap
+                    .read()
+                    .await
+                    .action_for(&leading.to_ascii_lowercase())
+                {
+                    Some(KeymapAction::ReadingForward | KeymapAction::ReadingJump) => "F",
+                    Some(KeymapAction::ReadingReverse) => "R",
+                    Some(KeymapAction::ReadingReply) => "E",
+                    Some(KeymapAction::ReadingHelp) => "H",
+                    Some(
+                        KeymapAction::ReadingDeleteCurrent | KeymapAction::ReadingDeleteSpecific,
+                    ) => "D",
+                    _ => leading,
+                };
+                let upper = match reading_rest {
+                    Some(r) => format!("{} {}", translated.to_uppercase(), r.to_uppercase()),
+                    None => translated.to_uppercase(),
+                };
                 match upper.as_str() {
                     "F" => self.handle_read_forward(session, None).await,
                     "R" => self.handle_read_reverse(session).await,
@@ -6709,7 +6792,12 @@ fn validate_new_username(raw: &str) -> Result<Username, String> {
 
 // ── Help text ─────────────────────────────────────────────────────────────────
 
-fn help_text(topic: Option<&str>, level: Option<PermissionLevel>, on_radio: bool) -> String {
+fn help_text(
+    topic: Option<&str>,
+    level: Option<PermissionLevel>,
+    on_radio: bool,
+    keymap: &Keymap,
+) -> String {
     let logged_in = level.is_some();
     let is_aide = level >= Some(PermissionLevel::Aide);
     let is_sysop = level >= Some(PermissionLevel::Sysop);
@@ -6717,7 +6805,7 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>, on_radio: bool
     match topic {
         None => {
             if logged_in {
-                HELP_QUICK_LOGGED_IN.to_owned()
+                quick_help_logged_in(keymap)
             } else if on_radio {
                 // Radio transports advertise one-shot auth (fewer round-trips).
                 HELP_QUICK_ANON_RADIO.to_owned()
@@ -6886,17 +6974,47 @@ REGISTER <user> <password>\n\
 LOGIN <user> <password>\n\
 (omit password to be prompted)";
 
-// 156 bytes — must stay ≤ MAX_REPLY_BYTES (MAX_FRAME_SIZE(172) - 16 bytes overhead).
-const HELP_QUICK_LOGGED_IN: &str = "\
- K  list rooms\n\
- C  change room\n\
- N  new messages\n\
- E  enter message\n\
- G  next unread\n\
- M  go to Mail\n\
- W  who's online\n\
- Q  log out\n\
-H all - help topics";
+/// The 8 actions `quick_help_logged_in` lists, native-Supply-Drop order
+/// (GH #354 Phase 3, P3.5). Labels match the old hardcoded
+/// `HELP_QUICK_LOGGED_IN` constant's wording exactly, so output for
+/// `Keymap::native()` stays byte-for-byte identical to what shipped before
+/// this generator replaced it.
+const QUICK_HELP_ACTIONS: &[(KeymapAction, &str)] = &[
+    (KeymapAction::ListRooms, "list rooms"),
+    (KeymapAction::ChangeRoom, "change room"),
+    (KeymapAction::ReadNew, "new messages"),
+    (KeymapAction::EnterMessage, "enter message"),
+    (KeymapAction::GoNextUnread, "next unread"),
+    (KeymapAction::GoMail, "go to Mail"),
+    (KeymapAction::WhoIsOnline, "who's online"),
+    (KeymapAction::Quit, "log out"),
+];
+
+/// Build the "quick reference" line shown after login for `topic: None`
+/// (GH #354 Phase 3, P3.5): one `KEY  label` line per action in
+/// [`QUICK_HELP_ACTIONS`], using the active keymap's override keyword if
+/// the action is remapped, or its native keyword unchanged otherwise —
+/// generated at request time instead of hardcoded into a `const`, so it
+/// can never drift from the keymap actually in effect the way a per-preset
+/// hand-written string could. Byte-identical to the old
+/// `HELP_QUICK_LOGGED_IN` constant when `keymap` is [`Keymap::native`]
+/// (every lookup then falls straight through to `native_keyword()`).
+fn quick_help_logged_in(keymap: &Keymap) -> String {
+    let mut lines: Vec<String> = QUICK_HELP_ACTIONS
+        .iter()
+        .map(|(action, label)| {
+            let key = keymap
+                .bindings
+                .iter()
+                .find(|(_, &a)| a == *action)
+                .map(|(k, _)| k.to_ascii_uppercase())
+                .unwrap_or_else(|| action.native_keyword().to_ascii_uppercase());
+            format!("{key}  {label}")
+        })
+        .collect();
+    lines.push("H all - help topics".to_owned());
+    lines.join("\n")
+}
 
 const HELP_OVERVIEW: &str = "\
 H M — Mail\n\
@@ -7031,19 +7149,18 @@ mod tests {
         // MAX_FRAME_SIZE(172) - 16 bytes overhead = 156 bytes max text.
         const MESH_MAX: usize = 156;
         let cases = [
-            ("HELP_QUICK_ANON", HELP_QUICK_ANON),
-            ("HELP_QUICK_ANON_RADIO", HELP_QUICK_ANON_RADIO),
-            ("HELP_QUICK_LOGGED_IN", HELP_QUICK_LOGGED_IN),
-            ("HELP_OVERVIEW", HELP_OVERVIEW),
-            ("HELP_MAIL", HELP_MAIL),
-            ("HELP_READING", HELP_READING),
-            ("HELP_READING_MODE", HELP_READING_MODE),
-            ("HELP_POSTING", HELP_POSTING),
-            ("HELP_NAVIGATION", HELP_NAVIGATION),
-            ("HELP_ACCOUNT", HELP_ACCOUNT),
-            ("HELP_AIDE", HELP_AIDE),
-            ("HELP_USERS", HELP_USERS),
-            ("HELP_SYSOP", HELP_SYSOP),
+            ("HELP_QUICK_ANON", HELP_QUICK_ANON.to_owned()),
+            ("HELP_QUICK_ANON_RADIO", HELP_QUICK_ANON_RADIO.to_owned()),
+            ("HELP_OVERVIEW", HELP_OVERVIEW.to_owned()),
+            ("HELP_MAIL", HELP_MAIL.to_owned()),
+            ("HELP_READING", HELP_READING.to_owned()),
+            ("HELP_READING_MODE", HELP_READING_MODE.to_owned()),
+            ("HELP_POSTING", HELP_POSTING.to_owned()),
+            ("HELP_NAVIGATION", HELP_NAVIGATION.to_owned()),
+            ("HELP_ACCOUNT", HELP_ACCOUNT.to_owned()),
+            ("HELP_AIDE", HELP_AIDE.to_owned()),
+            ("HELP_USERS", HELP_USERS.to_owned()),
+            ("HELP_SYSOP", HELP_SYSOP.to_owned()),
         ];
         for (name, s) in cases {
             assert!(
@@ -7052,19 +7169,81 @@ mod tests {
                 s.len()
             );
         }
+
+        // Every built-in preset, not just native/maximus/packet-bbs — a
+        // hostile audit caught this gap: `wwiv_family()` binds WhoIsOnline
+        // to "//who" (6 bytes) instead of a single native letter, which the
+        // earlier hand-picked list never would have exercised. Iterating
+        // `BUILTIN_NAMES` means a future preset is covered automatically,
+        // not just the ones someone remembered to add to a fixed list.
+        for name in Keymap::BUILTIN_NAMES {
+            let km = Keymap::by_name(name).unwrap();
+            let s = quick_help_logged_in(&km);
+            assert!(
+                s.len() <= MESH_MAX,
+                "quick_help_logged_in({name:?}) is {} bytes — exceeds {MESH_MAX}-byte MeshCore \
+                 payload limit",
+                s.len()
+            );
+        }
+    }
+
+    /// GH #354 Phase 3, P3.5: `quick_help_logged_in(&Keymap::native())` must
+    /// produce byte-identical output to what the old hardcoded
+    /// `HELP_QUICK_LOGGED_IN` constant shipped, so the dynamic generator is
+    /// provably a "zero behavior change" replacement for every existing
+    /// (native) caller.
+    #[test]
+    fn quick_help_for_native_matches_the_old_hardcoded_text() {
+        // Deliberately a single-line literal, no `\`-continuation: Rust
+        // strips ALL leading whitespace on a continued line (confirmed by
+        // hand-compiling a throwaway snippet while writing this test — the
+        // old `HELP_QUICK_LOGGED_IN` constant's apparent " K  list rooms"
+        // indentation in source did NOT survive into the compiled string;
+        // it was actually "K  list rooms", no leading space).
+        assert_eq!(
+            quick_help_logged_in(&Keymap::native()),
+            "K  list rooms\nC  change room\nN  new messages\nE  enter message\nG  next unread\nM  go to Mail\nW  who's online\nQ  log out\nH all - help topics"
+        );
+    }
+
+    /// A preset's remapped keys must actually show up in the quick help —
+    /// the whole point of generating it from the active keymap instead of a
+    /// hardcoded native-only constant.
+    #[test]
+    fn quick_help_for_maximus_shows_the_remapped_keys() {
+        let text = quick_help_logged_in(&Keymap::maximus());
+        // Quit moved from native Q to Maximus's G; GoNextUnread was
+        // displaced from G to Maximus's ].
+        assert!(text.contains("G  log out"), "{text}");
+        assert!(text.contains("]  next unread"), "{text}");
+        assert!(text.contains("A  change room"), "{text}");
+        // ReadNew and ListRooms are unchanged in Maximus — still native.
+        assert!(text.contains("N  new messages"), "{text}");
+        assert!(text.contains("K  list rooms"), "{text}");
     }
 
     /// Issue #126: `H all` must list the Aide/Sysop help topics for users at
     /// those levels so operators can discover their admin toolset in-app.
     #[test]
     fn help_all_lists_admin_topics_by_level() {
-        let user = help_text(Some("all"), Some(PermissionLevel::User), false);
+        let user = help_text(
+            Some("all"),
+            Some(PermissionLevel::User),
+            false,
+            &Keymap::native(),
+        );
         assert!(
             !user.contains("AIDE") && !user.contains("SYSOP"),
             "a plain User should not see admin topics: {user}"
         );
 
-        let aide = help_text(Some("all"), Some(PermissionLevel::Aide), false);
+        let aide = help_text(
+            Some("all"),
+            Some(PermissionLevel::Aide),
+            false,
+            &Keymap::native(),
+        );
         assert!(
             aide.contains("H AIDE"),
             "aide should see the AIDE topic: {aide}"
@@ -7074,7 +7253,12 @@ mod tests {
             "an aide should not see the SYSOP topic: {aide}"
         );
 
-        let sysop = help_text(Some("all"), Some(PermissionLevel::Sysop), false);
+        let sysop = help_text(
+            Some("all"),
+            Some(PermissionLevel::Sysop),
+            false,
+            &Keymap::native(),
+        );
         assert!(
             sysop.contains("H AIDE") && sysop.contains("H SYSOP"),
             "sysop should see both admin topics: {sysop}"
@@ -9213,9 +9397,34 @@ mod tests {
         let db = Database::open(&f.path().to_string_lossy())
             .await
             .expect("db open");
-        let host = BbsHost::with_config(db, None, true, policy, None);
+        let host = BbsHost::with_config(db, None, true, policy, None, Keymap::native());
         host.ensure_guest_room().await.expect("ensure_guest_room");
         (Arc::new(host), f)
+    }
+
+    /// GH #354 hostile-audit follow-up: `with_config`'s "keymap should
+    /// already be validated" contract has no runtime enforcement in every
+    /// real call site today (`Keymap::by_name`'s presets are never
+    /// `.validate()`d at runtime, only by a unit test staying in sync) — a
+    /// `debug_assert!` catches a regression in dev/test builds instead of
+    /// silently constructing a `BbsHost` with an unreachable action.
+    #[tokio::test]
+    #[should_panic(expected = "invalid Keymap")]
+    async fn with_config_debug_asserts_on_an_invalid_keymap() {
+        // Steals native "g" (GoNextUnread) for Quit without relocating
+        // GoNextUnread — the same Rule 2 violation exercised elsewhere in
+        // this codebase's keymap tests, here to prove with_config itself
+        // catches it rather than silently accepting an unvalidated value.
+        let broken = Keymap {
+            name: "broken".to_owned(),
+            description: "test".to_owned(),
+            bindings: std::collections::BTreeMap::from([("g".to_owned(), KeymapAction::Quit)]),
+        };
+        let f = NamedTempFile::new().unwrap();
+        let db = Database::open(&f.path().to_string_lossy())
+            .await
+            .expect("db open");
+        let _ = BbsHost::with_config(db, None, true, AccessPolicy::default(), None, broken);
     }
 
     /// require_verify = false: unvalidated user gets full access right after registration.

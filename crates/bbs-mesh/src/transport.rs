@@ -2840,7 +2840,10 @@ async fn dispatch_message(
     }
 
     // ── Parse the command ─────────────────────────────────────────────────────
-    let Some(cmd) = parse_command(text, command_prefix, awaiting_reply) else {
+    // Fetched fresh per message (not cached) so a live keymap switch
+    // (GH #354 Phase 3) takes effect on the very next message.
+    let keymap = host.active_keymap().await;
+    let Some(cmd) = parse_command(text, command_prefix, awaiting_reply, &keymap) else {
         // Message doesn't match prefix and no workflow active — silently ignore.
         debug!("mesh: message ignored (no prefix match, no active workflow)");
         return;
@@ -2922,7 +2925,7 @@ async fn dispatch_message(
             // sends "N" → parsed as WorkflowReply.  After eviction the fresh
             // session has Workflow::None, so we re-parse "N" as Command::ReadNew.
             let retry_cmd = if matches!(cmd, Command::WorkflowReply { .. }) {
-                parse_command(text, command_prefix, false).unwrap_or_else(|| cmd.clone())
+                parse_command(text, command_prefix, false, &keymap).unwrap_or_else(|| cmd.clone())
             } else {
                 cmd.clone()
             };

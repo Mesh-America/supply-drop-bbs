@@ -21,22 +21,30 @@
 //! keyword *before* the existing keyword match runs — the match itself never
 //! needs to know keymaps exist.
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// An action a keymap can bind a keyword to. A closed set matching the
 /// subset of [`Command`](crate::Command)'s keyword table (plus the
-/// reading-mode-only actions, meant to be parsed separately in `bbs-core`'s
-/// `host.rs` from `WorkflowReply` text — see spec.md's Constraints) that
-/// presets actually have reason to remap. Sysop/aide-only actions are out
-/// of scope for v1: see spec.md Open question 5.
+/// reading-mode-only actions, parsed separately in `bbs-core`'s `host.rs`
+/// from `WorkflowReply` text — see spec.md's Constraints) that presets
+/// actually have reason to remap. Sysop/aide-only actions are out of scope
+/// for v1: see spec.md Open question 5.
 ///
-/// As of GH #354 Phase 1, the seven `Reading*` variants below validate
-/// cleanly but have **no runtime effect**: `bbs-core`'s reading-mode
-/// matcher does not yet consult a [`Keymap`] at all (Phase 2,
-/// `specs/002-command-keymaps/tasks.md` P2.3). A [`Keymap`] that overrides
-/// one of them passes [`Keymap::validate`] and is silently a no-op until
-/// that wiring lands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// The seven `Reading*` variants are consulted only by reading mode's own
+/// lookup (`bbs-core`'s `handle_workflow_reply`, GH #354 Phase 2's P2.3);
+/// [`Command::parse_with_keymap`](crate::Command::parse_with_keymap)
+/// explicitly ignores a binding that resolves to one
+/// ([`KeymapAction::is_reading_only`]), and reading mode likewise ignores a
+/// binding that resolves to a non-`Reading*` action — each consumer only
+/// ever acts within its own namespace of this one flat table.
+///
+/// `Serialize`/`Deserialize` use the variant name verbatim (`"Quit"`,
+/// `"ChangeRoom"`, …) — this is the wire format for a custom keymap TOML
+/// file's `[bindings]` table (GH #354 Phase 4); an unrecognised action name
+/// is a deserialization error, which is exactly the "reject a bad custom
+/// keymap file with a clear, specific error" behavior Phase 4 wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum KeymapAction {
     /// Log out / end the session. Native: `q`/`quit`/`exit`/`bye`/`logout`.
@@ -147,6 +155,40 @@ impl KeymapAction {
             KeymapAction::ReadingDeleteSpecific => "d",
         }
     }
+
+    /// Whether this action is one of the seven `Reading*` variants.
+    ///
+    /// A keymap binds one flat table across both namespaces (see the
+    /// module doc comment's "Design: partial override" section), so
+    /// nothing stops a binding from targeting a `Reading*` action.
+    /// [`Command::parse_with_keymap`](crate::Command::parse_with_keymap)
+    /// calls this method directly to ignore such a lookup (treating it the
+    /// same as an unbound keyword) rather than misapplying it at the top
+    /// level — the GH #354 Phase 2 hostile audit finding this method fixes:
+    /// a keyword bound to `ReadingHelp`, for example, used to translate to
+    /// `ReadingHelp`'s native keyword `"h"` and silently trigger top-level
+    /// `Command::Help` when typed outside reading mode.
+    ///
+    /// `bbs-core`'s reading-mode lookup (`handle_workflow_reply`'s
+    /// `Workflow::Reading` arm) achieves the *opposite*-direction filter —
+    /// ignoring a lookup that resolves to a non-`Reading*` action — through
+    /// its own match arms instead of calling this method; matching on the
+    /// five concrete `Reading*` translation outcomes already excludes every
+    /// top-level action by construction, so there was nothing for this
+    /// method to add there.
+    #[must_use]
+    pub fn is_reading_only(self) -> bool {
+        matches!(
+            self,
+            KeymapAction::ReadingForward
+                | KeymapAction::ReadingJump
+                | KeymapAction::ReadingReverse
+                | KeymapAction::ReadingReply
+                | KeymapAction::ReadingHelp
+                | KeymapAction::ReadingDeleteCurrent
+                | KeymapAction::ReadingDeleteSpecific
+        )
+    }
 }
 
 /// Why a [`Keymap`] failed [`Keymap::validate`].
@@ -202,7 +244,26 @@ impl std::error::Error for KeymapError {}
 /// A named, partial override table: only the actions it remaps. Anything
 /// not listed here keeps its [`KeymapAction::native_keyword`] binding — see
 /// the module doc comment for why.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` are this type's TOML wire format for a custom
+/// keymap file (GH #354 Phase 4) — the same shape as the two built-in
+/// presets, so a custom file and a preset share one validation path:
+///
+/// ```toml
+/// name = "my-bbs"
+/// description = "..."
+///
+/// [bindings]
+/// g = "Quit"
+/// a = "ChangeRoom"
+/// ```
+///
+/// `deny_unknown_fields` rejects a typo'd top-level key (e.g. `[binding]`)
+/// at parse time rather than silently ignoring it; an unrecognised value
+/// inside `bindings` (a bad action name) is likewise a parse-time error,
+/// not a silent skip — see [`KeymapAction`]'s own doc comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Keymap {
     /// Short identifier, e.g. `"native"`, `"maximus"` — matches the `[bbs]
     /// keymap = "..."` config value.
@@ -232,6 +293,183 @@ impl Keymap {
             bindings: BTreeMap::new(),
         }
     }
+
+    /// The Maximus preset, worked through to full rigor in
+    /// `specs/002-command-keymaps/plan.md`'s "Worked example 1". Five
+    /// actions remapped; everything else (including `ReadNew`, which has no
+    /// single-key Maximus equivalent, and `ListRooms`, whose closest
+    /// Maximus key `A` already belongs to `ChangeRoom` here) stays on
+    /// Supply Drop's native key.
+    #[must_use]
+    pub fn maximus() -> Self {
+        Keymap {
+            name: "maximus".to_owned(),
+            description: "Maximus BBS conventions: G(oodbye), A(rea change), ] (next area), \
+                           L(ist brief). GoNextUnread moves to ] since Maximus's own G means \
+                           quit; ReadNew and ListRooms have no clean single-key Maximus \
+                           equivalent and stay on Supply Drop's native keys."
+                .to_owned(),
+            bindings: BTreeMap::from([
+                ("g".to_owned(), KeymapAction::Quit),
+                ("a".to_owned(), KeymapAction::ChangeRoom),
+                ("]".to_owned(), KeymapAction::GoNextUnread),
+                ("l".to_owned(), KeymapAction::ScanMessages),
+                ("w".to_owned(), KeymapAction::WhoIsOnline),
+            ]),
+        }
+    }
+
+    /// The Packet-BBS preset, worked through in
+    /// `specs/002-command-keymaps/plan.md`'s "Worked example 2". A
+    /// deliberately thin preset — packet BBS has no room hierarchy, just
+    /// bulletins and personal mail — with only one action remapped.
+    ///
+    /// Packet-BBS's own `B` (Bye) convention for `Quit` is intentionally
+    /// **not** bound here: `b` is Supply Drop's real `BlockUser` command,
+    /// and Supply Drop already recognizes `bye` as a native `Quit` synonym,
+    /// so the convention is satisfied with zero override (this exact
+    /// collision — found by the Phase 1 hostile audit, not by either
+    /// validation rule at the time — is why `Keymap::validate` now rejects
+    /// a binding on any of the specific reserved keywords in this file's
+    /// `RESERVED_KEYWORDS` — every admin/auth keyword `Command::parse_with_keymap`
+    /// recognizes outside the closed `KeymapAction` set, `"b"` included).
+    #[must_use]
+    pub fn packet_bbs() -> Self {
+        Keymap {
+            name: "packet-bbs".to_owned(),
+            description: "Packet-BBS conventions for checking new traffic; type `bye` to log \
+                           off as on the source system, or use Supply Drop's own keys for \
+                           everything else, since packet BBS has no room concept to map from."
+                .to_owned(),
+            bindings: BTreeMap::from([("l".to_owned(), KeymapAction::ReadNew)]),
+        }
+    }
+
+    /// The PCBoard preset — sourced from the PCBoard v15.22 Technical
+    /// Reference Manual (`specs/002-command-keymaps/research-classic-bbs-commands.md`).
+    /// Deliberately the thinnest of the built-in presets: PCBoard's own
+    /// `Q`/`M`/`P` mean Quick-scan/graphics-mode/page-length, **not**
+    /// Quit/Mail/Post — reusing those letters for Supply Drop's actions of
+    /// the same *name* would actively mislead a PCBoard veteran, the exact
+    /// opposite of this feature's goal, so none of them are bound here.
+    /// PCBoard's `G` (logoff) collides with Supply Drop's native
+    /// `GoNextUnread`, and PCBoard has no single-key "next unread"
+    /// equivalent to relocate it to, so `Quit` also stays native.
+    #[must_use]
+    pub fn pcboard() -> Self {
+        Keymap {
+            name: "pcboard".to_owned(),
+            description: "PCBoard conventions: J(oin conference), WHO. PCBoard's own Q/M/P/G \
+                           mean quick-scan/graphics-mode/page-length/logoff, not Supply Drop's \
+                           ScanMessages/GoMail/EnterMessage/Quit — none of those are remapped \
+                           here to avoid actively misleading a PCBoard veteran; use Supply \
+                           Drop's own keys for everything else."
+                .to_owned(),
+            bindings: BTreeMap::from([
+                ("j".to_owned(), KeymapAction::ChangeRoom),
+                ("who".to_owned(), KeymapAction::WhoIsOnline),
+            ]),
+        }
+    }
+
+    /// The WWIV-family preset — sourced from `docs.wwivbbs.org` and the
+    /// `wwivbbs/wwiv` source
+    /// (`specs/002-command-keymaps/research-classic-bbs-commands.md`).
+    /// Telegard was originally built from WWIV source, and Renegade from
+    /// Telegard, so one "WWIV-family" preset (with this note) is more
+    /// honest than three thin, unverifiable ones — Renegade's own default
+    /// letters aren't documented anywhere primary.
+    ///
+    /// WWIV's `H` (hop to a sub by name) is **not** bound to `ChangeRoom`:
+    /// `h` is Supply Drop's own Help key, and WWIV has no other
+    /// single-key-by-name goto to fall back on (its other option is typing
+    /// a bare number, which isn't a fixed keyword a keymap can bind), so
+    /// `ChangeRoom` stays native `c`.
+    #[must_use]
+    pub fn wwiv_family() -> Self {
+        Keymap {
+            name: "wwiv-family".to_owned(),
+            description: "WWIV/Telegard/Renegade conventions: * (list subs), P(ost), O(ff), \
+                           //WHO. N(ew)/S(can)/M(ail) already match Supply Drop's own keys. \
+                           WWIV's H (goto sub by name) is not remapped — h is Supply Drop's \
+                           Help key."
+                .to_owned(),
+            bindings: BTreeMap::from([
+                ("*".to_owned(), KeymapAction::ListRooms),
+                ("n".to_owned(), KeymapAction::ReadNew),
+                ("s".to_owned(), KeymapAction::ScanMessages),
+                ("p".to_owned(), KeymapAction::EnterMessage),
+                ("o".to_owned(), KeymapAction::Quit),
+                ("m".to_owned(), KeymapAction::GoMail),
+                ("//who".to_owned(), KeymapAction::WhoIsOnline),
+                ("-".to_owned(), KeymapAction::ReadingReverse),
+            ]),
+        }
+    }
+
+    /// The Synchronet preset — sourced from `gitlab.synchro.net/main/sbbs`
+    /// (`specs/002-command-keymaps/research-classic-bbs-commands.md`). The
+    /// one preset a modern user might genuinely be running today, not just
+    /// remembering from the 90s.
+    ///
+    /// Synchronet's mail section (`E` to enter, then `U`/`S` to read/send)
+    /// is a two-keystroke flow that doesn't map onto a single `GoMail`
+    /// keyword, so it's left native `m` rather than half-remapped.
+    #[must_use]
+    pub fn synchronet() -> Self {
+        Keymap {
+            name: "synchronet".to_owned(),
+            description: "Synchronet conventions: * (list sub-boards), J(ump), L(ist/scan), \
+                           P(ost), O(ff). N(ew)/W(ho) already match Supply Drop's own keys. \
+                           Synchronet's two-keystroke mail flow (E then U/S) doesn't map onto a \
+                           single GoMail key, so mail stays on Supply Drop's native M."
+                .to_owned(),
+            bindings: BTreeMap::from([
+                ("*".to_owned(), KeymapAction::ListRooms),
+                ("j".to_owned(), KeymapAction::ChangeRoom),
+                ("n".to_owned(), KeymapAction::ReadNew),
+                ("l".to_owned(), KeymapAction::ScanMessages),
+                ("p".to_owned(), KeymapAction::EnterMessage),
+                ("o".to_owned(), KeymapAction::Quit),
+                ("w".to_owned(), KeymapAction::WhoIsOnline),
+                ("-".to_owned(), KeymapAction::ReadingReverse),
+            ]),
+        }
+    }
+
+    /// Look up a built-in preset by its [`Keymap::name`](Keymap) — the same
+    /// string a `[bbs] keymap = "..."` config value or a
+    /// `config set-keymap <name>` CLI argument carries. `"native"` returns
+    /// [`Keymap::native`]'s value; an unrecognised name returns `None` — the
+    /// caller decides how to react (`resolve_startup_keymap` in
+    /// `src/main.rs` logs a specific warning and falls back to
+    /// [`Keymap::native`] rather than failing the whole BBS start over a
+    /// config typo; `config set-keymap`'s CLI handler instead refuses to
+    /// write the bad value and exits with an error, since a sysop actively
+    /// running that command wants to know immediately).
+    #[must_use]
+    pub fn by_name(name: &str) -> Option<Self> {
+        match name {
+            "native" => Some(Self::native()),
+            "maximus" => Some(Self::maximus()),
+            "packet-bbs" => Some(Self::packet_bbs()),
+            "pcboard" => Some(Self::pcboard()),
+            "wwiv-family" => Some(Self::wwiv_family()),
+            "synchronet" => Some(Self::synchronet()),
+            _ => None,
+        }
+    }
+
+    /// Every built-in preset name, in the order `Keymap::by_name` and a
+    /// sysop-facing preset list should present them (`"native"` first).
+    pub const BUILTIN_NAMES: &'static [&'static str] = &[
+        "native",
+        "maximus",
+        "packet-bbs",
+        "pcboard",
+        "wwiv-family",
+        "synchronet",
+    ];
 
     /// Look up the action bound to `keyword` under this keymap, if any.
     /// Returns `None` for a keyword this keymap doesn't override — callers
@@ -415,42 +653,22 @@ mod tests {
         }
     }
 
-    /// The Maximus preset worked through in plan.md, built here directly
-    /// (not via a `Keymap::maximus()` const yet — that's Phase 3/P3.1) to
-    /// prove the validation model against a real, previously-hand-checked
-    /// case: `g` (native GoNextUnread) reassigned to Quit, with
-    /// GoNextUnread explicitly given `]` so it stays reachable.
-    fn maximus_bindings() -> BTreeMap<String, KeymapAction> {
-        BTreeMap::from([
-            ("g".to_owned(), KeymapAction::Quit),
-            ("a".to_owned(), KeymapAction::ChangeRoom),
-            ("]".to_owned(), KeymapAction::GoNextUnread),
-            ("l".to_owned(), KeymapAction::ScanMessages),
-            ("w".to_owned(), KeymapAction::WhoIsOnline),
-        ])
-    }
-
     #[test]
     fn maximus_preset_validates() {
-        let km = Keymap {
-            name: "maximus".to_owned(),
-            description: "test".to_owned(),
-            bindings: maximus_bindings(),
-        };
-        assert_eq!(km.validate(), Ok(()));
+        assert_eq!(Keymap::maximus().validate(), Ok(()));
     }
 
     #[test]
     fn maximus_preset_resolves_g_to_quit_not_go_next_unread() {
-        let km = Keymap {
-            name: "maximus".to_owned(),
-            description: "test".to_owned(),
-            bindings: maximus_bindings(),
-        };
+        let km = Keymap::maximus();
         assert_eq!(km.action_for("g"), Some(KeymapAction::Quit));
         assert_eq!(km.action_for("]"), Some(KeymapAction::GoNextUnread));
+        assert_eq!(km.action_for("a"), Some(KeymapAction::ChangeRoom));
+        assert_eq!(km.action_for("l"), Some(KeymapAction::ScanMessages));
+        assert_eq!(km.action_for("w"), Some(KeymapAction::WhoIsOnline));
         // Not overridden by this preset — falls through to native.
         assert_eq!(km.action_for("n"), None);
+        assert_eq!(km.action_for("k"), None);
     }
 
     #[test]
@@ -477,12 +695,81 @@ mod tests {
         // longer shadow it (see binding_a_reserved_admin_keyword_is_rejected
         // and plan.md's updated Packet-BBS worked example). "bye" already
         // works natively as a Quit synonym, so no override is needed.
-        let km = Keymap {
-            name: "packet-bbs".to_owned(),
-            description: "test".to_owned(),
-            bindings: BTreeMap::from([("l".to_owned(), KeymapAction::ReadNew)]),
-        };
+        let km = Keymap::packet_bbs();
         assert_eq!(km.validate(), Ok(()));
+        assert_eq!(km.action_for("l"), Some(KeymapAction::ReadNew));
+        assert_eq!(km.action_for("b"), None);
+    }
+
+    #[test]
+    fn by_name_resolves_every_builtin_name_and_only_those() {
+        assert_eq!(Keymap::by_name("native"), Some(Keymap::native()));
+        assert_eq!(Keymap::by_name("maximus"), Some(Keymap::maximus()));
+        assert_eq!(Keymap::by_name("packet-bbs"), Some(Keymap::packet_bbs()));
+        assert_eq!(Keymap::by_name("not-a-real-preset"), None);
+        for name in Keymap::BUILTIN_NAMES {
+            assert!(
+                Keymap::by_name(name).is_some(),
+                "BUILTIN_NAMES lists {name:?} but by_name doesn't resolve it"
+            );
+        }
+    }
+
+    #[test]
+    fn every_builtin_preset_validates() {
+        for name in Keymap::BUILTIN_NAMES {
+            let km = Keymap::by_name(name).unwrap();
+            assert_eq!(km.validate(), Ok(()), "preset {name:?} failed to validate");
+        }
+    }
+
+    #[test]
+    fn pcboard_avoids_its_own_q_m_p_g_collision_trap() {
+        // The research doc's own warning: PCBoard's Q/M/P/G mean quick-scan/
+        // graphics-mode/page-length/logoff, NOT Supply Drop's ScanMessages/
+        // GoMail/EnterMessage/Quit. None of those four letters are bound —
+        // confirm they're still untouched (falling through to native).
+        let km = Keymap::pcboard();
+        for letter in ["q", "m", "p", "g"] {
+            assert_eq!(
+                km.action_for(letter),
+                None,
+                "pcboard preset must not bind {letter:?} — see the research doc's collision warning"
+            );
+        }
+        assert_eq!(km.action_for("j"), Some(KeymapAction::ChangeRoom));
+        assert_eq!(km.action_for("who"), Some(KeymapAction::WhoIsOnline));
+    }
+
+    #[test]
+    fn wwiv_family_does_not_remap_h_because_it_is_supply_drops_help_key() {
+        let km = Keymap::wwiv_family();
+        assert_eq!(km.action_for("h"), None);
+        assert_eq!(km.action_for("o"), Some(KeymapAction::Quit));
+        assert_eq!(km.action_for("*"), Some(KeymapAction::ListRooms));
+        assert_eq!(
+            km.action_for("-"),
+            Some(KeymapAction::ReadingReverse),
+            "reading-mode reverse should be remapped too, not just top-level actions"
+        );
+    }
+
+    #[test]
+    fn synchronet_reading_reverse_does_not_break_reading_reply_reachability() {
+        // "-" -> ReadingReverse doesn't touch "e" (ReadingReply's native
+        // keyword) or "r" (top-level ReadReverse's native keyword) — a
+        // regression guard for the near-miss found while designing this
+        // preset: an earlier draft bound "e" -> GoMail here, which broke
+        // ReadingReply's reachability (both EnterMessage AND ReadingReply
+        // share native keyword "e") without the validator having a
+        // relocation for ReadingReply. That draft was replaced with this
+        // one specifically because validate() caught it.
+        let km = Keymap::synchronet();
+        assert_eq!(km.validate(), Ok(()));
+        assert_eq!(km.action_for("e"), None, "native e must stay untouched");
+        assert_eq!(km.action_for("-"), Some(KeymapAction::ReadingReverse));
+        assert_eq!(km.action_for("p"), Some(KeymapAction::EnterMessage));
+        assert_eq!(km.action_for("o"), Some(KeymapAction::Quit));
     }
 
     #[test]
@@ -652,5 +939,63 @@ mod tests {
         // more entries than the enum actually has (impossible without the
         // exhaustive match failing first) and documents the expected count.
         assert_eq!(KeymapAction::ALL.len(), 19);
+    }
+
+    /// GH #354 Phase 4: a custom keymap is authored as TOML on disk in
+    /// exactly this shape. Proves the derived `Serialize`/`Deserialize`
+    /// actually round-trips through TOML (not just serde's in-memory
+    /// model) for both the struct's own fields and the `BTreeMap` of
+    /// dynamically-keyed action values.
+    #[test]
+    fn maximus_round_trips_through_toml() {
+        let original = Keymap::maximus();
+        let text = toml::to_string_pretty(&original).expect("serialize");
+        let parsed: Keymap = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed, original);
+    }
+
+    #[test]
+    fn a_hand_authored_toml_custom_keymap_parses() {
+        let text = r#"
+            name = "my-bbs"
+            description = "A hand-authored custom keymap."
+
+            [bindings]
+            l = "ScanMessages"
+            a = "ChangeRoom"
+        "#;
+        let km: Keymap = toml::from_str(text).expect("deserialize");
+        assert_eq!(km.name, "my-bbs");
+        assert_eq!(km.action_for("l"), Some(KeymapAction::ScanMessages));
+        assert_eq!(km.action_for("a"), Some(KeymapAction::ChangeRoom));
+        assert_eq!(km.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_unrecognised_action_name_in_toml_is_a_parse_error_not_a_silent_skip() {
+        let text = r#"
+            name = "broken"
+            description = "test"
+
+            [bindings]
+            g = "Kwit"
+        "#;
+        assert!(
+            toml::from_str::<Keymap>(text).is_err(),
+            "a typo'd action name must fail to parse, not silently produce an \
+             empty or partial Keymap"
+        );
+    }
+
+    #[test]
+    fn an_unknown_top_level_field_in_toml_is_a_parse_error() {
+        let text = r#"
+            name = "broken"
+            description = "test"
+            extra_field = "typo, e.g. [binding] instead of [bindings]"
+
+            [bindings]
+        "#;
+        assert!(toml::from_str::<Keymap>(text).is_err());
     }
 }

@@ -36,6 +36,7 @@ pub mod dir_perms;
 pub mod disk_space;
 pub mod host;
 pub mod ids;
+pub mod keymap_file;
 pub mod mesh_name;
 pub mod message;
 pub mod restore_apply;

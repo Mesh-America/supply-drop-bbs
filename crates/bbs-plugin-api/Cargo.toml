@@ -25,6 +25,11 @@ tokio.workspace       = true
 # Tokio with the full feature set for tests (we use the macro
 # attributes for #[tokio::test]).
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Dev-only: proves Keymap's Serialize/Deserialize actually round-trips
+# through the TOML wire format a custom keymap file (GH #354 Phase 4) uses.
+# The real on-disk loading code lives in bbs-core/src, which already
+# depends on toml — this crate's own Keymap type stays format-agnostic.
+toml.workspace = true
 
 [lints]
 workspace = true

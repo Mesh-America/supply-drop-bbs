@@ -114,6 +114,76 @@ which plugin sections are valid.
 | `timezone`       | string | `"UTC"`                  | no       | Display timezone for sysop UI; storage is always UTC |
 | `require_verify` | bool   | `true`                   | no       | When `false`, skip sysop verification — new accounts are treated as `User` immediately (SHTF mode) |
 | `guest_room`     | string | (unset)                  | no       | Name of a room unverified users are allowed into; created automatically on startup if it does not exist |
+| `keymap`         | string | `"native"`               | no       | Which command keymap to activate (GH #354) — see [Command keymaps](#command-keymaps) below |
+
+### Command keymaps
+
+A keymap remaps which typed keyword triggers which action — e.g. so a board
+can look and feel like a classic BBS system its users already know — without
+changing what any action *does*. Supply Drop's own commands (`native`) are
+always the default and never disappear: a keymap only lists the actions it
+actually remaps, so anything a preset doesn't mention keeps behaving exactly
+as documented in [USER_GUIDE.md](USER_GUIDE.md).
+
+```toml
+[bbs]
+keymap = "maximus"
+```
+
+**Built-in presets**, each sourced from that system's own manual/source (see
+`specs/002-command-keymaps/research-classic-bbs-commands.md` for citations —
+a preset only remaps an action where the source system has a genuine,
+verifiable single-key equivalent; nothing is invented):
+
+| Name          | Source system                          |
+|---------------|-----------------------------------------|
+| `native`      | Supply Drop's own commands (default)    |
+| `maximus`     | Maximus 3.0x                            |
+| `packet-bbs`  | Packet-radio BBS (F6FBB / BPQ / W0RLI)  |
+| `pcboard`     | PCBoard 15.x                            |
+| `wwiv-family` | WWIV 5.x (also covers Telegard/Renegade, built from WWIV/Telegard source) |
+| `synchronet`  | Synchronet (current)                    |
+
+**Custom keymaps** are TOML files in the same shape as a built-in preset,
+placed under `data_dir`:
+
+```toml
+name = "my-bbs"
+description = "A hand-authored custom keymap."
+
+[bindings]
+g = "Quit"
+a = "ChangeRoom"
+```
+
+`bindings` maps a lowercase override keyword to one of the action names
+listed in `bbs_plugin_api::KeymapAction`'s own doc comment (e.g. `Quit`,
+`ListRooms`, `ChangeRoom`, `ScanMessages`, …) — an unrecognised action name,
+or a binding that would leave some action with no way to reach it, is
+rejected with a specific error rather than silently accepted. A binding
+can't target a command outside that closed set (admin/auth commands, the
+CANCEL/STOP words, and Supply Drop's own Help alias are all reserved) —
+attempting to shadow one of those is rejected too.
+
+Activate one via the CLI (checks and, for a custom file, fully loads and
+validates the keymap before writing anything — a typo or a broken file is
+caught immediately, not silently ignored at the next restart):
+
+```sh
+# A built-in preset:
+supply-drop-bbs config set-keymap maximus
+
+# A custom keymap — upload the file into data_dir, then activate it:
+supply-drop-bbs config upload-keymap ./my-bbs.toml
+supply-drop-bbs config set-keymap custom:my-bbs.toml
+
+# Revert to Supply Drop's own commands:
+supply-drop-bbs config set-keymap native
+```
+
+Restart the BBS for the change to take effect. `config set-keymap native`
+is always a clean, lossless revert — the native keymap has no overrides at
+all, so nothing about it can drift or leave leftover state behind.
 
 ### Access control and SHTF mode
 

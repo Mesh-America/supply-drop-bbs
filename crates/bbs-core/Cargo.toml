@@ -26,6 +26,11 @@ sqlx.workspace        = true
 thiserror.workspace   = true
 time.workspace        = true
 tokio.workspace       = true
+# Custom keymap files (GH #354 Phase 4) are plain TOML deserialized
+# directly into bbs_plugin_api::Keymap via serde — config.toml's own
+# read-modify-write editing stays on toml_edit below, which preserves
+# comments/formatting that a typed round-trip through `toml` would lose.
+toml.workspace        = true
 toml_edit.workspace   = true
 tracing.workspace     = true
 zip.workspace         = true

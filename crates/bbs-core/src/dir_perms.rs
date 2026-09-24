@@ -61,6 +61,37 @@ pub fn restrict_to_owner(path: &Path) {
     }
 }
 
+/// Best-effort: set a regular *file* (not a directory — see
+/// [`restrict_to_owner`] for that) to owner-only (0600) permissions on
+/// Unix, and hand it to `data_dir`'s owner first (via
+/// `restore_stage::hand_fd_to_dir_owner`) the same way
+/// `db::restrict_db_files_to_owner` does for the database's own files —
+/// operator-uploaded content (a custom keymap file, GH #354 Phase 4) is the
+/// same trust tier as a backup or the live database, not something a
+/// different-uid process should be able to read.
+///
+/// A no-op (with a warning) on a missing/unwritable file, matching
+/// [`restrict_to_owner`]'s treatment — this is the sole enforcement of the
+/// file's confidentiality, not a convenience fallback.
+pub fn restrict_file_to_owner(data_dir: &Path, path: &Path) {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path);
+    match opened {
+        Ok(f) => {
+            crate::restore_stage::hand_fd_to_dir_owner(data_dir, &f);
+            if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                warn!(path = %path.display(), "could not restrict file to owner-only: {e}");
+            }
+        }
+        Err(e) => {
+            warn!(path = %path.display(), "could not open file to restrict its permissions: {e}");
+        }
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;

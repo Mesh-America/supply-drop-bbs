@@ -254,6 +254,13 @@ H
 
 Shows the quick command list for your current access level.
 
+> **Note:** this guide describes Supply Drop's own default commands. A sysop
+> can activate a different **command keymap** so the board's keys match a
+> classic BBS system's conventions instead (GH #354) — if a key here doesn't
+> do what's described, type `H` and use whatever key it actually lists for
+> that action; the quick command list always reflects the board's active
+> keymap, not just this guide's defaults.
+
 ### Help topics
 
 `H all` lists the help topics. Each topic has a single-letter shortcut and a

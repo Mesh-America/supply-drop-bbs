@@ -2614,7 +2614,10 @@ async fn dispatch_message(
         return;
     }
 
-    let Some(cmd) = parse_command(text, command_prefix, awaiting_reply) else {
+    // Fetched fresh per message (not cached) so a live keymap switch
+    // (GH #354 Phase 3) takes effect on the very next message.
+    let keymap = host.active_keymap().await;
+    let Some(cmd) = parse_command(text, command_prefix, awaiting_reply, &keymap) else {
         debug!("meshtastic: message ignored (no prefix match, no active workflow)");
         return;
     };

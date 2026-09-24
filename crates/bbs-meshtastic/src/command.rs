@@ -1,8 +1,20 @@
 //! Command parsing and response rendering for the Meshtastic transport.
 
-use bbs_plugin_api::{event::Notification, identity::Username, Command, PermissionLevel, Response};
+use bbs_plugin_api::{event::Notification, identity::Username, Command, Keymap, Response};
 
-pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> Option<Command> {
+/// Parse the raw text of an incoming direct message into a [`Command`].
+///
+/// See `crates/bbs-mesh/src/command.rs`'s `parse_command` doc comment — this
+/// is Meshtastic's copy of the same design (GH #354 Phase 2): one-shot
+/// `register`/`login` stays here (radio-only, ahead of any keymap lookup;
+/// reserved so a keymap can never bind it), everything else delegates to
+/// [`Command::parse_with_keymap`].
+pub fn parse_command(
+    text: &str,
+    prefix: Option<char>,
+    awaiting_reply: bool,
+    keymap: &Keymap,
+) -> Option<Command> {
     let text = text.trim();
 
     if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {
@@ -33,197 +45,51 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
     let keyword = word.to_ascii_lowercase();
 
     match keyword.as_str() {
-        "h" | "help" | "?" => Some(Command::Help {
-            topic: rest.map(str::to_owned),
-        }),
         // `register <user>` → interactive; `register <user> <password>` → one-shot.
-        "register" => match rest {
+        "register" => Some(match rest {
             Some(r) => {
                 let (name, password) = split_first_word(r);
                 if name.is_empty() {
-                    Some(Command::Help {
+                    Command::Help {
                         topic: Some("register".to_owned()),
-                    })
+                    }
                 } else if let Some(password) = password {
-                    Some(Command::RegisterOneShot {
+                    Command::RegisterOneShot {
                         username: name.to_owned(),
                         password: password.into(),
-                    })
+                    }
                 } else {
-                    Some(Command::Register {
+                    Command::Register {
                         username: name.to_owned(),
-                    })
+                    }
                 }
             }
-            None => Some(Command::Help {
+            None => Command::Help {
                 topic: Some("register".to_owned()),
-            }),
-        },
+            },
+        }),
         // `login <user>` → interactive; `login <user> <password>` → one-shot.
-        "login" => match rest {
+        "login" => Some(match rest {
             Some(r) => {
                 let (name, password) = split_first_word(r);
                 match (Username::new(name).ok(), password) {
-                    (Some(username), Some(password)) => Some(Command::LoginOneShot {
+                    (Some(username), Some(password)) => Command::LoginOneShot {
                         username,
                         password: password.into(),
-                    }),
-                    (Some(username), None) => Some(Command::Login { username }),
-                    (None, _) => Some(Command::Help {
+                    },
+                    (Some(username), None) => Command::Login { username },
+                    (None, _) => Command::Help {
                         topic: Some("login".to_owned()),
-                    }),
+                    },
                 }
             }
-            None => Some(Command::Help {
+            None => Command::Help {
                 topic: Some("login".to_owned()),
-            }),
-        },
-        "whoami" => Some(Command::Whoami),
-        "k" => Some(Command::ListRooms),
-        "g" => Some(Command::GoNextUnread),
-        "c" => Some(Command::ChangeRoom {
-            target: rest.unwrap_or("").to_owned(),
+            },
         }),
-        "m" => Some(Command::GoMail),
-        "n" => Some(Command::ReadNew),
-        "f" => Some(Command::ReadForward {
-            after: rest.and_then(|s| s.parse::<i64>().ok()),
-        }),
-        "r" => Some(Command::ReadReverse),
-        "s" => match rest {
-            Some(q) if !q.is_empty() => Some(Command::SearchUsers {
-                query: q.to_owned(),
-            }),
-            _ => Some(Command::ScanMessages),
-        },
-        ".ff" => Some(Command::FastForward),
-        "e" => Some(Command::EnterMessage {
-            body: rest.filter(|s| !s.is_empty()).map(str::to_owned),
-        }),
-        "d" => match rest.and_then(|s| s.parse::<i64>().ok()) {
-            Some(id) => Some(Command::DeleteMessage { id }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        // All quit aliases map to one intent (Quit), parallel with the mesh and
-        // canonical parsers. (#124 follow-up)
-        "q" | "quit" | "exit" | "bye" | "logout" => Some(Command::Quit),
-        "cancel" | "stop" => Some(Command::Cancel),
-        "w" => Some(Command::WhoIsOnline),
-        "pending" => Some(Command::ListPending),
-        "v" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::ValidateUser { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        "b" => {
-            let raw_arg = rest.unwrap_or("").trim();
-            let (force, name) = if let Some(s) = raw_arg.strip_prefix('+') {
-                (Some(true), s.trim())
-            } else if let Some(s) = raw_arg.strip_prefix('-') {
-                (Some(false), s.trim())
-            } else {
-                (None, raw_arg)
-            };
-            match Username::new(name) {
-                Ok(target) => Some(Command::BlockUser { target, force }),
-                Err(_) => Some(Command::Unknown {
-                    raw: text.to_owned(),
-                }),
-            }
-        }
-        "ban" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::BanUser { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        "unban" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::UnbanUser { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        "timeout" => {
-            let mut parts = rest.unwrap_or("").split_whitespace();
-            let username = parts.next().and_then(|s| Username::new(s).ok());
-            let days = parts.next().and_then(|s| s.parse::<u8>().ok());
-            match (username, days) {
-                (Some(username), Some(days)) if (1..=5).contains(&days) => {
-                    Some(Command::TimeoutUser { username, days })
-                }
-                _ => Some(Command::Unknown {
-                    raw: text.to_owned(),
-                }),
-            }
-        }
-        "u" | "users" => Some(Command::ListUsers {
-            filter: rest.map(str::to_owned),
-        }),
-        "whois" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::UserInfo { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        "profile" => Some(Command::EditProfile),
-        "passwd" => Some(Command::ChangePassword),
-        ".c" => match rest {
-            Some(name) if !name.is_empty() => Some(Command::CreateRoom {
-                name: name.to_owned(),
-            }),
-            _ => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        ".dr" => match rest {
-            Some(name) if !name.is_empty() => Some(Command::DeleteRoom {
-                name: name.to_owned(),
-            }),
-            _ => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        ".er" => Some(Command::EditRoom),
-        ".eu" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::EditUser { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        ".du" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::DeleteUser { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
-            Some(username) => Some(Command::SetUserPassword { username }),
-            None => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        ".aide" => Some(parse_set_level(rest, PermissionLevel::Aide)),
-        ".sysop" => Some(parse_set_level(rest, PermissionLevel::Sysop)),
-        ".user" => Some(parse_set_level(rest, PermissionLevel::User)),
-        "openaccess" => Some(Command::OpenAccess),
-        "closeaccess" => Some(Command::CloseAccess),
-        "guestroom" => match rest {
-            Some(arg) if arg.eq_ignore_ascii_case("off") => {
-                Some(Command::SetGuestRoom { name: None })
-            }
-            Some(name) if !name.is_empty() => Some(Command::SetGuestRoom {
-                name: Some(name.to_owned()),
-            }),
-            _ => Some(Command::Unknown {
-                raw: text.to_owned(),
-            }),
-        },
-        _ => Some(Command::Unknown {
-            raw: text.to_owned(),
-        }),
+        // Every other keyword goes through the canonical, keymap-aware
+        // parser. `awaiting_reply` is always `false` here.
+        _ => Some(Command::parse_with_keymap(text, false, keymap)),
     }
 }
 
@@ -233,25 +99,6 @@ fn split_first_word(s: &str) -> (&str, Option<&str>) {
         Some(i) => {
             let rest = s[i..].trim_start();
             (&s[..i], if rest.is_empty() { None } else { Some(rest) })
-        }
-    }
-}
-
-/// Parse a `.AIDE` / `.SYSOP` / `.USER <user>` set-level command. (#127)
-fn parse_set_level(rest: Option<&str>, level: PermissionLevel) -> Command {
-    match rest.and_then(|s| Username::new(s).ok()) {
-        Some(username) => Command::SetUserLevel { username, level },
-        // Missing/invalid username → show the command's usage rather than a
-        // generic "unknown command". (#127 follow-up)
-        None => {
-            let topic = match level {
-                PermissionLevel::Aide => ".aide",
-                PermissionLevel::Sysop => ".sysop",
-                _ => ".user",
-            };
-            Command::Help {
-                topic: Some(topic.to_owned()),
-            }
         }
     }
 }
@@ -301,9 +148,12 @@ mod tests {
 
     #[test]
     fn prefix_without_match_is_ignored() {
-        assert_eq!(parse_command("hello", Some('!'), false), None);
+        assert_eq!(
+            parse_command("hello", Some('!'), false, &Keymap::native()),
+            None
+        );
         assert!(matches!(
-            parse_command("!h", Some('!'), false),
+            parse_command("!h", Some('!'), false, &Keymap::native()),
             Some(Command::Help { .. })
         ));
     }
@@ -311,7 +161,7 @@ mod tests {
     #[test]
     fn workflow_reply_beats_prefix() {
         assert_eq!(
-            parse_command("secret", Some('!'), true),
+            parse_command("secret", Some('!'), true, &Keymap::native()),
             Some(Command::WorkflowReply {
                 reply: "secret".to_owned()
             })
@@ -322,14 +172,14 @@ mod tests {
     fn timeout_user_and_days() {
         let u = Username::new("bob").unwrap();
         assert_eq!(
-            parse_command("timeout bob 3", None, false),
+            parse_command("timeout bob 3", None, false, &Keymap::native()),
             Some(Command::TimeoutUser {
                 username: u.clone(),
                 days: 3
             })
         );
         assert_eq!(
-            parse_command("TIMEOUT bob 5", None, false),
+            parse_command("TIMEOUT bob 5", None, false, &Keymap::native()),
             Some(Command::TimeoutUser {
                 username: u,
                 days: 5
@@ -347,7 +197,7 @@ mod tests {
             "timeout bob x",
         ] {
             assert_eq!(
-                parse_command(text, None, false),
+                parse_command(text, None, false, &Keymap::native()),
                 Some(Command::Unknown {
                     raw: text.to_owned()
                 }),
@@ -359,25 +209,25 @@ mod tests {
     #[test]
     fn access_policy_words() {
         assert_eq!(
-            parse_command("openaccess", None, false),
+            parse_command("openaccess", None, false, &Keymap::native()),
             Some(Command::OpenAccess)
         );
         assert_eq!(
-            parse_command("CloseAccess", None, false),
+            parse_command("CloseAccess", None, false, &Keymap::native()),
             Some(Command::CloseAccess)
         );
         assert_eq!(
-            parse_command("guestroom Lobby", None, false),
+            parse_command("guestroom Lobby", None, false, &Keymap::native()),
             Some(Command::SetGuestRoom {
                 name: Some("Lobby".to_owned())
             })
         );
         assert_eq!(
-            parse_command("guestroom OFF", None, false),
+            parse_command("guestroom OFF", None, false, &Keymap::native()),
             Some(Command::SetGuestRoom { name: None })
         );
         assert_eq!(
-            parse_command("guestroom", None, false),
+            parse_command("guestroom", None, false, &Keymap::native()),
             Some(Command::Unknown {
                 raw: "guestroom".to_owned()
             })
@@ -386,7 +236,10 @@ mod tests {
 
     /// The radio parser must agree with the canonical `Command::parse` on the
     /// sysop/aide words — they drifted once (timeout, openaccess, closeaccess,
-    /// guestroom fell through to Unknown on radio).
+    /// guestroom fell through to Unknown on radio). GH #354 Phase 2 made this
+    /// parity structural (everything but register/login now delegates to
+    /// `Command::parse_with_keymap`), so this also covers keywords that
+    /// never drifted, as a belt-and-braces regression guard.
     #[test]
     fn sysop_words_match_canonical_parser() {
         for text in [
@@ -398,13 +251,58 @@ mod tests {
             "guestroom Lobby",
             "guestroom off",
             "guestroom",
+            ".aide bob",
+            ".sysop bob",
+            ".user bob",
+            ".aide",
+            ".pw bob",
+            "ban bob",
+            "unban bob",
+            "whois bob",
+            "k",
+            "g",
+            "c lobby",
+            "s",
+            "s query text",
+            "d 5",
+            "help topic",
         ] {
             assert_eq!(
-                parse_command(text, None, false),
+                parse_command(text, None, false, &Keymap::native()),
                 Some(Command::parse(text, false)),
                 "{text}"
             );
         }
+    }
+
+    /// GH #354 Phase 2: a keymap override now reaches the Meshtastic parser
+    /// too, not just the canonical `Command::parse`.
+    #[test]
+    fn keymap_override_reaches_the_meshtastic_parser() {
+        let km = Keymap {
+            name: "test".to_owned(),
+            description: "test".to_owned(),
+            bindings: std::collections::BTreeMap::from([(
+                "a".to_owned(),
+                bbs_plugin_api::KeymapAction::ChangeRoom,
+            )]),
+        };
+        assert_eq!(
+            parse_command("a Lobby", None, false, &km),
+            Some(Command::ChangeRoom {
+                target: "Lobby".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_command("register alice", None, false, &km),
+            Some(Command::Register {
+                username: "alice".to_owned()
+            })
+        );
+        assert_eq!(
+            parse_command("cancel", None, false, &km),
+            Some(Command::Cancel)
+        );
     }
 
     #[test]
