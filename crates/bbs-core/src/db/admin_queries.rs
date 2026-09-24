@@ -1690,7 +1690,9 @@ name = \"X\"
         let started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let copying = std::fs::read_dir(&d).unwrap().flatten().any(|e| {
-                    e.file_name().to_string_lossy().starts_with("restore_upload_")
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("restore_upload_")
                         && e.metadata().is_ok_and(|m| m.len() > 0)
                 });
                 if copying {
