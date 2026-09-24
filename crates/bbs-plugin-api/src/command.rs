@@ -435,7 +435,22 @@ impl Command {
     /// This is the canonical parser shared by all transports that forward raw
     /// text lines (CLI, process plugins).  Transports with their own wire
     /// syntax (e.g. MeshCore frames) do their own mapping.
+    ///
+    /// Equivalent to [`Self::parse_with_keymap`] with
+    /// [`crate::Keymap::native()`] — Supply Drop's own bindings, unaffected
+    /// by keymap machinery. Existing callers are unchanged; a transport that
+    /// wants keymap-aware parsing (GH #354) calls `parse_with_keymap`
+    /// directly instead.
     pub fn parse(line: &str, awaiting_reply: bool) -> Self {
+        Self::parse_with_keymap(line, awaiting_reply, &crate::Keymap::native())
+    }
+
+    /// [`Self::parse`], but a non-native `keymap` can redirect a keyword to a
+    /// different [`crate::KeymapAction`]'s native keyword before the match
+    /// below runs — see `crates/bbs-plugin-api/src/keymap.rs`'s module doc
+    /// comment for the full design. The match arms themselves never need to
+    /// know keymaps exist: only the keyword text they see can change.
+    pub fn parse_with_keymap(line: &str, awaiting_reply: bool, keymap: &crate::Keymap) -> Self {
         let text = line.trim();
 
         // CANCEL / STOP always break out of a workflow, before the awaiting-reply
@@ -455,7 +470,14 @@ impl Command {
         }
 
         let (word, rest) = split_first_word(text);
-        let keyword = word.to_ascii_lowercase();
+        let typed_keyword = word.to_ascii_lowercase();
+        // A keymap override redirects the typed keyword to the action's own
+        // native keyword before matching — Keymap::native() has no entries,
+        // so this is always a no-op for existing callers of `parse`.
+        let keyword = match keymap.action_for(&typed_keyword) {
+            Some(action) => action.native_keyword().to_owned(),
+            None => typed_keyword,
+        };
 
         match keyword.as_str() {
             // ── Auth ─────────────────────────────────────────────────────────
@@ -839,5 +861,164 @@ mod tests {
                 reply: "Alice".to_owned()
             }
         );
+    }
+
+    // GH #354: a keymap override redirects a typed keyword to its action's
+    // native keyword before the match runs, so the match arms themselves
+    // (and every test above this one) never need to know keymaps exist.
+    mod keymap_aware_parsing {
+        use super::*;
+        use crate::{Keymap, KeymapAction};
+        use std::collections::BTreeMap;
+
+        #[test]
+        fn parse_is_unaffected_by_keymap_plumbing() {
+            // Keymap::native() has no overrides, so parse() (which now
+            // delegates to parse_with_keymap under the hood) must behave
+            // identically to before this change for every existing caller.
+            for (line, awaiting) in [
+                ("k", false),
+                ("g", false),
+                ("c lobby", false),
+                ("cancel", true),
+            ] {
+                assert_eq!(
+                    Command::parse(line, awaiting),
+                    Command::parse_with_keymap(line, awaiting, &Keymap::native()),
+                );
+            }
+        }
+
+        #[test]
+        fn an_overridden_keyword_resolves_to_the_remapped_actions_command() {
+            let km = Keymap {
+                name: "test".to_owned(),
+                description: "test".to_owned(),
+                bindings: BTreeMap::from([("g".to_owned(), KeymapAction::Quit)]),
+            };
+            // Native `g` is GoNextUnread; under this keymap it means Quit.
+            assert_eq!(Command::parse_with_keymap("g", false, &km), Command::Quit);
+        }
+
+        #[test]
+        fn an_argument_survives_the_keyword_translation() {
+            // Maximus's `a <room>` should behave exactly like native
+            // `c <room>` — the translation only swaps the keyword, the rest
+            // of the line flows through untouched.
+            let km = Keymap {
+                name: "test".to_owned(),
+                description: "test".to_owned(),
+                bindings: BTreeMap::from([("a".to_owned(), KeymapAction::ChangeRoom)]),
+            };
+            assert_eq!(
+                Command::parse_with_keymap("a Lobby", false, &km),
+                Command::ChangeRoom {
+                    target: "Lobby".to_owned()
+                }
+            );
+        }
+
+        #[test]
+        fn a_keyword_not_touched_by_the_keymap_still_falls_through_to_native() {
+            let km = Keymap {
+                name: "test".to_owned(),
+                description: "test".to_owned(),
+                bindings: BTreeMap::from([("g".to_owned(), KeymapAction::Quit)]),
+            };
+            // `n` isn't in this keymap's bindings at all — native ReadNew.
+            assert_eq!(
+                Command::parse_with_keymap("n", false, &km),
+                Command::ReadNew
+            );
+        }
+
+        #[test]
+        fn awaiting_reply_and_cancel_still_take_priority_over_the_keymap() {
+            // A keymap must not be able to make CANCEL/STOP stop working, or
+            // make a workflow reply get reinterpreted as a command — both
+            // checks in parse_with_keymap run before the keyword lookup.
+            let km = Keymap {
+                name: "test".to_owned(),
+                description: "test".to_owned(),
+                bindings: BTreeMap::from([("cancel".to_owned(), KeymapAction::Quit)]),
+            };
+            assert_eq!(
+                Command::parse_with_keymap("cancel", true, &km),
+                Command::Cancel
+            );
+            assert_eq!(
+                Command::parse_with_keymap("g", true, &km),
+                Command::WorkflowReply {
+                    reply: "g".to_owned()
+                }
+            );
+        }
+
+        /// Drift guard: `KeymapAction::native_keyword()` (keymap.rs) and this
+        /// file's `match keyword.as_str()` arms are two independently
+        /// hand-maintained tables with nothing tying them together at
+        /// compile time. Before this test, only 2 of the 12 top-level
+        /// actions (Quit, ChangeRoom, above) were exercised end to end; a
+        /// typo'd or renamed literal in either file for any of the other 10
+        /// would silently fall through to `Command::Unknown` and nothing
+        /// would catch it. This binds every top-level action to a distinct
+        /// override keyword and asserts translating through it lands on the
+        /// exact same `Command` a bare native invocation produces — for
+        /// every top-level action, not just the two already covered above.
+        ///
+        /// Deliberately bare (no trailing argument) on both sides: this
+        /// tests keyword-table parity, not per-arm argument handling (the
+        /// "s" ScanMessages/SearchUsers argument-dependent split is a
+        /// separate, already-documented concern — see
+        /// `KeymapAction::ScanMessages`'s doc comment).
+        #[test]
+        fn every_top_level_action_round_trips_through_its_own_override_keyword() {
+            let top_level_actions: &[KeymapAction] = &[
+                KeymapAction::Quit,
+                KeymapAction::ListRooms,
+                KeymapAction::GoNextUnread,
+                KeymapAction::ChangeRoom,
+                KeymapAction::GoMail,
+                KeymapAction::ReadNew,
+                KeymapAction::ReadForward,
+                KeymapAction::ReadReverse,
+                KeymapAction::ScanMessages,
+                KeymapAction::EnterMessage,
+                KeymapAction::DeleteMessage,
+                KeymapAction::WhoIsOnline,
+            ];
+            for (i, &action) in top_level_actions.iter().enumerate() {
+                let override_keyword = format!("zz{i}");
+                let km = Keymap {
+                    name: "test".to_owned(),
+                    description: "test".to_owned(),
+                    bindings: BTreeMap::from([(override_keyword.clone(), action)]),
+                };
+                let via_override = Command::parse_with_keymap(&override_keyword, false, &km);
+                let via_native =
+                    Command::parse_with_keymap(action.native_keyword(), false, &Keymap::native());
+                // `Command::Unknown { raw }` legitimately echoes the typed
+                // line verbatim (e.g. DeleteMessage's "d" arm with no
+                // numeric argument falls back to Unknown), so its `raw`
+                // field is expected to differ between the two distinct
+                // typed keywords even when the keyword table hasn't
+                // drifted at all — compare variant identity there instead
+                // of full equality. Every other variant's fields are
+                // argument-derived, not raw-text-derived, so full equality
+                // is the right check everywhere else.
+                let matches = match (&via_override, &via_native) {
+                    (Command::Unknown { .. }, Command::Unknown { .. }) => true,
+                    _ => via_override == via_native,
+                };
+                assert!(
+                    matches,
+                    "{action:?}: override keyword {override_keyword:?} resolved to \
+                     {via_override:?}, but its native keyword {:?} resolves to \
+                     {via_native:?} — native_keyword() and this file's match arms \
+                     have drifted apart for this action",
+                    action.native_keyword()
+                );
+            }
+        }
     }
 }

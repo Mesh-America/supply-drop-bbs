@@ -16,6 +16,7 @@
 //! - [`event`]       — `DomainEvent`, `Notification`
 //! - [`command`]     — `Command`, `Response` (still placeholders;
 //!   these grow with feature work)
+//! - [`keymap`]      — `Keymap`, `KeymapAction`, `KeymapError`
 //! - [`error`]       — `PluginError`, `HostError`, `TransportError`
 //! - [`registry`]    — `PluginRegistryApi`, `ProcessPluginConfig`, `PluginStatus`
 //! - [`testing`]     — fake `Host` for plugin unit tests
@@ -35,6 +36,7 @@ pub mod error;
 pub mod event;
 pub mod host;
 pub mod identity;
+pub mod keymap;
 pub mod permissions;
 pub mod plugin;
 pub mod registry;
@@ -62,6 +64,7 @@ pub use error::{HostError, PluginError, TransportError};
 pub use event::{DomainEvent, MessageRecipient, Notification, NotifyOutcome};
 pub use host::{Host, MeshKeyRequest, MeshtasticAdminRequest};
 pub use identity::{SessionId, Username};
+pub use keymap::{Keymap, KeymapAction, KeymapError};
 pub use permissions::{PermissionCtx, PermissionLevel};
 pub use plugin::Plugin;
 pub use registry::{

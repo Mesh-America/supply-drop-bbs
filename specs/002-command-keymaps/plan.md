@@ -87,14 +87,16 @@ deliberately thin:
 
 | Action | Packet-BBS letter | Collision | Resolution |
 |---|---|---|---|
-| Quit | `b` (Bye) | none | direct override |
+| Quit | `b` (Bye) | **found during the Phase 1 hostile audit, not by Rule 1/2**: `b` is Supply Drop's real `BlockUser` command (`command.rs`'s `"b"` arm), which has no `KeymapAction` of its own, so neither validation rule catches the shadowing — `Keymap::validate` now rejects any binding on a keyword outside the closed `KeymapAction` set for exactly this reason | not remapped — Supply Drop already recognizes `"bye"` as a native `Quit` synonym (`command.rs`: `"logout" \| "q" \| "quit" \| "exit" \| "bye" => Command::Quit`), so the packet-BBS convention is satisfied with zero override needed |
 | ReadNew | `l` (list new since last) | none — but see Maximus preset above; presets don't share a namespace, each is independently validated | direct override |
 | DeleteMessage | *(not remapped)* | `k` is packet-BBS's Kill, but native `k` = ListRooms | Rule 2 would require rebinding ListRooms too, for a very marginal gain (packet BBS's `K`/`KM` are natural, but forcing this collision resolution for one thin preset isn't worth it) — left native |
 
-Final Packet-BBS keymap: `{b: Quit, l: ReadNew}`. Everything else — room navigation, mail — has no
-confident single-key equivalent in the source system, so it stays native. The preset's description
-text should say this plainly: "Packet-BBS conventions for logging off and checking new traffic;
-Supply Drop's own keys cover everything else, since packet BBS has no room concept to map from."
+Final Packet-BBS keymap: `{l: ReadNew}`. Everything else — room navigation, mail, and logging off
+via the native `bye` synonym — has no confident single-key equivalent in the source system (or
+already works natively), so it stays native. The preset's description text should say this
+plainly: "Packet-BBS conventions for checking new traffic; type `bye` to log off as on the source
+system, or use Supply Drop's own keys for everything else, since packet BBS has no room concept to
+map from."
 
 ## Not yet worked: PCBoard, WWIV-family, Synchronet
 
