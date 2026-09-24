@@ -239,31 +239,46 @@ mod tests {
     }
 
     // The WAL/SHM sidecars are the flagship reason `restrict_db_files_to_owner`
-    // exists (the main file alone isn't the whole story under WAL mode) —
-    // simulate a pre-existing, loosely-permissioned pair (e.g. left by an
-    // older version of this project) rather than depending on the timing of
-    // when SQLite itself would create them.
-    #[tokio::test]
-    async fn opening_a_database_tightens_pre_existing_wal_and_shm_sidecars_too() {
+    // exists (the main file alone isn't the whole story under WAL mode).
+    // Exercised directly on plain files rather than through `Database::open`:
+    // SQLite memory-maps a real `-shm`, so planting fake content in one and
+    // reopening the database reads past the end of the mapping (SIGBUS),
+    // which took down the whole test binary in CI.
+    #[test]
+    fn loosely_permissioned_wal_and_shm_sidecars_are_tightened_too() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bbs.sqlite");
-        {
-            let db = Database::open(&path.to_string_lossy()).await.unwrap();
-            drop(db);
-        }
-        let wal = format!("{}-wal", path.to_string_lossy());
-        let shm = format!("{}-shm", path.to_string_lossy());
-        std::fs::write(&wal, b"fake wal content").unwrap();
-        std::fs::write(&shm, b"fake shm content").unwrap();
-        for sidecar in [&wal, &shm] {
-            std::fs::set_permissions(sidecar, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let path_str = path.to_string_lossy().into_owned();
+        let files = [
+            path_str.clone(),
+            format!("{path_str}-wal"),
+            format!("{path_str}-shm"),
+        ];
+        for f in &files {
+            std::fs::write(f, b"x").unwrap();
+            std::fs::set_permissions(f, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
 
-        let db = Database::open(&path.to_string_lossy()).await.unwrap();
-        for sidecar in [&wal, &shm] {
-            let mode = std::fs::metadata(sidecar).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "{sidecar}: {mode:o}");
+        super::restrict_db_files_to_owner(&path_str);
+
+        for f in &files {
+            let mode = std::fs::metadata(f).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{f}: {mode:o}");
         }
-        drop(db);
+    }
+
+    // A missing sidecar (the common case: WAL only creates them once
+    // something writes) is skipped, not treated as an error.
+    #[test]
+    fn missing_sidecars_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bbs.sqlite");
+        std::fs::write(&path, b"x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        super::restrict_db_files_to_owner(&path.to_string_lossy());
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
     }
 }
