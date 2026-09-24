@@ -329,6 +329,27 @@ the table is full, without knowing which users have an active BBS session;
 see [saturated contact table](#meshcore-saturated-contact-table) below for how
 the BBS handles a full table.
 
+**Reply handling.** The read (`CMD_GET_AUTOADD_CONFIG`) and the write
+(`CMD_SET_AUTOADD_CONFIG`, sent when a bit needs to change) are each tracked
+against a single pending slot, mutually exclusive with the one used for
+sysop-triggered key export/import and radio-parameter pushes: the wire gives a
+bare Ok/Err no correlation id, so the BBS never has both a key operation and
+an autoadd probe outstanding at once, rejecting one as busy until the other
+resolves. A reply that never arrives (a lost frame) doesn't wedge that slot
+forever either — the BBS gives up on it after a bounded timeout so a stuck
+key operation can't be blocked by it indefinitely.
+
+This tracking isn't airtight. A rejected read is logged at `warn` naming the
+failure, but the attribution is inherently best-effort: it is sent as part of
+the same connect-time burst as the message-queue drain and the contact fetch
+— all three go out before any of their replies can have arrived, and the wire
+does not say which one a given Err belongs to. That ambiguity is a
+pre-existing limit shared by those other connect-time commands, not something
+the autoadd read can resolve on its own. Separately, the radio's own
+proactive contact-table eviction (see below) also gets a bare Ok/Err with
+nothing tracking it (it has no caller waiting on that reply), so on rare
+occasions its reply can be logged as if it were the write's.
+
 ### MeshCore: saturated contact table
 
 If MeshCore's own contact table is completely full — no further contact,
