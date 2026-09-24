@@ -32,6 +32,7 @@ pub mod audit_archive;
 pub mod backup_bundle;
 pub mod config_lock;
 pub mod db;
+pub mod dir_perms;
 pub mod disk_space;
 pub mod host;
 pub mod ids;

@@ -18,10 +18,13 @@ case "$1" in
         supply-drop
     fi
 
-    # ── Data directory — writeable only by the service account ──────────────
+    # ── Data directory — owner-only; holds the live database ────────────────
+    # Matches install.sh and what the running service re-asserts on every
+    # startup (bbs_core::dir_perms) — this line mainly matters for the
+    # window before the service's first start.
     mkdir -p /var/lib/supply-drop-bbs
     chown supply-drop:supply-drop /var/lib/supply-drop-bbs
-    chmod 750 /var/lib/supply-drop-bbs
+    chmod 700 /var/lib/supply-drop-bbs
 
     # ── Config directory — populated by the setup wizard ────────────────────
     mkdir -p /etc/supply-drop-bbs

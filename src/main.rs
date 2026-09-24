@@ -1037,6 +1037,13 @@ async fn cmd_run(cli: &Cli) {
         error!(path = %data_dir.display(), "could not create data directory: {e}");
         std::process::exit(1);
     }
+    // Owner-only: the live database (password hashes, message content) and
+    // staged restores live here, and neither the database file itself
+    // (sqlx/SQLite set no mode of their own) nor a 0600 private temp file is
+    // actually private if this directory is world-listable. Re-applied on
+    // every startup, not just first creation, so an install from before
+    // this existed self-heals. See bbs_core::dir_perms.
+    bbs_core::dir_perms::restrict_to_owner(data_dir);
 
     // ── 3a. Remove restore temp copies orphaned by an interrupted request ───────
     sweep_stale_restore_temp_files(data_dir);
@@ -1274,6 +1281,9 @@ async fn cmd_run(cli: &Cli) {
                         warn!("backup: could not create backup dir: {e}");
                         continue;
                     }
+                    // Backups are full copies of the live database — as
+                    // sensitive as it is. See bbs_core::dir_perms.
+                    bbs_core::dir_perms::restrict_to_owner(&backup_dir);
                     let dir_str = backup_dir.to_string_lossy();
                     match host_backup
                         .admin_trigger_backup_bundle(&dir_str, backup_config_path.as_deref())
@@ -2459,6 +2469,7 @@ async fn cmd_backup(cli: &Cli) {
         eprintln!("error creating backup directory: {e}");
         std::process::exit(1);
     }
+    bbs_core::dir_perms::restrict_to_owner(backup_dir);
 
     let dir_str = backup_dir.to_string_lossy();
     match host
@@ -2647,6 +2658,7 @@ async fn cmd_restore(cli: &Cli, action: &RestoreAction) {
         eprintln!("error creating data directory: {e}");
         std::process::exit(1);
     }
+    bbs_core::dir_perms::restrict_to_owner(data_dir);
 
     match action {
         RestoreAction::Stage { path } => {
