@@ -4122,11 +4122,18 @@ async fn api_export_node_key(
     }
     match state.host.admin_export_node_key().await {
         Ok(hex) => Json(serde_json::json!({ "key": hex })).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json_error(&format!("{e}"))),
-        )
-            .into_response(),
+        Err(e) => {
+            // Matches api_import_node_key/api_apply_mesh_radio's mapping: a
+            // transport-unavailable or device-didn't-reply-in-time error
+            // (both surface as HostError::Internal) is a routine, expected
+            // condition for a sysop to retry, not a server bug — keep it
+            // distinguishable from a genuine 500.
+            let status = match &e {
+                HostError::Internal(_) => StatusCode::SERVICE_UNAVAILABLE,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json_error(&format!("{e}")))).into_response()
+        }
     }
 }
 

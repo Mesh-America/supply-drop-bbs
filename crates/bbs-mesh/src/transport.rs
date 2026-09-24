@@ -81,6 +81,24 @@ const RETRY_TICK: Duration = Duration::from_millis(500);
 /// wait this long past sending means the reply is lost, not just slow, and
 /// a lost reply must not block every key op for the rest of the connection.
 const AUTOADD_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long `pending_key_op` (a sysop-triggered key export/import or
+/// radio-parameter push) may sit unanswered before the event loop gives up
+/// on it and fails its caller's reply channel — supply-drop-bbs-u0vv / GH
+/// #398. Without this, a lost reply wedges the slot (and, via the
+/// `MeshKeyRequest` busy-checks, every future key op) for the rest of the
+/// connection with nothing to clear it short of a disconnect; the HTTP
+/// caller for export/import has no timeout of its own at all.
+///
+/// Deliberately shorter than `admin_apply_mesh_radio`'s existing 10s
+/// client-side timeout (which never reaches back into the event loop to free
+/// this slot on its own) rather than equal to it: this side must win the
+/// race and clear the slot *before* that client gives up, or two problems
+/// follow — the client's own timeout fires first and drops its `reply_rx`
+/// before this side's more specific "device did not reply in time" message
+/// can ever reach it, and the slot stays busy for up to one more
+/// `RETRY_TICK` after the sysop already saw an error, so an immediate retry
+/// is confusingly rejected as "already in progress".
+const PENDING_KEY_OP_TIMEOUT: Duration = Duration::from_secs(8);
 /// How often the event loop appends a delivery-history sample for trend display.
 const SAMPLE_TICK: Duration = Duration::from_secs(60);
 /// How far back to seed the in-memory trend from persisted samples on startup
@@ -1033,6 +1051,13 @@ async fn event_loop(
 ) {
     // Pending one-shot key operation. At most one at a time.
     let mut pending_key_op: Option<PendingKeyOp> = None;
+    // When `pending_key_op` was last set (not reset by `ApplyRadio`'s
+    // internal params->tx_power phase change — the deadline covers the
+    // whole two-step operation from the caller's perspective), so
+    // `retry_tick` can give up on it (see `PENDING_KEY_OP_TIMEOUT`) instead
+    // of blocking every future key op for the rest of the connection —
+    // supply-drop-bbs-u0vv / GH #398.
+    let mut pending_key_op_since: Option<Instant> = None;
     // Pending connect-time autoadd probe/write. Mutually exclusive with
     // `pending_key_op` — see `PendingAutoadd`'s doc comment.
     let mut pending_autoadd: Option<PendingAutoadd> = None;
@@ -1333,6 +1358,7 @@ async fn event_loop(
                         // the caller's oneshot receiver is not left hanging
                         // indefinitely waiting for a reply that will never come.
                         if let Some(op) = pending_key_op.take() {
+                            pending_key_op_since = None;
                             let err = "device disconnected".to_owned();
                             match op {
                                 PendingKeyOp::Export { reply } => { let _ = reply.send(Err(err)); }
@@ -1364,22 +1390,40 @@ async fn event_loop(
                         // see supply-drop-bbs-6tw.
                         let consumed = match &frame {
                             InboundFrame::PrivateKey { key } => {
-                                if let Some(PendingKeyOp::Export { reply }) = pending_key_op.take() {
-                                    let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
-                                    let _ = reply.send(Ok(hex));
-                                    true
-                                } else {
-                                    false
+                                match pending_key_op.take() {
+                                    Some(PendingKeyOp::Export { reply }) => {
+                                        pending_key_op_since = None;
+                                        let hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+                                        let _ = reply.send(Ok(hex));
+                                        true
+                                    }
+                                    // Not the pending op this answers (a mismatched
+                                    // or stray device response) — restore it rather
+                                    // than silently dropping Import/ApplyRadio's
+                                    // reply sender and orphaning
+                                    // `pending_key_op_since` as `Some` with
+                                    // `pending_key_op` now `None`, which would
+                                    // permanently suppress the retry_tick timeout
+                                    // (it only fires from inside
+                                    // `pending_key_op.take()` returning `Some`).
+                                    other => {
+                                        pending_key_op = other;
+                                        false
+                                    }
                                 }
                             }
                             InboundFrame::Ok => {
                                 match pending_key_op.take() {
                                     Some(PendingKeyOp::Import { reply }) => {
+                                        pending_key_op_since = None;
                                         let _ = reply.send(Ok(()));
                                         true
                                     }
                                     Some(PendingKeyOp::ApplyRadio { reply, waiting_for_params: true, tx_power_dbm }) => {
-                                        // Params acknowledged — now send TX power
+                                        // Params acknowledged — now send TX power.
+                                        // `pending_key_op_since` is left as-is: the
+                                        // deadline covers this whole two-step
+                                        // operation from the caller's perspective.
                                         let _ = cmd_tx.send(OutboundFrame::SetRadioTxPower { power_dbm: tx_power_dbm }).await;
                                         pending_key_op = Some(PendingKeyOp::ApplyRadio {
                                             reply,
@@ -1390,6 +1434,7 @@ async fn event_loop(
                                     }
                                     Some(PendingKeyOp::ApplyRadio { reply, waiting_for_params: false, .. }) => {
                                         // TX power acknowledged — done
+                                        pending_key_op_since = None;
                                         let _ = reply.send(Ok(()));
                                         true
                                     }
@@ -1427,6 +1472,7 @@ async fn event_loop(
                             // flight — propagate it so the caller doesn't hang.
                             InboundFrame::Err { error_code } => {
                                 if let Some(op) = pending_key_op.take() {
+                                    pending_key_op_since = None;
                                     let msg = format!("device error (code {error_code:#04x})");
                                     match op {
                                         PendingKeyOp::Export { reply } => { let _ = reply.send(Err(msg)); }
@@ -1605,6 +1651,30 @@ async fn event_loop(
                     pending_autoadd = None;
                     pending_autoadd_since = None;
                 }
+                // Same reasoning in the other direction: a lost reply to a
+                // sysop-triggered key op (export/import/apply-radio) would
+                // otherwise wedge `pending_key_op` — and so
+                // `pending_autoadd`'s own busy-check — for the rest of the
+                // connection. `admin_export_node_key`/`admin_import_node_key`
+                // have no timeout of their own at all, and
+                // `admin_apply_mesh_radio`'s 10s client-side timeout never
+                // reaches back into this loop — supply-drop-bbs-u0vv / GH #398.
+                if pending_key_op_since.is_some_and(|since| since.elapsed() >= PENDING_KEY_OP_TIMEOUT) {
+                    if let Some(op) = pending_key_op.take() {
+                        pending_key_op_since = None;
+                        warn!(
+                            "mesh: a key operation got no reply within {PENDING_KEY_OP_TIMEOUT:?} \
+                             — giving up on it so future key operations aren't blocked for the \
+                             rest of this connection"
+                        );
+                        let err = "device did not reply in time".to_owned();
+                        match op {
+                            PendingKeyOp::Export { reply } => { let _ = reply.send(Err(err)); }
+                            PendingKeyOp::Import { reply } => { let _ = reply.send(Err(err)); }
+                            PendingKeyOp::ApplyRadio { reply, .. } => { let _ = reply.send(Err(err)); }
+                        }
+                    }
+                }
             }
             _ = sample_tick.tick() => {
                 let s = delivery_stats.sample(now_unix_secs() as u64);
@@ -1633,6 +1703,7 @@ async fn event_loop(
                         } else {
                             let _ = cmd_tx.send(OutboundFrame::ExportPrivateKey).await;
                             pending_key_op = Some(PendingKeyOp::Export { reply });
+                            pending_key_op_since = Some(Instant::now());
                         }
                     }
                     MeshKeyRequest::ImportKey { key, reply } => {
@@ -1641,6 +1712,7 @@ async fn event_loop(
                         } else {
                             let _ = cmd_tx.send(OutboundFrame::ImportPrivateKey { key }).await;
                             pending_key_op = Some(PendingKeyOp::Import { reply });
+                            pending_key_op_since = Some(Instant::now());
                         }
                     }
                     MeshKeyRequest::ApplyRadio { params, reply } => {
@@ -1658,6 +1730,7 @@ async fn event_loop(
                                 waiting_for_params: true,
                                 tx_power_dbm: params.tx_power_dbm,
                             });
+                            pending_key_op_since = Some(Instant::now());
                         }
                     }
                     MeshKeyRequest::RemoveContact { pubkey, reply } => {
