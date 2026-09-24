@@ -824,16 +824,7 @@ impl Database {
             .await
             .is_err()
         {
-            let len = tokio::fs::metadata(uploaded_path)
-                .await
-                .map_err(|e| StoreError::Decode(format!("stage restore file: {e}")))?
-                .len();
-            crate::disk_space::ensure_free_space(data_dir, len).map_err(StoreError::Decode)?;
-            if let Err(e) = tokio::fs::copy(uploaded_path, &staged_path).await {
-                // Don't leave a torn file where a later confirm could pick it up.
-                let _ = tokio::fs::remove_file(&staged_path).await;
-                return Err(StoreError::Decode(format!("stage restore file: {e}")));
-            }
+            copy_via_private_temp(uploaded_path, &staged_path, data_dir).await?;
             let _ = tokio::fs::remove_file(uploaded_path).await;
         }
 
@@ -899,9 +890,7 @@ impl Database {
             .await
             .is_err()
         {
-            tokio::fs::copy(&staged_path, &confirmed_path)
-                .await
-                .map_err(|e| StoreError::Decode(format!("confirm restore file: {e}")))?;
+            copy_via_private_temp(&staged_path, &confirmed_path, data_dir).await?;
             let _ = tokio::fs::remove_file(&staged_path).await;
         }
 
@@ -974,6 +963,79 @@ async fn stage_config(data_dir: &Path, text: Option<&str>) -> Result<(), StoreEr
     .await
     .map_err(|e| StoreError::Decode(format!("staging config.toml: {e}")))?
     .map_err(|e| StoreError::Decode(format!("staging config.toml: {e}")))
+}
+
+/// The EXDEV fallback shared by [`Database::stage_restore`] and
+/// [`Database::admin_apply_staged_restore_with`]'s final renames: copies
+/// `source` into `dest` when a same-filesystem rename isn't possible. `dest`
+/// must be a direct child of `data_dir` — the final rename below relies on
+/// that to land on the same filesystem as the private temp copy, or it would
+/// only trade one EXDEV for another.
+///
+/// Copies into a private, guarded temp file in `data_dir` first, rather than
+/// writing `dest` (a name shared with whatever else the caller's lock — where
+/// it has one; `stage_restore`'s CLI caller has none, see `restore_stage.rs`)
+/// is meant to serialize against. A whole-file `tokio::fs::copy` runs on a
+/// blocking-pool thread that Tokio cannot cancel; dropping the caller's
+/// future mid-copy (an HTTP client disconnect) would leave it running to
+/// completion regardless of any lock already released to a second request.
+/// Using [`tokio::io::copy`] instead — the same idiom `restore_stage::stage_copy`
+/// already uses for CLI-sourced restores — dispatches each chunk as its own
+/// blocking read/write, so a dropped future stops issuing new chunks; at most
+/// one already-dispatched chunk can land after cancellation, not the whole
+/// file. Writing to a private name nothing else looks up also means that
+/// orphaned chunk can never land on the shared `dest` — the guard's `Drop`
+/// unlinks the temp name immediately, and on Unix the orphaned write then
+/// lands on an already-unlinked inode that vanishes once it finishes and
+/// closes it.
+///
+/// This narrows the cancellation window from the whole copy down to the
+/// final `rename` below, a single near-instant syscall — it does not close
+/// that window entirely. A future dropped while that specific rename is
+/// in flight can still publish to `dest` after the caller's lock (if any)
+/// has already been released, exactly as for the direct-rename fast path
+/// a few lines above every call site of this function; both accept that
+/// residual, syscall-sized race rather than the multi-second one a whole-file
+/// copy could leave open.
+async fn copy_via_private_temp(
+    source: &Path,
+    dest: &Path,
+    data_dir: &Path,
+) -> Result<(), StoreError> {
+    let mut src = tokio::fs::File::open(source)
+        .await
+        .map_err(|e| StoreError::Decode(format!("reading {}: {e}", source.display())))?;
+    let len = src
+        .metadata()
+        .await
+        .map_err(|e| StoreError::Decode(format!("reading {}: {e}", source.display())))?
+        .len();
+    crate::disk_space::ensure_free_space(data_dir, len).map_err(StoreError::Decode)?;
+    let (guard, mut file) = crate::restore_stage::new_private_temp(data_dir, "restore_upload_")
+        .await
+        .map_err(|e| {
+            StoreError::Decode(format!(
+                "creating a temp copy in {}: {e}",
+                data_dir.display()
+            ))
+        })?;
+    tokio::io::copy(&mut src, &mut file)
+        .await
+        .map_err(|e| StoreError::Decode(format!("copying {}: {e}", source.display())))?;
+    // Flushed before it takes `dest`'s name: a rename of data that is not yet
+    // on disk can leave a torn file after a power cut, the same reasoning
+    // `sync_file_blocking` documents for the direct-rename fast path.
+    tokio::io::AsyncWriteExt::flush(&mut file)
+        .await
+        .map_err(|e| StoreError::Decode(format!("flushing {}: {e}", data_dir.display())))?;
+    file.sync_all()
+        .await
+        .map_err(|e| StoreError::Decode(format!("flushing {}: {e}", data_dir.display())))?;
+    drop(file);
+    tokio::fs::rename(guard.path(), dest)
+        .await
+        .map_err(|e| StoreError::Decode(format!("publishing {}: {e}", dest.display())))?;
+    Ok(())
 }
 
 /// Read just the first 16 bytes of `path` and check them against the SQLite
@@ -1149,8 +1211,8 @@ fn extract_single_db_with_chunk(
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_upload, extract_single_db_from_zip, extract_single_db_with_chunk, StoreError,
-        UploadKind,
+        classify_upload, copy_via_private_temp, extract_single_db_from_zip,
+        extract_single_db_with_chunk, StoreError, UploadKind,
     };
     use std::path::PathBuf;
 
@@ -1590,5 +1652,101 @@ name = \"X\"
             classify_upload(&dir.path().join("absent")).await,
             Err(StoreError::Decode(_))
         ));
+    }
+
+    // supply-drop-bbs-fuh: the EXDEV fallback's copy used to run as a single
+    // whole-file `tokio::fs::copy` on a blocking-pool thread Tokio cannot
+    // cancel, so dropping the caller's future mid-copy (an HTTP client
+    // disconnect) left an orphaned write racing straight into
+    // `pending_restore.staged.db` — the same name a second upload or confirm
+    // reaches for as soon as the lock guarding it is released by that drop.
+    // `copy_via_private_temp` routes the copy through a private temp name
+    // instead, chunk-at-a-time via `tokio::io::copy`, so cancellation can
+    // publish at most one already-dispatched chunk to that private name —
+    // never to the shared path — and the task ends (`is_cancelled()`) rather
+    // than running unbounded in the background the way a whole-file
+    // `spawn_blocking` copy would.
+    #[tokio::test]
+    async fn cancelling_the_copy_fallback_never_publishes_to_the_shared_path() {
+        let data = tempfile::tempdir().unwrap();
+        let d = data.path().to_path_buf();
+        // Large enough that many chunks are needed, so the copy is still
+        // running when the abort below lands.
+        let src = d.join("src.db");
+        std::fs::write(&src, vec![0u8; 512 * 1024 * 1024]).unwrap();
+        let staged = d.join("pending_restore.staged.db");
+
+        let task = tokio::spawn({
+            let (src, staged, d) = (src.clone(), staged.clone(), d.clone());
+            async move { copy_via_private_temp(&src, &staged, &d).await }
+        });
+        // Abort only once the copy has observably started: the private temp
+        // exists and has data in it. A fixed sleep isn't enough. On a slow
+        // runner it can land while `new_private_temp`'s blocking open is still
+        // in flight, before the `TempFile` guard exists, and an open orphaned
+        // that way leaves its file behind for the startup sweep to collect
+        // (the accepted behaviour `TempFile`'s doc comment describes), which
+        // this test would misread as the guard failing to clean up.
+        let started = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let copying = std::fs::read_dir(&d).unwrap().flatten().any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("restore_upload_")
+                        && e.metadata().is_ok_and(|m| m.len() > 0)
+                });
+                if copying {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "the copy never visibly started");
+        assert!(
+            !task.is_finished(),
+            "the copy must still be running for this test to actually catch it mid-flight \
+             (bump the source size above if this becomes flaky)"
+        );
+
+        // Simulate the HTTP handler's future being dropped mid-await (a
+        // client disconnect): `abort()` stops `copy_via_private_temp` from
+        // ever resuming, exactly as a dropped future would. Only the single
+        // blocking read or write `tokio::io::copy` had already dispatched for
+        // its current chunk is not stopped by this — Tokio's own docs confirm
+        // blocking tasks cannot be cancelled — everything after that chunk
+        // simply never runs.
+        task.abort();
+        assert!(
+            task.await.unwrap_err().is_cancelled(),
+            "the task must actually have been aborted mid-flight, not merely raced to completion"
+        );
+
+        assert!(
+            !staged.exists(),
+            "an aborted copy must never have published to the shared staged path"
+        );
+        let leftover: Vec<_> = std::fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("restore_upload_"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "the guard must unlink its private temp name promptly on cancellation, not leave it \
+             sitting under a discoverable name: {leftover:?}"
+        );
+
+        // Give the orphaned chunk (at most one small blocking read or write,
+        // not the whole file — unlike a whole-file `spawn_blocking` copy)
+        // time to actually finish, then confirm it still never touched the
+        // shared name: its destination was always the already-unlinked
+        // private temp, whose space is reclaimed once it closes the file.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !staged.exists(),
+            "even once the orphaned chunk finally completes, it must not land on the shared path"
+        );
     }
 }
