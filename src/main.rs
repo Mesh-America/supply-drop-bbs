@@ -461,19 +461,22 @@ enum ConfigAction {
 
     /// Activate a command keymap (GH #354).
     ///
-    /// `name` is a built-in preset (`native`, `maximus`, `packet-bbs`), or
-    /// `custom:<filename>` for a validated TOML file already placed under
-    /// `data_dir` — see `docs/PROTOCOL.md`'s keymap section for the file
+    /// `name` is a built-in preset (`native`, `maximus`, `packet-bbs`, ...),
+    /// or `custom:<filename>` for a validated TOML file already placed under
+    /// `data_dir` — see `docs/CONFIG.md`'s keymap section for the file
     /// format. The name/file is checked (and, for `custom:`, fully loaded
     /// and validated) before anything is written, so a typo or a broken
     /// custom file is caught here rather than silently falling back to
-    /// `native` at the next BBS start. Changes take effect on the next BBS
-    /// restart. (Minimal offline mechanism per
-    /// `specs/002-command-keymaps/plan.md`'s Open question 3 fallback — no
-    /// live, no-restart switch yet.)
+    /// `native` at the next BBS start. Changes made this way take effect on
+    /// the next BBS restart — the web admin UI's keymap picker applies
+    /// live, this CLI form does not (it edits `config.toml` for a process
+    /// that isn't necessarily running).
+    ///
+    /// Run with no `name` to pick interactively from a menu of every
+    /// built-in preset instead.
     SetKeymap {
-        /// Preset name, or `custom:<filename>`.
-        name: String,
+        /// Preset name, or `custom:<filename>`. Omit to pick interactively.
+        name: Option<String>,
     },
 
     /// Copy a local custom keymap TOML file into `data_dir` (GH #354 Phase 4).
@@ -800,7 +803,10 @@ fn time_since_last_touched(meta: &std::fs::Metadata) -> Option<std::time::Durati
 }
 
 /// Resolve `[bbs] keymap` into an actual, already-[`validate`](bbs_plugin_api::Keymap::validate)d
-/// [`Keymap`](bbs_plugin_api::Keymap) for `BbsHost::with_config` (GH #354 Phase 3/4).
+/// [`Keymap`](bbs_plugin_api::Keymap) for `BbsHost::with_config` (GH #354 Phase 3/4), plus the
+/// identifier that actually ended up active — which may differ from `configured` on any
+/// fallback below, and is what `BbsHost` should report as active (via `admin_get_keymap`)
+/// rather than blindly echoing a config value that didn't actually take effect.
 ///
 /// - A built-in preset name (`"native"`, `"maximus"`, `"packet-bbs"`) resolves via
 ///   [`Keymap::by_name`](bbs_plugin_api::Keymap::by_name).
@@ -809,37 +815,72 @@ fn time_since_last_touched(meta: &std::fs::Metadata) -> Option<std::time::Durati
 ///
 /// An unrecognised name, or a custom file that fails to load/parse/validate,
 /// is a **startup warning**, not a fatal error: the BBS falls back to
-/// [`Keymap::native`](bbs_plugin_api::Keymap::native) rather than refusing
-/// to start over a keymap typo — a sysop's mistake here shouldn't take the
-/// whole board down for every user. The warning names the exact problem so
-/// the sysop can fix `config.toml` (or the custom file) and restart.
-fn resolve_startup_keymap(configured: &str, data_dir: &std::path::Path) -> bbs_plugin_api::Keymap {
+/// [`Keymap::native`](bbs_plugin_api::Keymap::native) (identifier `"native"`)
+/// rather than refusing to start over a keymap typo — a sysop's mistake here
+/// shouldn't take the whole board down for every user. The warning names the
+/// exact problem so the sysop can fix `config.toml` (or the custom file) and
+/// restart.
+fn resolve_startup_keymap(
+    configured: &str,
+    data_dir: &std::path::Path,
+) -> (bbs_plugin_api::Keymap, String) {
     use bbs_plugin_api::Keymap;
 
     if let Some(filename) = configured.strip_prefix("custom:") {
         return match bbs_core::keymap_file::load_custom_keymap(data_dir, filename) {
             Ok(km) => {
                 info!(name = %km.name, filename, "loaded custom keymap");
-                km
+                (km, configured.to_owned())
             }
             Err(e) => {
                 warn!("{e} — falling back to the native keymap");
-                Keymap::native()
+                (Keymap::native(), "native".to_owned())
             }
         };
     }
 
     match Keymap::by_name(configured) {
-        Some(km) => km,
+        Some(km) => (km, configured.to_owned()),
         None => {
             warn!(
                 configured,
                 builtin = ?Keymap::BUILTIN_NAMES,
                 "unrecognised [bbs] keymap value — falling back to the native keymap"
             );
-            Keymap::native()
+            (Keymap::native(), "native".to_owned())
         }
     }
+}
+
+/// Validate and copy a local keymap TOML file into `data_dir`, returning the
+/// parsed keymap and the filename it was saved under.
+///
+/// Shared by `config upload-keymap` and the interactive `config set-keymap`
+/// picker's "custom" option, so the two don't drift on filename derivation
+/// or validation. Delegates the actual validate-then-write step to
+/// `bbs_core::keymap_file::save_custom_keymap`.
+///
+/// # Errors
+///
+/// A specific, human-readable error — never a panic.
+fn upload_keymap_from_path(
+    data_dir: &std::path::Path,
+    path: &std::path::Path,
+    as_filename: Option<String>,
+) -> Result<(bbs_plugin_api::Keymap, String), String> {
+    let filename = as_filename.unwrap_or_else(|| {
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    });
+    bbs_core::keymap_file::is_safe_filename(&filename)
+        .map_err(|e| format!("{e} — pass an explicit filename with a plain name"))?;
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    std::fs::create_dir_all(data_dir)
+        .map_err(|e| format!("could not create data_dir {}: {e}", data_dir.display()))?;
+    let keymap = bbs_core::keymap_file::save_custom_keymap(data_dir, &filename, &text)?;
+    Ok((keymap, filename))
 }
 
 /// Delete the temporary copies the web admin's restore endpoints leave in
@@ -1293,7 +1334,7 @@ async fn cmd_run(cli: &Cli) {
         guest_room_name: cfg.bbs.guest_room.clone(),
     };
 
-    let keymap = resolve_startup_keymap(&cfg.bbs.keymap, data_dir);
+    let (keymap, active_keymap_name) = resolve_startup_keymap(&cfg.bbs.keymap, data_dir);
 
     let bbs = BbsHost::with_config(
         db,
@@ -1302,6 +1343,7 @@ async fn cmd_run(cli: &Cli) {
         access_policy,
         host_config_path,
         keymap,
+        active_keymap_name,
     );
 
     // bbs.name is the MeshCore advert node name. Store an advert-safe
@@ -1918,6 +1960,70 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
             }
         }
         ConfigAction::SetKeymap { name } => {
+            let name = match name {
+                Some(n) => n,
+                None => {
+                    use dialoguer::{theme::ColorfulTheme, Input, Select};
+                    let theme = ColorfulTheme::default();
+                    let mut items: Vec<String> = bbs_plugin_api::Keymap::BUILTIN_NAMES
+                        .iter()
+                        .map(|id| {
+                            let km = bbs_plugin_api::Keymap::by_name(id)
+                                .expect("BUILTIN_NAMES entry must resolve");
+                            format!("{id} — {}", km.description)
+                        })
+                        .collect();
+                    let custom_index = items.len();
+                    items.push("custom (upload a local TOML file now)".to_owned());
+                    let choice = Select::with_theme(&theme)
+                        .with_prompt("Which keymap should this board use?")
+                        .items(&items)
+                        .default(0)
+                        .interact()
+                        .unwrap_or_else(|e| {
+                            eprintln!("error: {e}");
+                            std::process::exit(1);
+                        });
+                    if choice == custom_index {
+                        let path_str: String = Input::with_theme(&theme)
+                            .with_prompt("Path to a custom keymap TOML file")
+                            .interact_text()
+                            .unwrap_or_else(|e| {
+                                eprintln!("error: {e}");
+                                std::process::exit(1);
+                            });
+                        let Some(data_dir) = cfg.bbs.data_dir.as_deref() else {
+                            eprintln!(
+                                "error: could not resolve data_dir to place the uploaded keymap \
+                                 file"
+                            );
+                            std::process::exit(1);
+                        };
+                        match upload_keymap_from_path(
+                            data_dir,
+                            std::path::Path::new(&path_str),
+                            None,
+                        ) {
+                            Ok((km, filename)) => {
+                                println!(
+                                    "Uploaded {:?} ({}, {} binding(s)).",
+                                    km.name,
+                                    km.description,
+                                    km.bindings.len()
+                                );
+                                format!("custom:{filename}")
+                            }
+                            Err(e) => {
+                                eprintln!("error: {e}");
+                                std::process::exit(1);
+                            }
+                        }
+                    } else {
+                        bbs_plugin_api::Keymap::BUILTIN_NAMES[choice].to_owned()
+                    }
+                }
+            };
+
             if let Some(filename) = name.strip_prefix("custom:") {
                 let Some(data_dir) = cfg.bbs.data_dir.as_deref() else {
                     eprintln!(
@@ -1957,65 +2063,22 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                 eprintln!("error: could not resolve data_dir to place the uploaded keymap file");
                 std::process::exit(1);
             };
-            let filename = as_filename.unwrap_or_else(|| {
-                path.file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            });
-            // Same check load_custom_keymap uses on this filename once
-            // it's in data_dir (bbs_core::keymap_file::is_safe_filename) —
-            // shared so the two can't independently drift on which
-            // filenames are considered safe (an earlier version of this
-            // command checked only `/`/`\`, not `.`/`..`).
-            if let Err(e) = bbs_core::keymap_file::is_safe_filename(&filename) {
-                eprintln!("error: {e} — pass --as-filename with a plain filename");
-                std::process::exit(1);
-            }
-
-            let text = match std::fs::read_to_string(&path) {
-                Ok(t) => t,
+            match upload_keymap_from_path(data_dir, &path, as_filename) {
+                Ok((keymap, filename)) => {
+                    println!(
+                        "Uploaded {:?} ({}, {} binding(s)) to {}.\n\
+                         Run 'supply-drop-bbs config set-keymap custom:{filename}' to activate it.",
+                        keymap.name,
+                        keymap.description,
+                        keymap.bindings.len(),
+                        data_dir.join(&filename).display()
+                    );
+                }
                 Err(e) => {
-                    eprintln!("error: could not read {}: {e}", path.display());
+                    eprintln!("error: {e}");
                     std::process::exit(1);
                 }
-            };
-            // Validate BEFORE copying anything into data_dir — a broken
-            // file must never land there. Shares parse_and_validate with
-            // load_custom_keymap's own validation of this exact file once
-            // it IS in data_dir, instead of a second, independently
-            // written check that could drift from it.
-            let keymap =
-                match bbs_core::keymap_file::parse_and_validate(&text, &path.display().to_string())
-                {
-                    Ok(k) => k,
-                    Err(e) => {
-                        eprintln!("error: {e}");
-                        std::process::exit(1);
-                    }
-                };
-
-            if let Err(e) = std::fs::create_dir_all(data_dir) {
-                eprintln!(
-                    "error: could not create data_dir {}: {e}",
-                    data_dir.display()
-                );
-                std::process::exit(1);
             }
-            let dest = data_dir.join(&filename);
-            if let Err(e) = std::fs::copy(&path, &dest) {
-                eprintln!("error: could not copy to {}: {e}", dest.display());
-                std::process::exit(1);
-            }
-            bbs_core::dir_perms::restrict_file_to_owner(data_dir, &dest);
-
-            println!(
-                "Uploaded {:?} ({}, {} binding(s)) to {}.\n\
-                 Run 'supply-drop-bbs config set-keymap custom:{filename}' to activate it.",
-                keymap.name,
-                keymap.description,
-                keymap.bindings.len(),
-                dest.display()
-            );
         }
         ConfigAction::Location {
             latitude,

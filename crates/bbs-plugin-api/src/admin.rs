@@ -263,6 +263,36 @@ pub struct AdminAccessPolicy {
     pub guest_room_id: Option<i64>,
 }
 
+/// One selectable built-in command-keymap preset, for a picker UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeymapPresetInfo {
+    /// The identifier used in `[bbs] keymap` / `config set-keymap` (one of
+    /// [`crate::Keymap::BUILTIN_NAMES`]).
+    pub id: String,
+    /// The preset's human-readable name (its `Keymap::name`).
+    pub name: String,
+    /// The preset's human-readable description (its `Keymap::description`).
+    pub description: String,
+}
+
+/// The BBS's currently active command keymap, plus every selectable preset.
+///
+/// Returned by [`crate::host::Host::admin_get_keymap`] and consumed by the
+/// web admin UI's keymap picker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminKeymapInfo {
+    /// The active keymap's config-file identifier: `"native"`, a
+    /// [`crate::Keymap::BUILTIN_NAMES`] entry, or `"custom:<filename>"`.
+    pub active: String,
+    /// The active keymap's human-readable name (its `Keymap::name`).
+    pub active_name: String,
+    /// The active keymap's human-readable description.
+    pub active_description: String,
+    /// Every built-in preset, for a picker UI. Does not include custom
+    /// keymaps — there's no registry of previously-uploaded ones to list.
+    pub presets: Vec<KeymapPresetInfo>,
+}
+
 /// Radio parameters applied to a MeshCore companion device.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeshRadioParams {

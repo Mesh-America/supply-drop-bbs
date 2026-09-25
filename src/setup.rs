@@ -30,6 +30,10 @@ use std::{
 struct Existing {
     bbs_name: String,
     data_dir: String,
+    // Command keymap (GH #354 follow-up) — the raw `[bbs] keymap` config
+    // value, e.g. "native", "maximus", or "custom:my-bbs.toml". `None` when
+    // not yet configured (fresh install).
+    keymap: Option<String>,
     // MeshCore
     mesh_enabled: bool,
     mesh_connection_type: String,
@@ -134,6 +138,11 @@ fn load_existing(out_path: &Path) -> Existing {
                     .unwrap_or_else(|| "/var/lib/supply-drop-bbs".to_owned())
             }
         });
+
+    let keymap = bbs
+        .and_then(|b| b.get("keymap"))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
 
     // MeshCore existing values
     let mesh_enabled = mesh
@@ -305,6 +314,7 @@ fn load_existing(out_path: &Path) -> Existing {
     Existing {
         bbs_name,
         data_dir,
+        keymap,
         mesh_enabled,
         mesh_connection_type,
         mesh_serial_port,
@@ -495,6 +505,24 @@ pub fn run_wizard(config_out: Option<&Path>) {
         })
         .interact_text()
         .unwrap_or_else(|_| cancelled());
+
+    // ── Command keymap ───────────────────────────────────────────────────────────
+    //
+    // GH #354 follow-up: presets are the primary, easiest-to-use way to
+    // remap Supply Drop's command letters to match a classic BBS system's
+    // conventions. Reconfigure-safe: a board that already has a custom
+    // keymap active keeps it by default rather than silently reverting to
+    // native on a routine re-run of setup.
+    section("Command keymap");
+
+    let keymap_menu = build_keymap_menu(ex.keymap.as_deref());
+    let keymap_choice = prompt_select(
+        &theme,
+        "Which keymap should this board use?",
+        &keymap_menu.items,
+        keymap_menu.default,
+    );
+    let keymap = resolve_keymap_choice(ex.keymap.as_deref(), &keymap_menu, keymap_choice);
 
     // ── Data storage ──────────────────────────────────────────────────────────
     section("Data storage");
@@ -1245,6 +1273,7 @@ pub fn run_wizard(config_out: Option<&Path>) {
     let toml = build_toml(&TomlParams {
         bbs_name: &bbs_name,
         data_dir: &data_dir,
+        keymap: &keymap,
         use_mesh,
         mesh_connection_type: mesh_conn_type,
         mesh_serial_port: mesh_serial_port.as_deref(),
@@ -2064,6 +2093,7 @@ fn build_companion_yaml(p: &HatParams) -> String {
 struct TomlParams<'a> {
     bbs_name: &'a str,
     data_dir: &'a Path,
+    keymap: &'a str,
     // MeshCore
     use_mesh: bool,
     mesh_connection_type: &'a str,
@@ -2117,6 +2147,7 @@ fn build_toml(p: &TomlParams<'_>) -> String {
     writeln!(s, "\n[bbs]").unwrap();
     writeln!(s, "name = {}", toml_str(p.bbs_name)).unwrap();
     writeln!(s, "data_dir = {}", toml_str(&p.data_dir.to_string_lossy())).unwrap();
+    writeln!(s, "keymap = {}", toml_str(p.keymap)).unwrap();
 
     // [location]
     if let (Some(lat), Some(lon)) = (p.latitude, p.longitude) {
@@ -2753,6 +2784,58 @@ fn cancelled() -> ! {
     std::process::exit(0);
 }
 
+/// The keymap picker's menu items and default selection, built from the
+/// existing config's `[bbs] keymap` value (GH #354 follow-up).
+struct KeymapMenu {
+    items: Vec<String>,
+    default: usize,
+    /// Index into `items` where the built-in presets start — indices before
+    /// this are the "keep current custom keymap" entry, if present.
+    builtin_start: usize,
+}
+
+/// Build the keymap picker's menu. Reconfigure-safe: a board with an active
+/// custom keymap (`existing` starts with `"custom:"`) gets a "keep current"
+/// entry defaulted to, so re-running setup never silently discards it.
+fn build_keymap_menu(existing: Option<&str>) -> KeymapMenu {
+    let existing_custom = existing.filter(|k| k.starts_with("custom:"));
+    let mut items = Vec::new();
+    if let Some(spec) = existing_custom {
+        items.push(format!("Keep current custom keymap ({spec})"));
+    }
+    let builtin_start = items.len();
+    items.extend(bbs_plugin_api::Keymap::BUILTIN_NAMES.iter().map(|id| {
+        let km = bbs_plugin_api::Keymap::by_name(id).expect("BUILTIN_NAMES entry must resolve");
+        format!("{id} — {}", km.description)
+    }));
+    let default = match existing_custom {
+        Some(_) => 0,
+        None => {
+            let configured = existing.unwrap_or("native");
+            bbs_plugin_api::Keymap::BUILTIN_NAMES
+                .iter()
+                .position(|id| *id == configured)
+                .unwrap_or(0)
+                + builtin_start
+        }
+    };
+    KeymapMenu {
+        items,
+        default,
+        builtin_start,
+    }
+}
+
+/// Resolve a chosen index from [`build_keymap_menu`] back into the
+/// `[bbs] keymap` value to write.
+fn resolve_keymap_choice(existing: Option<&str>, menu: &KeymapMenu, choice: usize) -> String {
+    let existing_custom = existing.filter(|k| k.starts_with("custom:"));
+    match existing_custom {
+        Some(spec) if choice == 0 => spec.to_owned(),
+        _ => bbs_plugin_api::Keymap::BUILTIN_NAMES[choice - menu.builtin_start].to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod build_toml_tests {
     use super::*;
@@ -2772,6 +2855,7 @@ mod build_toml_tests {
         TomlParams {
             bbs_name: "Test BBS",
             data_dir: Path::new("/var/lib/supply-drop-bbs"),
+            keymap: "native",
             use_mesh: true,
             mesh_connection_type,
             mesh_serial_port: None,
@@ -2852,6 +2936,26 @@ mod build_toml_tests {
         std::fs::write(&path, &toml).unwrap();
         let cfg = crate::config::load(Some(&path)).unwrap();
         assert_eq!(cfg.plugins.mesh.advert_scope.as_deref(), Some("usa"));
+    }
+
+    #[test]
+    fn keymap_is_written_explicitly_and_loads_back() {
+        let mut p = base_params("serial", None);
+        p.keymap = "maximus";
+        let toml = build_toml(&p);
+        assert!(toml.contains("keymap = \"maximus\""), "{toml}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, &toml).unwrap();
+        let cfg = crate::config::load(Some(&path)).unwrap();
+        assert_eq!(cfg.bbs.keymap, "maximus");
+    }
+
+    #[test]
+    fn keymap_is_written_even_when_native_the_default() {
+        let toml = build_toml(&base_params("serial", None));
+        assert!(toml.contains("keymap = \"native\""), "{toml}");
     }
 
     #[test]
@@ -3282,5 +3386,81 @@ mod serial_port_menu_tests {
         ];
         let aliases = [some(ALIAS_A), None, some(ALIAS_B)];
         assert_eq!(trusted_aliases(&ids, &aliases), [None, None, some(ALIAS_B)]);
+    }
+}
+
+#[cfg(test)]
+mod keymap_menu_tests {
+    use super::*;
+
+    #[test]
+    fn default_selects_native_when_nothing_is_configured() {
+        let menu = build_keymap_menu(None);
+        assert_eq!(menu.builtin_start, 0);
+        assert_eq!(
+            menu.items.len(),
+            bbs_plugin_api::Keymap::BUILTIN_NAMES.len()
+        );
+        let native_idx = bbs_plugin_api::Keymap::BUILTIN_NAMES
+            .iter()
+            .position(|id| *id == "native")
+            .unwrap();
+        assert_eq!(menu.default, native_idx);
+        assert_eq!(resolve_keymap_choice(None, &menu, menu.default), "native");
+    }
+
+    #[test]
+    fn default_selects_a_previously_configured_builtin_preset() {
+        let menu = build_keymap_menu(Some("maximus"));
+        assert_eq!(menu.builtin_start, 0);
+        let maximus_idx = bbs_plugin_api::Keymap::BUILTIN_NAMES
+            .iter()
+            .position(|id| *id == "maximus")
+            .unwrap();
+        assert_eq!(menu.default, maximus_idx);
+        assert_eq!(
+            resolve_keymap_choice(Some("maximus"), &menu, menu.default),
+            "maximus"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_configured_value_falls_back_to_the_first_item() {
+        // e.g. a keymap name that existed in an older release and was
+        // since removed — must not panic or pick an out-of-range index.
+        let menu = build_keymap_menu(Some("not-a-real-preset"));
+        assert_eq!(menu.default, 0);
+    }
+
+    // Reconfigure-safety: an existing custom keymap must not be silently
+    // discarded by re-running setup.
+    #[test]
+    fn an_existing_custom_keymap_is_offered_as_keep_current_and_defaulted_to() {
+        let menu = build_keymap_menu(Some("custom:my-bbs.toml"));
+        assert_eq!(menu.builtin_start, 1);
+        assert_eq!(menu.default, 0);
+        assert!(
+            menu.items[0].contains("custom:my-bbs.toml"),
+            "{:?}",
+            menu.items[0]
+        );
+        assert_eq!(
+            resolve_keymap_choice(Some("custom:my-bbs.toml"), &menu, 0),
+            "custom:my-bbs.toml"
+        );
+    }
+
+    #[test]
+    fn choosing_a_builtin_preset_over_an_existing_custom_keymap_switches_away_from_it() {
+        let menu = build_keymap_menu(Some("custom:my-bbs.toml"));
+        let synchronet_idx = menu.builtin_start
+            + bbs_plugin_api::Keymap::BUILTIN_NAMES
+                .iter()
+                .position(|id| *id == "synchronet")
+                .unwrap();
+        assert_eq!(
+            resolve_keymap_choice(Some("custom:my-bbs.toml"), &menu, synchronet_idx),
+            "synchronet"
+        );
     }
 }

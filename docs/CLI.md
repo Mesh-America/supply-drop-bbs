@@ -209,22 +209,28 @@ sudo supply-drop-bbs config guest-room off \
 ### `config set-keymap`
 
 ```
-supply-drop-bbs config set-keymap <name> [OPTIONS]
+supply-drop-bbs config set-keymap [<name>] [OPTIONS]
 ```
 
-Activate a command keymap (GH #354) — see [CONFIG.md's Command keymaps section](CONFIG.md#command-keymaps) for the full list of built-in presets and the custom keymap file format. Writes `keymap` in the `[bbs]` section. **Takes effect on the next BBS restart.**
+Activate a command keymap (GH #354) — see [CONFIG.md's Command keymaps section](CONFIG.md#command-keymaps) for the full list of built-in presets and the custom keymap file format. Writes `keymap` in the `[bbs]` section. **Takes effect on the next BBS restart** (the web admin UI's keymap picker is the only path that applies live — see CONFIG.md).
 
 `<name>` is checked before anything is written: a built-in preset name must be one of `bbs_plugin_api::Keymap::BUILTIN_NAMES`, and a `custom:<filename>` name is fully loaded and validated from `data_dir` right here — a typo or a broken custom file is caught immediately, not silently ignored until the next restart.
 
+Run with **no `<name>`** for an interactive picker (a menu of every built-in preset, plus a "custom" option that prompts for a local TOML file path and uploads + activates it in one step) — the same UX as the setup wizard's keymap step.
+
 | Argument | Meaning |
 |----------|---------|
-| `<name>` | A built-in preset (`native`, `maximus`, `packet-bbs`, `pcboard`, `wwiv-family`, `synchronet`), or `custom:<filename>` for a file already placed under `data_dir` (see `config upload-keymap`) |
+| `<name>` | A built-in preset (`native`, `maximus`, `packet-bbs`, `pcboard`, `wwiv-family`, `synchronet`), or `custom:<filename>` for a file already placed under `data_dir` (see `config upload-keymap`). Omit for an interactive picker. |
 
 ```sh
 sudo supply-drop-bbs config set-keymap maximus \
   --config /etc/supply-drop-bbs/config.toml
 
 sudo supply-drop-bbs config set-keymap custom:my-bbs.toml \
+  --config /etc/supply-drop-bbs/config.toml
+
+# Interactive picker:
+sudo supply-drop-bbs config set-keymap \
   --config /etc/supply-drop-bbs/config.toml
 
 # Revert to Supply Drop's own commands — always a clean, lossless revert.

@@ -53,10 +53,10 @@ pub mod transport;
 
 pub use admin::{
     AdminAccessPolicy, AdminAuditArchive, AdminAuditEntry, AdminBackupRecord, AdminDailyVolume,
-    AdminHourlyActivity, AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo,
-    AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo, AdminWeeklySignups,
-    DeliverySampleRecord, MeshRadioParams, MeshtasticDeviceSnapshot, MeshtasticLoRaConfig,
-    MeshtasticOwnerInfo, MeshtasticSecurityInfo,
+    AdminHourlyActivity, AdminKeymapInfo, AdminMessageRecord, AdminReports, AdminRoomSummary,
+    AdminSessionInfo, AdminStaleRoom, AdminStats, AdminTopRoom, AdminTopSender, AdminUserInfo,
+    AdminWeeklySignups, DeliverySampleRecord, KeymapPresetInfo, MeshRadioParams,
+    MeshtasticDeviceSnapshot, MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };
 pub use advert::{AdvertBus, AdvertRecord, FavouriteOutcome, FavouriteSnapshot};
 pub use command::{Command, Response, Secret};

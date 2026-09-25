@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
-import { api, ApiError } from '../api/client'
+import { api, request, ApiError } from '../api/client'
 
 interface ConfigData {
   config_file: string | null
@@ -32,6 +32,19 @@ interface AccessPolicyData {
   require_verify: boolean
   guest_room: string | null
   guest_room_id: number | null
+}
+
+interface KeymapPresetInfo {
+  id: string
+  name: string
+  description: string
+}
+
+interface KeymapData {
+  active: string
+  active_name: string
+  active_description: string
+  presets: KeymapPresetInfo[]
 }
 
 interface RoomSummary {
@@ -394,6 +407,84 @@ async function saveAccessPolicy() {
     accessPolicySaveError.value = e?.message ?? 'failed to save access policy'
   } finally {
     accessPolicySaving.value = false
+  }
+}
+
+// ── Command keymap (GH #354 preset-selection follow-up) ─────────────────────────
+
+const keymap = ref<KeymapData | null>(null)
+const keymapLoading = ref(false)
+const keymapError = ref<string | null>(null)
+
+// Working copy for the preset <select>, independent of `keymap.active`
+// until Save is clicked (same pattern as the access-policy working refs).
+const keymapChoice = ref('')
+
+const keymapSaving = ref(false)
+const keymapSaveOk = ref<string | null>(null)
+const keymapSaveError = ref<string | null>(null)
+
+const keymapUploadFile = ref<File | null>(null)
+const keymapFileInput = ref<HTMLInputElement | null>(null)
+const keymapUploading = ref(false)
+const keymapUploadOk = ref<string | null>(null)
+const keymapUploadError = ref<string | null>(null)
+
+async function loadKeymap() {
+  keymapLoading.value = true
+  keymapError.value = null
+  try {
+    const k = await api.get<KeymapData>('/api/v1/keymap')
+    keymap.value = k
+    keymapChoice.value = k.presets.some(p => p.id === k.active) ? k.active : ''
+  } catch (e: any) {
+    keymapError.value = e?.message ?? 'failed to load keymap'
+  } finally {
+    keymapLoading.value = false
+  }
+}
+
+async function saveKeymap() {
+  if (!keymapChoice.value) return
+  keymapSaving.value = true
+  keymapSaveOk.value = null
+  keymapSaveError.value = null
+  try {
+    const updated = await api.patch<KeymapData>('/api/v1/keymap', { preset: keymapChoice.value })
+    keymap.value = updated
+    keymapSaveOk.value = 'Keymap updated. Changes take effect immediately, no restart required.'
+  } catch (e: any) {
+    keymapSaveError.value = e?.message ?? 'failed to save keymap'
+  } finally {
+    keymapSaving.value = false
+  }
+}
+
+function pickKeymapFile(e: Event) {
+  const input = e.target as HTMLInputElement
+  keymapUploadFile.value = input.files?.[0] ?? null
+  keymapUploadError.value = null
+  keymapUploadOk.value = null
+}
+
+async function uploadKeymap() {
+  if (!keymapUploadFile.value) return
+  keymapUploading.value = true
+  keymapUploadOk.value = null
+  keymapUploadError.value = null
+  try {
+    const form = new FormData()
+    form.append('file', keymapUploadFile.value)
+    const updated = await request<KeymapData>('/api/v1/keymap/upload', { method: 'POST', body: form })
+    keymap.value = updated
+    keymapChoice.value = ''
+    keymapUploadOk.value = `${keymapUploadFile.value.name} uploaded and activated immediately.`
+    keymapUploadFile.value = null
+    if (keymapFileInput.value) keymapFileInput.value.value = ''
+  } catch (e: any) {
+    keymapUploadError.value = e?.message ?? 'upload failed: the keymap was not activated'
+  } finally {
+    keymapUploading.value = false
   }
 }
 
@@ -1013,6 +1104,7 @@ onMounted(() => {
   load()
   loadRooms()
   loadAccessPolicy()
+  loadKeymap()
   loadRadioConfig()
   loadNodeIdentity()
   loadMeshtasticSnapshot()
@@ -1292,6 +1384,69 @@ chmod g+w {{ configFile }}</pre>
             @click="saveAccessPolicy"
           >
             {{ accessPolicySaving ? 'saving…' : 'save access policy' }}
+          </button>
+        </div>
+      </section>
+
+      <!-- Command keymap -->
+      <section v-show="settingsTab === 'general'" class="card">
+        <h2>Command keymap</h2>
+        <p class="hint">
+          Remaps Supply Drop's command letters to match a classic BBS system's
+          conventions (or your own custom keymap). Sysop-only. Changes made
+          here take effect immediately, no restart required — unlike
+          <code>config set-keymap</code> from the CLI or the setup wizard,
+          which both require a restart.
+        </p>
+
+        <div v-if="keymapError" class="notice error-notice">{{ keymapError }}</div>
+        <div v-if="keymapSaveOk" class="notice ok-notice">{{ keymapSaveOk }}</div>
+        <div v-if="keymapSaveError" class="notice error-notice">{{ keymapSaveError }}</div>
+
+        <p v-if="keymap" class="hint">
+          Currently active: <strong>{{ keymap.active_name }}</strong>
+          ({{ keymap.active_description }})
+        </p>
+
+        <div class="field">
+          <label>Preset</label>
+          <select v-model="keymapChoice" :disabled="keymapLoading" style="max-width: 320px">
+            <option value="" disabled>(select a preset)</option>
+            <option v-for="p in keymap?.presets ?? []" :key="p.id" :value="p.id">{{ p.name }}</option>
+          </select>
+          <p v-if="keymapChoice && keymap" class="hint">
+            {{ keymap.presets.find(p => p.id === keymapChoice)?.description }}
+          </p>
+        </div>
+
+        <div class="actions">
+          <button
+            type="button"
+            :disabled="!keymapChoice || keymapSaving || keymapLoading"
+            @click="saveKeymap"
+          >
+            {{ keymapSaving ? 'saving…' : 'activate preset' }}
+          </button>
+        </div>
+
+        <p class="hint" style="margin-top: 1rem">
+          Or upload a custom keymap TOML file — see
+          <code>docs/CONFIG.md</code>'s "Command keymaps" section for the
+          file format. Validated before it's activated; a bad file is
+          rejected with a specific error and nothing changes.
+        </p>
+        <div v-if="keymapUploadOk" class="notice ok-notice">{{ keymapUploadOk }}</div>
+        <div v-if="keymapUploadError" class="notice error-notice">{{ keymapUploadError }}</div>
+        <div class="restore-controls">
+          <input
+            ref="keymapFileInput"
+            type="file"
+            accept=".toml"
+            :disabled="keymapUploading"
+            @change="pickKeymapFile"
+          />
+          <button @click="uploadKeymap" :disabled="!keymapUploadFile || keymapUploading">
+            {{ keymapUploading ? 'uploading…' : 'upload & activate' }}
           </button>
         </div>
       </section>

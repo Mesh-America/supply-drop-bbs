@@ -796,6 +796,11 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/access-policy",
             get(api_get_access_policy).patch(api_patch_access_policy),
         )
+        .route("/keymap", get(api_get_keymap).patch(api_patch_keymap))
+        .route(
+            "/keymap/upload",
+            post(api_upload_keymap).layer(DefaultBodyLimit::max(KEYMAP_UPLOAD_MAX_BYTES)),
+        )
         .route(
             "/radio-config",
             get(api_get_radio_config).patch(api_patch_radio_config),
@@ -3319,6 +3324,179 @@ async fn api_patch_access_policy(
             guest_room_id: p.guest_room_id,
         })
         .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+// ── Command keymap (GH #354 preset-selection follow-up) ────────────────────────
+
+/// A keymap TOML file is a few KB at most — nowhere near the 2 GiB a
+/// database restore upload needs, so this stays a small, generous ceiling
+/// rather than reusing `RESTORE_UPLOAD_MAX_BYTES`.
+const KEYMAP_UPLOAD_MAX_BYTES: usize = 256 * 1024;
+
+/// `GET /api/v1/keymap` — the active keymap plus every built-in preset, for
+/// the Settings page's picker.
+async fn api_get_keymap(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    match state.host.admin_get_keymap().await {
+        Ok(info) => Json(info).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+/// Patch body for `PATCH /api/v1/keymap`.
+#[derive(Debug, Deserialize)]
+struct KeymapPatch {
+    /// A [`bbs_plugin_api::Keymap::BUILTIN_NAMES`] identifier.
+    preset: String,
+}
+
+/// `PATCH /api/v1/keymap` — switch to a built-in preset. Applies live and
+/// persists to `config.toml` (see `Host::admin_set_keymap_preset`'s doc
+/// comment — this is the one part of keymap selection that genuinely
+/// differs in behavior from the CLI/setup-wizard forms, which both require
+/// a restart).
+async fn api_patch_keymap(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    Json(patch): Json<KeymapPatch>,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    if let Err(e) = state.host.admin_set_keymap_preset(&patch.preset).await {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json_error(&e.to_string())),
+        )
+            .into_response();
+    }
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", user.username),
+            "keymap_change",
+            Some(patch.preset.as_str()),
+            None,
+        )
+        .await;
+    match state.host.admin_get_keymap().await {
+        Ok(info) => Json(info).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json_error(&format!("{e}"))),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/v1/keymap/upload` — validate, save, and activate a custom
+/// keymap from an uploaded TOML file. Unlike `api_upload_restore`, this
+/// reads the whole (small) field into memory rather than streaming to a
+/// temp file — a keymap file is a few KB, not gigabytes.
+async fn api_upload_keymap(
+    State(state): State<Arc<AppState>>,
+    Extension(user): Extension<CurrentUser>,
+    mut multipart: Multipart,
+) -> Response {
+    if user.permission_level < 100 {
+        return (StatusCode::FORBIDDEN, Json(json_error("sysop required"))).into_response();
+    }
+    let Some(data_dir) = state.data_dir() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json_error("data_dir not configured")),
+        )
+            .into_response();
+    };
+
+    let field = match multipart.next_field().await {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("no file in upload")),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error(&format!("reading upload: {e}"))),
+            )
+                .into_response()
+        }
+    };
+    let filename = field
+        .file_name()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "custom.toml".to_owned());
+    let bytes = match field.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error(&format!("reading upload: {e}"))),
+            )
+                .into_response()
+        }
+    };
+    if bytes.len() > KEYMAP_UPLOAD_MAX_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json_error(
+                "keymap file is larger than expected for a TOML file",
+            )),
+        )
+            .into_response();
+    }
+    let toml_text = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error("upload is not valid UTF-8")),
+            )
+                .into_response()
+        }
+    };
+
+    if let Err(e) = state
+        .host
+        .admin_upload_keymap(&data_dir, &filename, toml_text)
+        .await
+    {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json_error(&e.to_string())),
+        )
+            .into_response();
+    }
+    let _ = state
+        .host
+        .admin_write_audit(
+            &format!("web:{}", user.username),
+            "keymap_upload",
+            Some(filename.as_str()),
+            None,
+        )
+        .await;
+    match state.host.admin_get_keymap().await {
+        Ok(info) => Json(info).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json_error(&format!("{e}"))),
@@ -7312,6 +7490,184 @@ mod tests {
         /// build time on a conflict, so building the router is the test.
         #[tokio::test]
         async fn router_builds_with_the_archive_routes() {
+            let f = fixture().await;
+            let _router = build_router(Arc::clone(&f.state));
+        }
+    }
+
+    // GH #354 preset-selection follow-up: web UI keymap picker. Uses a real
+    // BbsHost (like stage_backup_restore_tests) rather than MockHost, since
+    // these routes exercise the live RwLock swap + persist machinery, not
+    // just permission gating.
+    mod keymap_route_tests {
+        use super::*;
+
+        struct Fixture {
+            state: Arc<AppState>,
+            data_dir: tempfile::TempDir,
+            _live_db: tempfile::NamedTempFile,
+        }
+
+        async fn fixture() -> Fixture {
+            let live_db = tempfile::NamedTempFile::new().unwrap();
+            let db = bbs_core::Database::open(&live_db.path().to_string_lossy())
+                .await
+                .expect("open database");
+            let host: Arc<dyn Host> = Arc::new(bbs_core::BbsHost::new(db));
+            let state = Arc::new(AppState::new(host, WebConfig::default()));
+            let data_dir = tempfile::tempdir().unwrap();
+            *state.data_dir.lock().unwrap() = Some(data_dir.path().to_string_lossy().into());
+            Fixture {
+                state,
+                data_dir,
+                _live_db: live_db,
+            }
+        }
+
+        fn multipart_body(filename: &str, toml_text: &str) -> (String, Vec<u8>) {
+            let boundary = "----keymaptestboundary";
+            let mut body = Vec::new();
+            body.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+                     filename=\"{filename}\"\r\nContent-Type: application/toml\r\n\r\n"
+                )
+                .as_bytes(),
+            );
+            body.extend_from_slice(toml_text.as_bytes());
+            body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+            (format!("multipart/form-data; boundary={boundary}"), body)
+        }
+
+        async fn upload(
+            f: &Fixture,
+            caller: CurrentUser,
+            filename: &str,
+            toml_text: &str,
+        ) -> Response {
+            use axum::extract::FromRequest as _;
+            let (content_type, body) = multipart_body(filename, toml_text);
+            let req = Request::builder()
+                .method("POST")
+                .header(header::CONTENT_TYPE, content_type)
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let multipart = Multipart::from_request(req, &()).await.unwrap();
+            api_upload_keymap(State(Arc::clone(&f.state)), Extension(caller), multipart).await
+        }
+
+        #[tokio::test]
+        async fn get_keymap_requires_sysop() {
+            let f = fixture().await;
+            let resp = api_get_keymap(State(Arc::clone(&f.state)), Extension(regular_user())).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn get_keymap_lists_every_builtin_preset() {
+            let f = fixture().await;
+            let resp = api_get_keymap(State(Arc::clone(&f.state)), Extension(sysop())).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            assert_eq!(body["active"], "native");
+            assert_eq!(
+                body["presets"].as_array().map(Vec::len),
+                Some(bbs_plugin_api::Keymap::BUILTIN_NAMES.len())
+            );
+        }
+
+        #[tokio::test]
+        async fn patch_keymap_requires_sysop() {
+            let f = fixture().await;
+            let resp = api_patch_keymap(
+                State(Arc::clone(&f.state)),
+                Extension(regular_user()),
+                Json(KeymapPatch {
+                    preset: "maximus".to_owned(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn patch_keymap_switches_preset_live() {
+            let f = fixture().await;
+            let resp = api_patch_keymap(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Json(KeymapPatch {
+                    preset: "maximus".to_owned(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(f.state.host.active_keymap().await.name, "maximus");
+
+            let body = body_json(resp).await;
+            assert_eq!(body["active"], "maximus");
+        }
+
+        #[tokio::test]
+        async fn patch_keymap_rejects_an_unknown_preset() {
+            let f = fixture().await;
+            let resp = api_patch_keymap(
+                State(Arc::clone(&f.state)),
+                Extension(sysop()),
+                Json(KeymapPatch {
+                    preset: "not-a-real-preset".to_owned(),
+                }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(f.state.host.active_keymap().await.name, "native");
+        }
+
+        #[tokio::test]
+        async fn upload_keymap_requires_sysop() {
+            let f = fixture().await;
+            let resp = upload(
+                &f,
+                regular_user(),
+                "my-bbs.toml",
+                "name = \"my-bbs\"\ndescription = \"test\"\n",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn upload_keymap_activates_a_valid_custom_file() {
+            let f = fixture().await;
+            let resp = upload(
+                &f,
+                sysop(),
+                "my-bbs.toml",
+                "name = \"my-bbs\"\ndescription = \"test\"\n[bindings]\nl = \"ScanMessages\"\n",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(f.state.host.active_keymap().await.name, "my-bbs");
+
+            let body = body_json(resp).await;
+            assert_eq!(body["active"], "custom:my-bbs.toml");
+            assert!(f.data_dir.path().join("my-bbs.toml").exists());
+        }
+
+        #[tokio::test]
+        async fn a_rejected_upload_leaves_nothing_behind_and_keymap_untouched() {
+            let f = fixture().await;
+            let resp = upload(&f, sysop(), "bad.toml", "not valid toml {{{").await;
+            assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(f.state.host.active_keymap().await.name, "native");
+            assert!(!f.data_dir.path().join("bad.toml").exists());
+        }
+
+        /// The keymap routes sit beside `/access-policy`; axum panics at
+        /// router build time on a conflict, so building the router is the
+        /// test.
+        #[tokio::test]
+        async fn router_builds_with_the_keymap_routes() {
             let f = fixture().await;
             let _router = build_router(Arc::clone(&f.state));
         }

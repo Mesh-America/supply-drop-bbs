@@ -119,10 +119,10 @@ pub enum MeshtasticAdminRequest {
 }
 
 use crate::admin::{
-    AdminAccessPolicy, AdminAuditArchive, AdminAuditEntry, AdminBackupRecord, AdminMessageRecord,
-    AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo,
-    DeliverySampleRecord, MeshRadioParams, MeshtasticLoRaConfig, MeshtasticOwnerInfo,
-    MeshtasticSecurityInfo,
+    AdminAccessPolicy, AdminAuditArchive, AdminAuditEntry, AdminBackupRecord, AdminKeymapInfo,
+    AdminMessageRecord, AdminReports, AdminRoomSummary, AdminSessionInfo, AdminStats,
+    AdminUserInfo, DeliverySampleRecord, MeshRadioParams, MeshtasticLoRaConfig,
+    MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };
 use crate::advert::AdvertBus;
 use crate::command::{Command, Response};
@@ -673,6 +673,48 @@ pub trait Host: Send + Sync {
     async fn admin_set_guest_room(&self, name: Option<String>) -> Result<(), HostError> {
         let _ = name;
         Err(HostError::NotSupported("admin_set_guest_room".into()))
+    }
+
+    // ── Command keymap ───────────────────────────────────────────────────────────
+
+    /// Return the active keymap's identifier plus every built-in preset, for
+    /// a picker UI (GH #354 follow-up: setup wizard / CLI / web UI selection).
+    ///
+    /// Returns `HostError::NotSupported` in minimal implementations.
+    async fn admin_get_keymap(&self) -> Result<AdminKeymapInfo, HostError> {
+        Err(HostError::NotSupported("admin_get_keymap".into()))
+    }
+
+    /// Switch to a built-in preset by its [`crate::Keymap::BUILTIN_NAMES`]
+    /// identifier. `HostError::PreconditionFailed` for an unrecognised name.
+    ///
+    /// Takes effect immediately (the very next command parsed on any
+    /// transport, per [`Host::active_keymap`]'s doc comment) and is
+    /// persisted to `config.toml`.
+    async fn admin_set_keymap_preset(&self, name: &str) -> Result<(), HostError> {
+        let _ = name;
+        Err(HostError::NotSupported("admin_set_keymap_preset".into()))
+    }
+
+    /// Validate, save, and activate a custom keymap from raw TOML text.
+    ///
+    /// Takes raw text rather than a local path — the caller (e.g. a web
+    /// upload) may not have filesystem access to wherever the BBS process
+    /// runs. `filename` is the name it's saved under in `data_dir` (must be
+    /// a plain filename with no path separators — see
+    /// `bbs_core::keymap_file::is_safe_filename`). `data_dir` is passed
+    /// explicitly, matching `admin_stage_restore`'s convention, since the
+    /// host doesn't otherwise track its own data directory. On success this
+    /// is equivalent to `config set-keymap custom:<filename>` but applied
+    /// live and persisted, rather than requiring a restart.
+    async fn admin_upload_keymap(
+        &self,
+        data_dir: &str,
+        filename: &str,
+        toml_text: &str,
+    ) -> Result<(), HostError> {
+        let _ = (data_dir, filename, toml_text);
+        Err(HostError::NotSupported("admin_upload_keymap".into()))
     }
 
     // ── Node location ────────────────────────────────────────────────────────────

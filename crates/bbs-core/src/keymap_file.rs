@@ -11,13 +11,20 @@ use bbs_plugin_api::Keymap;
 use std::path::Path;
 
 /// Reject a filename that isn't a single, safe path component: empty,
-/// containing a path separator, or equal to `.`/`..`.
+/// containing a path separator, containing a control character, or equal
+/// to `.`/`..`.
 ///
 /// Shared by every entry point that turns a sysop-supplied string into a
 /// filename under `data_dir` — [`load_custom_keymap`] (from `[bbs] keymap
-/// = "custom:<filename>"`) and `src/main.rs`'s `config upload-keymap
-/// --as-filename` — so the two can't independently drift on which
-/// filenames are considered safe.
+/// = "custom:<filename>"`), `src/main.rs`'s `config upload-keymap
+/// --as-filename`, and the web admin API's upload route (from the
+/// multipart request's own `filename` field) — so none of them can
+/// independently drift on which filenames are considered safe. The control-
+/// character check matters specifically for the web upload path: a
+/// filename containing e.g. a newline would otherwise pass through
+/// untouched into `admin_write_audit`'s log entry and `config.toml`'s
+/// `keymap = "custom:<filename>"` value (TOML-escaped there, but not in a
+/// plain-text audit log viewer).
 ///
 /// # Errors
 ///
@@ -31,16 +38,22 @@ pub fn is_safe_filename(filename: &str) -> Result<(), String> {
             "filename {filename:?} must be a plain filename with no path separators"
         ));
     }
+    if filename.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "filename {filename:?} must not contain control characters"
+        ));
+    }
     Ok(())
 }
 
 /// Parse `text` as a [`Keymap`] and validate it.
 ///
 /// Shared by [`load_custom_keymap`] (reading a file already in `data_dir`)
-/// and `src/main.rs`'s `config upload-keymap` (reading an arbitrary local
-/// file, before it's copied into `data_dir`), so both entry points reject
-/// a bad custom keymap the exact same way instead of maintaining two
-/// independently-written parse+validate steps that could drift apart.
+/// and [`save_custom_keymap`] (validating a keymap before it's ever written
+/// to `data_dir`, from the CLI, the web admin API, or `admin_upload_keymap`),
+/// so every entry point rejects a bad custom keymap the exact same way
+/// instead of maintaining independently-written parse+validate steps that
+/// could drift apart.
 ///
 /// # Errors
 ///
@@ -102,6 +115,61 @@ pub fn load_custom_keymap(data_dir: &Path, filename: &str) -> Result<Keymap, Str
     Ok(keymap)
 }
 
+/// Validate `toml_text` and save it as a custom keymap file at
+/// `data_dir/filename`, in one shot.
+///
+/// Shared by the CLI's `config upload-keymap`, `Host::admin_upload_keymap`,
+/// and the web admin API's keymap-upload route — every caller that turns a
+/// sysop-supplied blob of TOML text into a keymap file on disk. Taking the
+/// text directly (rather than a source path to copy) is deliberate: the web
+/// upload path never has a local file to re-read a second time, and this
+/// shape closes a TOCTOU window an earlier, path-based version of the CLI's
+/// upload had (GH #416) — `toml_text` is validated once, and the exact same
+/// bytes that were validated are the only bytes ever written, with no
+/// separate "read again to copy" step that could observe a changed file.
+///
+/// `data_dir` is assumed to already exist; callers that can't assume that
+/// (the CLI, run standalone before any BBS has started) should
+/// `create_dir_all` it first.
+///
+/// # Errors
+///
+/// Returns a specific, human-readable error — never a panic — identifying
+/// which step failed (unsafe filename, malformed TOML, a validation rule, or
+/// an I/O failure writing the file). Nothing is written to `data_dir` unless
+/// `toml_text` fully validates first.
+pub fn save_custom_keymap(
+    data_dir: &Path,
+    filename: &str,
+    toml_text: &str,
+) -> Result<Keymap, String> {
+    is_safe_filename(filename).map_err(|e| format!("custom keymap {e}"))?;
+    let keymap = parse_and_validate(toml_text, &format!("custom keymap {filename:?}"))?;
+
+    let path = data_dir.join(filename);
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+        .map_err(|e| format!("could not write custom keymap file {}: {e}", path.display()))?;
+    std::io::Write::write_all(&mut file, toml_text.as_bytes())
+        .map_err(|e| format!("could not write custom keymap file {}: {e}", path.display()))?;
+    file.sync_all()
+        .map_err(|e| format!("could not write custom keymap file {}: {e}", path.display()))?;
+    drop(file);
+
+    // Same confidentiality tier as load_custom_keymap's own post-read step
+    // (load_custom_keymap only reads an existing file; this is the write
+    // counterpart, but the trust tier and the restrict-after-confirming-
+    // valid rationale are identical).
+    crate::dir_perms::restrict_file_to_owner(data_dir, &path);
+
+    Ok(keymap)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +188,21 @@ mod tests {
     #[test]
     fn is_safe_filename_accepts_a_plain_name() {
         assert!(is_safe_filename("my-bbs.toml").is_ok());
+    }
+
+    // Hostile-review finding, GH #354 preset-selection follow-up: a
+    // newline (or other control character) in a web-uploaded filename would
+    // otherwise reach config.toml and an audit-log entry verbatim.
+    #[test]
+    fn is_safe_filename_rejects_control_characters() {
+        for bad in [
+            "my\nbbs.toml",
+            "my\r\nbbs.toml",
+            "my\tbbs.toml",
+            "my\0bbs.toml",
+        ] {
+            assert!(is_safe_filename(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 
     #[test]
@@ -214,5 +297,76 @@ mod tests {
     fn an_empty_filename_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_custom_keymap(dir.path(), "").is_err());
+    }
+
+    #[test]
+    fn save_custom_keymap_writes_and_returns_a_valid_keymap() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = r#"
+            name = "my-bbs"
+            description = "test"
+
+            [bindings]
+            l = "ScanMessages"
+            a = "ChangeRoom"
+        "#;
+        let km = save_custom_keymap(dir.path(), "my-bbs.toml", text).unwrap();
+        assert_eq!(km.name, "my-bbs");
+        assert_eq!(km.validate(), Ok(()));
+
+        // What's on disk is exactly what was validated, and loads back the
+        // same way load_custom_keymap would read any other custom file.
+        let reloaded = load_custom_keymap(dir.path(), "my-bbs.toml").unwrap();
+        assert_eq!(reloaded.name, "my-bbs");
+        assert_eq!(reloaded.bindings, km.bindings);
+    }
+
+    #[test]
+    fn save_custom_keymap_rejects_invalid_toml_without_writing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = save_custom_keymap(dir.path(), "bad.toml", "not valid toml {{{").unwrap_err();
+        assert!(err.contains("bad.toml"), "{err}");
+        assert!(!dir.path().join("bad.toml").exists());
+    }
+
+    #[test]
+    fn save_custom_keymap_rejects_a_keymap_that_fails_validate_without_writing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        // Steals native "g" (GoNextUnread) for Quit without relocating
+        // GoNextUnread — Rule 2 violation, same as the load_custom_keymap
+        // test above.
+        let text = "name = \"broken\"\ndescription = \"test\"\n[bindings]\ng = \"Quit\"\n";
+        let err = save_custom_keymap(dir.path(), "broken.toml", text).unwrap_err();
+        assert!(err.contains("failed validation"), "{err}");
+        assert!(!dir.path().join("broken.toml").exists());
+    }
+
+    #[test]
+    fn save_custom_keymap_rejects_an_unsafe_filename_without_writing_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = save_custom_keymap(
+            dir.path(),
+            "../escape.toml",
+            "name = \"x\"\ndescription = \"x\"\n",
+        )
+        .unwrap_err();
+        assert!(err.contains("path separators"), "{err}");
+        assert!(!dir.path().join("escape.toml").exists());
+        assert!(!dir.path().parent().unwrap().join("escape.toml").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_custom_keymap_restricts_the_file_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let text = "name = \"my-bbs\"\ndescription = \"test\"\n[bindings]\nl = \"ScanMessages\"\n";
+        save_custom_keymap(dir.path(), "my-bbs.toml", text).unwrap();
+        let mode = std::fs::metadata(dir.path().join("my-bbs.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

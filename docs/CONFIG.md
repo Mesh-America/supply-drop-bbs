@@ -165,25 +165,42 @@ can't target a command outside that closed set (admin/auth commands, the
 CANCEL/STOP words, and Supply Drop's own Help alias are all reserved) —
 attempting to shadow one of those is rejected too.
 
-Activate one via the CLI (checks and, for a custom file, fully loads and
-validates the keymap before writing anything — a typo or a broken file is
-caught immediately, not silently ignored at the next restart):
+A keymap can be selected three ways:
 
-```sh
-# A built-in preset:
-supply-drop-bbs config set-keymap maximus
+- **The setup wizard** (`supply-drop-bbs setup`) — a "Command keymap" step
+  offers every built-in preset. Re-running setup on a board that already has
+  a custom keymap active offers "keep current" as the default, so a routine
+  reconfigure never silently discards it.
+- **The CLI** (checks and, for a custom file, fully loads and validates the
+  keymap before writing anything — a typo or a broken file is caught
+  immediately, not silently ignored at the next restart):
 
-# A custom keymap — upload the file into data_dir, then activate it:
-supply-drop-bbs config upload-keymap ./my-bbs.toml
-supply-drop-bbs config set-keymap custom:my-bbs.toml
+  ```sh
+  # A built-in preset:
+  supply-drop-bbs config set-keymap maximus
 
-# Revert to Supply Drop's own commands:
-supply-drop-bbs config set-keymap native
-```
+  # Or run with no name for an interactive picker:
+  supply-drop-bbs config set-keymap
 
-Restart the BBS for the change to take effect. `config set-keymap native`
-is always a clean, lossless revert — the native keymap has no overrides at
-all, so nothing about it can drift or leave leftover state behind.
+  # A custom keymap — upload the file into data_dir, then activate it:
+  supply-drop-bbs config upload-keymap ./my-bbs.toml
+  supply-drop-bbs config set-keymap custom:my-bbs.toml
+
+  # Revert to Supply Drop's own commands:
+  supply-drop-bbs config set-keymap native
+  ```
+
+- **The web admin UI** — Settings → General → "Command keymap" offers the
+  same built-in presets, plus a file upload for a custom keymap. Sysop-only.
+
+**The setup wizard and CLI both require a restart** for the change to take
+effect — they only edit `config.toml`, for a process that isn't necessarily
+running. **The web UI applies immediately, no restart required** — it's the
+only path that also updates the live, already-running BBS.
+
+`config set-keymap native` (or picking `native` anywhere) is always a clean,
+lossless revert — the native keymap has no overrides at all, so nothing
+about it can drift or leave leftover state behind.
 
 ### Access control and SHTF mode
 

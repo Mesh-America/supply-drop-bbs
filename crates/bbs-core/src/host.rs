@@ -28,10 +28,10 @@ use async_trait::async_trait;
 use bbs_plugin_api::advert::AdvertBus;
 use bbs_plugin_api::host::Host;
 use bbs_plugin_api::{
-    AdminAccessPolicy, AdminAuditArchive, AdminBackupRecord, AdminMessageRecord, AdminRoomSummary,
-    AdminSessionInfo, AdminStats, AdminUserInfo, Command, DomainEvent, HostError, Keymap,
-    KeymapAction, MessageRecipient, PermissionCtx, PermissionLevel, Response, Secret, SessionId,
-    Username,
+    AdminAccessPolicy, AdminAuditArchive, AdminBackupRecord, AdminKeymapInfo, AdminMessageRecord,
+    AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, Command, DomainEvent, HostError,
+    Keymap, KeymapAction, KeymapPresetInfo, MessageRecipient, PermissionCtx, PermissionLevel,
+    Response, Secret, SessionId, Username,
 };
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -381,17 +381,22 @@ pub struct BbsHost {
     /// Access policy — controls verification and guest-room behaviour.
     /// Wrapped in a `RwLock` so in-BBS sysop commands can update it live.
     access_policy: RwLock<AccessPolicy>,
-    /// Active command keymap (GH #354). `RwLock` follows the
-    /// `access_policy` precedent so a future live-switch surface can reuse
-    /// the same mechanism (an in-memory swap under `.write()`, then a
-    /// `config_lock`-guarded persist like `persist_access_policy`'s), but
-    /// nothing currently writes to it: it's set once at construction time
-    /// (via [`Self::with_config`], from `[bbs] keymap`) and only ever read
-    /// — [`Self::active_keymap`](bbs_plugin_api::Host::active_keymap) and
-    /// `handle_workflow_reply`'s `Workflow::Reading` arm. A sysop changes
-    /// keymaps today via `config set-keymap` + a restart, not a live write
-    /// to this field (see `docs/CONFIG.md`'s "Command keymaps" section).
+    /// Active command keymap (GH #354). Live-switchable: `admin_set_keymap_preset`
+    /// / `admin_upload_keymap` swap this under `.write()` and persist the
+    /// change via `persist_keymap`, following the `access_policy` precedent
+    /// (an in-memory swap, then a `config_lock`-guarded persist like
+    /// `persist_access_policy`'s). Read by
+    /// [`Self::active_keymap`](bbs_plugin_api::Host::active_keymap) and
+    /// `handle_workflow_reply`'s `Workflow::Reading` arm.
     keymap: RwLock<Keymap>,
+    /// The active keymap's config-file identifier — `"native"`, a
+    /// [`Keymap::BUILTIN_NAMES`] entry, or `"custom:<filename>"` — kept
+    /// alongside `keymap` so `admin_get_keymap` can report *which* preset is
+    /// active without fragile inference from `keymap`'s bindings (a custom
+    /// keymap could coincidentally match a preset's bindings), and so
+    /// `persist_keymap` knows what string to write back to `config.toml`.
+    /// Always updated in the same write as `keymap`.
+    active_keymap_name: RwLock<String>,
     /// Resolved guest room ID — populated by [`Self::ensure_guest_room`].
     /// `None` when the guest room feature is disabled or not yet initialised.
     guest_room_id: std::sync::RwLock<Option<RoomId>>,
@@ -429,6 +434,7 @@ impl BbsHost {
             AccessPolicy::default(),
             None,
             Keymap::native(),
+            "native".to_owned(),
         )
     }
 
@@ -456,6 +462,7 @@ impl BbsHost {
         policy: AccessPolicy,
         config_path: Option<PathBuf>,
         keymap: Keymap,
+        active_keymap_name: String,
     ) -> Self {
         debug_assert!(
             keymap.validate().is_ok(),
@@ -477,6 +484,7 @@ impl BbsHost {
             node_name: std::sync::RwLock::new(None),
             access_policy: RwLock::new(policy),
             keymap: RwLock::new(keymap),
+            active_keymap_name: RwLock::new(active_keymap_name),
             guest_room_id: std::sync::RwLock::new(None),
             config_path,
             node_pubkey: std::sync::RwLock::new(None),
@@ -2280,6 +2288,77 @@ impl Host for BbsHost {
             *self.guest_room_id.write().expect("guest_room_id poisoned") = None;
         }
         self.persist_access_policy().await;
+        Ok(())
+    }
+
+    async fn admin_get_keymap(&self) -> Result<AdminKeymapInfo, HostError> {
+        // Both guards are held simultaneously, acquired in the same order
+        // (keymap, then active_keymap_name) that admin_set_keymap_preset and
+        // admin_upload_keymap use to write both fields together — this is
+        // what makes the pair race-free. A version that dropped each read
+        // guard before acquiring the next could observe `active` from
+        // before a concurrent preset switch and `keymap` from after it (or
+        // vice versa), returning a torn, self-contradictory result.
+        let (keymap, active) = {
+            let keymap_guard = self.keymap.read().await;
+            let active_guard = self.active_keymap_name.read().await;
+            (keymap_guard.clone(), active_guard.clone())
+        };
+        let presets = Keymap::BUILTIN_NAMES
+            .iter()
+            .map(|id| {
+                let preset = Keymap::by_name(id).expect("BUILTIN_NAMES entry must resolve");
+                KeymapPresetInfo {
+                    id: (*id).to_owned(),
+                    name: preset.name,
+                    description: preset.description,
+                }
+            })
+            .collect();
+        Ok(AdminKeymapInfo {
+            active,
+            active_name: keymap.name,
+            active_description: keymap.description,
+            presets,
+        })
+    }
+
+    async fn admin_set_keymap_preset(&self, name: &str) -> Result<(), HostError> {
+        let Some(preset) = Keymap::by_name(name) else {
+            return Err(HostError::PreconditionFailed(format!(
+                "{name:?} is not a built-in keymap preset"
+            )));
+        };
+        {
+            let mut keymap = self.keymap.write().await;
+            let mut active_name = self.active_keymap_name.write().await;
+            *keymap = preset;
+            *active_name = name.to_owned();
+        }
+        self.persist_keymap(name).await;
+        Ok(())
+    }
+
+    async fn admin_upload_keymap(
+        &self,
+        data_dir: &str,
+        filename: &str,
+        toml_text: &str,
+    ) -> Result<(), HostError> {
+        let keymap = crate::keymap_file::save_custom_keymap(
+            std::path::Path::new(data_dir),
+            filename,
+            toml_text,
+        )
+        .map_err(HostError::PreconditionFailed)?;
+        let spec = format!("custom:{filename}");
+        {
+            let mut active_keymap = self.keymap.write().await;
+            let mut active_name = self.active_keymap_name.write().await;
+            *active_keymap = keymap;
+            *active_name = spec.clone();
+        }
+        self.persist_keymap(&spec).await;
         Ok(())
     }
 
@@ -4856,6 +4935,47 @@ impl BbsHost {
             );
         } else {
             info!(path = %path.display(), "access policy persisted to config");
+        }
+    }
+
+    /// Persist the active keymap identifier to `config.toml`.
+    ///
+    /// `spec` is the exact string to write as `[bbs] keymap` — a
+    /// [`Keymap::BUILTIN_NAMES`] entry or `"custom:<filename>"`. Modeled
+    /// byte-for-byte on `persist_access_policy`: failures are logged as
+    /// warnings but not propagated — the in-memory state is already updated
+    /// and the sysop can restart to re-read the file.
+    async fn persist_keymap(&self, spec: &str) {
+        let Some(path) = self.config_path.clone() else {
+            warn!("no config_path set — keymap change will not survive restart");
+            return;
+        };
+
+        let spec = spec.to_owned();
+        let path_for_closure = path.clone();
+        let result = crate::config_lock::with_config_lock(&path, move || {
+            let content = std::fs::read_to_string(&path_for_closure)?;
+            let mut doc = content
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(std::io::Error::other)?;
+
+            if doc.get("bbs").is_none() {
+                doc["bbs"] = toml_edit::Item::Table(toml_edit::Table::new());
+            }
+
+            doc["bbs"]["keymap"] = toml_edit::value(spec);
+
+            crate::config_lock::atomic_write_file(&path_for_closure, doc.to_string().as_bytes())
+        })
+        .await;
+
+        if let Err(e) = result {
+            warn!(
+                "persist_keymap: could not read/parse/write {}: {e}",
+                path.display()
+            );
+        } else {
+            info!(path = %path.display(), "keymap persisted to config");
         }
     }
 }
@@ -9397,7 +9517,15 @@ mod tests {
         let db = Database::open(&f.path().to_string_lossy())
             .await
             .expect("db open");
-        let host = BbsHost::with_config(db, None, true, policy, None, Keymap::native());
+        let host = BbsHost::with_config(
+            db,
+            None,
+            true,
+            policy,
+            None,
+            Keymap::native(),
+            "native".to_owned(),
+        );
         host.ensure_guest_room().await.expect("ensure_guest_room");
         (Arc::new(host), f)
     }
@@ -9424,7 +9552,130 @@ mod tests {
         let db = Database::open(&f.path().to_string_lossy())
             .await
             .expect("db open");
-        let _ = BbsHost::with_config(db, None, true, AccessPolicy::default(), None, broken);
+        let _ = BbsHost::with_config(
+            db,
+            None,
+            true,
+            AccessPolicy::default(),
+            None,
+            broken,
+            "broken".to_owned(),
+        );
+    }
+
+    // ── Keymap admin tests (GH #354 preset-selection follow-up) ────────────────
+
+    /// A host with a real, writable `config.toml` so `persist_keymap` has
+    /// somewhere to actually write — `make_host_with_policy`'s `config_path:
+    /// None` means every persist call is a silent no-op, which can't
+    /// exercise the disk-write path these tests are for.
+    async fn make_host_for_keymap_tests() -> (Arc<BbsHost>, NamedTempFile, NamedTempFile) {
+        let db_file = NamedTempFile::new().unwrap();
+        let db = Database::open(&db_file.path().to_string_lossy())
+            .await
+            .expect("db open");
+        let config_file = NamedTempFile::new().unwrap();
+        std::fs::write(config_file.path(), "[bbs]\nname = \"test\"\n").unwrap();
+        let host = BbsHost::with_config(
+            db,
+            None,
+            true,
+            AccessPolicy::default(),
+            Some(config_file.path().to_path_buf()),
+            Keymap::native(),
+            "native".to_owned(),
+        );
+        (Arc::new(host), db_file, config_file)
+    }
+
+    #[tokio::test]
+    async fn admin_get_keymap_lists_every_builtin_preset() {
+        let (host, _db, _cfg) = make_host_for_keymap_tests().await;
+        let info = host.admin_get_keymap().await.unwrap();
+        assert_eq!(info.active, "native");
+        assert_eq!(info.active_name, Keymap::native().name);
+        assert_eq!(info.presets.len(), Keymap::BUILTIN_NAMES.len());
+        assert!(info.presets.iter().any(|p| p.id == "maximus"));
+    }
+
+    #[tokio::test]
+    async fn admin_set_keymap_preset_applies_live_and_persists() {
+        let (host, _db, cfg) = make_host_for_keymap_tests().await;
+        host.admin_set_keymap_preset("maximus").await.unwrap();
+
+        // Live: the very next active_keymap() read reflects it, no restart.
+        let active = host.active_keymap().await;
+        assert_eq!(active.name, Keymap::maximus().name);
+
+        let info = host.admin_get_keymap().await.unwrap();
+        assert_eq!(info.active, "maximus");
+
+        // Persisted: config.toml on disk actually changed.
+        let on_disk = std::fs::read_to_string(cfg.path()).unwrap();
+        assert!(on_disk.contains("keymap = \"maximus\""), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn admin_set_keymap_preset_rejects_an_unknown_name() {
+        let (host, _db, cfg) = make_host_for_keymap_tests().await;
+        let err = host.admin_set_keymap_preset("not-a-real-preset").await;
+        assert!(
+            matches!(err, Err(HostError::PreconditionFailed(_))),
+            "{err:?}"
+        );
+
+        // Untouched: still native, config.toml unchanged.
+        assert_eq!(host.active_keymap().await.name, Keymap::native().name);
+        let on_disk = std::fs::read_to_string(cfg.path()).unwrap();
+        assert!(!on_disk.contains("keymap"), "{on_disk}");
+    }
+
+    #[tokio::test]
+    async fn admin_upload_keymap_applies_live_persists_and_restricts_the_file() {
+        let (host, _db, cfg) = make_host_for_keymap_tests().await;
+        let data_dir = tempfile::tempdir().unwrap();
+        let text = "name = \"my-bbs\"\ndescription = \"test\"\n[bindings]\nl = \"ScanMessages\"\n";
+
+        host.admin_upload_keymap(&data_dir.path().to_string_lossy(), "my-bbs.toml", text)
+            .await
+            .unwrap();
+
+        let active = host.active_keymap().await;
+        assert_eq!(active.name, "my-bbs");
+
+        let info = host.admin_get_keymap().await.unwrap();
+        assert_eq!(info.active, "custom:my-bbs.toml");
+
+        let on_disk = std::fs::read_to_string(cfg.path()).unwrap();
+        assert!(
+            on_disk.contains("keymap = \"custom:my-bbs.toml\""),
+            "{on_disk}"
+        );
+
+        assert!(data_dir.path().join("my-bbs.toml").exists());
+    }
+
+    #[tokio::test]
+    async fn admin_upload_keymap_rejects_invalid_toml_without_touching_anything() {
+        let (host, _db, cfg) = make_host_for_keymap_tests().await;
+        let data_dir = tempfile::tempdir().unwrap();
+
+        let err = host
+            .admin_upload_keymap(
+                &data_dir.path().to_string_lossy(),
+                "bad.toml",
+                "not valid {{{",
+            )
+            .await;
+        assert!(
+            matches!(err, Err(HostError::PreconditionFailed(_))),
+            "{err:?}"
+        );
+
+        assert_eq!(host.active_keymap().await.name, Keymap::native().name);
+        let on_disk = std::fs::read_to_string(cfg.path()).unwrap();
+        assert!(!on_disk.contains("keymap"), "{on_disk}");
+        assert!(!data_dir.path().join("bad.toml").exists());
     }
 
     /// require_verify = false: unvalidated user gets full access right after registration.
