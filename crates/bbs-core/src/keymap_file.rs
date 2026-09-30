@@ -182,7 +182,7 @@ mod tests {
     fn valid_toml(name: &str) -> String {
         let km = Keymap {
             name: name.to_owned(),
-            ..Keymap::maximus()
+            ..Keymap::maximus_legacy()
         };
         toml::to_string(&km).unwrap()
     }

@@ -7583,7 +7583,7 @@ mod tests {
                 State(Arc::clone(&f.state)),
                 Extension(regular_user()),
                 Json(KeymapPatch {
-                    preset: "maximus".to_owned(),
+                    preset: "maximus-legacy".to_owned(),
                 }),
             )
             .await;
@@ -7597,15 +7597,15 @@ mod tests {
                 State(Arc::clone(&f.state)),
                 Extension(sysop()),
                 Json(KeymapPatch {
-                    preset: "maximus".to_owned(),
+                    preset: "maximus-legacy".to_owned(),
                 }),
             )
             .await;
             assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(f.state.host.active_keymap().await.name, "maximus");
+            assert_eq!(f.state.host.active_keymap().await.name, "maximus-legacy");
 
             let body = body_json(resp).await;
-            assert_eq!(body["active"], "maximus");
+            assert_eq!(body["active"], "maximus-legacy");
         }
 
         #[tokio::test]
@@ -7641,7 +7641,7 @@ mod tests {
             let f = fixture().await;
             let text = toml::to_string(&bbs_plugin_api::Keymap {
                 name: "my-bbs".to_owned(),
-                ..bbs_plugin_api::Keymap::maximus()
+                ..bbs_plugin_api::Keymap::maximus_legacy()
             })
             .unwrap();
             let resp = upload(&f, sysop(), "my-bbs.toml", &text).await;

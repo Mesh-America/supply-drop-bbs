@@ -318,3 +318,40 @@ requester's layout is kept as the worked example
 `contrib/keymaps/issue-354-layout.toml`, and the `maximus` preset says in its
 description that it is Scott Dudley's Maximus and not MAX's BBS.
 
+### Legacy Maximus and MaximusNG are separate presets (2026-09-30)
+
+- **Legacy Maximus** (`github.com/sdudley/maximus`, `ctl/menus.ctl`) and the legacy
+  menu file in MaximusNG
+  (`MaximusNG-BBS/maximus`, `resources/config/legacy/menus.ctl`) define the same
+  options; only file paths and the case of menu names differ, and the MEX sample
+  menu has one changed line. Preset: `maximus-legacy`.
+- **MaximusNG 4.0** replaced `menus.ctl` with TOML menus
+  (`resources/config/menus/message.toml` and `main.toml`; `message.maxng.toml` is an
+  optional theme with the same options). They differ from legacy. Preset:
+  `maximus-ng`. The hotkey rule is unchanged (first letter of `description`;
+  `key_poke` is type-ahead, not a hotkey), but every matching option runs in file
+  order, so `M` on the message menu runs "Mail a User" and then "Main menu".
+
+| Action | Legacy Maximus | MaximusNG 4.0 |
+|---|---|---|
+| Quit | G | G (message menu), L (main menu "Log Off") |
+| Change room | A, `[` `]` | A, `[` `]` |
+| Read new | N (next message) | R then N (the reader's prompt; type-ahead not verified) |
+| Read forward | digits (read by number) | R then F (asks for a message number) |
+| Read reverse | P | none |
+| Scan | L (List brief) | L (List Messages, then a pause) |
+| Enter | E | W (Write a Message) |
+| Delete | K (prompts for a number) | none on the menu; D or K inside the reader |
+| Go to Mail | none | C (Check Email); M is "Mail a User" |
+| Who is online | W (main menu) | W (main menu; W is Write on the message menu) |
+| Reading: next / previous | N / P | N / P (or the arrow keys) inside the reader |
+| Reading: reply | R | R inside the reader (E edits) |
+| Reading: delete | K | D or K inside the reader, with a yes/no confirm |
+| Reading: help | ? | ? |
+
+Legacy keys removed from the NG message menu: `N`, `P`, `E`, `R` (reply), `K`, `C`
+(change current), the digits, `=`, `-`, `+`, `*`, and the sysop options. Added: `W`,
+`R` (read), `S` (search), `C` (check e-mail), `M` (mail a user). Not verified for
+NG: what `Msg_Area`, `Msg_List`, `Email_Compose` and `Msg_NG_Find` prompt for, the
+reader's help screen, and the classic browse reader's per-message keys.
+

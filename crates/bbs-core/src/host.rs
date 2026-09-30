@@ -7083,10 +7083,18 @@ fn help_for_action(action: KeymapAction, logged_in: bool, keymap: &Keymap) -> Op
             "{} <id> — delete a message\nAides and sysops can delete any message.",
             k(A::DeleteMessage)
         ),
-        A::GoNextUnread => format!(
-            "{} — read unread here, else go to the next room with unread",
-            k(A::GoNextUnread)
-        ),
+        A::GoNextUnread => match keymap.label(A::GoNextUnread) {
+            // A keymap whose source system means something slightly different
+            // by this key says so, then what it does here.
+            Some(label) => format!(
+                "{} — {label}: goes to the next room with unread messages",
+                k(A::GoNextUnread)
+            ),
+            None => format!(
+                "{} — read unread here, else go to the next room with unread",
+                k(A::GoNextUnread)
+            ),
+        },
         A::ChangeRoom => format!("{} <name> — change room by name or number", k(A::ChangeRoom)),
         A::ListRooms => format!("{} — list known rooms", k(A::ListRooms)),
         A::GoMail => format!(
@@ -7238,6 +7246,7 @@ fn quick_help_logged_in(keymap: &Keymap) -> String {
         .iter()
         .map(|(action, label)| {
             let key = keymap.primary(*action).to_uppercase();
+            let label = keymap.label(*action).unwrap_or(label);
             format!("{key}  {label}")
         })
         .collect();
@@ -7566,12 +7575,14 @@ mod tests {
     /// the whole point of generating it from the active keymap instead of a
     /// hardcoded native-only constant.
     #[test]
-    fn quick_help_for_maximus_shows_the_remapped_keys() {
-        let text = quick_help_logged_in(&Keymap::maximus());
+    fn quick_help_for_maximus_legacy_shows_the_remapped_keys() {
+        let text = quick_help_logged_in(&Keymap::maximus_legacy());
         // Quit moved from native Q to Maximus's G; GoNextUnread was
         // displaced from G to Maximus's ].
         assert!(text.contains("G  log out"), "{text}");
-        assert!(text.contains("]  next unread"), "{text}");
+        // Maximus's ] is "next area", so the quick help says so.
+        assert!(text.contains("]  next area"), "{text}");
+        assert!(!text.contains("next unread"), "{text}");
         assert!(text.contains("A  change room"), "{text}");
         // Maximus has no list-rooms key, so that action uses the word ROOMS.
         assert!(text.contains("N  new messages"), "{text}");
@@ -9827,24 +9838,26 @@ mod tests {
         assert_eq!(info.active, "native");
         assert_eq!(info.active_name, Keymap::native().name);
         assert_eq!(info.presets.len(), Keymap::BUILTIN_NAMES.len());
-        assert!(info.presets.iter().any(|p| p.id == "maximus"));
+        assert!(info.presets.iter().any(|p| p.id == "maximus-legacy"));
     }
 
     #[tokio::test]
     async fn admin_set_keymap_preset_applies_live_and_persists() {
         let (host, _db, cfg) = make_host_for_keymap_tests().await;
-        host.admin_set_keymap_preset("maximus").await.unwrap();
+        host.admin_set_keymap_preset("maximus-legacy")
+            .await
+            .unwrap();
 
         // Live: the very next active_keymap() read reflects it, no restart.
         let active = host.active_keymap().await;
-        assert_eq!(active.name, Keymap::maximus().name);
+        assert_eq!(active.name, Keymap::maximus_legacy().name);
 
         let info = host.admin_get_keymap().await.unwrap();
-        assert_eq!(info.active, "maximus");
+        assert_eq!(info.active, "maximus-legacy");
 
         // Persisted: config.toml on disk actually changed.
         let on_disk = std::fs::read_to_string(cfg.path()).unwrap();
-        assert!(on_disk.contains("keymap = \"maximus\""), "{on_disk}");
+        assert!(on_disk.contains("keymap = \"maximus-legacy\""), "{on_disk}");
     }
 
     #[tokio::test]
@@ -9868,7 +9881,7 @@ mod tests {
         let data_dir = tempfile::tempdir().unwrap();
         let text = toml::to_string(&Keymap {
             name: "my-bbs".to_owned(),
-            ..Keymap::maximus()
+            ..Keymap::maximus_legacy()
         })
         .unwrap();
 
@@ -15293,7 +15306,7 @@ mod tests {
         let sid = host.create_session("test").await.unwrap();
         register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
         let ids = post_all(&host, sid, &["first", "second", "third"]).await;
-        *host.keymap.write().await = Keymap::maximus();
+        *host.keymap.write().await = Keymap::maximus_legacy();
 
         host.process_command(
             sid,
@@ -15353,7 +15366,7 @@ mod tests {
         let sid = host.create_session("test").await.unwrap();
         register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
         let ids = post_all(&host, sid, &["first", "second", "third"]).await;
-        *host.keymap.write().await = Keymap::maximus();
+        *host.keymap.write().await = Keymap::maximus_legacy();
 
         // The intro prompt (reading mode entered with no message on screen).
         let text = shown(
@@ -15409,9 +15422,9 @@ mod tests {
         let (host, _tmp) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
-        *host.keymap.write().await = Keymap::maximus();
+        *host.keymap.write().await = Keymap::maximus_legacy();
 
-        let help = help_reading_mode(&Keymap::maximus());
+        let help = help_reading_mode(&Keymap::maximus_legacy());
         assert!(help.contains("N  next message"), "{help}");
         assert!(help.contains("P  previous message"), "{help}");
         assert!(help.contains("N/P <#>  jump to message"), "{help}");
@@ -15709,7 +15722,7 @@ mod tests {
     #[test]
     fn help_for_a_key_explains_the_action_it_triggers_on_this_keymap() {
         let lvl = Some(PermissionLevel::User);
-        let km = Keymap::maximus();
+        let km = Keymap::maximus_legacy();
         let h = |cmd: &str| help_text(Some(cmd), lvl, false, &km);
         // `L` is scan on Maximus, and the text names L, not S.
         assert_eq!(h("l"), "L — scan message headers in this room");
@@ -15778,18 +15791,18 @@ mod tests {
         let (host, _tmp) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
-        *host.keymap.write().await = Keymap::maximus();
+        *host.keymap.write().await = Keymap::maximus_legacy();
 
         for typed in ["j", "J", "j 5"] {
-            let cmd = Command::parse_with_keymap(typed, false, &Keymap::maximus());
+            let cmd = Command::parse_with_keymap(typed, false, &Keymap::maximus_legacy());
             let text = shown(host.process_command(sid, cmd).await.unwrap());
             assert_eq!(text, "No file areas on this BBS.", "{typed}");
         }
-        let cmd = Command::parse_with_keymap("zzz", false, &Keymap::maximus());
+        let cmd = Command::parse_with_keymap("zzz", false, &Keymap::maximus_legacy());
         let text = shown(host.process_command(sid, cmd).await.unwrap());
         assert!(text.contains("Unknown command"), "{text:?}");
         // The native key the preset dropped is unknown, not silently working.
-        let cmd = Command::parse_with_keymap("q", false, &Keymap::maximus());
+        let cmd = Command::parse_with_keymap("q", false, &Keymap::maximus_legacy());
         let text = shown(host.process_command(sid, cmd).await.unwrap());
         assert!(text.contains("Unknown command"), "{text:?}");
     }
@@ -15806,6 +15819,33 @@ mod tests {
         assert!(help.len() < 120, "{} bytes: {help}", help.len());
         // Single-letter keymaps keep the full layout.
         assert!(help_reading_mode(&Keymap::native()).contains("previous message"));
-        assert!(help_reading_mode(&Keymap::maximus()).contains("previous message"));
+        assert!(help_reading_mode(&Keymap::maximus_legacy()).contains("previous message"));
+    }
+
+    /// A bare message number reads that message on the Maximus preset, in the
+    /// prompt and while reading, and is unknown on native.
+    #[tokio::test]
+    async fn a_bare_number_reads_a_message_where_the_keymap_allows_it() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+        let km = Keymap::maximus_legacy();
+        *host.keymap.write().await = km.clone();
+
+        let cmd = Command::parse_with_keymap(&ids[1].to_string(), false, &km);
+        let text = shown(host.process_command(sid, cmd).await.unwrap());
+        assert!(text.contains("second"), "{text:?}");
+
+        // While reading, a bare number jumps too.
+        let text = shown(say(&host, sid, &ids[2].to_string()).await);
+        assert!(text.contains("third"), "{text:?}");
+        let sessions = host.sessions.read().await;
+        assert!(matches!(sessions[&sid].workflow, Workflow::Reading));
+        drop(sessions);
+
+        // Native: a bare number at the prompt is an unknown command.
+        let cmd = Command::parse_with_keymap("5", false, &Keymap::native());
+        assert!(matches!(cmd, Command::Unknown { .. }));
     }
 }

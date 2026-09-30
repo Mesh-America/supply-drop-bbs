@@ -122,6 +122,28 @@ impl KeymapAction {
     }
 }
 
+/// What a bare number typed at the command prompt does under a keymap.
+///
+/// Several classic BBS systems treat a lone number as a command: in some it
+/// reads that message, in others it changes to that sub-board. `Off` keeps the
+/// number as an unknown command, as on native.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BareNumber {
+    /// A bare number is an unknown command.
+    #[default]
+    Off,
+    /// A bare number reads that message, like `ReadForward <id>`.
+    ReadMessage,
+    /// A bare number changes to that room, like `ChangeRoom <number>`.
+    ChangeRoom,
+}
+
+impl BareNumber {
+    fn is_off(&self) -> bool {
+        matches!(self, BareNumber::Off)
+    }
+}
+
 /// Why a [`Keymap`] failed [`Keymap::validate`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -149,6 +171,8 @@ pub enum KeymapError {
     /// An `unsupported` entry uses a keyword that is also bound to an action
     /// or reserved, so the friendly reply could never be reached.
     UnsupportedKeywordInUse(String),
+    /// A help label is empty, too long for a radio line, or has a newline.
+    InvalidLabel(KeymapAction),
 }
 
 impl std::fmt::Display for KeymapError {
@@ -184,6 +208,11 @@ impl std::fmt::Display for KeymapError {
                 f,
                 "\"{keyword}\" is listed as unsupported but is also bound to an action or \
                  reserved, so its message could never be shown"
+            ),
+            KeymapError::InvalidLabel(action) => write!(
+                f,
+                "the help label for {action:?} must be 1 to {MAX_LABEL_CHARS} characters \
+                 on one line"
             ),
         }
     }
@@ -234,7 +263,21 @@ pub struct Keymap {
     /// sysop; never presented as authentic.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub no_source_equivalent: Vec<KeymapAction>,
+    /// Short help wording for an action where this system's meaning is a little
+    /// different from the default, for example `next area` for the key that
+    /// goes to the next room. Used by the quick help list. Optional.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<KeymapAction, String>,
+    /// What a bare number at the command prompt does. Default: nothing.
+    #[serde(default, skip_serializing_if = "BareNumber::is_off")]
+    pub bare_number: BareNumber,
+    /// Whether a bare number jumps to that message while reading. Default: no.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reading_bare_number: bool,
 }
+
+/// Longest help label, so a quick help line stays short on a radio.
+pub const MAX_LABEL_CHARS: usize = 24;
 
 impl Keymap {
     /// Build a keymap from a full list of `(action, keywords)` pairs.
@@ -257,6 +300,9 @@ impl Keymap {
                 .map(|(k, m)| ((*k).to_owned(), (*m).to_owned()))
                 .collect(),
             no_source_equivalent: no_source_equivalent.to_vec(),
+            labels: BTreeMap::new(),
+            bare_number: BareNumber::Off,
+            reading_bare_number: false,
         }
     }
 
@@ -320,11 +366,12 @@ impl Keymap {
     /// no mail room, no "next room with unread" and no list-rooms key, so
     /// those use plain words and are listed in `no_source_equivalent`.
     #[must_use]
-    pub fn maximus() -> Self {
+    pub fn maximus_legacy() -> Self {
         use KeymapAction as A;
-        Self::build(
-            "maximus",
-            "Maximus-style keys, from Scott Dudley's Maximus (the DOS, OS/2 and Linux BBS): \
+        let mut km = Self::build(
+            "maximus-legacy",
+            "Maximus-style keys from the legacy menus (Scott Dudley's Maximus 3.x, also the \
+             legacy menu file shipped with MaximusNG): \
              G(oodbye), A(rea change), L(ist brief), N/P next and previous, E(nter), \
              R(eply) and K(ill) while reading. This is not MAX's BBS for Amiga, whose \
              menus are set by each sysop. Keys only: no file areas, menus, chat, bulletins \
@@ -356,16 +403,93 @@ impl Keymap {
                 ("y", "No sysop paging on this BBS."),
                 ("o", "No offline reader on this BBS."),
                 ("t", "No message tagging on this BBS."),
-                ("c", "No terminal settings on this BBS."),
+                ("c", "No settings or message editing on this BBS."),
                 ("s", "No statistics screen on this BBS."),
                 ("m", "Rooms are flat here. Use A to change room."),
                 ("/", "No chat on this BBS."),
                 ("=", "No nonstop reading on this BBS."),
                 ("+", "No thread navigation on this BBS."),
                 ("*", "No re-read command on this BBS."),
+                ("-", "No thread navigation on this BBS."),
+                ("$", "No cross-area replies on this BBS."),
+                ("^", "No file attaches on this BBS."),
+                ("[", "No previous-area key. Use A to change room."),
             ],
             &[A::ListRooms, A::GoNextUnread, A::GoMail, A::ReadForward],
-        )
+        );
+        km.labels.insert(A::GoNextUnread, "next area".to_owned());
+        km.bare_number = BareNumber::ReadMessage;
+        km.reading_bare_number = true;
+        km
+    }
+
+    /// The MaximusNG-style preset: the stock TOML menus of MaximusNG 4.0
+    /// (`resources/config/menus/message.toml` and `main.toml`). They differ
+    /// from the legacy menus: `W` writes, `R` reads, `C` checks e-mail, `S`
+    /// searches, and the legacy `N`, `P`, `E`, `K` and reply keys are gone from
+    /// the menu. The next, previous, reply and delete keys (`N`, `P`, `R`,
+    /// `D` or `K`) live inside the message reader. Every MaximusNG command
+    /// prompts for its details afterwards, so nothing takes an inline
+    /// argument. A menu key is the first letter of the option's description.
+    #[must_use]
+    pub fn maximus_ng() -> Self {
+        use KeymapAction as A;
+        let mut km = Self::build(
+            "maximus-ng",
+            "MaximusNG-style keys (MaximusNG 4.0 stock menus): A(rea change), C (check \
+             e-mail), W(rite), R(ead), RN (read new), L(ist), G(oodbye). While reading: N \
+             and P next and previous, R reply, D or K delete. This is not legacy Maximus \
+             (use maximus-legacy for that). No file areas, games, chat, bulletins, \
+             tagging or crossposting. Who is online, list rooms, newest first and delete \
+             from the menu have no key in MaximusNG, so they use the words WHO, ROOMS, \
+             BACK and DELETE, and ] (next area) stands in for next unread.",
+            &[
+                (A::Quit, &["g"]),
+                (A::ListRooms, &["rooms"]),
+                (A::GoNextUnread, &["]"]),
+                (A::ChangeRoom, &["a"]),
+                (A::GoMail, &["c"]),
+                (A::ReadNew, &["rn"]),
+                (A::ReadForward, &["r"]),
+                (A::ReadReverse, &["back"]),
+                (A::ScanMessages, &["l"]),
+                (A::EnterMessage, &["w"]),
+                (A::DeleteMessage, &["delete"]),
+                (A::WhoIsOnline, &["who"]),
+                (A::ReadingForward, &["n"]),
+                (A::ReadingReverse, &["p"]),
+                (A::ReadingReply, &["r"]),
+                (A::ReadingHelp, &["?"]),
+                (A::ReadingDelete, &["d", "k"]),
+            ],
+            &[
+                ("m", "To write mail: type C for mail, then W @user message."),
+                ("s", "No message search on this BBS."),
+                ("t", "No message tagging on this BBS."),
+                ("f", "No forwarding or file areas on this BBS."),
+                ("x", "No crossposting on this BBS."),
+                ("d", "No attachments on this BBS."),
+                ("j", "No file areas on this BBS."),
+                ("y", "No sysop paging on this BBS."),
+                ("o", "No offline reader on this BBS."),
+                ("/", "No chat on this BBS."),
+                ("[", "No previous-area key. Use A to change room."),
+                ("e", "Editing messages is not available on this BBS."),
+                ("k", "To delete, type DELETE <number>."),
+                ("n", "To read new messages type RN."),
+                ("p", "Previous message works while reading: P."),
+            ],
+            &[
+                A::ListRooms,
+                A::GoNextUnread,
+                A::ReadReverse,
+                A::DeleteMessage,
+                A::WhoIsOnline,
+            ],
+        );
+        km.labels.insert(A::GoNextUnread, "next area".to_owned());
+        km.labels.insert(A::GoMail, "check mail".to_owned());
+        km
     }
 
     /// The packet-radio BBS (F6FBB and BPQ) style preset. Commands are from the
@@ -458,7 +582,7 @@ impl Keymap {
     #[must_use]
     pub fn pcboard() -> Self {
         use KeymapAction as A;
-        Self::build(
+        let mut km = Self::build(
             "pcboard",
             "PCBoard style keys: G(oodbye), J(oin conference), Q(uick scan), E(nter), \
              K(ill), WHO, R;S (read new), R;L (newest first), R <number>. Reading: NEXT, \
@@ -512,7 +636,9 @@ impl Keymap {
                 ("user", "Use SEARCH <name> to find users."),
             ],
             &[A::ListRooms, A::GoNextUnread, A::ReadingHelp],
-        )
+        );
+        km.reading_bare_number = true;
+        km
     }
 
     /// The WWIV-style preset. Keys are from WWIV 5.x's shipped menu and read
@@ -523,7 +649,7 @@ impl Keymap {
     #[must_use]
     pub fn wwiv_family() -> Self {
         use KeymapAction as A;
-        Self::build(
+        let mut km = Self::build(
             "wwiv-family",
             "WWIV-style keys (WWIV 5.x; Telegard and Renegade are not covered): * (list \
              subs), N(ew), S(can), P(ost), M(ail), R(emove your post), O(ff), //WHO, - \
@@ -570,7 +696,10 @@ impl Keymap {
                 A::ReadReverse,
                 A::ReadingDelete,
             ],
-        )
+        );
+        km.bare_number = BareNumber::ChangeRoom;
+        km.reading_bare_number = true;
+        km
     }
 
     /// The Synchronet-style preset, from the default command shell
@@ -581,7 +710,7 @@ impl Keymap {
     #[must_use]
     pub fn synchronet() -> Self {
         use KeymapAction as A;
-        Self::build(
+        let mut km = Self::build(
             "synchronet",
             "Synchronet-style keys: * (list sub-boards), J(ump), N(ew), R(ead), L(ist), \
              P(ost), E (mail), W(ho), O(ff). While reading: + next, - back, A reply, D \
@@ -621,7 +750,10 @@ impl Keymap {
                 ("z", "No continuous scan on this BBS."),
             ],
             &[A::GoNextUnread, A::ReadReverse, A::DeleteMessage],
-        )
+        );
+        km.bare_number = BareNumber::ChangeRoom;
+        km.reading_bare_number = true;
+        km
     }
 
     /// Look up a built-in preset by name, the string a `[bbs] keymap = "..."`
@@ -631,7 +763,8 @@ impl Keymap {
     pub fn by_name(name: &str) -> Option<Self> {
         match name {
             "native" => Some(Self::native()),
-            "maximus" => Some(Self::maximus()),
+            "maximus-legacy" | "maximus" => Some(Self::maximus_legacy()),
+            "maximus-ng" => Some(Self::maximus_ng()),
             "packet-bbs" => Some(Self::packet_bbs()),
             "pcboard" => Some(Self::pcboard()),
             "wwiv-family" => Some(Self::wwiv_family()),
@@ -643,7 +776,8 @@ impl Keymap {
     /// Every built-in preset name, `"native"` first.
     pub const BUILTIN_NAMES: &'static [&'static str] = &[
         "native",
-        "maximus",
+        "maximus-legacy",
+        "maximus-ng",
         "packet-bbs",
         "pcboard",
         "wwiv-family",
@@ -670,6 +804,12 @@ impl Keymap {
             },
             String::as_str,
         )
+    }
+
+    /// This keymap's own help wording for `action`, if it has one.
+    #[must_use]
+    pub fn label(&self, action: KeymapAction) -> Option<&str> {
+        self.labels.get(&action).map(String::as_str)
     }
 
     /// The key to show a user for `action` in a message: its primary key in
@@ -779,6 +919,12 @@ impl Keymap {
             }
             if is_reserved_keyword(keyword) || self.action_for(keyword).is_some() {
                 return Err(KeymapError::UnsupportedKeywordInUse(keyword.clone()));
+            }
+        }
+        for (action, label) in &self.labels {
+            let len = label.chars().count();
+            if len == 0 || len > MAX_LABEL_CHARS || label.contains('\n') {
+                return Err(KeymapError::InvalidLabel(*action));
             }
         }
         Ok(())
@@ -908,14 +1054,14 @@ mod tests {
 
     #[test]
     fn primary_falls_back_to_native_for_an_unlisted_action() {
-        let mut km = Keymap::maximus();
+        let mut km = Keymap::maximus_legacy();
         km.bindings.remove(&KeymapAction::GoNextUnread);
         assert_eq!(km.primary(KeymapAction::GoNextUnread), "g");
     }
 
     #[test]
     fn key_is_the_upper_cased_primary() {
-        let km = Keymap::maximus();
+        let km = Keymap::maximus_legacy();
         assert_eq!(km.key(KeymapAction::Quit), "G");
         assert_eq!(km.key(KeymapAction::GoNextUnread), "]");
         assert_eq!(km.key_with(KeymapAction::ReadForward, "<id>"), "READ <id>");
@@ -946,7 +1092,7 @@ mod tests {
 
     #[test]
     fn a_preset_drops_the_native_keys_it_replaces() {
-        let km = Keymap::maximus();
+        let km = Keymap::maximus_legacy();
         assert_eq!(km.action_for("g"), Some(KeymapAction::Quit));
         assert_eq!(km.action_for("]"), Some(KeymapAction::GoNextUnread));
         assert_eq!(km.action_for("q"), None, "native q must not carry over");
@@ -1208,7 +1354,7 @@ Quit = ["g"]
             }
         };
         check(
-            Keymap::maximus(),
+            Keymap::maximus_legacy(),
             &[
                 ("g", A::Quit),
                 ("a", A::ChangeRoom),
@@ -1222,6 +1368,24 @@ Quit = ["g"]
                 ("n", A::ReadingForward),
                 ("p", A::ReadingReverse),
                 ("r", A::ReadingReply),
+                ("k", A::ReadingDelete),
+            ],
+        );
+        check(
+            Keymap::maximus_ng(),
+            &[
+                ("g", A::Quit),
+                ("a", A::ChangeRoom),
+                ("c", A::GoMail),
+                ("r", A::ReadForward),
+                ("l", A::ScanMessages),
+                ("w", A::EnterMessage),
+            ],
+            &[
+                ("n", A::ReadingForward),
+                ("p", A::ReadingReverse),
+                ("r", A::ReadingReply),
+                ("d", A::ReadingDelete),
                 ("k", A::ReadingDelete),
             ],
         );
@@ -1299,7 +1463,16 @@ Quit = ["g"]
     fn trap_keys_are_never_bound_to_a_different_meaning() {
         // (preset, key a source user would expect to do something else)
         for (preset, traps) in [
-            ("maximus", &["f", "j", "y", "o", "t", "c", "s", "m"][..]),
+            (
+                "maximus-legacy",
+                &["f", "j", "y", "o", "t", "c", "s", "m", "-", "$", "^", "["][..],
+            ),
+            (
+                "maximus-ng",
+                &[
+                    "m", "s", "t", "f", "x", "d", "j", "y", "o", "/", "[", "e", "k", "n", "p",
+                ][..],
+            ),
             (
                 "pcboard",
                 &[
@@ -1346,7 +1519,7 @@ Quit = ["g"]
                 if key.chars().count() == 1 {
                     let allowed: &[&str] = match km.name.as_str() {
                         // `]` is Maximus's "next area", the closest key to next unread.
-                        "maximus" => &["]"],
+                        "maximus-legacy" | "maximus-ng" => &["]"],
                         // `e` is this BBS's own key for entering a message.
                         "packet-bbs" => &["e"],
                         _ => &[],
@@ -1359,5 +1532,46 @@ Quit = ["g"]
                 }
             }
         }
+    }
+
+    #[test]
+    fn labels_and_bare_number_settings_round_trip_and_validate() {
+        let km = Keymap::maximus_legacy();
+        assert_eq!(km.label(KeymapAction::GoNextUnread), Some("next area"));
+        assert_eq!(km.bare_number, BareNumber::ReadMessage);
+        assert!(km.reading_bare_number);
+        let back: Keymap = toml::from_str(&toml::to_string(&km).unwrap()).unwrap();
+        assert_eq!(back, km);
+        // Native leaves all three off, so its file has none of these fields.
+        let text = toml::to_string(&Keymap::native()).unwrap();
+        assert!(
+            !text.contains("bare_number") && !text.contains("labels"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_bad_label_is_rejected() {
+        for bad in [
+            "",
+            "two\nlines",
+            "a label that is much too long for a radio line",
+        ] {
+            let mut km = Keymap::native();
+            km.labels.insert(KeymapAction::GoNextUnread, bad.to_owned());
+            assert_eq!(
+                km.validate(),
+                Err(KeymapError::InvalidLabel(KeymapAction::GoNextUnread)),
+                "{bad:?}"
+            );
+        }
+    }
+
+    /// `maximus` was the preset's name before the legacy and NG split, so a
+    /// config that still says it keeps working.
+    #[test]
+    fn the_old_maximus_name_still_resolves_to_the_legacy_preset() {
+        assert_eq!(Keymap::by_name("maximus"), Some(Keymap::maximus_legacy()));
+        assert!(!Keymap::BUILTIN_NAMES.contains(&"maximus"));
     }
 }

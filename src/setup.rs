@@ -2811,7 +2811,11 @@ fn build_keymap_menu(existing: Option<&str>) -> KeymapMenu {
     let default = match existing_custom {
         Some(_) => 0,
         None => {
-            let configured = existing.unwrap_or("native");
+            // `maximus` was the name before the legacy and NG presets split.
+            let configured = match existing.unwrap_or("native") {
+                "maximus" => "maximus-legacy",
+                other => other,
+            };
             bbs_plugin_api::Keymap::BUILTIN_NAMES
                 .iter()
                 .position(|id| *id == configured)
@@ -2941,15 +2945,15 @@ mod build_toml_tests {
     #[test]
     fn keymap_is_written_explicitly_and_loads_back() {
         let mut p = base_params("serial", None);
-        p.keymap = "maximus";
+        p.keymap = "maximus-legacy";
         let toml = build_toml(&p);
-        assert!(toml.contains("keymap = \"maximus\""), "{toml}");
+        assert!(toml.contains("keymap = \"maximus-legacy\""), "{toml}");
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         std::fs::write(&path, &toml).unwrap();
         let cfg = crate::config::load(Some(&path)).unwrap();
-        assert_eq!(cfg.bbs.keymap, "maximus");
+        assert_eq!(cfg.bbs.keymap, "maximus-legacy");
     }
 
     #[test]
@@ -3411,16 +3415,16 @@ mod keymap_menu_tests {
 
     #[test]
     fn default_selects_a_previously_configured_builtin_preset() {
-        let menu = build_keymap_menu(Some("maximus"));
+        let menu = build_keymap_menu(Some("maximus-legacy"));
         assert_eq!(menu.builtin_start, 0);
         let maximus_idx = bbs_plugin_api::Keymap::BUILTIN_NAMES
             .iter()
-            .position(|id| *id == "maximus")
+            .position(|id| *id == "maximus-legacy")
             .unwrap();
         assert_eq!(menu.default, maximus_idx);
         assert_eq!(
-            resolve_keymap_choice(Some("maximus"), &menu, menu.default),
-            "maximus"
+            resolve_keymap_choice(Some("maximus-legacy"), &menu, menu.default),
+            "maximus-legacy"
         );
     }
 

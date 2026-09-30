@@ -64,7 +64,7 @@ pub use error::{HostError, PluginError, TransportError};
 pub use event::{DomainEvent, MessageRecipient, Notification, NotifyOutcome};
 pub use host::{Host, MeshKeyRequest, MeshtasticAdminRequest};
 pub use identity::{SessionId, Username};
-pub use keymap::{Keymap, KeymapAction, KeymapError};
+pub use keymap::{BareNumber, Keymap, KeymapAction, KeymapError};
 pub use permissions::{PermissionCtx, PermissionLevel};
 pub use plugin::Plugin;
 pub use registry::{

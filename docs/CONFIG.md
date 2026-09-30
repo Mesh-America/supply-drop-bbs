@@ -140,7 +140,7 @@ what is not covered.
 
 ```toml
 [bbs]
-keymap = "maximus"
+keymap = "maximus-legacy"
 ```
 
 **Built-in presets**, each sourced from that system's own manual/source (see
@@ -152,11 +152,20 @@ preset):
 | Name          | Source system                          | Coverage |
 |---------------|-----------------------------------------|----------|
 | `native`      | Supply Drop's own commands (default)    | Everything |
-| `maximus`     | Maximus 3.0x (Scott Dudley's; not MAX's BBS for Amiga) | Keys verified from the shipped menu files. No list-rooms, mail or next-unread key exists in Maximus, so those are the words `ROOMS`, `MAIL` and `READ`, and `]` (next area) stands in for next unread. |
+| `maximus-legacy` | Maximus 3.x (Scott Dudley's; also the legacy menu file shipped with MaximusNG). Not MAX's BBS for Amiga. | Keys verified from the shipped legacy menus: `G` goodbye, `A` area change, `L` list, `E` enter, `K` kill, `N`/`P` next and previous, `R` reply. No list-rooms, mail or next-unread key exists, so those use the words `ROOMS`, `MAIL` and `READ`, and `]` (next area) stands in for next unread. A bare message number reads that message. |
+| `maximus-ng`  | MaximusNG 4.0 (its stock TOML menus) | Keys verified from MaximusNG's menu files: `A` area change, `C` check e-mail, `W` write, `R` read, `RN` read new, `L` list, `G` goodbye. While reading: `N`/`P`, `R` reply, `D` or `K` delete. MaximusNG dropped the legacy `N`, `P`, `E`, `K` and reply keys from the menu. `WHO`, `ROOMS`, `BACK` and `DELETE` are plain words because the menus have no key for them. |
 | `wwiv-family` | WWIV 5.x                                | Keys verified from the shipped menus and read prompt. Telegard and Renegade are not covered. WWIV's `H` (hop) is help here, so the word `HOP` is used. |
 | `synchronet`  | Synchronet (default command shell)      | Keys verified from the shipped shell and reading prompt. `E` (the e-mail menu) goes to the Mail room. Next unread, newest first and delete use the words `UNREAD`, `BACK` and `DELETE`. |
 | `pcboard`     | PCBoard 15.x                            | Keys verified from the PCBoard 15.x manual. PCBoard has no mail room, list-rooms or next-unread command, so those use `Y` (nearest), `ROOMS` and `NEXT`. Reading uses `NEXT`, `PREV`, `RE` and `K`. |
 | `packet-bbs`  | Packet-radio BBS (F6FBB / BPQ / W0RLI)  | Commands verified from the F6FBB and BPQ user command pages. Packet BBS has no rooms, so room navigation uses the words `ROOMS`, `GOTO` and `NEXT`. Logoff is `LOGOFF` or `BYE`. Sending mail is done in the Mail room, not with `SP`. |
+
+Two presets also let a lone number act as a command, as the source systems do:
+on `maximus-legacy` a bare number reads that message, and on `wwiv-family` and
+`synchronet` it changes to that room. While reading, a bare number jumps to that
+message on `maximus-legacy`, `wwiv-family`, `synchronet` and `pcboard`. A custom
+keymap turns these on with `bare_number = "ReadMessage"` (or `"ChangeRoom"`) and
+`reading_bare_number = true`. A custom keymap can also set a `[labels]` table
+with shorter help wording for an action, for example `GoNextUnread = "next area"`.
 
 Every preset answers the source system's own keys that this BBS lacks (file
 areas, doors, chat and so on) with a short message, and never gives such a key a
@@ -169,7 +178,7 @@ here) and `H` in WWIV (hop, help here). The full list of what each system has is
 An example custom keymap for the layout requested in GH #354 is in
 `contrib/keymaps/issue-354-layout.toml`. That layout comes from the requester's
 own Amiga board (most likely MAX's BBS, whose menus each sysop defines), so it
-differs from the stock Maximus keys in the `maximus` preset.
+differs from the stock Maximus keys in the `maximus-legacy` and `maximus-ng` presets.
 
 **Custom keymaps** are TOML files in the same shape as a built-in preset,
 placed under `data_dir`. Every action must be listed, each with a list of
@@ -233,7 +242,7 @@ A keymap can be selected three ways:
 
   ```sh
   # A built-in preset:
-  supply-drop-bbs config set-keymap maximus
+  supply-drop-bbs config set-keymap maximus-legacy
 
   # Or run with no name for an interactive picker:
   supply-drop-bbs config set-keymap

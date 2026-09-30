@@ -220,10 +220,10 @@ Run with **no `<name>`** for an interactive picker (a menu of every built-in pre
 
 | Argument | Meaning |
 |----------|---------|
-| `<name>` | A built-in preset (`native`, `maximus`, `packet-bbs`, `pcboard`, `wwiv-family`, `synchronet`), or `custom:<filename>` for a file already placed under `data_dir` (see `config upload-keymap`). Omit for an interactive picker. |
+| `<name>` | A built-in preset (`native`, `maximus-legacy`, `maximus-ng`, `packet-bbs`, `pcboard`, `wwiv-family`, `synchronet`; the old name `maximus` still works and means `maximus-legacy`), or `custom:<filename>` for a file already placed under `data_dir` (see `config upload-keymap`). Omit for an interactive picker. |
 
 ```sh
-sudo supply-drop-bbs config set-keymap maximus \
+sudo supply-drop-bbs config set-keymap maximus-legacy \
   --config /etc/supply-drop-bbs/config.toml
 
 sudo supply-drop-bbs config set-keymap custom:my-bbs.toml \

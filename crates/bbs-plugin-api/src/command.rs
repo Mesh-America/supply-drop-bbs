@@ -533,6 +533,23 @@ impl Command {
         if crate::keymap::is_reserved_keyword(&typed_keyword) {
             return parse_fixed(&typed_keyword, text, rest);
         }
+        // Some classic systems treat a lone number as a command. Only keymaps
+        // that opt in do; on native a bare number is unknown.
+        if rest.is_none() {
+            if let Some(n) = bare_number(&typed_keyword) {
+                match keymap.bare_number {
+                    crate::BareNumber::ReadMessage => {
+                        return Command::ReadForward { after: Some(n) };
+                    }
+                    crate::BareNumber::ChangeRoom => {
+                        return Command::ChangeRoom {
+                            target: n.to_string(),
+                        };
+                    }
+                    crate::BareNumber::Off => {}
+                }
+            }
+        }
         Command::Unknown {
             raw: text.to_owned(),
         }
@@ -678,6 +695,12 @@ impl ReadingInput {
         let stripped = strip_zero_width(line.trim());
         let (word, rest) = split_first_word(&stripped);
         let Some(action) = keymap.reading_action_for(&word.to_lowercase()) else {
+            // A lone number jumps to that message on keymaps that opt in.
+            if keymap.reading_bare_number && rest.is_none() {
+                if let Some(n) = bare_number(word) {
+                    return ReadingInput::Jump(n);
+                }
+            }
             return ReadingInput::Other;
         };
         let id = || rest.and_then(|r| r.parse::<i64>().ok());
@@ -698,6 +721,15 @@ impl ReadingInput {
             _ => ReadingInput::Other,
         }
     }
+}
+
+/// `word` as a message or room number if it is only ASCII digits (and short
+/// enough to fit an `i64`).
+fn bare_number(word: &str) -> Option<i64> {
+    if word.is_empty() || word.len() > 18 || !word.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    word.parse().ok()
 }
 
 /// Build the [`Command`] for a keymap action, given the full trimmed line and
@@ -1154,7 +1186,7 @@ mod tests {
         fn a_native_key_the_preset_dropped_no_longer_works() {
             // Maximus moves Quit to `g` and ScanMessages to `l`, so native
             // `q` and `s` are unknown there.
-            let km = Keymap::maximus();
+            let km = Keymap::maximus_legacy();
             assert_eq!(Command::parse_with_keymap("g", false, &km), Command::Quit);
             assert_eq!(
                 Command::parse_with_keymap("l", false, &km),
@@ -1201,7 +1233,7 @@ mod tests {
 
         #[test]
         fn awaiting_reply_and_cancel_still_take_priority_over_the_keymap() {
-            let km = Keymap::maximus();
+            let km = Keymap::maximus_legacy();
             assert_eq!(
                 Command::parse_with_keymap("cancel", true, &km),
                 Command::Cancel
@@ -1423,7 +1455,7 @@ mod tests {
     #[test]
     fn reading_input_follows_the_active_keymap() {
         use crate::Keymap;
-        let km = Keymap::maximus();
+        let km = Keymap::maximus_legacy();
         assert_eq!(ReadingInput::parse("n", &km), ReadingInput::Forward);
         assert_eq!(ReadingInput::parse("p", &km), ReadingInput::Reverse);
         assert_eq!(ReadingInput::parse("n 4", &km), ReadingInput::Jump(4));
@@ -1460,5 +1492,76 @@ mod tests {
         let km = Keymap::native();
         assert_eq!(km.action_for("k"), Some(KeymapAction::ListRooms));
         assert_eq!(ReadingInput::parse("k", &km), ReadingInput::Other);
+    }
+
+    // ── Bare numbers (Maximus, WWIV, Synchronet) ─────────────────────────
+
+    #[test]
+    fn a_bare_number_is_a_command_only_where_the_keymap_opts_in() {
+        use crate::Keymap;
+        // Maximus: a number reads that message.
+        assert_eq!(
+            Command::parse_with_keymap("12", false, &Keymap::maximus_legacy()),
+            Command::ReadForward { after: Some(12) }
+        );
+        // WWIV and Synchronet: a number changes to that sub-board.
+        for km in [Keymap::wwiv_family(), Keymap::synchronet()] {
+            assert_eq!(
+                Command::parse_with_keymap("3", false, &km),
+                Command::ChangeRoom {
+                    target: "3".to_owned()
+                },
+                "{}",
+                km.name
+            );
+        }
+        // Native, packet BBS and PCBoard: unknown, as before.
+        for km in [Keymap::native(), Keymap::packet_bbs(), Keymap::pcboard()] {
+            assert!(
+                matches!(
+                    Command::parse_with_keymap("12", false, &km),
+                    Command::Unknown { .. }
+                ),
+                "{}",
+                km.name
+            );
+        }
+        // A number with anything after it, or too long, is still unknown.
+        let km = Keymap::maximus_legacy();
+        for text in ["12 x", "1o", "99999999999999999999"] {
+            assert!(
+                matches!(
+                    Command::parse_with_keymap(text, false, &km),
+                    Command::Unknown { .. }
+                ),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bare_number_jumps_while_reading_where_the_keymap_opts_in() {
+        use crate::Keymap;
+        for km in [
+            Keymap::maximus_legacy(),
+            Keymap::wwiv_family(),
+            Keymap::synchronet(),
+            Keymap::pcboard(),
+        ] {
+            assert_eq!(
+                ReadingInput::parse("7", &km),
+                ReadingInput::Jump(7),
+                "{}",
+                km.name
+            );
+        }
+        for km in [Keymap::native(), Keymap::packet_bbs()] {
+            assert_eq!(
+                ReadingInput::parse("7", &km),
+                ReadingInput::Other,
+                "{}",
+                km.name
+            );
+        }
     }
 }
