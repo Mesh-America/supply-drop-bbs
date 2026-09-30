@@ -26,6 +26,8 @@
 use crate::identity::Username;
 use crate::permissions::PermissionLevel;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 /// A secret string carried inside a [`Command`] (currently a one-shot password).
 ///
@@ -34,12 +36,32 @@ use serde::{Deserialize, Serialize};
 /// prints `<redacted>`, so the plaintext can never reach a log via `?cmd`.
 ///
 /// `Serialize`/`Deserialize` are transparent (the wire form is the raw string)
-/// so the enum still round-trips across the process transport; only `Debug` is
-/// redacted. Call [`Secret::expose`] only where the plaintext is genuinely
-/// required (hashing/verifying) and never log the result.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// so the enum still round-trips across the process transport. That means
+/// **`Debug` is the only redacted output**: serialising a `Command` (for
+/// structured logs, telemetry or an audit trail) writes the plaintext, so never
+/// do that outside the transport itself. Call [`Secret::expose`] only where the
+/// plaintext is genuinely required (hashing/verifying) and never log the result.
+///
+/// The buffer is overwritten when the value is dropped, and `==` compares in
+/// constant time. Both are best effort: clones, and copies made by code that
+/// called [`Secret::expose`], are not wiped.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
+
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_bytes().ct_eq(other.0.as_bytes()).into()
+    }
+}
+
+impl Eq for Secret {}
 
 impl Secret {
     /// Borrow the plaintext. Use only for hashing/verification; never log it.
@@ -94,7 +116,8 @@ fn strip_zero_width(s: &str) -> String {
         .filter(|c| {
             !matches!(
                 *c,
-                '\u{200B}'..='\u{200D}' // ZWSP, ZWNJ, ZWJ
+                '\u{200B}'
+                    ..='\u{200D}' // ZWSP, ZWNJ, ZWJ
                     | '\u{2060}'         // word joiner
                     | '\u{FEFF}' // BOM / zero-width no-break space
             )
@@ -345,7 +368,7 @@ pub enum Command {
         filter: Option<String>,
     },
 
-    /// Search user accounts by username substring (Aide+). (SEARCH)
+    /// Search user accounts by username substring (Aide+). (`SEARCH <query>`)
     SearchUsers {
         /// Substring to match against usernames (case-insensitive).
         query: String,
@@ -882,5 +905,84 @@ mod tests {
                 reply: "Alice".to_owned()
             }
         );
+    }
+
+    // ── Parser hardening (#411, #412, #413) ──────────────────────────────
+
+    #[test]
+    fn s_is_always_scan_and_search_is_the_user_search() {
+        assert_eq!(Command::parse("s", false), Command::ScanMessages);
+        assert_eq!(Command::parse("s foo", false), Command::ScanMessages);
+        assert_eq!(
+            Command::parse("SEARCH bob", false),
+            Command::SearchUsers {
+                query: "bob".to_owned()
+            }
+        );
+        assert!(matches!(
+            Command::parse("search", false),
+            Command::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn zero_width_characters_cannot_defeat_cancel_or_keywords() {
+        for text in ["cancel\u{200B}", "\u{FEFF}STOP", "ca\u{200D}ncel"] {
+            assert_eq!(Command::parse(text, true), Command::Cancel, "{text:?}");
+            assert_eq!(Command::parse(text, false), Command::Cancel, "{text:?}");
+        }
+        assert_eq!(Command::parse("n\u{200B}", false), Command::ReadNew);
+    }
+
+    #[test]
+    fn non_breaking_space_splits_keyword_and_argument() {
+        assert!(matches!(
+            Command::parse("c\u{00A0}lobby", false),
+            Command::ChangeRoom { .. }
+        ));
+    }
+
+    #[test]
+    fn keyword_matching_uses_unicode_lowercasing() {
+        assert_eq!(Command::parse("N", false), Command::ReadNew);
+        // A non-ASCII capital must not panic and is not a keyword.
+        assert!(matches!(
+            Command::parse("\u{0130}", false),
+            Command::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn f_with_a_bad_id_is_unknown_not_continue() {
+        assert_eq!(
+            Command::parse("f 10", false),
+            Command::ReadForward { after: Some(10) }
+        );
+        assert_eq!(
+            Command::parse("f", false),
+            Command::ReadForward { after: None }
+        );
+        assert!(matches!(
+            Command::parse("f 1o", false),
+            Command::Unknown { .. }
+        ));
+    }
+
+    // ── Secret (#414) ────────────────────────────────────────────────────
+
+    #[test]
+    fn secret_compares_by_value_and_stays_redacted_in_debug() {
+        assert_eq!(Secret::from("abc"), Secret::from("abc"));
+        assert_ne!(Secret::from("abc"), Secret::from("abd"));
+        assert_ne!(Secret::from("abc"), Secret::from("abcd"));
+        assert_eq!(format!("{:?}", Secret::from("abc")), "<redacted>");
+    }
+
+    #[test]
+    fn secret_still_round_trips_over_the_wire() {
+        let json = serde_json::to_string(&Secret::from("pw")).unwrap();
+        assert_eq!(json, "\"pw\"");
+        let back: Secret = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.expose(), "pw");
     }
 }

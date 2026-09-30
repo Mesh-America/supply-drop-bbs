@@ -369,12 +369,7 @@ fn split_first_word(s: &str) -> (&str, Option<&str>) {
 /// helper for the full rationale (#412).
 fn strip_zero_width(s: &str) -> String {
     s.chars()
-        .filter(|c| {
-            !matches!(
-                *c,
-                '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'
-            )
-        })
+        .filter(|c| !matches!(*c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
         .collect()
 }
 
@@ -884,5 +879,48 @@ mod tests {
     fn render_system_event() {
         let text = render_notification(&Notification::SystemEvent("validated".to_owned()));
         assert!(text.contains("validated") && text.contains("[system]"));
+    }
+
+    // ── Parser hardening (#411, #412, #413) ──────────────────────────────
+
+    fn hardening(text: &str) -> Option<Command> {
+        parse_command(text, None, false)
+    }
+
+    #[test]
+    fn s_is_always_scan_and_search_is_the_user_search() {
+        assert_eq!(hardening("s"), Some(Command::ScanMessages));
+        assert_eq!(hardening("s foo"), Some(Command::ScanMessages));
+        assert_eq!(
+            hardening("search bob"),
+            Some(Command::SearchUsers {
+                query: "bob".to_owned()
+            })
+        );
+        assert!(matches!(hardening("search"), Some(Command::Unknown { .. })));
+    }
+
+    #[test]
+    fn zero_width_characters_cannot_defeat_cancel() {
+        for text in ["cancel\u{200B}", "\u{FEFF}STOP", "ca\u{200D}ncel"] {
+            assert_eq!(hardening(text), Some(Command::Cancel), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn non_breaking_space_splits_keyword_and_argument() {
+        assert!(matches!(
+            hardening("c\u{00A0}lobby"),
+            Some(Command::ChangeRoom { .. })
+        ));
+    }
+
+    #[test]
+    fn f_with_a_bad_id_is_unknown_not_continue() {
+        assert_eq!(
+            hardening("f 10"),
+            Some(Command::ReadForward { after: Some(10) })
+        );
+        assert!(matches!(hardening("f 1o"), Some(Command::Unknown { .. })));
     }
 }

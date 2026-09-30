@@ -20,6 +20,10 @@ serde.workspace       = true
 serde_json.workspace  = true
 thiserror.workspace   = true
 tokio.workspace       = true
+# Tiny, already in the graph. Used only by `command::Secret` to wipe its
+# buffer on drop and compare in constant time.
+subtle                = "2.6"
+zeroize               = "1.8"
 
 [dev-dependencies]
 # Tokio with the full feature set for tests (we use the macro

@@ -333,8 +333,10 @@ dependencies = [
  "async-trait",
  "serde",
  "serde_json",
+ "subtle",
  "thiserror 1.0.69",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
