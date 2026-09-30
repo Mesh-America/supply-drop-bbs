@@ -256,10 +256,11 @@ Shows the quick command list for your current access level.
 
 > **Note:** this guide describes Supply Drop's own default commands. A sysop
 > can activate a different **command keymap** so the board's keys match a
-> classic BBS system's conventions instead (GH #354) — if a key here doesn't
-> do what's described, type `H` and use whatever key it actually lists for
-> that action; the quick command list always reflects the board's active
-> keymap, not just this guide's defaults.
+> classic BBS system's conventions instead. On such a board only that
+> keymap's keys work, so a key from this guide may not do what is described.
+> Type `H`: the quick list, the help topics, `H <key>` and the hints in
+> replies (like "Type N to read") all show the keys that work on that board.
+> `H`, `register`, `login`, `cancel` and the account commands never change.
 
 ### Help topics
 
