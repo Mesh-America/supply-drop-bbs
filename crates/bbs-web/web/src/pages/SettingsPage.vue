@@ -1392,8 +1392,12 @@ chmod g+w {{ configFile }}</pre>
       <section v-show="settingsTab === 'general'" class="card">
         <h2>Command keymap</h2>
         <p class="hint">
-          Remaps Supply Drop's command letters to match a classic BBS system's
-          conventions (or your own custom keymap). Sysop-only. Changes made
+          Chooses which keys trigger which commands, to match a classic BBS
+          system's conventions (or your own custom keymap). Only the chosen
+          keymap's keys work, so users of another board's keys will see
+          "Unknown command" or a short note. Help and replies always show the
+          keys that work on this board. Read each description for what a
+          preset does not cover. Sysop-only. Changes made
           here take effect immediately, no restart required — unlike
           <code>config set-keymap</code> from the CLI or the setup wizard,
           which both require a restart.

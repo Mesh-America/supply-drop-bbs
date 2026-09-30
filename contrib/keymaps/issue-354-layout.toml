@@ -1,0 +1,75 @@
+# Example custom keymap: the layout requested in GH #354.
+#
+# This is a worked example of the custom keymap format, not a built-in preset.
+# To try it:
+#
+#   supply-drop-bbs config upload-keymap contrib/keymaps/issue-354-layout.toml
+#   supply-drop-bbs config set-keymap custom:issue-354-layout.toml
+#
+# The format and its rules are described in docs/CONFIG.md ("Command keymaps").
+#
+# How the requested layout maps onto this BBS:
+#
+# - Supply Drop has flat rooms and Mail is one of them, so the requested mail
+#   commands (lm, jm, rm, dm, nm, cm, sm, xm, qm) have no separate meaning
+#   here. Each one answers with a short message that says how to do the same
+#   thing (see [unsupported] at the bottom). The mail commands are not
+#   actions, so they cannot be bound to anything.
+# - Writing a message ends with "." to send or "C" to cancel. Those compose
+#   keys are fixed, so "s" (send) and "c" (cancel) answer with a message.
+# - There is no main menu to exit to, so "x" answers with a message.
+# - "j <number>" jumps to a message. While reading, "j" is bound to the same
+#   action as "n", so a bare "j" also means next message. A bare "j" would ask
+#   for a number on the original system.
+# - Supply Drop has no "next room with unread" key in the requested layout,
+#   and no key for deleting a message, replying while reading, or reading
+#   newest first other than "p". Those keys were picked only because every
+#   action needs one. They are listed in no_source_equivalent.
+#
+# "h" for help, "who"-style words that are not actions, "q", and the other
+# fixed words are described in docs/CONFIG.md.
+
+name = "issue-354-layout"
+description = "The #354 requested layout: L(ist rooms), G(oto room), R(ead new), M(essage list), J(ump), N/P next and previous while reading, W(rite), MAIL. Mail commands such as LM and RM are answered with how to do it here."
+no_source_equivalent = [
+    "GoNextUnread",
+    "DeleteMessage",
+    "ReadingReply",
+    "ReadingDelete",
+]
+
+[bindings]
+Quit = ["q"]
+ListRooms = ["l"]
+GoNextUnread = ["unread"]
+ChangeRoom = ["g"]
+GoMail = ["mail"]
+ReadNew = ["r"]
+ReadForward = ["j"]
+ReadReverse = ["p"]
+ScanMessages = ["m"]
+EnterMessage = ["w"]
+DeleteMessage = ["d"]
+WhoIsOnline = ["who"]
+# Keys used while reading messages one at a time.
+ReadingForward = ["n", "j"]
+ReadingReverse = ["p"]
+ReadingReply = ["e"]
+ReadingHelp = ["h", "?"]
+ReadingDelete = ["d"]
+
+# Keys the requested layout has that this BBS does not, with the reply.
+[unsupported]
+n = "To read new messages type R. While reading, N is next."
+c = "While writing a message, type C to cancel it."
+s = "While writing a message, type . on its own line to send it."
+x = "There is no main menu here. Type L to list rooms, G to change room."
+lm = "Mail is a room here: type MAIL, then M to list your mail."
+jm = "Mail is a room here: type MAIL, then J <number> to read one."
+rm = "Mail is a room here: type MAIL, then R to read new mail."
+dm = "Mail is a room here: type MAIL, then D <number> to delete."
+nm = "Mail is a room here: type MAIL, then W @user message to send."
+cm = "While writing a message, type C to cancel it."
+sm = "While writing a message, type . on its own line to send it."
+xm = "Mail is a room here: type G to change room, or L to list rooms."
+qm = "No quick messages. Send mail: type MAIL, then W @user message."

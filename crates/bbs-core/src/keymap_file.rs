@@ -372,4 +372,29 @@ mod tests {
             & 0o777;
         assert_eq!(mode, 0o600);
     }
+
+    /// The shipped example file stays valid: it parses, validates, and binds
+    /// what its comments say.
+    #[test]
+    fn the_issue_354_example_keymap_is_valid() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../contrib/keymaps/issue-354-layout.toml"
+        );
+        let text = std::fs::read_to_string(path).expect("example keymap file");
+        let km = parse_and_validate(&text, "issue-354-layout.toml").unwrap();
+        assert_eq!(km.name, "issue-354-layout");
+        assert_eq!(
+            km.action_for("g"),
+            Some(bbs_plugin_api::KeymapAction::ChangeRoom)
+        );
+        assert_eq!(
+            km.reading_action_for("j"),
+            Some(bbs_plugin_api::KeymapAction::ReadingForward)
+        );
+        // Every requested mail command has a reply.
+        for key in ["lm", "jm", "rm", "dm", "nm", "cm", "sm", "xm", "qm"] {
+            assert!(km.unsupported_message(key).is_some(), "{key}");
+        }
+    }
 }
