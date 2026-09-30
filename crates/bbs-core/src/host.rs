@@ -31,7 +31,7 @@ use bbs_plugin_api::{
     AdminAccessPolicy, AdminAuditArchive, AdminBackupRecord, AdminKeymapInfo, AdminMessageRecord,
     AdminRoomSummary, AdminSessionInfo, AdminStats, AdminUserInfo, Command, DomainEvent, HostError,
     Keymap, KeymapAction, KeymapPresetInfo, MessageRecipient, PermissionCtx, PermissionLevel,
-    Response, Secret, SessionId, Username,
+    ReadingInput, Response, Secret, SessionId, Username,
 };
 use tokio::sync::{broadcast, RwLock};
 use tracing::{debug, info, warn};
@@ -3740,140 +3740,62 @@ impl BbsHost {
 
             // ── Message reading ──────────────────────────────────────────────
             Workflow::Reading => {
-                let trimmed = reply.trim();
-                // Keymap-translate the leading keyword (GH #354 Phase 2,
-                // P2.3): a preset can rebind the seven Reading* actions
-                // (five actions, each covering its bare and its `<key> <id>`
-                // form) to different letters. Translation only ever
-                // changes which single letter this block matches on next —
-                // the bare-vs-"<letter> <id>" argument logic below is
-                // unchanged, and it keeps disambiguating solely by whether
-                // an id argument follows, exactly as it always has. A
-                // binding to any non-Reading* action falls to the `_`
-                // arm below and is treated as untranslated (unlike
-                // Command::parse_with_keymap's opposite-direction guard,
-                // this match's own arms are the filter — it doesn't call
-                // KeymapAction::is_reading_only itself, since matching on
-                // the five concrete Reading* patterns already excludes
-                // every top-level action by construction).
-                let (leading, reading_rest) = trimmed
-                    .split_once(|c: char| c.is_ascii_whitespace())
-                    .map_or((trimmed, None), |(w, r)| (w, Some(r.trim_start())));
-                let translated = match self
-                    .keymap
-                    .read()
-                    .await
-                    .reading_action_for(&leading.to_lowercase())
-                {
-                    Some(KeymapAction::ReadingForward) => "F",
-                    Some(KeymapAction::ReadingReverse) => "R",
-                    Some(KeymapAction::ReadingReply) => "E",
-                    Some(KeymapAction::ReadingHelp) => "H",
-                    Some(KeymapAction::ReadingDelete) => "D",
-                    // Not one of the active keymap's reading keys, so nothing
-                    // below may match it: only the active keys work.
-                    _ => "\u{0}",
+                // Reading mode uses the same keymap as the command prompt: the
+                // line is parsed into a `ReadingInput` from the active
+                // keymap's reading keys, then handled by variant. A reading
+                // key with an argument it does not take is `Other`, like any
+                // unrecognised input, and exits reading mode.
+                let input = {
+                    let keymap = self.keymap.read().await;
+                    ReadingInput::parse(&reply, &keymap)
                 };
-                let upper = match reading_rest {
-                    Some(r) => format!("{} {}", translated.to_uppercase(), r.to_uppercase()),
-                    None => translated.to_uppercase(),
-                };
-                match upper.as_str() {
-                    "F" => self.handle_read_forward(session, None).await,
-                    "R" => self.handle_read_reverse(session, None).await,
-                    "E" => self.handle_reply_from_reading(session, None).await,
-                    // H is the universal help key; in reading mode it shows
-                    // contextual help and stays in the reading sub-mode rather
-                    // than bouncing the user out (issue #109).
-                    "H" | "?" => Ok(Response::Text(HELP_READING_MODE.into())),
-                    _ => {
-                        // F <id> jumps to a message without leaving reading
-                        // mode. Without this it fell through to the catch-all
-                        // below and exited, so the messages a scan listed could
-                        // not be read one after another by number.
-                        if let Some(id) = upper
-                            .strip_prefix("F ")
-                            .and_then(|rest| rest.trim().parse::<i64>().ok())
-                        {
-                            return self.handle_read_forward(session, Some(id)).await;
-                        }
-
-                        // R <id> is the reverse counterpart of F <id> (#415).
-                        // Without it "R 5" hit the catch-all and silently
-                        // exited reading mode.
-                        if let Some(id) = upper
-                            .strip_prefix("R ")
-                            .and_then(|rest| rest.trim().parse::<i64>().ok())
-                        {
-                            return self.handle_read_reverse(session, Some(id)).await;
-                        }
-
-                        // E <text> starts a reply with that text as the draft
-                        // (#410). Uses `reply`, not `upper`, to keep the case
-                        // the user typed.
-                        let trimmed = reply.trim();
-                        if trimmed.len() > 2
-                            && trimmed.is_char_boundary(2)
-                            && trimmed[..2].eq_ignore_ascii_case("e ")
-                        {
-                            let body = trimmed[2..].trim();
-                            if !body.is_empty() {
-                                return self
-                                    .handle_reply_from_reading(session, Some(body.to_owned()))
-                                    .await;
-                            }
-                        }
-
-                        // D [<id>] deletes without leaving reading mode (issue
-                        // #184) -- previously any input other than F/R/E/H
-                        // fell straight to the catch-all below, so "D <id>"
-                        // just exited reading mode instead of deleting; only
-                        // a second, out-of-reading-mode "D <id>" worked.
-                        // Bare "D" targets whatever message is on screen.
-                        let delete_id = if upper == "D" {
-                            let sessions = self.sessions.read().await;
-                            sessions
-                                .get(&session)
-                                .and_then(|r| r.current_message_id)
-                                .map(MessageId::as_i64)
-                        } else {
-                            upper
-                                .strip_prefix("D ")
-                                .and_then(|rest| rest.trim().parse::<i64>().ok())
-                        };
-
-                        if let Some(id) = delete_id {
-                            let current = {
-                                let sessions = self.sessions.read().await;
-                                sessions.get(&session).and_then(|r| r.current_message_id)
-                            };
-                            let response = self.handle_delete(session, id).await;
-                            // Deleting the message on screen (or a bare "D")
-                            // leaves nothing left to show -- exit reading
-                            // mode. Deleting some other id read earlier
-                            // leaves the current message intact; stay put.
-                            if current.map(MessageId::as_i64) == Some(id) {
-                                let mut sessions = self.sessions.write().await;
-                                if let Some(r) = sessions.get_mut(&session) {
-                                    r.workflow = Workflow::None;
-                                    r.current_message_id = None;
-                                }
-                            }
-                            return response;
-                        }
-
-                        // Any other input exits reading mode.
-                        {
-                            let mut sessions = self.sessions.write().await;
-                            if let Some(r) = sessions.get_mut(&session) {
-                                r.workflow = Workflow::None;
-                                r.current_message_id = None;
-                            }
-                        }
-                        Ok(Response::Text(
-                            "Exited reading mode. Type H for help.".into(),
-                        ))
+                match input {
+                    ReadingInput::Forward => self.handle_read_forward(session, None).await,
+                    // `<key> <id>` jumps to a message without leaving reading
+                    // mode, so the messages a scan listed can be read one
+                    // after another by number.
+                    ReadingInput::Jump(id) => self.handle_read_forward(session, Some(id)).await,
+                    ReadingInput::Reverse => self.handle_read_reverse(session, None).await,
+                    // The reverse counterpart of the jump (#415).
+                    ReadingInput::ReverseTo(id) => {
+                        self.handle_read_reverse(session, Some(id)).await
                     }
+                    // A reply with text starts the draft with that text (#410).
+                    ReadingInput::Reply(body) => {
+                        self.handle_reply_from_reading(session, body).await
+                    }
+                    // Help shows contextual help and stays in the reading
+                    // sub-mode rather than bouncing the user out (issue #109).
+                    ReadingInput::Help => Ok(Response::Text(HELP_READING_MODE.into())),
+                    // Delete works without leaving reading mode (issue #184).
+                    // Bare delete targets whatever message is on screen.
+                    ReadingInput::Delete(target) => {
+                        let current = {
+                            let sessions = self.sessions.read().await;
+                            sessions.get(&session).and_then(|r| r.current_message_id)
+                        };
+                        let id = target.or_else(|| current.map(MessageId::as_i64));
+                        match id {
+                            Some(id) => {
+                                let response = self.handle_delete(session, id).await;
+                                // Deleting the message on screen (or a bare
+                                // delete) leaves nothing left to show, so
+                                // reading mode ends. Deleting some other id
+                                // read earlier leaves the current message
+                                // intact; stay put.
+                                if current.map(MessageId::as_i64) == Some(id) {
+                                    let mut sessions = self.sessions.write().await;
+                                    if let Some(r) = sessions.get_mut(&session) {
+                                        r.workflow = Workflow::None;
+                                        r.current_message_id = None;
+                                    }
+                                }
+                                response
+                            }
+                            None => self.exit_reading_mode(session).await,
+                        }
+                    }
+                    ReadingInput::Other => self.exit_reading_mode(session).await,
                 }
             }
 
@@ -4751,6 +4673,20 @@ impl BbsHost {
             text: prompt,
             hide_input: false,
         })
+    }
+
+    /// Leave reading mode after input that is not a reading key.
+    async fn exit_reading_mode(&self, session: SessionId) -> Result<Response, HostError> {
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::None;
+                r.current_message_id = None;
+            }
+        }
+        Ok(Response::Text(
+            "Exited reading mode. Type H for help.".into(),
+        ))
     }
 
     /// Advance the `ReviewPending` queue to `next_index`, showing the next
@@ -15018,5 +14954,66 @@ mod tests {
             .await
             .unwrap();
         assert!(all.messages.iter().any(|m| m.content == "Hello There"));
+    }
+
+    // ── Reading mode uses the active keymap (GH #354 phase 4) ────────────
+
+    /// Maximus reads with N and P. Its keys work, the native F does not, and
+    /// a dropped key ends reading mode like any other unrecognised input.
+    #[tokio::test]
+    async fn reading_mode_uses_the_active_keymaps_keys() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+        *host.keymap.write().await = Keymap::maximus();
+
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[0]),
+            },
+        )
+        .await
+        .unwrap();
+        let text = shown(say(&host, sid, "n").await);
+        assert!(text.contains("second"), "{text:?}");
+        let text = shown(say(&host, sid, "N").await);
+        assert!(text.contains("third"), "{text:?}");
+        let text = shown(say(&host, sid, "p").await);
+        assert!(text.contains("second"), "{text:?}");
+
+        // Native F is not a reading key on this keymap.
+        let text = shown(say(&host, sid, "f").await);
+        assert!(text.to_lowercase().contains("exited"), "{text:?}");
+        let sessions = host.sessions.read().await;
+        assert!(!matches!(sessions[&sid].workflow, Workflow::Reading));
+    }
+
+    /// The WWIV idiom `- 5` (reverse to message 5) jumps instead of silently
+    /// leaving reading mode (#415).
+    #[tokio::test]
+    async fn a_preset_reverse_key_with_an_id_jumps() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+        *host.keymap.write().await = Keymap::wwiv_family();
+
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[2]),
+            },
+        )
+        .await
+        .unwrap();
+        let text = shown(say(&host, sid, &format!("- {}", ids[0])).await);
+        assert!(
+            text.contains("first") && !text.to_lowercase().contains("exited"),
+            "{text:?}"
+        );
+        let sessions = host.sessions.read().await;
+        assert!(matches!(sessions[&sid].workflow, Workflow::Reading));
     }
 }

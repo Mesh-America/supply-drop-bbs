@@ -637,6 +637,69 @@ impl Command {
     }
 }
 
+// ── Reading-mode input ────────────────────────────────────────────────────────
+
+/// What a user typed while reading messages one at a time.
+///
+/// Parsed by [`ReadingInput::parse`] from the active keymap's reading keys, so
+/// reading mode uses the same table as the command prompt and a valid key can
+/// no longer fall through to "exit reading mode" because of its argument.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadingInput {
+    /// Next message (`ReadingForward`, bare).
+    Forward,
+    /// Jump to a message by id (`ReadingForward` with an id).
+    Jump(i64),
+    /// Previous message (`ReadingReverse`, bare).
+    Reverse,
+    /// Jump to a message by id, reading backward from there
+    /// (`ReadingReverse` with an id).
+    ReverseTo(i64),
+    /// Reply to the message on screen. `Some(text)` starts the reply with that
+    /// text as the draft (`ReadingReply` with text).
+    Reply(Option<String>),
+    /// Show reading-mode help (`ReadingHelp`, bare).
+    Help,
+    /// Delete the message on screen (`None`) or a specific one
+    /// (`ReadingDelete`).
+    Delete(Option<i64>),
+    /// Anything else, including a reading key with an argument it does not
+    /// take. Reading mode ends.
+    Other,
+}
+
+impl ReadingInput {
+    /// Parse a line typed in reading mode using `keymap`'s reading keys. A key
+    /// that is not one of the keymap's reading keys is [`ReadingInput::Other`]:
+    /// only the active keys work.
+    #[must_use]
+    pub fn parse(line: &str, keymap: &crate::Keymap) -> Self {
+        use crate::KeymapAction as A;
+        let stripped = strip_zero_width(line.trim());
+        let (word, rest) = split_first_word(&stripped);
+        let Some(action) = keymap.reading_action_for(&word.to_lowercase()) else {
+            return ReadingInput::Other;
+        };
+        let id = || rest.and_then(|r| r.parse::<i64>().ok());
+        match (action, rest) {
+            (A::ReadingForward, None) => ReadingInput::Forward,
+            (A::ReadingForward, Some(_)) => id().map_or(ReadingInput::Other, ReadingInput::Jump),
+            (A::ReadingReverse, None) => ReadingInput::Reverse,
+            (A::ReadingReverse, Some(_)) => {
+                id().map_or(ReadingInput::Other, ReadingInput::ReverseTo)
+            }
+            (A::ReadingReply, None) => ReadingInput::Reply(None),
+            (A::ReadingReply, Some(text)) => ReadingInput::Reply(Some(text.to_owned())),
+            (A::ReadingHelp, None) => ReadingInput::Help,
+            (A::ReadingDelete, None) => ReadingInput::Delete(None),
+            (A::ReadingDelete, Some(_)) => {
+                id().map_or(ReadingInput::Other, |i| ReadingInput::Delete(Some(i)))
+            }
+            _ => ReadingInput::Other,
+        }
+    }
+}
+
 /// Build the [`Command`] for a keymap action, given the full trimmed line and
 /// the text after the keyword. The keyword the user typed does not matter
 /// here: this is where each action's arguments are defined, once.
@@ -1321,5 +1384,75 @@ mod tests {
         assert_eq!(json, "\"pw\"");
         let back: Secret = serde_json::from_str(&json).unwrap();
         assert_eq!(back.expose(), "pw");
+    }
+
+    // ── Reading-mode input (GH #354 phase 4) ─────────────────────────────
+
+    #[test]
+    fn reading_input_native_forms() {
+        use crate::Keymap;
+        let km = Keymap::native();
+        let p = |t: &str| ReadingInput::parse(t, &km);
+        assert_eq!(p("f"), ReadingInput::Forward);
+        assert_eq!(p("F"), ReadingInput::Forward);
+        assert_eq!(p("f 12"), ReadingInput::Jump(12));
+        assert_eq!(p("r"), ReadingInput::Reverse);
+        assert_eq!(p("R 5"), ReadingInput::ReverseTo(5));
+        assert_eq!(p("e"), ReadingInput::Reply(None));
+        assert_eq!(p("E"), ReadingInput::Reply(None));
+        assert_eq!(
+            p("E Thanks, Bob"),
+            ReadingInput::Reply(Some("Thanks, Bob".to_owned()))
+        );
+        assert_eq!(p("h"), ReadingInput::Help);
+        assert_eq!(p("?"), ReadingInput::Help);
+        assert_eq!(p("d"), ReadingInput::Delete(None));
+        assert_eq!(p("d 7"), ReadingInput::Delete(Some(7)));
+    }
+
+    #[test]
+    fn reading_input_bad_arguments_and_other_text_end_reading() {
+        use crate::Keymap;
+        let km = Keymap::native();
+        let p = |t: &str| ReadingInput::parse(t, &km);
+        for text in ["f x", "f 1o", "r x", "d x", "h me", "x", "hello", "", "5"] {
+            assert_eq!(p(text), ReadingInput::Other, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn reading_input_follows_the_active_keymap() {
+        use crate::Keymap;
+        let km = Keymap::maximus();
+        assert_eq!(ReadingInput::parse("n", &km), ReadingInput::Forward);
+        assert_eq!(ReadingInput::parse("p", &km), ReadingInput::Reverse);
+        assert_eq!(ReadingInput::parse("n 4", &km), ReadingInput::Jump(4));
+        // Native forward and reverse keys were replaced, so they end reading.
+        assert_eq!(ReadingInput::parse("f", &km), ReadingInput::Other);
+        assert_eq!(ReadingInput::parse("r", &km), ReadingInput::Other);
+
+        let km = Keymap::wwiv_family();
+        assert_eq!(ReadingInput::parse("-", &km), ReadingInput::Reverse);
+        assert_eq!(ReadingInput::parse("- 5", &km), ReadingInput::ReverseTo(5));
+    }
+
+    #[test]
+    fn reading_input_ignores_zero_width_characters_and_unicode_spaces() {
+        use crate::Keymap;
+        let km = Keymap::native();
+        assert_eq!(ReadingInput::parse("f\u{200B}", &km), ReadingInput::Forward);
+        assert_eq!(
+            ReadingInput::parse("f\u{00A0}9", &km),
+            ReadingInput::Jump(9)
+        );
+    }
+
+    #[test]
+    fn a_top_level_only_key_is_not_a_reading_key() {
+        use crate::{Keymap, KeymapAction};
+        // `k` lists rooms at the prompt but means nothing while reading.
+        let km = Keymap::native();
+        assert_eq!(km.action_for("k"), Some(KeymapAction::ListRooms));
+        assert_eq!(ReadingInput::parse("k", &km), ReadingInput::Other);
     }
 }

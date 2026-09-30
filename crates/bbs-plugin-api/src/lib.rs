@@ -59,7 +59,7 @@ pub use admin::{
     MeshtasticDeviceSnapshot, MeshtasticLoRaConfig, MeshtasticOwnerInfo, MeshtasticSecurityInfo,
 };
 pub use advert::{AdvertBus, AdvertRecord, FavouriteOutcome, FavouriteSnapshot};
-pub use command::{Command, Response, Secret};
+pub use command::{Command, ReadingInput, Response, Secret};
 pub use error::{HostError, PluginError, TransportError};
 pub use event::{DomainEvent, MessageRecipient, Notification, NotifyOutcome};
 pub use host::{Host, MeshKeyRequest, MeshtasticAdminRequest};
