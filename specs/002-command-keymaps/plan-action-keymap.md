@@ -1,6 +1,7 @@
 # Plan: action-based keymaps (replaces the "translate to the native key" approach)
 
-Status: draft for TJ. Supersedes the translation design in `plan.md` and the
+Status: phases 1 and 2 done (parser fixes merged, complete-table data model);
+phase 3 onward not started. Draft for TJ. Supersedes the translation design in `plan.md` and the
 module doc of `crates/bbs-plugin-api/src/keymap.rs`. GH #354.
 
 ## Why change
@@ -133,9 +134,10 @@ if any is over the limit.
 
 Each phase ends with the full gate from CLAUDE.md and a commit.
 
-1. **Merge the parser fixes.** Merge `fix/command-parser-hardening` into this
+1. **Merge the parser fixes.** (done) Merge `fix/command-parser-hardening` into this
    branch. Resolve the `s`/`search` conflict in favour of the fix.
-2. **Data model.** Keymap with ordered keywords and primaries. `native()` built
+2. **Data model.** (done; presets are completed mechanically, key accuracy
+   is still phase 7) Keymap with ordered keywords and primaries. `native()` built
    from it. Validation additions. Tests: primary survives layering, reserved
    words rejected, custom TOML still loads.
 3. **Parse by action.** Per-action argument parsers, one shared entry point.

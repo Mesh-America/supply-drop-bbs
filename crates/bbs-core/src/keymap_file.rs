@@ -61,8 +61,12 @@ pub fn is_safe_filename(filename: &str) -> Result<(), String> {
 /// parsing or validation failed. `context` is prepended (typically the
 /// file path) to make the error self-contained for a CLI's `eprintln!`.
 pub fn parse_and_validate(text: &str, context: &str) -> Result<Keymap, String> {
-    let keymap: Keymap =
-        toml::from_str(text).map_err(|e| format!("could not parse {context}: {e}"))?;
+    let keymap: Keymap = toml::from_str(text).map_err(|e| {
+        format!(
+            "could not parse {context}: {e}\nA custom keymap must list every action, each \
+             with a list of keys, for example: Quit = [\"g\"]. See docs/CONFIG.md."
+        )
+    })?;
     keymap
         .validate()
         .map_err(|e| format!("{context} failed validation: {e}"))?;
@@ -174,6 +178,25 @@ pub fn save_custom_keymap(
 mod tests {
     use super::*;
 
+    /// A complete, valid keymap file named `name`.
+    fn valid_toml(name: &str) -> String {
+        let km = Keymap {
+            name: name.to_owned(),
+            ..Keymap::maximus()
+        };
+        toml::to_string(&km).unwrap()
+    }
+
+    /// A complete keymap file that fails validation: `g` is stolen for Quit,
+    /// leaving GoNextUnread with no key.
+    fn invalid_toml(name: &str) -> String {
+        let km = Keymap {
+            name: name.to_owned(),
+            ..Keymap::native_with_overrides(&[("g", bbs_plugin_api::KeymapAction::Quit)])
+        };
+        toml::to_string(&km).unwrap()
+    }
+
     fn write(dir: &Path, filename: &str, contents: &str) {
         std::fs::write(dir.join(filename), contents).unwrap();
     }
@@ -213,11 +236,7 @@ mod tests {
 
     #[test]
     fn parse_and_validate_rejects_a_keymap_that_fails_validate_with_context() {
-        let err = parse_and_validate(
-            "name = \"x\"\ndescription = \"x\"\n[bindings]\ng = \"Quit\"\n",
-            "ctx.toml",
-        )
-        .unwrap_err();
+        let err = parse_and_validate(&invalid_toml("x"), "ctx.toml").unwrap_err();
         assert!(err.contains("ctx.toml"), "{err}");
         assert!(err.contains("failed validation"), "{err}");
     }
@@ -225,21 +244,22 @@ mod tests {
     #[test]
     fn a_valid_custom_keymap_loads_and_validates() {
         let dir = tempfile::tempdir().unwrap();
-        write(
-            dir.path(),
-            "my-bbs.toml",
-            r#"
-                name = "my-bbs"
-                description = "test"
-
-                [bindings]
-                l = "ScanMessages"
-                a = "ChangeRoom"
-            "#,
-        );
+        write(dir.path(), "my-bbs.toml", &valid_toml("my-bbs"));
         let km = load_custom_keymap(dir.path(), "my-bbs.toml").unwrap();
         assert_eq!(km.name, "my-bbs");
         assert_eq!(km.validate(), Ok(()));
+    }
+
+    #[test]
+    fn an_old_partial_keymap_file_is_rejected_with_a_hint() {
+        // The pre-complete-table format: keyword = "Action".
+        let err = parse_and_validate(
+            "name = \"x\"\ndescription = \"x\"\n[bindings]\nl = \"ScanMessages\"\n",
+            "old.toml",
+        )
+        .unwrap_err();
+        assert!(err.contains("old.toml"), "{err}");
+        assert!(err.contains("must list every action"), "{err}");
     }
 
     #[test]
@@ -262,21 +282,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Steals native "g" (GoNextUnread) for Quit without relocating
         // GoNextUnread — Rule 2 violation.
-        write(
-            dir.path(),
-            "broken.toml",
-            r#"
-                name = "broken"
-                description = "test"
-
-                [bindings]
-                g = "Quit"
-            "#,
-        );
+        write(dir.path(), "broken.toml", &invalid_toml("broken"));
         let err = load_custom_keymap(dir.path(), "broken.toml").unwrap_err();
         assert!(err.contains("broken.toml"), "{err}");
         assert!(
-            err.contains("GoNextUnread") || err.contains("failed validation"),
+            err.contains("Quit") || err.contains("failed validation"),
             "{err}"
         );
     }
@@ -302,15 +312,8 @@ mod tests {
     #[test]
     fn save_custom_keymap_writes_and_returns_a_valid_keymap() {
         let dir = tempfile::tempdir().unwrap();
-        let text = r#"
-            name = "my-bbs"
-            description = "test"
-
-            [bindings]
-            l = "ScanMessages"
-            a = "ChangeRoom"
-        "#;
-        let km = save_custom_keymap(dir.path(), "my-bbs.toml", text).unwrap();
+        let text = valid_toml("my-bbs");
+        let km = save_custom_keymap(dir.path(), "my-bbs.toml", &text).unwrap();
         assert_eq!(km.name, "my-bbs");
         assert_eq!(km.validate(), Ok(()));
 
@@ -335,8 +338,8 @@ mod tests {
         // Steals native "g" (GoNextUnread) for Quit without relocating
         // GoNextUnread — Rule 2 violation, same as the load_custom_keymap
         // test above.
-        let text = "name = \"broken\"\ndescription = \"test\"\n[bindings]\ng = \"Quit\"\n";
-        let err = save_custom_keymap(dir.path(), "broken.toml", text).unwrap_err();
+        let text = invalid_toml("broken");
+        let err = save_custom_keymap(dir.path(), "broken.toml", &text).unwrap_err();
         assert!(err.contains("failed validation"), "{err}");
         assert!(!dir.path().join("broken.toml").exists());
     }
@@ -360,8 +363,8 @@ mod tests {
     fn save_custom_keymap_restricts_the_file_to_owner_only() {
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let text = "name = \"my-bbs\"\ndescription = \"test\"\n[bindings]\nl = \"ScanMessages\"\n";
-        save_custom_keymap(dir.path(), "my-bbs.toml", text).unwrap();
+        let text = valid_toml("my-bbs");
+        save_custom_keymap(dir.path(), "my-bbs.toml", &text).unwrap();
         let mode = std::fs::metadata(dir.path().join("my-bbs.toml"))
             .unwrap()
             .permissions()

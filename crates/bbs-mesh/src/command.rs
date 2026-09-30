@@ -558,14 +558,7 @@ mod tests {
     /// the canonical parser directly).
     #[test]
     fn keymap_override_reaches_the_mesh_parser() {
-        let km = Keymap {
-            name: "test".to_owned(),
-            description: "test".to_owned(),
-            bindings: std::collections::BTreeMap::from([(
-                "a".to_owned(),
-                bbs_plugin_api::KeymapAction::ChangeRoom,
-            )]),
-        };
+        let km = Keymap::native_with_overrides(&[("a", bbs_plugin_api::KeymapAction::ChangeRoom)]);
         assert_eq!(
             parse_command("a Lobby", None, false, &km),
             Some(Command::ChangeRoom {

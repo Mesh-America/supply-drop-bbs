@@ -7639,13 +7639,12 @@ mod tests {
         #[tokio::test]
         async fn upload_keymap_activates_a_valid_custom_file() {
             let f = fixture().await;
-            let resp = upload(
-                &f,
-                sysop(),
-                "my-bbs.toml",
-                "name = \"my-bbs\"\ndescription = \"test\"\n[bindings]\nl = \"ScanMessages\"\n",
-            )
-            .await;
+            let text = toml::to_string(&bbs_plugin_api::Keymap {
+                name: "my-bbs".to_owned(),
+                ..bbs_plugin_api::Keymap::maximus()
+            })
+            .unwrap();
+            let resp = upload(&f, sysop(), "my-bbs.toml", &text).await;
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(f.state.host.active_keymap().await.name, "my-bbs");
 

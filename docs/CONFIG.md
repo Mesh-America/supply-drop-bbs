@@ -118,12 +118,25 @@ which plugin sections are valid.
 
 ### Command keymaps
 
-A keymap remaps which typed keyword triggers which action — e.g. so a board
-can look and feel like a classic BBS system its users already know — without
-changing what any action *does*. Supply Drop's own commands (`native`) are
-always the default and never disappear: a keymap only lists the actions it
-actually remaps, so anything a preset doesn't mention keeps behaving exactly
-as documented in [USER_GUIDE.md](USER_GUIDE.md).
+A keymap decides which typed keyword triggers which action, so a board can use
+the keys a classic BBS system's users already know, without changing what any
+action *does*. Supply Drop's own commands (`native`) are the default.
+
+A keymap is a **complete table**: it lists every action, and only the keys in
+the active keymap work. Choosing a preset replaces the native keys, so a
+native key the preset does not list is "Unknown command" on that board. A few
+words never change, in every keymap: `help`, the account and admin commands
+(`register`, `login`, `whoami`, `passwd`, `search`, and so on), `cancel`,
+`stop`, and the quit words `quit`, `exit`, `bye` and `logout`, so users can
+always get help and always log out.
+
+Messages that name a key (help pages, "Type N to read") show the key from the
+active keymap.
+
+A preset changes keys, not features. Where the source BBS has a command
+Supply Drop does not offer (file areas, graphics mode), the preset answers
+with a short message instead of "Unknown command", and its description says
+what is not covered.
 
 ```toml
 [bbs]
@@ -132,8 +145,9 @@ keymap = "maximus"
 
 **Built-in presets**, each sourced from that system's own manual/source (see
 `specs/002-command-keymaps/research-classic-bbs-commands.md` for citations —
-a preset only remaps an action where the source system has a genuine,
-verifiable single-key equivalent; nothing is invented):
+a key is only presented as the source system's own where that is verified.
+Actions with no equivalent keep a Supply Drop key and are marked as such in the
+preset):
 
 | Name          | Source system                          |
 |---------------|-----------------------------------------|
@@ -145,25 +159,54 @@ verifiable single-key equivalent; nothing is invented):
 | `synchronet`  | Synchronet (current)                    |
 
 **Custom keymaps** are TOML files in the same shape as a built-in preset,
-placed under `data_dir`:
+placed under `data_dir`. Every action must be listed, each with a list of
+keys. The first key is the one messages show. Keys can be single letters,
+words or multi-letter codes (`lm`, `goto`):
 
 ```toml
 name = "my-bbs"
 description = "A hand-authored custom keymap."
 
 [bindings]
-g = "Quit"
-a = "ChangeRoom"
+Quit = ["g"]
+ListRooms = ["k", "rooms"]
+GoNextUnread = ["next"]
+ChangeRoom = ["a", "goto"]
+GoMail = ["m"]
+ReadNew = ["n"]
+ReadForward = ["f"]
+ReadReverse = ["r"]
+ScanMessages = ["l"]
+EnterMessage = ["e"]
+DeleteMessage = ["d"]
+WhoIsOnline = ["w"]
+# Keys used while reading messages one at a time.
+ReadingForward = ["n"]
+ReadingReverse = ["p"]
+ReadingReply = ["e"]
+ReadingHelp = ["?"]
+ReadingDelete = ["d"]
+
+# Optional: source-BBS keys this board does not support, with the reply.
+[unsupported]
+j = "No file areas on this BBS."
 ```
 
-`bindings` maps a lowercase override keyword to one of the action names
-listed in `bbs_plugin_api::KeymapAction`'s own doc comment (e.g. `Quit`,
-`ListRooms`, `ChangeRoom`, `ScanMessages`, …) — an unrecognised action name,
-or a binding that would leave some action with no way to reach it, is
-rejected with a specific error rather than silently accepted. A binding
-can't target a command outside that closed set (admin/auth commands, the
-CANCEL/STOP words, and Supply Drop's own Help alias are all reserved) —
-attempting to shadow one of those is rejected too.
+Rules, each rejected with a specific error:
+
+- every action must have at least one key;
+- keys are lowercase, with no spaces or zero-width characters;
+- one key cannot trigger two actions in the same group (the top-level actions
+  and the reading-mode actions are separate groups, so `f` can be both);
+- a top-level key cannot be one of the fixed words above;
+- an `unsupported` key cannot also be bound to an action.
+
+An optional `no_source_equivalent = ["ListRooms", ...]` line records actions
+whose key was picked only because every action needs one. It is documentation
+for the sysop and does not change behaviour.
+
+Custom files written for the earlier format (`l = "ScanMessages"`, listing only
+some actions) are rejected with an error that says every action must be listed.
 
 A keymap can be selected three ways:
 
@@ -199,8 +242,7 @@ running. **The web UI applies immediately, no restart required** — it's the
 only path that also updates the live, already-running BBS.
 
 `config set-keymap native` (or picking `native` anywhere) is always a clean,
-lossless revert — the native keymap has no overrides at all, so nothing
-about it can drift or leave leftover state behind.
+lossless revert to Supply Drop's own keys.
 
 ### Access control and SHTF mode
 

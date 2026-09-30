@@ -3743,9 +3743,8 @@ impl BbsHost {
                 let trimmed = reply.trim();
                 // Keymap-translate the leading keyword (GH #354 Phase 2,
                 // P2.3): a preset can rebind the seven Reading* actions
-                // (five distinct letters — ReadingForward/ReadingJump both
-                // translate to "F", ReadingDeleteCurrent/ReadingDeleteSpecific
-                // both to "D") to different letters. Translation only ever
+                // (five actions, each covering its bare and its `<key> <id>`
+                // form) to different letters. Translation only ever
                 // changes which single letter this block matches on next —
                 // the bare-vs-"<letter> <id>" argument logic below is
                 // unchanged, and it keeps disambiguating solely by whether
@@ -3764,16 +3763,16 @@ impl BbsHost {
                     .keymap
                     .read()
                     .await
-                    .action_for(&leading.to_ascii_lowercase())
+                    .reading_action_for(&leading.to_lowercase())
                 {
-                    Some(KeymapAction::ReadingForward | KeymapAction::ReadingJump) => "F",
+                    Some(KeymapAction::ReadingForward) => "F",
                     Some(KeymapAction::ReadingReverse) => "R",
                     Some(KeymapAction::ReadingReply) => "E",
                     Some(KeymapAction::ReadingHelp) => "H",
-                    Some(
-                        KeymapAction::ReadingDeleteCurrent | KeymapAction::ReadingDeleteSpecific,
-                    ) => "D",
-                    _ => leading,
+                    Some(KeymapAction::ReadingDelete) => "D",
+                    // Not one of the active keymap's reading keys, so nothing
+                    // below may match it: only the active keys work.
+                    _ => "\u{0}",
                 };
                 let upper = match reading_rest {
                     Some(r) => format!("{} {}", translated.to_uppercase(), r.to_uppercase()),
@@ -7195,12 +7194,7 @@ fn quick_help_logged_in(keymap: &Keymap) -> String {
     let mut lines: Vec<String> = QUICK_HELP_ACTIONS
         .iter()
         .map(|(action, label)| {
-            let key = keymap
-                .bindings
-                .iter()
-                .find(|(_, &a)| a == *action)
-                .map(|(k, _)| k.to_ascii_uppercase())
-                .unwrap_or_else(|| action.native_keyword().to_ascii_uppercase());
+            let key = keymap.primary(*action).to_uppercase();
             format!("{key}  {label}")
         })
         .collect();
@@ -9616,11 +9610,7 @@ mod tests {
         // GoNextUnread — the same Rule 2 violation exercised elsewhere in
         // this codebase's keymap tests, here to prove with_config itself
         // catches it rather than silently accepting an unvalidated value.
-        let broken = Keymap {
-            name: "broken".to_owned(),
-            description: "test".to_owned(),
-            bindings: std::collections::BTreeMap::from([("g".to_owned(), KeymapAction::Quit)]),
-        };
+        let broken = Keymap::native_with_overrides(&[("g", KeymapAction::Quit)]);
         let f = NamedTempFile::new().unwrap();
         let db = Database::open(&f.path().to_string_lossy())
             .await
@@ -9707,9 +9697,13 @@ mod tests {
     async fn admin_upload_keymap_applies_live_persists_and_restricts_the_file() {
         let (host, _db, cfg) = make_host_for_keymap_tests().await;
         let data_dir = tempfile::tempdir().unwrap();
-        let text = "name = \"my-bbs\"\ndescription = \"test\"\n[bindings]\nl = \"ScanMessages\"\n";
+        let text = toml::to_string(&Keymap {
+            name: "my-bbs".to_owned(),
+            ..Keymap::maximus()
+        })
+        .unwrap();
 
-        host.admin_upload_keymap(&data_dir.path().to_string_lossy(), "my-bbs.toml", text)
+        host.admin_upload_keymap(&data_dir.path().to_string_lossy(), "my-bbs.toml", &text)
             .await
             .unwrap();
 

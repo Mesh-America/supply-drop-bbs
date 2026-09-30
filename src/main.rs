@@ -2009,7 +2009,7 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                                     "Uploaded {:?} ({}, {} binding(s)).",
                                     km.name,
                                     km.description,
-                                    km.bindings.len()
+                                    km.keyword_count()
                                 );
                                 format!("custom:{filename}")
                             }
@@ -2038,7 +2038,7 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                             "keymap = \"{name}\" (loaded {:?}, {} binding(s)). Restart the BBS \
                              for the change to take effect.",
                             km.name,
-                            km.bindings.len()
+                            km.keyword_count()
                         );
                     }
                     Err(e) => {
@@ -2070,7 +2070,7 @@ fn cmd_config(config_path: Option<&std::path::Path>, action: ConfigAction) {
                          Run 'supply-drop-bbs config set-keymap custom:{filename}' to activate it.",
                         keymap.name,
                         keymap.description,
-                        keymap.bindings.len(),
+                        keymap.keyword_count(),
                         data_dir.join(&filename).display()
                     );
                 }
