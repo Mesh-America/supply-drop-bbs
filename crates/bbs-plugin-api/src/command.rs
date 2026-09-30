@@ -69,13 +69,37 @@ impl From<&str> for Secret {
 // ── Parsing helpers (private) ─────────────────────────────────────────────────
 
 fn split_first_word(s: &str) -> (&str, Option<&str>) {
-    match s.find(|c: char| c.is_ascii_whitespace()) {
+    // Unicode-aware, matching `line.trim()`'s own whitespace definition — an
+    // ASCII-only split here left a line joined by e.g. a non-breaking space
+    // (U+00A0) as one unmatched word instead of keyword + argument (#413).
+    match s.find(char::is_whitespace) {
         None => (s, None),
         Some(i) => {
             let rest = s[i..].trim_start();
             (&s[..i], if rest.is_empty() { None } else { Some(rest) })
         }
     }
+}
+
+/// Strip zero-width and other default-ignorable code points that survive
+/// [`str::trim`] (which only strips characters with the Unicode
+/// `White_Space` property) and `to_lowercase()` (which doesn't remove
+/// characters at all) — without this, `"cancel\u{200B}"` is visually
+/// indistinguishable from `"cancel"` in any terminal but fails an exact
+/// string match, so CANCEL/STOP (and keyword matching in general) could be
+/// silently defeated by mesh-transport encoding noise or an adversarial
+/// payload (#412).
+fn strip_zero_width(s: &str) -> String {
+    s.chars()
+        .filter(|c| {
+            !matches!(
+                *c,
+                '\u{200B}'..='\u{200D}' // ZWSP, ZWNJ, ZWJ
+                    | '\u{2060}'         // word joiner
+                    | '\u{FEFF}' // BOM / zero-width no-break space
+            )
+        })
+        .collect()
 }
 
 /// A protocol-neutral command from a session to the BBS.
@@ -437,10 +461,12 @@ impl Command {
     /// syntax (e.g. MeshCore frames) do their own mapping.
     pub fn parse(line: &str, awaiting_reply: bool) -> Self {
         let text = line.trim();
+        let stripped = strip_zero_width(text);
+        let text = stripped.as_str();
 
         // CANCEL / STOP always break out of a workflow, before the awaiting-reply
         // passthrough, so they can't be swallowed as a literal reply. (#120)
-        if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {
+        if matches!(text.to_lowercase().as_str(), "cancel" | "stop") {
             return Command::Cancel;
         }
 
@@ -455,7 +481,7 @@ impl Command {
         }
 
         let (word, rest) = split_first_word(text);
-        let keyword = word.to_ascii_lowercase();
+        let keyword = word.to_lowercase();
 
         match keyword.as_str() {
             // ── Auth ─────────────────────────────────────────────────────────
@@ -493,15 +519,32 @@ impl Command {
 
             // ── Message reading ───────────────────────────────────────────────
             "n" => Command::ReadNew,
-            "f" => Command::ReadForward {
-                after: rest.and_then(|s| s.parse::<i64>().ok()),
+            "f" => match rest {
+                None => Command::ReadForward { after: None },
+                Some(s) => match s.parse::<i64>() {
+                    Ok(id) => Command::ReadForward { after: Some(id) },
+                    // A malformed id (e.g. "1o" for "10") must not silently
+                    // degrade to "continue from cursor" — mirrors "d"'s
+                    // fallback below (#413).
+                    Err(_) => Command::Unknown {
+                        raw: text.to_owned(),
+                    },
+                },
             },
             "r" => Command::ReadReverse,
-            "s" => match rest {
+            // Unconditionally ScanMessages regardless of trailing text — a
+            // keyword's action must not change based on its argument, since
+            // a keymap preset can bind an unrelated key to "s" and any
+            // trailing word (or a keymap-translation quirk) would otherwise
+            // silently invoke the unrelated, Aide+-only SearchUsers (#411).
+            "s" => Command::ScanMessages,
+            "search" => match rest {
                 Some(q) if !q.is_empty() => Command::SearchUsers {
                     query: q.to_owned(),
                 },
-                _ => Command::ScanMessages,
+                _ => Command::Unknown {
+                    raw: text.to_owned(),
+                },
             },
             ".ff" => Command::FastForward,
 
