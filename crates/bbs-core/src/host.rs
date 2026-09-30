@@ -4173,11 +4173,11 @@ impl BbsHost {
             return Ok((username, user_id, PermissionLevel::User, room_id));
         }
 
-        Err(Response::Text(
+        Err(Response::Text(format!(
             "Your account is pending validation by an aide.\n\
-             Type H for help, WHOAMI to see your status, or Q to log out."
-                .into(),
-        ))
+                 Type H for help, WHOAMI to see your status, or {} to log out.",
+            self.active_keymap().await.key(KeymapAction::Quit)
+        )))
     }
 
     /// Like [`session_auth_user`] but also allows Unvalidated users through
@@ -4338,9 +4338,12 @@ impl BbsHost {
         }
 
         let trailer = if next_page_start.is_some() {
-            "\n(more — press K again for the next page)"
+            format!(
+                "\n(more — press {} again for the next page)",
+                self.active_keymap().await.key(KeymapAction::ListRooms)
+            )
         } else {
-            ""
+            String::new()
         };
         Ok(Response::Prompt {
             text: format!(
@@ -4491,7 +4494,12 @@ impl BbsHost {
             if let Some(outcome) = outcome {
                 return Ok(Response::Text(outcome));
             }
-            return Ok(Response::Text("Usage: C <room name or number>".into()));
+            return Ok(Response::Text(format!(
+                "Usage: {}",
+                self.active_keymap()
+                    .await
+                    .key_with(KeymapAction::ChangeRoom, "<room name or number>")
+            )));
         }
 
         let (username, user_id, level, _) = match self.session_auth_or_guest(session).await {
@@ -4585,7 +4593,11 @@ impl BbsHost {
         let unread = self.unread_in(username, user_id, room.id).await?;
 
         let msg = if unread > 0 {
-            format!("Now in: {} ({unread} new). Type N to read.", room.name)
+            format!(
+                "Now in: {} ({unread} new). Type {} to read.",
+                room.name,
+                self.active_keymap().await.key(KeymapAction::ReadNew)
+            )
         } else {
             format!("Now in: {} (no new messages).", room.name)
         };
@@ -5100,10 +5112,16 @@ impl BbsHost {
             }
         }
         if let Some(cursor) = page.next_cursor {
+            let keymap = self.active_keymap().await;
             parts.push(format!(
-                "(more — type N again or F {} to continue)",
-                // F starts AT an id, so the next message is the id after the last shown.
-                cursor.as_i64().saturating_add(1)
+                "(more — type {} again or {} to continue)",
+                keymap.key(KeymapAction::ReadNew),
+                // The forward key starts AT an id, so the next message is the
+                // id after the last shown.
+                keymap.key_with(
+                    KeymapAction::ReadForward,
+                    &cursor.as_i64().saturating_add(1).to_string()
+                )
             ));
         }
         Ok(Response::MultiText(parts))
@@ -5502,7 +5520,12 @@ impl BbsHost {
             ));
         }
         if page.next_cursor.is_some() {
-            lines.push("(more — type F <id> to read from a message)".into());
+            lines.push(format!(
+                "(more — type {} to read from a message)",
+                self.active_keymap()
+                    .await
+                    .key_with(KeymapAction::ReadForward, "<id>")
+            ));
         }
         Ok(Response::Text(lines.join("\n")))
     }
@@ -6137,9 +6160,11 @@ impl BbsHost {
         if let Some(h) = hidden {
             let plural = if h.count == 1 { "message" } else { "messages" };
             msg.push_str(&format!(
-                " {} earlier {plural} of theirs stayed hidden — F {} to read from the oldest.",
+                " {} earlier {plural} of theirs stayed hidden — {} to read from the oldest.",
                 h.count,
-                h.oldest.as_i64()
+                self.active_keymap()
+                    .await
+                    .key_with(KeymapAction::ReadForward, &h.oldest.as_i64().to_string())
             ));
         }
         Ok(Response::Text(msg))
@@ -12890,6 +12915,98 @@ mod tests {
         );
     }
 
+    /// The unblock hint names the active keymap's forward key (GH #354 phase 5).
+    #[tokio::test]
+    async fn unblocking_hint_names_the_active_forward_key() {
+        let (host, _db) = make_host().await;
+        *host.keymap.write().await =
+            Keymap::native_with_overrides(&[("j", KeymapAction::ReadForward)]);
+
+        let alice_sid = host.create_session("test").await.unwrap();
+        let alice_name = Username::new("alice").unwrap();
+        register_and_login(&host, alice_sid, &alice_name, "pass1234").await;
+
+        let bob_sid = host.create_session("test").await.unwrap();
+        let bob_name = Username::new("bob").unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+
+        // Park alice in the Lobby with nothing new, and block bob there.
+        host.process_command(alice_sid, Command::GoNextUnread)
+            .await
+            .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::ChangeRoom {
+                target: "Lobby".into(),
+            },
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            alice_sid,
+            Command::BlockUser {
+                target: bob_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+        let lobby_id = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        let first = host
+            .db
+            .post_to_room(lobby_id, &bob_name, "hidden one", Timestamp::now())
+            .await
+            .unwrap();
+        host.db
+            .post_to_room(lobby_id, &bob_name, "hidden two", Timestamp::now())
+            .await
+            .unwrap();
+
+        // N shows nothing (both are blocked) but carries the pointer past them.
+        let read = host
+            .process_command(alice_sid, Command::ReadNew)
+            .await
+            .unwrap();
+        assert!(
+            matches!(read, Response::Text(ref t) if t.contains("No new messages")),
+            "both messages are blocked, so N should show nothing: {read:?}"
+        );
+
+        let resp = host
+            .process_command(
+                alice_sid,
+                Command::BlockUser {
+                    target: bob_name.clone(),
+                    force: Some(false),
+                },
+            )
+            .await
+            .unwrap();
+        let text = match resp {
+            Response::Text(t) => t,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(
+            text.contains("no longer blocked"),
+            "should confirm the unblock, got: {text:?}"
+        );
+        assert!(
+            text.contains("2 earlier messages"),
+            "should report both hidden messages, got: {text:?}"
+        );
+        assert!(
+            text.contains(&format!("J {}", first.as_i64()))
+                && !text.contains(&format!("F {}", first.as_i64())),
+            "should point at the oldest hidden message ({}), got: {text:?}",
+            first.as_i64()
+        );
+    }
+
     /// Nothing was hidden, so the unblock says only that.
     #[tokio::test]
     async fn unblocking_stays_quiet_when_nothing_was_hidden() {
@@ -15175,5 +15292,158 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(help_reading_mode(&Keymap::native()), expected);
+    }
+
+    /// A keymap that moves the navigation actions to letters no native key
+    /// uses, so any message still showing a native key is easy to spot.
+    fn distinct_keymap() -> Keymap {
+        Keymap::native_with_overrides(&[
+            ("l", KeymapAction::ReadNew),
+            ("j", KeymapAction::ReadForward),
+            ("z", KeymapAction::ListRooms),
+            ("a", KeymapAction::ChangeRoom),
+            ("x", KeymapAction::ScanMessages),
+            ("o", KeymapAction::Quit),
+        ])
+    }
+
+    #[tokio::test]
+    async fn paging_and_scan_hints_name_the_active_keys() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["m1", "m2", "m3", "m4", "m5", "m6", "m7"]).await;
+        // A first user's own posts are unread once the pointer is behind them.
+        *host.keymap.write().await = distinct_keymap();
+
+        let parts = match host.process_command(sid, Command::ReadNew).await.unwrap() {
+            Response::MultiText(p) => p,
+            other => panic!("expected MultiText, got {other:?}"),
+        };
+        let hint = parts.last().unwrap();
+        let next = ids[5];
+        assert!(
+            hint.contains(&format!("type L again or J {next} to continue")),
+            "{hint:?}"
+        );
+
+        let more: Vec<i64> = (0..8).collect();
+        let bodies: Vec<String> = more.iter().map(|i| format!("s{i}")).collect();
+        let refs: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        post_all(&host, sid, &refs).await;
+        let text = shown(
+            host.process_command(sid, Command::ScanMessages)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            text.contains("(more — type J <id> to read from a message)"),
+            "{text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn room_hints_name_the_active_keys() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        *host.keymap.write().await = distinct_keymap();
+
+        // Usage line.
+        let text = shown(
+            host.process_command(
+                sid,
+                Command::ChangeRoom {
+                    target: String::new(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(text.contains("Usage: A <room name or number>"), "{text:?}");
+
+        // "Now in: ... Type <key> to read." needs unread messages from someone
+        // else, in a room alice is not currently in.
+        let bob_name = Username::new("bob").unwrap();
+        let bob_sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, bob_sid, &bob_name, "pass1234").await;
+        RoomStore::create(
+            &host.db,
+            "Other",
+            None,
+            false,
+            PermissionLevel::User,
+            Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        host.process_command(
+            sid,
+            Command::ChangeRoom {
+                target: "Other".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let lobby = RoomStore::get_by_name(&host.db, "Lobby")
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        host.db
+            .post_to_room(lobby, &bob_name, "hello", Timestamp::now())
+            .await
+            .unwrap();
+        let text = shown(
+            host.process_command(
+                sid,
+                Command::ChangeRoom {
+                    target: "Lobby".into(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(text.contains("Type L to read."), "{text:?}");
+        assert!(!text.contains("Type N"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn the_room_list_page_hint_names_the_list_key() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        for i in 0..40 {
+            RoomStore::create(
+                &host.db,
+                &format!("Room number {i}"),
+                None,
+                false,
+                PermissionLevel::User,
+                Timestamp::now(),
+            )
+            .await
+            .unwrap();
+        }
+        *host.keymap.write().await = distinct_keymap();
+        let text = shown(host.process_command(sid, Command::ListRooms).await.unwrap());
+        assert!(text.contains("press Z again"), "{text:?}");
+        assert!(!text.contains("press K again"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn the_pending_validation_reply_names_the_quit_key() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let bob_sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, bob_sid, &Username::new("bob").unwrap(), "pass1234").await;
+        *host.keymap.write().await = distinct_keymap();
+        let text = shown(
+            host.process_command(bob_sid, Command::ReadNew)
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("or O to log out"), "{text:?}");
     }
 }
