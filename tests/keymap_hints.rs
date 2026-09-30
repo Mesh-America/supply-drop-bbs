@@ -36,6 +36,12 @@ const ALLOWED: &[(&str, &str)] = &[
     (".C — create a new room", "fixed sysop command"),
 ];
 
+/// Source files that legitimately name keys. `keymap.rs` holds the preset
+/// definitions, whose descriptions and `unsupported` replies describe that one
+/// preset's own keys ("Mail is a room here: type E"), so they cannot be built
+/// from a keymap.
+const EXEMPT_FILES: &[&str] = &["crates/bbs-plugin-api/src/keymap.rs"];
+
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -102,6 +108,10 @@ fn no_message_hard_codes_a_remappable_key() {
 
     let mut found = Vec::new();
     for file in &files {
+        let relative = file.strip_prefix(&root).unwrap_or(file);
+        if EXEMPT_FILES.iter().any(|f| relative == Path::new(f)) {
+            continue;
+        }
         let text = std::fs::read_to_string(file).unwrap();
         for (n, line) in non_test_source(&text).lines().enumerate() {
             let trimmed = line.trim_start();

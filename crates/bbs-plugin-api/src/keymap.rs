@@ -313,138 +313,152 @@ impl Keymap {
         km
     }
 
-    /// The Maximus-style preset. Keys sourced from Maximus 3.0x
-    /// (`research-classic-bbs-commands.md`). Maximus `G` is Goodbye, so
-    /// "next unread" moves to `]`. Actions with no Maximus equivalent keep a
-    /// native key and are listed in `no_source_equivalent`.
+    /// The Maximus-style preset. Keys are from Maximus 3.0x's shipped menu file
+    /// (`ctl/menus.ctl`): the hotkey of a menu option is the first letter of
+    /// its description. Maximus is menu based and has no separate reading
+    /// mode, so the Message menu keys serve as the reading keys. Maximus has
+    /// no mail room, no "next room with unread" and no list-rooms key, so
+    /// those use plain words and are listed in `no_source_equivalent`.
     #[must_use]
     pub fn maximus() -> Self {
         use KeymapAction as A;
         Self::build(
             "maximus",
             "Maximus-style keys: G(oodbye), A(rea change), L(ist brief), N/P next and \
-             previous while reading. Keys only: no file areas, no separate menus. Some \
-             actions have no Maximus key and keep Supply Drop's own.",
+             previous, E(nter), R(eply) and K(ill) while reading. Keys only: no file \
+             areas, menus, chat, bulletins or terminal settings. Maximus has no mail \
+             room, list-rooms or next-unread key, so those use the words MAIL, ROOMS \
+             and READ, and ] (next area) stands in for next unread.",
             &[
                 (A::Quit, &["g"]),
-                (A::ListRooms, &["k"]),
+                (A::ListRooms, &["rooms"]),
                 (A::GoNextUnread, &["]"]),
                 (A::ChangeRoom, &["a"]),
-                (A::GoMail, &["m"]),
+                (A::GoMail, &["mail"]),
                 (A::ReadNew, &["n"]),
-                (A::ReadForward, &["f"]),
-                (A::ReadReverse, &["r"]),
+                (A::ReadForward, &["read"]),
+                (A::ReadReverse, &["p"]),
                 (A::ScanMessages, &["l"]),
                 (A::EnterMessage, &["e"]),
-                (A::DeleteMessage, &["d"]),
+                (A::DeleteMessage, &["k"]),
                 (A::WhoIsOnline, &["w"]),
                 (A::ReadingForward, &["n"]),
                 (A::ReadingReverse, &["p"]),
-                (A::ReadingReply, &["e"]),
+                (A::ReadingReply, &["r"]),
                 (A::ReadingHelp, &["?"]),
-                (A::ReadingDelete, &["d"]),
+                (A::ReadingDelete, &["k"]),
             ],
-            &[("j", "No file areas on this BBS.")],
             &[
-                A::ListRooms,
-                A::GoNextUnread,
-                A::GoMail,
-                A::ReadNew,
-                A::ReadForward,
-                A::ReadReverse,
-                A::DeleteMessage,
-                A::ReadingReply,
-                A::ReadingDelete,
+                ("f", "No file areas or forwarding on this BBS."),
+                ("j", "No file areas on this BBS."),
+                ("y", "No sysop paging on this BBS."),
+                ("o", "No offline reader on this BBS."),
+                ("t", "No message tagging on this BBS."),
+                ("c", "No terminal settings on this BBS."),
+                ("s", "No statistics screen on this BBS."),
+                ("m", "Rooms are flat here. Use A to change room."),
+                ("/", "No chat on this BBS."),
+                ("=", "No nonstop reading on this BBS."),
+                ("+", "No thread navigation on this BBS."),
+                ("*", "No re-read command on this BBS."),
             ],
+            &[A::ListRooms, A::GoNextUnread, A::GoMail, A::ReadForward],
         )
     }
 
-    /// The packet-radio BBS (F6FBB/BPQ) style preset. Packet BBS has no room
-    /// hierarchy, so most actions keep a native key.
+    /// The packet-radio BBS (F6FBB/BPQ) style preset. Packet BBS has no rooms
+    /// and no reading mode, so most keys are plain words. Keys that are
+    /// sourced (`research-classic-bbs-commands.md`): `L` list new, `LM` list
+    /// your mail, `R n` read a message, `K n` kill a message, `SR` reply.
+    /// A full pass over the F6FBB manual is still pending network access.
     #[must_use]
     pub fn packet_bbs() -> Self {
         use KeymapAction as A;
         Self::build(
             "packet-bbs",
-            "Packet BBS style keys: L(ist new), LM (your mail), K(ill). Packet BBS has no \
-             rooms, so room navigation keeps Supply Drop's own keys. Sending mail uses the \
-             Mail room here, not SP.",
+            "Packet BBS style keys: L(ist new), LM (your mail), R (read a message), K(ill), \
+             SR (reply). Packet BBS has no rooms, so room navigation uses the words ROOMS, \
+             GOTO and NEXT. BYE logs off on every board. Sending mail uses the Mail room \
+             here, not SP, and there are no bulletin categories or forwarding.",
             &[
                 (A::Quit, &["q"]),
                 (A::ListRooms, &["rooms"]),
-                (A::GoNextUnread, &["g"]),
-                (A::ChangeRoom, &["c"]),
+                (A::GoNextUnread, &["next"]),
+                (A::ChangeRoom, &["goto"]),
                 (A::GoMail, &["lm"]),
                 (A::ReadNew, &["l"]),
-                (A::ReadForward, &["f"]),
-                (A::ReadReverse, &["r"]),
-                (A::ScanMessages, &["s"]),
+                (A::ReadForward, &["r"]),
+                (A::ReadReverse, &["back"]),
+                (A::ScanMessages, &["scan"]),
                 (A::EnterMessage, &["e"]),
                 (A::DeleteMessage, &["k"]),
-                (A::WhoIsOnline, &["w"]),
-                (A::ReadingForward, &["f"]),
-                (A::ReadingReverse, &["r"]),
-                (A::ReadingReply, &["e"]),
+                (A::WhoIsOnline, &["who"]),
+                (A::ReadingForward, &["next"]),
+                (A::ReadingReverse, &["back"]),
+                (A::ReadingReply, &["sr"]),
                 (A::ReadingHelp, &["h", "?"]),
-                (A::ReadingDelete, &["d"]),
+                (A::ReadingDelete, &["k"]),
             ],
             &[
                 (
                     "sp",
-                    "Send mail from the Mail room: M, then E @user message.",
+                    "Send mail from the Mail room: LM, then E @user message.",
                 ),
-                ("sr", "Reply from the Mail room: read the message, then E."),
-                ("km", "Delete mail from the Mail room with D <number>."),
-                ("rm", "Read mail: M, then N."),
-                ("rn", "Read new mail: M, then N."),
+                (
+                    "sb",
+                    "No bulletin categories. Post in a room: GOTO name, then E.",
+                ),
+                ("km", "Delete mail from the Mail room with K <number>."),
+                ("rm", "Read mail: type LM, then R <number>."),
+                ("rn", "Read new mail: type LM, then L."),
             ],
             &[
                 A::Quit,
                 A::ListRooms,
                 A::GoNextUnread,
                 A::ChangeRoom,
-                A::ReadForward,
                 A::ReadReverse,
                 A::ScanMessages,
                 A::EnterMessage,
                 A::WhoIsOnline,
                 A::ReadingForward,
                 A::ReadingReverse,
-                A::ReadingReply,
-                A::ReadingHelp,
-                A::ReadingDelete,
             ],
         )
     }
 
-    /// The PCBoard-style preset. PCBoard's own `M` (graphics mode), `P` (page
-    /// length) and `R` (read) are never bound to a different meaning here.
+    /// The PCBoard-style preset. Sourced keys: `G` goodbye, `J` join
+    /// conference, `Q` quick scan, `E` enter, `Y` read new mail, `WHO`, `R n`
+    /// read a message and `R;S` read new. PCBoard's `M` (graphics mode) and
+    /// `P` (page length) are answered with a message, never bound. A full
+    /// pass over the PCBoard manual is still pending network access.
     #[must_use]
     pub fn pcboard() -> Self {
         use KeymapAction as A;
         Self::build(
             "pcboard",
             "PCBoard style keys: G(oodbye), J(oin conference), Q(uick scan), E(nter), \
-             Y (your mail), WHO. Keys only: no graphics mode, no page length. Actions \
-             with no PCBoard key use plain words or Supply Drop's own keys.",
+             Y (your mail), R (read), R;S (read new), WHO. Keys only: no graphics mode, \
+             page length, file areas or doors. Actions with no PCBoard key use plain \
+             words such as ROOMS, NEXT, BACK and DELETE.",
             &[
                 (A::Quit, &["g"]),
-                (A::ListRooms, &["k"]),
+                (A::ListRooms, &["rooms"]),
                 (A::GoNextUnread, &["next"]),
                 (A::ChangeRoom, &["j"]),
                 (A::GoMail, &["y"]),
-                (A::ReadNew, &["n"]),
-                (A::ReadForward, &["f"]),
+                (A::ReadNew, &["r;s"]),
+                (A::ReadForward, &["r"]),
                 (A::ReadReverse, &["back"]),
                 (A::ScanMessages, &["q"]),
                 (A::EnterMessage, &["e"]),
-                (A::DeleteMessage, &["d"]),
+                (A::DeleteMessage, &["delete"]),
                 (A::WhoIsOnline, &["who"]),
-                (A::ReadingForward, &["f"]),
+                (A::ReadingForward, &["next"]),
                 (A::ReadingReverse, &["back"]),
-                (A::ReadingReply, &["e"]),
-                (A::ReadingHelp, &["?"]),
-                (A::ReadingDelete, &["d"]),
+                (A::ReadingReply, &["reply"]),
+                (A::ReadingHelp, &["h", "?"]),
+                (A::ReadingDelete, &["delete"]),
             ],
             &[
                 ("m", "Graphics mode is not available on this BBS."),
@@ -453,8 +467,6 @@ impl Keymap {
             &[
                 A::ListRooms,
                 A::GoNextUnread,
-                A::ReadNew,
-                A::ReadForward,
                 A::ReadReverse,
                 A::DeleteMessage,
                 A::ReadingForward,
@@ -465,89 +477,112 @@ impl Keymap {
         )
     }
 
-    /// The WWIV-family preset (WWIV, Telegard, Renegade). WWIV's `H` (hop to a
-    /// sub by name) is Supply Drop's help key and cannot be bound.
+    /// The WWIV-style preset. Keys are from WWIV 5.x's shipped menu and read
+    /// prompt (`main.mnu.json`, `mbmain.msg`, `msgscan.cpp`). Telegard and
+    /// Renegade share some read-prompt keys, but their defaults are not
+    /// verified and are not covered. WWIV's `H` (hop to a sub) is this BBS's
+    /// help key and cannot be bound.
     #[must_use]
     pub fn wwiv_family() -> Self {
         use KeymapAction as A;
         Self::build(
             "wwiv-family",
-            "WWIV, Telegard and Renegade style keys: * (list subs), N(ew), S(can), P(ost), \
-             O(ff), M(ail), //WHO, - (back) while reading. WWIV's H (hop to a sub) is not \
-             available because H is help here. Other actions keep Supply Drop's own keys.",
+            "WWIV-style keys (WWIV 5.x; Telegard and Renegade are not covered): * (list \
+             subs), N(ew), S(can), P(ost), M(ail), R(emove your post), O(ff), //WHO, - \
+             (back) and W (reply) while reading. WWIV's H (hop to a sub) is help here, so \
+             use HOP. No file transfer, doors, chat, voting or conferences.",
             &[
                 (A::Quit, &["o"]),
                 (A::ListRooms, &["*"]),
-                (A::GoNextUnread, &["g"]),
-                (A::ChangeRoom, &["c"]),
+                (A::GoNextUnread, &["unread"]),
+                (A::ChangeRoom, &["hop"]),
                 (A::GoMail, &["m"]),
                 (A::ReadNew, &["n"]),
-                (A::ReadForward, &["f"]),
-                (A::ReadReverse, &["r"]),
+                (A::ReadForward, &["next"]),
+                (A::ReadReverse, &["back"]),
                 (A::ScanMessages, &["s"]),
                 (A::EnterMessage, &["p"]),
-                (A::DeleteMessage, &["d"]),
+                (A::DeleteMessage, &["r"]),
                 (A::WhoIsOnline, &["//who"]),
-                (A::ReadingForward, &["f"]),
+                (A::ReadingForward, &["]"]),
                 (A::ReadingReverse, &["-"]),
-                (A::ReadingReply, &["e"]),
+                (A::ReadingReply, &["w"]),
                 (A::ReadingHelp, &["?"]),
                 (A::ReadingDelete, &["d"]),
             ],
-            &[],
+            &[
+                ("t", "No file areas on this BBS."),
+                (".", "No doors on this BBS."),
+                ("c", "No chat on this BBS."),
+                ("a", "No automessage on this BBS."),
+                ("g", "No bulletins on this BBS."),
+                ("f", "No feedback command on this BBS."),
+                ("d", "No user settings menu on this BBS."),
+                ("x", "No expert mode on this BBS."),
+                ("l", "No caller list on this BBS."),
+                ("i", "No system info page on this BBS."),
+                ("j", "No conferences on this BBS."),
+                ("q", "No quick scan. Use N to read new messages."),
+                ("e", "To send mail: type M, then P @user message."),
+            ],
             &[
                 A::GoNextUnread,
                 A::ChangeRoom,
                 A::ReadForward,
                 A::ReadReverse,
-                A::DeleteMessage,
-                A::ReadingForward,
-                A::ReadingReply,
                 A::ReadingDelete,
             ],
         )
     }
 
-    /// The Synchronet-style preset. Synchronet's two-keystroke mail flow does
-    /// not map onto one key, so mail keeps Supply Drop's `M`.
+    /// The Synchronet-style preset, from the default command shell
+    /// (`exec/default.js`) and the reading prompt in `readmsgs.cpp`. `E`
+    /// opens Synchronet's e-mail menu, which here goes to the Mail room;
+    /// Synchronet has no next-unread, newest-first or delete-by-id key at the
+    /// main prompt, so those use plain words.
     #[must_use]
     pub fn synchronet() -> Self {
         use KeymapAction as A;
         Self::build(
             "synchronet",
-            "Synchronet style keys: * (list sub-boards), J(ump), N(ew), L(ist), P(ost), \
-             O(ff), W(ho), - (back) while reading. Synchronet's two-step mail flow is not \
-             available; mail keeps M. Other actions keep Supply Drop's own keys.",
+            "Synchronet-style keys: * (list sub-boards), J(ump), N(ew), R(ead), L(ist), \
+             P(ost), E (mail), W(ho), O(ff). While reading: + next, - back, A reply, D \
+             delete. No file libraries, doors, chat, QWK, polls or time bank. Next \
+             unread, newest first and delete use the words UNREAD, BACK and DELETE.",
             &[
                 (A::Quit, &["o"]),
                 (A::ListRooms, &["*"]),
-                (A::GoNextUnread, &["g"]),
+                (A::GoNextUnread, &["unread"]),
                 (A::ChangeRoom, &["j"]),
-                (A::GoMail, &["m"]),
+                (A::GoMail, &["e"]),
                 (A::ReadNew, &["n"]),
-                (A::ReadForward, &["f"]),
-                (A::ReadReverse, &["r"]),
+                (A::ReadForward, &["r"]),
+                (A::ReadReverse, &["back"]),
                 (A::ScanMessages, &["l"]),
                 (A::EnterMessage, &["p"]),
-                (A::DeleteMessage, &["d"]),
+                (A::DeleteMessage, &["delete"]),
                 (A::WhoIsOnline, &["w"]),
-                (A::ReadingForward, &["f"]),
+                (A::ReadingForward, &["+"]),
                 (A::ReadingReverse, &["-"]),
-                (A::ReadingReply, &["e"]),
+                (A::ReadingReply, &["a"]),
                 (A::ReadingHelp, &["?"]),
                 (A::ReadingDelete, &["d"]),
             ],
-            &[],
             &[
-                A::GoNextUnread,
-                A::GoMail,
-                A::ReadForward,
-                A::ReadReverse,
-                A::DeleteMessage,
-                A::ReadingForward,
-                A::ReadingReply,
-                A::ReadingDelete,
+                ("t", "No file libraries on this BBS."),
+                ("x", "No doors on this BBS."),
+                ("c", "No chat on this BBS."),
+                ("q", "No QWK packets on this BBS."),
+                ("m", "No time bank on this BBS."),
+                ("g", "No text files on this BBS."),
+                ("i", "No information menu on this BBS."),
+                ("f", "No text search on this BBS."),
+                ("s", "Mail is a room here: type E for your mail."),
+                ("d", "No user settings menu on this BBS."),
+                ("a", "No auto-message on this BBS."),
+                ("z", "No continuous scan on this BBS."),
             ],
+            &[A::GoNextUnread, A::ReadReverse, A::DeleteMessage],
         )
     }
 
@@ -845,7 +880,7 @@ mod tests {
         let km = Keymap::maximus();
         assert_eq!(km.key(KeymapAction::Quit), "G");
         assert_eq!(km.key(KeymapAction::GoNextUnread), "]");
-        assert_eq!(km.key_with(KeymapAction::ReadForward, "<id>"), "F <id>");
+        assert_eq!(km.key_with(KeymapAction::ReadForward, "<id>"), "READ <id>");
         assert_eq!(
             Keymap::wwiv_family().key(KeymapAction::WhoIsOnline),
             "//WHO"
@@ -1097,5 +1132,165 @@ Quit = ["g"]
 "#;
         let km: Keymap = toml::from_str(text).unwrap();
         assert!(matches!(km.validate(), Err(KeymapError::MissingAction(_))));
+    }
+
+    // ── Preset accuracy (GH #354 phase 7) ────────────────────────────────
+
+    #[test]
+    fn unsupported_replies_are_short_enough_for_a_radio_message() {
+        for km in all_keymaps() {
+            for (key, message) in &km.unsupported {
+                assert!(
+                    message.len() <= 60,
+                    "{}: {key:?} reply is {} bytes: {message}",
+                    km.name,
+                    message.len()
+                );
+                assert!(!message.contains('\n'), "{}: {key:?}", km.name);
+            }
+        }
+    }
+
+    /// Keys a source system really has keep the meaning the research verified
+    /// (`research-classic-bbs-commands.md` and the Phase 7 addendum).
+    #[test]
+    fn verified_source_keys_map_to_the_actions_the_research_found() {
+        use KeymapAction as A;
+        let check = |km: Keymap, expected: &[(&str, A)], reading: &[(&str, A)]| {
+            for (key, action) in expected {
+                assert_eq!(km.action_for(key), Some(*action), "{} {key}", km.name);
+            }
+            for (key, action) in reading {
+                assert_eq!(
+                    km.reading_action_for(key),
+                    Some(*action),
+                    "{} reading {key}",
+                    km.name
+                );
+            }
+        };
+        check(
+            Keymap::maximus(),
+            &[
+                ("g", A::Quit),
+                ("a", A::ChangeRoom),
+                ("l", A::ScanMessages),
+                ("e", A::EnterMessage),
+                ("k", A::DeleteMessage),
+                ("w", A::WhoIsOnline),
+                ("p", A::ReadReverse),
+            ],
+            &[
+                ("n", A::ReadingForward),
+                ("p", A::ReadingReverse),
+                ("r", A::ReadingReply),
+                ("k", A::ReadingDelete),
+            ],
+        );
+        check(
+            Keymap::wwiv_family(),
+            &[
+                ("o", A::Quit),
+                ("*", A::ListRooms),
+                ("m", A::GoMail),
+                ("n", A::ReadNew),
+                ("s", A::ScanMessages),
+                ("p", A::EnterMessage),
+                ("r", A::DeleteMessage),
+                ("//who", A::WhoIsOnline),
+            ],
+            &[("-", A::ReadingReverse), ("w", A::ReadingReply)],
+        );
+        check(
+            Keymap::synchronet(),
+            &[
+                ("o", A::Quit),
+                ("*", A::ListRooms),
+                ("j", A::ChangeRoom),
+                ("n", A::ReadNew),
+                ("r", A::ReadForward),
+                ("l", A::ScanMessages),
+                ("p", A::EnterMessage),
+                ("w", A::WhoIsOnline),
+            ],
+            &[
+                ("+", A::ReadingForward),
+                ("-", A::ReadingReverse),
+                ("a", A::ReadingReply),
+                ("d", A::ReadingDelete),
+            ],
+        );
+        check(
+            Keymap::pcboard(),
+            &[
+                ("g", A::Quit),
+                ("j", A::ChangeRoom),
+                ("q", A::ScanMessages),
+                ("e", A::EnterMessage),
+                ("y", A::GoMail),
+                ("r;s", A::ReadNew),
+                ("who", A::WhoIsOnline),
+            ],
+            &[],
+        );
+    }
+
+    /// Source keys that mean something else there must never be bound to a
+    /// different action here; the research listed these as traps.
+    #[test]
+    fn trap_keys_are_never_bound_to_a_different_meaning() {
+        // (preset, key a source user would expect to do something else)
+        for (preset, traps) in [
+            ("maximus", &["f", "j", "y", "o", "t", "c", "s", "m"][..]),
+            ("pcboard", &["m", "p"][..]),
+            ("wwiv-family", &["t", "c", "a", "g", "f", "d", "q"][..]),
+            (
+                "synchronet",
+                &["t", "x", "c", "q", "m", "g", "f", "s", "d"][..],
+            ),
+        ] {
+            let km = Keymap::by_name(preset).unwrap();
+            for key in traps {
+                assert_eq!(km.action_for(key), None, "{preset} binds trap key {key:?}");
+                assert!(
+                    km.unsupported_message(key).is_some(),
+                    "{preset} gives trap key {key:?} no reply"
+                );
+            }
+        }
+    }
+
+    /// A preset's gap keys are the actions whose key is only there because every
+    /// action needs one, so they must not be a key the source system gives a
+    /// different meaning (that would be a trap): a gap action uses a plain word.
+    #[test]
+    fn gap_actions_use_plain_words_or_keys_the_source_really_has() {
+        for km in all_keymaps() {
+            if km.name == "native" {
+                continue;
+            }
+            for action in &km.no_source_equivalent {
+                if action.is_reading_only() {
+                    continue;
+                }
+                let key = km.primary(*action);
+                // A single-character gap key is allowed only where the research
+                // verified that character for this system.
+                if key.chars().count() == 1 {
+                    let allowed: &[&str] = match km.name.as_str() {
+                        // `]` is Maximus's "next area", the closest key to next unread.
+                        "maximus" => &["]"],
+                        // `q` is only a stand-in: BYE logs off on every board.
+                        "packet-bbs" => &["q", "e"],
+                        _ => &[],
+                    };
+                    assert!(
+                        allowed.contains(&key),
+                        "{}: gap action {action:?} uses the single key {key:?}",
+                        km.name
+                    );
+                }
+            }
+        }
     }
 }

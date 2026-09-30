@@ -1427,9 +1427,15 @@ mod tests {
         assert_eq!(ReadingInput::parse("n", &km), ReadingInput::Forward);
         assert_eq!(ReadingInput::parse("p", &km), ReadingInput::Reverse);
         assert_eq!(ReadingInput::parse("n 4", &km), ReadingInput::Jump(4));
-        // Native forward and reverse keys were replaced, so they end reading.
+        // Maximus reads with N and P and replies with R; the native F ends
+        // reading and the native E is not a reply key there.
         assert_eq!(ReadingInput::parse("f", &km), ReadingInput::Other);
-        assert_eq!(ReadingInput::parse("r", &km), ReadingInput::Other);
+        assert_eq!(ReadingInput::parse("e", &km), ReadingInput::Other);
+        assert_eq!(ReadingInput::parse("r", &km), ReadingInput::Reply(None));
+        assert_eq!(
+            ReadingInput::parse("k 4", &km),
+            ReadingInput::Delete(Some(4))
+        );
 
         let km = Keymap::wwiv_family();
         assert_eq!(ReadingInput::parse("-", &km), ReadingInput::Reverse);

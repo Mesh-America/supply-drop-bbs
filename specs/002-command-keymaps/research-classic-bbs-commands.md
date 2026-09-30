@@ -140,3 +140,94 @@ Drop Wildcat! and RemoteAccess from the initial set — not because they're unim
 their default letters aren't documented anywhere verifiable, and shipping a "preset" that's
 actually invented defeats the point of offering one. Both stay eligible for a later, explicitly
 best-effort preset, or as a community-contributed custom keymap (see spec's upload requirement).
+
+## Phase 7 addendum (2026-09-30): full command pass
+
+A second pass read each system's own menu, help and source files in full, to list
+every command and to check the preset keys. Three systems were read from primary
+sources. PCBoard and packet BBS could not be: this environment's network policy
+denied `kuehlbox.wtf`, `archive.org`, `textfiles.com`, `f6fbb.org` and
+`cantab.net`, and the agents stopped rather than guess. Those two presets keep
+only the keys already marked V above, and their full pass is still open (see
+"Still open").
+
+### How the keys were verified
+
+- **Maximus** (`github.com/sdudley/maximus`, `ctl/menus.ctl`, `mec/hlp/*`,
+  `docs/max_mast.txt` section 4.7.3, `max/*.c`). Rule, V: "Maximus will search the
+  entire menu for a menu option that has a description starting with that key",
+  so a hotkey is the first letter of the option's description unless an explicit
+  key is given. A summarizer mis-stated several letters in an earlier attempt,
+  so the raw files were read.
+- **WWIV 5.x** (`github.com/wwivbbs/wwiv`, commit `56dfa23`: `main.mnu.json`,
+  `mbmain.msg`, `msgscan.cpp`, `readmail.cpp`, `mmkey.cpp`).
+- **Synchronet** (the GitHub mirror of the GitLab tree, `exec/default.js`,
+  `exec/email_sec.js`, `src/sbbs3/readmsgs.cpp`, `readmail.cpp`; the default
+  shell only).
+
+### What each system has that this BBS does not
+
+| System | Commands | Reply given here |
+|---|---|---|
+| Maximus | F (forward a copy, or file areas), J (file areas), Y (yell), O (offline reader), T (tag areas), C (change setup), S (statistics), M (menu switch), / (chat), = (nonstop), - and + (thread), * (re-read) | one short message per key, see the preset |
+| WWIV | T (transfer), . (doors), C (chat), A (automessage), G (gfiles), F (feedback), D (defaults), X (expert), L (last callers), I (info), J (conferences), Q (quick scan), E (email) | one short message per key |
+| Synchronet | T (file section), X (externals), C (chat), Q (QWK), M (time bank), G (text files), I (info), F (find), S (messages to you), D (user config), A (auto-message), Z (continuous scan) | one short message per key |
+
+### Traps that cannot be answered with a message
+
+These source keys are also fixed words here, and a fixed word always runs as
+ours, so the preset cannot reply to them:
+
+- `B` is Browse in Maximus, Bypass sub in WWIV and Browse backward in Synchronet.
+  Here `b` blocks a user.
+- `V` is Version in Maximus, Voting in WWIV and Polls in Synchronet. Here `v`
+  validates a user (aide and above).
+- `U` is User list (Maximus, WWIV, Synchronet). Here `u` also lists users, so it
+  matches.
+- `H` is Hop to a sub in WWIV. Here `h` is help, and the preset uses the word `hop`.
+
+### Verified key maps used by the presets
+
+| Action | Maximus | WWIV | Synchronet |
+|---|---|---|---|
+| Quit | G | O | O |
+| List rooms | none (A then ?) | * | * |
+| Change room | A | none (H, blocked) | J |
+| Next unread | none (] is next area) | none | none (N scans new) |
+| Go to Mail | none | M | E (opens the e-mail menu) |
+| Read new | N (inferred) | N | N |
+| Read forward | none | none | R (inferred) |
+| Read reverse | P | none | none (B is inferred) |
+| Scan | L | S | L |
+| Enter message | E | P | P |
+| Delete | K | R (own posts only) | D at the reading prompt only |
+| Who is online | W | //WHO | W |
+| Reading: next | N (or Enter) | ] in the full-screen reader | + (or Enter) |
+| Reading: previous | P | - | - |
+| Reading: reply | R | W | A |
+| Reading: help | ? | ? | ? |
+| Reading: delete | K | D (sysop and moderators) | D |
+
+Maximus has no separate reading mode (the Message menu keys are the reading keys)
+and jumps to a message by typing its bare number. WWIV and Synchronet also jump by
+typing a bare number; Synchronet's number is a position in the sub-board, not a
+message id.
+
+### Telegard and Renegade
+
+Not covered. Telegard's read prompt shares several WWIV keys (`Enter`, number,
+`-`, `R`, `T`, `B`, `Q`, `P`, `W`, `A`) but differs on `C`, `H` and `Z` and has no
+find key. Renegade's keys are sysop-defined and its defaults could not be read.
+The lineage (Renegade from Telegard from WWIV) was not verified. The
+`wwiv-family` preset is therefore described as WWIV-style only.
+
+### Still open
+
+- **PCBoard**: read the user command chapter of the v15.22 manual (kuehlbox.wtf or
+  an archive copy) and verify `J`, `Q`, `R;S`, `Y`, `WHO`, plus the keys for
+  reply, delete, next and previous while reading.
+- **Packet BBS**: read the F6FBB and BPQ user command pages and verify `L`, `LM`,
+  `R n`, `K n`, `SR`, and what a bare `R` does.
+- Both need those hosts allowed in the cloud environment's network settings, or
+  the pages pasted in.
+

@@ -7276,18 +7276,30 @@ fn help_reading(keymap: &Keymap) -> String {
 fn help_reading_mode(keymap: &Keymap) -> String {
     let fwd = keymap.key(KeymapAction::ReadingForward);
     let rev = keymap.key(KeymapAction::ReadingReverse);
+    let reply = keymap.key(KeymapAction::ReadingReply);
+    let delete = keymap.key(KeymapAction::ReadingDelete);
+    let help = keymap.key(KeymapAction::ReadingHelp);
+    let key_chars: usize = [&fwd, &rev, &reply, &delete, &help]
+        .iter()
+        .map(|k| k.chars().count())
+        .sum();
+    // Long word keys (NEXT, REPLY, DELETE) would push the page over the radio
+    // limit, so use a shorter layout for them.
+    if key_chars > 8 {
+        return format!(
+            "Reading mode:\n{fwd} next\n{rev} previous\n{fwd} <#> jump\n{reply} reply\n\
+             {delete} delete\n{help} help\nX exit"
+        );
+    }
     format!(
         "Reading mode:\n\
          {fwd}  next message\n\
          {rev}  previous message\n\
          {fwd}/{rev} <#>  jump to message\n\
-         {}  reply to this message\n\
-         {}  delete message\n\
-         {}  this help\n\
-         X  exit reading",
-        keymap.key(KeymapAction::ReadingReply),
-        keymap.key(KeymapAction::ReadingDelete),
-        keymap.key(KeymapAction::ReadingHelp),
+         {reply}  reply to this message\n\
+         {delete}  delete message\n\
+         {help}  this help\n\
+         X  exit reading"
     )
 }
 
@@ -7561,9 +7573,10 @@ mod tests {
         assert!(text.contains("G  log out"), "{text}");
         assert!(text.contains("]  next unread"), "{text}");
         assert!(text.contains("A  change room"), "{text}");
-        // ReadNew and ListRooms are unchanged in Maximus — still native.
+        // Maximus has no list-rooms key, so that action uses the word ROOMS.
         assert!(text.contains("N  new messages"), "{text}");
-        assert!(text.contains("K  list rooms"), "{text}");
+        assert!(text.contains("ROOMS  list rooms"), "{text}");
+        assert!(!text.contains("K  list rooms"), "{text}");
     }
 
     /// Issue #126: `H all` must list the Aide/Sysop help topics for users at
@@ -15366,7 +15379,8 @@ mod tests {
         );
         assert!(text.contains("P - Previous"), "{text:?}");
         assert!(text.contains("N - Next"), "{text:?}");
-        assert!(text.contains("E - Reply"), "{text:?}");
+        assert!(text.contains("R - Reply"), "{text:?}");
+        assert!(!text.contains("E - Reply"), "{text:?}");
         assert!(!text.contains("R - Previous"), "{text:?}");
         assert!(!text.contains("F - Next"), "{text:?}");
 
@@ -15699,8 +15713,11 @@ mod tests {
         let h = |cmd: &str| help_text(Some(cmd), lvl, false, &km);
         // `L` is scan on Maximus, and the text names L, not S.
         assert_eq!(h("l"), "L — scan message headers in this room");
-        // Native `S` no longer does anything there, so there is no help for it.
-        assert!(h("s").starts_with("No help for 's'"), "{}", h("s"));
+        // Native `S` no longer scans there. Maximus S is statistics, which this
+        // BBS does not have, so the keymap says so.
+        assert_eq!(h("s"), "No statistics screen on this BBS.");
+        // A native key with no meaning on that keymap has no help.
+        assert!(h("q").starts_with("No help for 'q'"), "{}", h("q"));
         // `G` is quit on Maximus.
         assert_eq!(h("g"), "G — log out");
         // A key the preset declares unsupported gets its friendly message.
@@ -15775,5 +15792,20 @@ mod tests {
         let cmd = Command::parse_with_keymap("q", false, &Keymap::maximus());
         let text = shown(host.process_command(sid, cmd).await.unwrap());
         assert!(text.contains("Unknown command"), "{text:?}");
+    }
+
+    /// Word keys switch the reading-mode help to a shorter layout, which still
+    /// names every key.
+    #[test]
+    fn reading_help_switches_to_a_compact_layout_for_long_keys() {
+        let km = Keymap::pcboard();
+        let help = help_reading_mode(&km);
+        for key in ["NEXT", "BACK", "REPLY", "DELETE"] {
+            assert!(help.contains(key), "{help}");
+        }
+        assert!(help.len() < 120, "{} bytes: {help}", help.len());
+        // Single-letter keymaps keep the full layout.
+        assert!(help_reading_mode(&Keymap::native()).contains("previous message"));
+        assert!(help_reading_mode(&Keymap::maximus()).contains("previous message"));
     }
 }
