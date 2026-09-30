@@ -29,7 +29,7 @@
 //! [`render_notification`] converts a [`Notification`] (a host-initiated push)
 //! into the text string delivered via `OutboundFrame::SendTxtMsg`.
 
-use bbs_plugin_api::{event::Notification, Command, Keymap, Response};
+use bbs_plugin_api::{event::Notification, Command, Keymap, KeymapAction, Response};
 
 // ── Command parsing ───────────────────────────────────────────────────────────
 
@@ -90,13 +90,14 @@ pub fn format_response(response: &Response) -> Option<String> {
 ///
 /// Called from [`MeshTransport::notify`](crate::MeshTransport) when the host
 /// pushes an unsolicited event to an active session.
-pub fn render_notification(notification: &Notification) -> String {
+pub fn render_notification(notification: &Notification, keymap: &Keymap) -> String {
     match notification {
         Notification::Text(t) => t.clone(),
         Notification::MailWaiting { count } => format!(
-            "You have {} unread message{}. Reply 'M' to read.",
+            "You have {} unread message{}. Reply '{}' to read.",
             count,
-            if *count == 1 { "" } else { "s" }
+            if *count == 1 { "" } else { "s" },
+            keymap.key(KeymapAction::GoMail)
         ),
         Notification::SystemEvent(s) => format!("[system] {s}"),
         // Non-exhaustive catch-all.
@@ -545,26 +546,29 @@ mod tests {
     #[test]
     fn render_text_notification() {
         assert_eq!(
-            render_notification(&Notification::Text("hello".to_owned())),
+            render_notification(&Notification::Text("hello".to_owned()), &Keymap::native()),
             "hello"
         );
     }
 
     #[test]
     fn render_mail_waiting_singular() {
-        let text = render_notification(&Notification::MailWaiting { count: 1 });
+        let text = render_notification(&Notification::MailWaiting { count: 1 }, &Keymap::native());
         assert!(text.contains('1') && !text.contains("messages"));
     }
 
     #[test]
     fn render_mail_waiting_plural() {
-        let text = render_notification(&Notification::MailWaiting { count: 3 });
+        let text = render_notification(&Notification::MailWaiting { count: 3 }, &Keymap::native());
         assert!(text.contains('3') && text.contains("messages"));
     }
 
     #[test]
     fn render_system_event() {
-        let text = render_notification(&Notification::SystemEvent("validated".to_owned()));
+        let text = render_notification(
+            &Notification::SystemEvent("validated".to_owned()),
+            &Keymap::native(),
+        );
         assert!(text.contains("validated") && text.contains("[system]"));
     }
 
@@ -614,8 +618,19 @@ mod tests {
     /// #409: the notification must name a keyword that parses to GoMail.
     #[test]
     fn render_mail_waiting_names_a_real_working_command() {
-        let text = render_notification(&Notification::MailWaiting { count: 1 });
+        let text = render_notification(&Notification::MailWaiting { count: 1 }, &Keymap::native());
         assert!(text.contains("'M'"), "{text}");
         assert_eq!(hardening("M"), Some(Command::GoMail));
+    }
+
+    /// The mail notification names the key that works on this board.
+    #[test]
+    fn mail_waiting_names_the_active_keymaps_mail_key() {
+        let text = render_notification(
+            &Notification::MailWaiting { count: 2 },
+            &Keymap::packet_bbs(),
+        );
+        assert!(text.contains("'LM'"), "{text}");
+        assert!(!text.contains("'M'"), "{text}");
     }
 }

@@ -15,7 +15,7 @@ use bbs_plugin_api::registry::ProcessPluginConfig;
 use bbs_plugin_api::{
     Command, Host, PluginError, Response, SessionId, TransportEngine, TransportError,
 };
-use bbs_plugin_api::{NotifyOutcome, Plugin};
+use bbs_plugin_api::{Keymap, KeymapAction, NotifyOutcome, Plugin};
 use serde_json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command as TokioCommand};
@@ -191,13 +191,14 @@ impl ProcessTransport {
     }
 }
 
-fn render_notification(n: &Notification) -> String {
+fn render_notification(n: &Notification, keymap: &Keymap) -> String {
     match n {
         Notification::Text(t) => t.clone(),
         Notification::MailWaiting { count } => format!(
-            "You have {} unread message{}. Type 'mail' to read.",
+            "You have {} unread message{}. Type '{}' to read.",
             count,
-            if *count == 1 { "" } else { "s" }
+            if *count == 1 { "" } else { "s" },
+            keymap.key(KeymapAction::GoMail)
         ),
         Notification::SystemEvent(s) => format!("[system] {s}"),
         _ => "[notification]".to_owned(),
@@ -374,7 +375,7 @@ impl TransportEngine for ProcessTransport {
         };
         drop(map);
 
-        let text = render_notification(&payload);
+        let text = render_notification(&payload, &self.host.active_keymap().await);
         let Some(tx) = self.stdin_tx.get() else {
             return Ok(NotifyOutcome::PermanentFailure(
                 "transport not started".into(),

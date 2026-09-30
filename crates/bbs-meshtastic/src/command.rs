@@ -1,6 +1,6 @@
 //! Command parsing and response rendering for the Meshtastic transport.
 
-use bbs_plugin_api::{event::Notification, Command, Keymap, Response};
+use bbs_plugin_api::{event::Notification, Command, Keymap, KeymapAction, Response};
 
 /// Parse the raw text of an incoming direct message into a [`Command`].
 ///
@@ -33,13 +33,14 @@ pub fn format_response(response: &Response) -> Option<String> {
     }
 }
 
-pub fn render_notification(notification: &Notification) -> String {
+pub fn render_notification(notification: &Notification, keymap: &Keymap) -> String {
     match notification {
         Notification::Text(t) => t.clone(),
         Notification::MailWaiting { count } => format!(
-            "You have {} unread message{}. Reply 'M' to read.",
+            "You have {} unread message{}. Reply '{}' to read.",
             count,
-            if *count == 1 { "" } else { "s" }
+            if *count == 1 { "" } else { "s" },
+            keymap.key(KeymapAction::GoMail)
         ),
         Notification::SystemEvent(s) => format!("[system] {s}"),
         _ => "[notification]".to_owned(),
@@ -260,5 +261,16 @@ mod tests {
             Some(Command::ReadForward { after: Some(10) })
         );
         assert!(matches!(hardening("f 1o"), Some(Command::Unknown { .. })));
+    }
+
+    /// The mail notification names the key that works on this board.
+    #[test]
+    fn mail_waiting_names_the_active_keymaps_mail_key() {
+        let text = render_notification(
+            &Notification::MailWaiting { count: 2 },
+            &Keymap::packet_bbs(),
+        );
+        assert!(text.contains("'LM'"), "{text}");
+        assert!(!text.contains("'M'"), "{text}");
     }
 }

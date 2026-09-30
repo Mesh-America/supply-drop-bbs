@@ -737,6 +737,17 @@ impl Host for BbsHost {
                         .unwrap_or(false)
                 };
                 if is_authed {
+                    // A key the active keymap declares as unsupported (a
+                    // command the source BBS has and this one lacks) gets its
+                    // own short reply instead of a generic error.
+                    let word = raw
+                        .split_whitespace()
+                        .next()
+                        .map(str::to_lowercase)
+                        .unwrap_or_default();
+                    if let Some(message) = self.active_keymap().await.unsupported_message(&word) {
+                        return Ok(Response::Text(message.to_owned()));
+                    }
                     Ok(Response::Text("Unknown command. Type H for help.".into()))
                 } else if self.session_on_radio(session).await {
                     Ok(Response::Text(HELP_QUICK_ANON_RADIO.into()))
@@ -15741,5 +15752,28 @@ mod tests {
         assert!(account.contains("//WHO  who's online"), "{account}");
         assert_eq!(pad_key("N", 5), "N    ");
         assert_eq!(pad_key("//WHO", 5), "//WHO ");
+    }
+
+    /// A key the keymap declares unsupported gets its friendly reply, with or
+    /// without an argument; any other unknown word keeps the generic reply.
+    #[tokio::test]
+    async fn an_unsupported_key_gets_its_friendly_reply() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        *host.keymap.write().await = Keymap::maximus();
+
+        for typed in ["j", "J", "j 5"] {
+            let cmd = Command::parse_with_keymap(typed, false, &Keymap::maximus());
+            let text = shown(host.process_command(sid, cmd).await.unwrap());
+            assert_eq!(text, "No file areas on this BBS.", "{typed}");
+        }
+        let cmd = Command::parse_with_keymap("zzz", false, &Keymap::maximus());
+        let text = shown(host.process_command(sid, cmd).await.unwrap());
+        assert!(text.contains("Unknown command"), "{text:?}");
+        // The native key the preset dropped is unknown, not silently working.
+        let cmd = Command::parse_with_keymap("q", false, &Keymap::maximus());
+        let text = shown(host.process_command(sid, cmd).await.unwrap());
+        assert!(text.contains("Unknown command"), "{text:?}");
     }
 }

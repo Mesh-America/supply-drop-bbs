@@ -59,7 +59,7 @@ use tracing::{debug, error, info, warn};
 
 // Unix-only: command/response types needed by the session implementation.
 #[cfg(unix)]
-use bbs_plugin_api::{Command, Response};
+use bbs_plugin_api::{Command, Keymap, KeymapAction, Response};
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -317,7 +317,12 @@ impl TransportEngine for CliTransport {
             return Ok(NotifyOutcome::Dropped);
         };
 
-        let line = format!("{}{}", NOTIFY_PREFIX, render_notification(&payload));
+        let keymap = self.host.active_keymap().await;
+        let line = format!(
+            "{}{}",
+            NOTIFY_PREFIX,
+            render_notification(&payload, &keymap)
+        );
         match tx.send(line).await {
             Ok(()) => Ok(NotifyOutcome::Queued),
             // Receiver dropped — client disconnected between lookup and send.
@@ -548,13 +553,14 @@ fn format_response(response: &Response) -> Option<String> {
 // ── Notification rendering ────────────────────────────────────────────────────
 
 #[cfg(unix)]
-fn render_notification(notification: &Notification) -> String {
+fn render_notification(notification: &Notification, keymap: &Keymap) -> String {
     match notification {
         Notification::Text(t) => t.clone(),
         Notification::MailWaiting { count } => format!(
-            "You have {} unread message{}. Type 'mail' to read.",
+            "You have {} unread message{}. Type '{}' to read.",
             count,
-            if *count == 1 { "" } else { "s" }
+            if *count == 1 { "" } else { "s" },
+            keymap.key(KeymapAction::GoMail)
         ),
         Notification::SystemEvent(s) => format!("[system] {s}"),
         _ => "[notification]".to_owned(),
@@ -692,20 +698,31 @@ mod tests {
 
     #[test]
     fn render_mail_singular() {
-        let t = render_notification(&Notification::MailWaiting { count: 1 });
+        let t = render_notification(&Notification::MailWaiting { count: 1 }, &Keymap::native());
         assert!(t.contains('1') && !t.contains("messages"));
     }
 
     #[test]
     fn render_mail_plural() {
-        let t = render_notification(&Notification::MailWaiting { count: 3 });
+        let t = render_notification(&Notification::MailWaiting { count: 3 }, &Keymap::native());
         assert!(t.contains('3') && t.contains("messages"));
     }
 
     #[test]
     fn notify_prefix_in_rendered_output() {
-        let t = render_notification(&Notification::Text("hi".into()));
+        let t = render_notification(&Notification::Text("hi".into()), &Keymap::native());
         // render_notification itself doesn't add the prefix; notify() does.
         assert_eq!(t, "hi");
+    }
+
+    /// The mail notification names the key that works on this board.
+    #[test]
+    fn mail_waiting_names_the_active_keymaps_mail_key() {
+        let text = render_notification(
+            &Notification::MailWaiting { count: 2 },
+            &Keymap::packet_bbs(),
+        );
+        assert!(text.contains("'LM'"), "{text}");
+        assert!(!text.contains("'M'"), "{text}");
     }
 }

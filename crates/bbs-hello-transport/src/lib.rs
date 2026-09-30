@@ -36,8 +36,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bbs_plugin_api::{
-    event::Notification, Command, Host, NotifyOutcome, Plugin, PluginError, Response, SessionId,
-    TransportEngine, TransportError,
+    event::Notification, Command, Host, Keymap, KeymapAction, NotifyOutcome, Plugin, PluginError,
+    Response, SessionId, TransportEngine, TransportError,
 };
 use serde::Deserialize;
 use tokio::{
@@ -199,7 +199,7 @@ impl TransportEngine for HelloTransport {
         if active.session_id != session {
             return Ok(NotifyOutcome::Dropped);
         }
-        let text = render_notification(&payload);
+        let text = render_notification(&payload, &self.host.active_keymap().await);
         match active.tx.try_send(text) {
             Ok(()) => Ok(NotifyOutcome::Delivered),
             Err(_) => Ok(NotifyOutcome::Dropped),
@@ -273,12 +273,13 @@ async fn handle_connection(
     info!(?session_id, "hello-transport: connection closed");
 }
 
-fn render_notification(n: &Notification) -> String {
+fn render_notification(n: &Notification, keymap: &Keymap) -> String {
     match n {
         Notification::Text(t) => t.clone(),
         Notification::MailWaiting { count } => format!(
-            "You have {count} unread message{}. Type 'mail' to read.",
-            if *count == 1 { "" } else { "s" }
+            "You have {count} unread message{}. Type '{}' to read.",
+            if *count == 1 { "" } else { "s" },
+            keymap.key(KeymapAction::GoMail)
         ),
         Notification::SystemEvent(s) => format!("[system] {s}"),
         _ => "[notification]".to_owned(),
@@ -303,27 +304,30 @@ mod tests {
     #[test]
     fn render_text_notification() {
         let n = Notification::Text("hello".to_owned());
-        assert_eq!(render_notification(&n), "hello");
+        assert_eq!(render_notification(&n, &Keymap::native()), "hello");
     }
 
     #[test]
     fn render_mail_waiting_single() {
         let n = Notification::MailWaiting { count: 1 };
-        let s = render_notification(&n);
+        let s = render_notification(&n, &Keymap::native());
         assert!(s.contains("1 unread message."), "got: {s}");
     }
 
     #[test]
     fn render_mail_waiting_plural() {
         let n = Notification::MailWaiting { count: 3 };
-        let s = render_notification(&n);
+        let s = render_notification(&n, &Keymap::native());
         assert!(s.contains("3 unread messages."), "got: {s}");
     }
 
     #[test]
     fn render_system_event() {
         let n = Notification::SystemEvent("reboot in 60s".to_owned());
-        assert_eq!(render_notification(&n), "[system] reboot in 60s");
+        assert_eq!(
+            render_notification(&n, &Keymap::native()),
+            "[system] reboot in 60s"
+        );
     }
 
     /// Demonstrates MockHost usage: init → start → stop without panicking.
@@ -341,5 +345,16 @@ mod tests {
             .unwrap();
         transport.start().await.unwrap();
         transport.stop().await.unwrap();
+    }
+
+    /// The mail notification names the key that works on this board.
+    #[test]
+    fn mail_waiting_names_the_active_keymaps_mail_key() {
+        let text = render_notification(
+            &Notification::MailWaiting { count: 2 },
+            &Keymap::packet_bbs(),
+        );
+        assert!(text.contains("'LM'"), "{text}");
+        assert!(!text.contains("'M'"), "{text}");
     }
 }

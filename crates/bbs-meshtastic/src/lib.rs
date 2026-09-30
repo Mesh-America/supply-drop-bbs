@@ -546,7 +546,11 @@ impl TransportEngine for MeshtasticTransport {
             return Ok(NotifyOutcome::Dropped);
         };
 
-        let text = truncate_utf8(&render_notification(&payload), self.max_payload_bytes);
+        let keymap = self.host.active_keymap().await;
+        let text = truncate_utf8(
+            &render_notification(&payload, &keymap),
+            self.max_payload_bytes,
+        );
         let packet_id = self.packet_counter.fetch_add(1, Ordering::Relaxed);
         self.cmd_tx
             .send(direct_text_packet(

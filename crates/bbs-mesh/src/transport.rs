@@ -741,7 +741,7 @@ impl TransportEngine for MeshTransport {
             return Ok(NotifyOutcome::Dropped);
         };
 
-        let text = render_notification(&payload);
+        let text = render_notification(&payload, &self.host.active_keymap().await);
         enqueue_text(
             &self.send_tracker,
             &self.delivery_stats,
