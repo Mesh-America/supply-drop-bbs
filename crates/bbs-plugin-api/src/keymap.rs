@@ -324,11 +324,13 @@ impl Keymap {
         use KeymapAction as A;
         Self::build(
             "maximus",
-            "Maximus-style keys: G(oodbye), A(rea change), L(ist brief), N/P next and \
-             previous, E(nter), R(eply) and K(ill) while reading. Keys only: no file \
-             areas, menus, chat, bulletins or terminal settings. Maximus has no mail \
-             room, list-rooms or next-unread key, so those use the words MAIL, ROOMS \
-             and READ, and ] (next area) stands in for next unread.",
+            "Maximus-style keys, from Scott Dudley's Maximus (the DOS, OS/2 and Linux BBS): \
+             G(oodbye), A(rea change), L(ist brief), N/P next and previous, E(nter), \
+             R(eply) and K(ill) while reading. This is not MAX's BBS for Amiga, whose \
+             menus are set by each sysop. Keys only: no file areas, menus, chat, bulletins \
+             or terminal settings. Maximus has no mail room, list-rooms or next-unread \
+             key, so those use the words MAIL, ROOMS and READ, and ] (next area) stands \
+             in for next unread.",
             &[
                 (A::Quit, &["g"]),
                 (A::ListRooms, &["rooms"]),

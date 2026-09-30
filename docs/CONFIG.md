@@ -152,7 +152,7 @@ preset):
 | Name          | Source system                          | Coverage |
 |---------------|-----------------------------------------|----------|
 | `native`      | Supply Drop's own commands (default)    | Everything |
-| `maximus`     | Maximus 3.0x                            | Keys verified from the shipped menu files. No list-rooms, mail or next-unread key exists in Maximus, so those are the words `ROOMS`, `MAIL` and `READ`, and `]` (next area) stands in for next unread. |
+| `maximus`     | Maximus 3.0x (Scott Dudley's; not MAX's BBS for Amiga) | Keys verified from the shipped menu files. No list-rooms, mail or next-unread key exists in Maximus, so those are the words `ROOMS`, `MAIL` and `READ`, and `]` (next area) stands in for next unread. |
 | `wwiv-family` | WWIV 5.x                                | Keys verified from the shipped menus and read prompt. Telegard and Renegade are not covered. WWIV's `H` (hop) is help here, so the word `HOP` is used. |
 | `synchronet`  | Synchronet (default command shell)      | Keys verified from the shipped shell and reading prompt. `E` (the e-mail menu) goes to the Mail room. Next unread, newest first and delete use the words `UNREAD`, `BACK` and `DELETE`. |
 | `pcboard`     | PCBoard 15.x                            | Keys verified from the PCBoard 15.x manual. PCBoard has no mail room, list-rooms or next-unread command, so those use `Y` (nearest), `ROOMS` and `NEXT`. Reading uses `NEXT`, `PREV`, `RE` and `K`. |
@@ -167,7 +167,9 @@ here) and `H` in WWIV (hop, help here). The full list of what each system has is
 `specs/002-command-keymaps/research-classic-bbs-commands.md`.
 
 An example custom keymap for the layout requested in GH #354 is in
-`contrib/keymaps/issue-354-layout.toml`.
+`contrib/keymaps/issue-354-layout.toml`. That layout comes from the requester's
+own Amiga board (most likely MAX's BBS, whose menus each sysop defines), so it
+differs from the stock Maximus keys in the `maximus` preset.
 
 **Custom keymaps** are TOML files in the same shape as a built-in preset,
 placed under `data_dir`. Every action must be listed, each with a list of

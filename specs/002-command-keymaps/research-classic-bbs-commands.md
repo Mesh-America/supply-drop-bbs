@@ -279,3 +279,42 @@ The lineage (Renegade from Telegard from WWIV) was not verified. The
 - Packet BBS: what a bare `R` does, and how W0RLI differs, are not documented in
   the two pages read. The BPQ Quickstart guide was not found.
 - Telegard and Renegade defaults, and the WWIV lineage claim.
+
+### Why the #354 layout does not match the Maximus preset (2026-09-30)
+
+The requester of GH #354 wrote that their layout comes from "my maximus bbs I have
+still going to this date (For amiga software)". Two different programs are called
+Maximus or Max:
+
+- **Maximus** by Scott Dudley (DOS, OS/2, later Linux). This is what the `maximus`
+  preset follows. Verified from its shipped `ctl/menus.ctl` and help files.
+- **MAX's BBS** by Anthony Barrett (Amiga, 1989 to 1994; public domain release
+  1.52). The Amiga is almost certainly what the requester runs. Its readme says
+  it "can be completely customized: you can make your own menus". A web search
+  summary for this question just repeated the issue text, so it was not used.
+
+The public release `maxs152pd.lha` (from `software.bbsdocumentary.com`) was
+unpacked and its shipped files read: `MenuFunctions.text`, the sample menus under
+`BBS/Menus/` and the reading help under `BBS/Text/`. `MAXsBBS.manual` (168 KB) was
+not read. What the shipped samples show:
+
+- A menu is a text file whose option letters are chosen by the sysop. A separate
+  numbered function table (1 log out, 2 go to menu, 16 leave a message, 17 read
+  messages, 32 send NetMail, 38 who is online, and so on) says what each option
+  does. The keys are therefore not fixed by the software.
+- Shipped sample menus: main `L` local boards, `E` echo boards, `F` files, `N`
+  news, `U` user menu, `V` time bank, `W` who, `I` internode chat, `C` call the
+  sysop, `B` bye; a message section `R` read, `L` leave a message, `P` previous
+  menu, `Q` quit to main; private EMAIL `R`, `L`, `M`, `S`; read options `N` new,
+  `F` forward, `R` reverse, `T` threads, `I` individual, `S` search, `M` marked,
+  `A` abort, `H` help.
+- None of that matches the requester's table (`l` list rooms, `g` goto, `j` jump,
+  `m` list messages, `n` and `p`, `w` write, `lm`, `jm`, `rm`, `dm`, `nm`, `cm`,
+  `sm`, `xm`, `qm`). It is most likely the requester's own customised menu set, on
+  a version that may be newer than 1.52 (there are 1.54 and "MAXsPRO" releases).
+
+So there is no verifiable "Amiga Maximus default" to build a preset from. The
+requester's layout is kept as the worked example
+`contrib/keymaps/issue-354-layout.toml`, and the `maximus` preset says in its
+description that it is Scott Dudley's Maximus and not MAX's BBS.
+

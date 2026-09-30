@@ -1,6 +1,13 @@
 # Example custom keymap: the layout requested in GH #354.
 #
 # This is a worked example of the custom keymap format, not a built-in preset.
+#
+# Where the layout comes from: the requester of #354 wrote it from their own
+# board, which they call Maximus and say runs on Amiga software. That is most
+# likely MAX's BBS (Anthony Barrett), whose menus are set by each sysop, so the
+# layout is their own menu set and is not the stock Maximus layout that the
+# built-in "maximus" preset follows. See
+# specs/002-command-keymaps/research-classic-bbs-commands.md.
 # To try it:
 #
 #   supply-drop-bbs config upload-keymap contrib/keymaps/issue-354-layout.toml
