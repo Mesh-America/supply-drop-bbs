@@ -3766,7 +3766,9 @@ impl BbsHost {
                     }
                     // Help shows contextual help and stays in the reading
                     // sub-mode rather than bouncing the user out (issue #109).
-                    ReadingInput::Help => Ok(Response::Text(HELP_READING_MODE.into())),
+                    ReadingInput::Help => Ok(Response::Text(help_reading_mode(
+                        &self.active_keymap().await,
+                    ))),
                     // Delete works without leaving reading mode (issue #184).
                     // Bare delete targets whatever message is on screen.
                     ReadingInput::Delete(target) => {
@@ -5150,13 +5152,16 @@ impl BbsHost {
 
     /// The reply when a step ended part-way through a long run of blocked
     /// messages: move the reading position to where it stopped and say to
-    /// press the same key again. `key` is `F` or `R`.
+    /// press the same key again. `action` is `ReadingForward` or
+    /// `ReadingReverse`; the reply names that action's key in the active
+    /// keymap.
     async fn stopped_in_blocked_run(
         &self,
         session: SessionId,
         at: MessageId,
-        key: &str,
+        action: KeymapAction,
     ) -> Response {
+        let keymap = self.active_keymap().await;
         {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
@@ -5166,7 +5171,9 @@ impl BbsHost {
         }
         Response::Prompt {
             text: format!(
-                "Skipped a long run of blocked messages.\n{key} - Keep going  H - Help  X - Exit"
+                "Skipped a long run of blocked messages.\n{} - Keep going  {} - Help  X - Exit",
+                keymap.key(action),
+                keymap.key(KeymapAction::ReadingHelp)
             ),
             hide_input: false,
         }
@@ -5242,10 +5249,13 @@ impl BbsHost {
                 }
             }
 
+            let keymap = self.active_keymap().await;
             return Ok(Response::Prompt {
                 text: format!(
-                    "[{} — Reading]\n{} message(s)\nF - Forward  R - Backward  H - Help  X - Exit",
-                    room.name, count
+                    "[{} — Reading]\n{} message(s)\n{}",
+                    room.name,
+                    count,
+                    reading_footer(&keymap, true, true)
                 ),
                 hide_input: false,
             });
@@ -5262,7 +5272,9 @@ impl BbsHost {
         {
             ReadStep::Found(m) => m,
             ReadStep::Skipped(at) => {
-                return Ok(self.stopped_in_blocked_run(session, at, "F").await);
+                return Ok(self
+                    .stopped_in_blocked_run(session, at, KeymapAction::ReadingForward)
+                    .await);
             }
             ReadStep::End { last_skipped } => {
                 // Only blocked messages were left: mark them read so they do
@@ -5282,8 +5294,9 @@ impl BbsHost {
                 }
                 return Ok(Response::Prompt {
                     text: format!(
-                        "No more messages in {}.\nR - Backward  H - Help  X - Exit",
-                        room.name
+                        "No more messages in {}.\n{}",
+                        room.name,
+                        reading_footer(&self.active_keymap().await, false, true)
                     ),
                     hide_input: false,
                 });
@@ -5309,7 +5322,7 @@ impl BbsHost {
             .await?;
 
         Ok(Response::Prompt {
-            text: build_message_with_nav(&msg, has_prev, has_next),
+            text: build_message_with_nav(&msg, has_prev, has_next, &self.active_keymap().await),
             hide_input: false,
         })
     }
@@ -5368,10 +5381,13 @@ impl BbsHost {
                 }
             }
 
+            let keymap = self.active_keymap().await;
             return Ok(Response::Prompt {
                 text: format!(
-                    "[{} — Reading]\n{} message(s)\nF - Forward  R - Backward  H - Help  X - Exit",
-                    room.name, count
+                    "[{} — Reading]\n{} message(s)\n{}",
+                    room.name,
+                    count,
+                    reading_footer(&keymap, true, true)
                 ),
                 hide_input: false,
             });
@@ -5388,13 +5404,16 @@ impl BbsHost {
         {
             ReadStep::Found(m) => m,
             ReadStep::Skipped(at) => {
-                return Ok(self.stopped_in_blocked_run(session, at, "R").await);
+                return Ok(self
+                    .stopped_in_blocked_run(session, at, KeymapAction::ReadingReverse)
+                    .await);
             }
             ReadStep::End { .. } => {
                 return Ok(Response::Prompt {
                     text: format!(
-                        "No previous messages in {}.\nF - Forward  H - Help  X - Exit",
-                        room.name
+                        "No previous messages in {}.\n{}",
+                        room.name,
+                        reading_footer(&self.active_keymap().await, true, false)
                     ),
                     hide_input: false,
                 })
@@ -5420,7 +5439,7 @@ impl BbsHost {
             .await?;
 
         Ok(Response::Prompt {
-            text: build_message_with_nav(&msg, has_prev, has_next),
+            text: build_message_with_nav(&msg, has_prev, has_next, &self.active_keymap().await),
             hide_input: false,
         })
     }
@@ -7152,17 +7171,26 @@ Reading:\n\
  S    scan message headers\n\
  .FF  fast-forward past unread";
 
-/// Contextual help shown when `H`/`?` is pressed inside the one-at-a-time
-/// reading sub-mode (`Workflow::Reading`). Lists only the keys valid there.
-const HELP_READING_MODE: &str = "\
-Reading mode:\n\
- F  next message\n\
- R  previous message\n\
- F/R <#>  jump to message\n\
- E  reply to this message\n\
- D  delete message\n\
- H  this help\n\
- X  exit reading";
+/// Contextual help shown when the help key is pressed inside the
+/// one-at-a-time reading sub-mode (`Workflow::Reading`). Lists only the keys
+/// valid there, taken from the active keymap.
+fn help_reading_mode(keymap: &Keymap) -> String {
+    let fwd = keymap.key(KeymapAction::ReadingForward);
+    let rev = keymap.key(KeymapAction::ReadingReverse);
+    format!(
+        "Reading mode:\n\
+         {fwd}  next message\n\
+         {rev}  previous message\n\
+         {fwd}/{rev} <#>  jump to message\n\
+         {}  reply to this message\n\
+         {}  delete message\n\
+         {}  this help\n\
+         X  exit reading",
+        keymap.key(KeymapAction::ReadingReply),
+        keymap.key(KeymapAction::ReadingDelete),
+        keymap.key(KeymapAction::ReadingHelp),
+    )
+}
 
 const HELP_POSTING: &str = "\
 Posting:\n\
@@ -7225,16 +7253,51 @@ Sysop:\n\
 
 // ── Formatting helpers ────────────────────────────────────────────────────────
 
-fn build_message_with_nav(msg: &Message, has_prev: bool, has_next: bool) -> String {
+fn build_message_with_nav(
+    msg: &Message,
+    has_prev: bool,
+    has_next: bool,
+    keymap: &Keymap,
+) -> String {
     let mut nav = Vec::new();
     if has_prev {
-        nav.push("R - Previous");
+        nav.push(format!(
+            "{} - Previous",
+            keymap.key(KeymapAction::ReadingReverse)
+        ));
     }
     if has_next {
-        nav.push("F - Next");
+        nav.push(format!(
+            "{} - Next",
+            keymap.key(KeymapAction::ReadingForward)
+        ));
     }
-    nav.push("E - Reply");
+    nav.push(format!(
+        "{} - Reply",
+        keymap.key(KeymapAction::ReadingReply)
+    ));
     format!("{}\n{}", format_message(msg), nav.join("  "))
+}
+
+/// The key hints ending a reading-mode prompt: forward and backward if they
+/// apply, then help and exit. Reading keys come from the active keymap.
+fn reading_footer(keymap: &Keymap, forward: bool, reverse: bool) -> String {
+    let mut parts = Vec::new();
+    if forward {
+        parts.push(format!(
+            "{} - Forward",
+            keymap.key(KeymapAction::ReadingForward)
+        ));
+    }
+    if reverse {
+        parts.push(format!(
+            "{} - Backward",
+            keymap.key(KeymapAction::ReadingReverse)
+        ));
+    }
+    parts.push(format!("{} - Help", keymap.key(KeymapAction::ReadingHelp)));
+    parts.push("X - Exit".to_owned());
+    parts.join("  ")
 }
 
 fn format_message(msg: &Message) -> String {
@@ -7275,7 +7338,7 @@ mod tests {
             ("HELP_OVERVIEW", HELP_OVERVIEW.to_owned()),
             ("HELP_MAIL", HELP_MAIL.to_owned()),
             ("HELP_READING", HELP_READING.to_owned()),
-            ("HELP_READING_MODE", HELP_READING_MODE.to_owned()),
+            ("HELP_READING_MODE", help_reading_mode(&Keymap::native())),
             ("HELP_POSTING", HELP_POSTING.to_owned()),
             ("HELP_NAVIGATION", HELP_NAVIGATION.to_owned()),
             ("HELP_ACCOUNT", HELP_ACCOUNT.to_owned()),
@@ -15015,5 +15078,102 @@ mod tests {
         );
         let sessions = host.sessions.read().await;
         assert!(matches!(sessions[&sid].workflow, Workflow::Reading));
+    }
+
+    // ── Messages name the active keymap's keys (GH #354 phase 5) ─────────
+
+    /// Reading prompts show the reading keys of the active keymap.
+    #[tokio::test]
+    async fn reading_prompts_name_the_active_keymaps_keys() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+        *host.keymap.write().await = Keymap::maximus();
+
+        // The intro prompt (reading mode entered with no message on screen).
+        let text = shown(
+            host.process_command(sid, Command::ReadForward { after: None })
+                .await
+                .unwrap(),
+        );
+        assert!(
+            text.contains("N - Forward  P - Backward  ? - Help  X - Exit"),
+            "{text:?}"
+        );
+
+        // A middle message has both neighbours.
+        let text = shown(
+            host.process_command(
+                sid,
+                Command::ReadForward {
+                    after: Some(ids[1]),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(text.contains("P - Previous"), "{text:?}");
+        assert!(text.contains("N - Next"), "{text:?}");
+        assert!(text.contains("E - Reply"), "{text:?}");
+        assert!(!text.contains("R - Previous"), "{text:?}");
+        assert!(!text.contains("F - Next"), "{text:?}");
+
+        // The end of the room, reading forward.
+        let text = shown(
+            host.process_command(
+                sid,
+                Command::ReadForward {
+                    after: Some(ids[2]),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let text = if text.contains("third") {
+            shown(say(&host, sid, "n").await)
+        } else {
+            text
+        };
+        assert!(text.contains("P - Backward  ? - Help"), "{text:?}");
+        assert!(!text.contains("R - Backward"), "{text:?}");
+    }
+
+    #[tokio::test]
+    async fn reading_help_and_blocked_run_hints_name_the_active_keys() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        *host.keymap.write().await = Keymap::maximus();
+
+        let help = help_reading_mode(&Keymap::maximus());
+        assert!(help.contains("N  next message"), "{help}");
+        assert!(help.contains("P  previous message"), "{help}");
+        assert!(help.contains("N/P <#>  jump to message"), "{help}");
+        assert!(help.contains("?  this help"), "{help}");
+        assert!(!help.contains("F  next"), "{help}");
+
+        let reply = host
+            .stopped_in_blocked_run(sid, MessageId::new(1), KeymapAction::ReadingForward)
+            .await;
+        let text = shown(reply);
+        assert!(text.contains("N - Keep going  ? - Help"), "{text:?}");
+    }
+
+    /// Native output is unchanged by the keymap plumbing.
+    #[test]
+    fn native_reading_help_is_the_documented_text() {
+        let expected = [
+            "Reading mode:",
+            "F  next message",
+            "R  previous message",
+            "F/R <#>  jump to message",
+            "E  reply to this message",
+            "D  delete message",
+            "H  this help",
+            "X  exit reading",
+        ]
+        .join("\n");
+        assert_eq!(help_reading_mode(&Keymap::native()), expected);
     }
 }

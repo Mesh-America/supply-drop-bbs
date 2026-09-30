@@ -599,6 +599,22 @@ impl Keymap {
         )
     }
 
+    /// The key to show a user for `action` in a message: its primary key in
+    /// upper case (`"N"`, `"//WHO"`). Every user-facing message that names a
+    /// key must get it from here so it names the key that works on this
+    /// board, not the native one.
+    #[must_use]
+    pub fn key(&self, action: KeymapAction) -> String {
+        self.primary(action).to_uppercase()
+    }
+
+    /// [`Keymap::key`] followed by an argument placeholder, for example
+    /// `key_with(ReadForward, "<id>")` gives `"F <id>"`.
+    #[must_use]
+    pub fn key_with(&self, action: KeymapAction, arg: &str) -> String {
+        format!("{} {arg}", self.key(action))
+    }
+
     /// The top-level action bound to `keyword`, if any. `keyword` must
     /// already be lowercase.
     #[must_use]
@@ -822,6 +838,18 @@ mod tests {
         let mut km = Keymap::maximus();
         km.bindings.remove(&KeymapAction::GoNextUnread);
         assert_eq!(km.primary(KeymapAction::GoNextUnread), "g");
+    }
+
+    #[test]
+    fn key_is_the_upper_cased_primary() {
+        let km = Keymap::maximus();
+        assert_eq!(km.key(KeymapAction::Quit), "G");
+        assert_eq!(km.key(KeymapAction::GoNextUnread), "]");
+        assert_eq!(km.key_with(KeymapAction::ReadForward, "<id>"), "F <id>");
+        assert_eq!(
+            Keymap::wwiv_family().key(KeymapAction::WhoIsOnline),
+            "//WHO"
+        );
     }
 
     #[test]
