@@ -168,14 +168,31 @@ Each phase ends with the full gate from CLAUDE.md and a commit.
   test plus per-site tests cover it.
 - Hints get longer on radio. Covered by the length test.
 
-## Open questions (TJ)
+## Decisions (answered by TJ)
 
-1. Exclusive presets: should a preset drop the native keys it replaces, or keep
-   them as aliases? Affects what "primary" means for help text and whether old
-   habits still work.
-2. Long-form aliases (`goto`, `list`): allowed in presets? They are just extra
-   keywords in this design, so the cost is low.
-3. Multi-key commands (`lm`, `jm`, `rm` from the #354 layout): allowed as
-   keywords? Also low cost here. The only care is that a keyword may not be a
-   prefix problem for arguments (`jm 3`).
-4. Should the #354 layout ship as a built-in preset or only as an example file?
+1. **Exclusive presets: drop native keys.** When a preset binds an action, the
+   native keys for that action stop working. Actions the preset does not
+   mention keep their native keys, because the validation rule that every
+   action needs a key still holds. This replaces the "native stays as an alias"
+   line in design section 1.
+2. **Long-form aliases: allowed.** Any word can be a keyword.
+3. **Multi-key commands: allowed as plain keywords.** `lm`, `jm 3` and the rest
+   of the #354 mail menu work. The first word is the keyword, the rest is the
+   argument.
+4. **The #354 layout ships as an example file only.** It goes in an examples
+   folder for sysops to upload as a custom keymap. It is not a built-in preset.
+
+### What these decisions change in the plan
+
+- A user on a preset who types a dropped native key gets "Unknown command". The
+  unknown-command reply must name the preset's help key (`{help}`), so they can
+  recover. Add this to the section 4 table and to phase 5.
+- Dropping native keys means the shown key is always a key that works, which
+  makes the "message names an unusable key" risk in the risks section smaller.
+- Validation adds a check: a keyword that a preset frees up (for example native
+  `g` when `Quit` takes it) may be rebound by that preset without a collision,
+  but two actions may never share a keyword.
+- Custom keymap files can use any word, so the radio length test in design
+  section 5 must include a custom keymap with long keywords.
+- Phase 7 shrinks: the questions are answered, so it becomes updating the
+  presets and adding the example file.
