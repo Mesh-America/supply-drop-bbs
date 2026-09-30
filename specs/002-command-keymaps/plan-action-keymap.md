@@ -151,8 +151,11 @@ Each phase ends with the full gate from CLAUDE.md and a commit.
 6. **Guard test.** A test that scans the sources for literal key hints in
    user-facing strings (for example `Type [A-Z]`, `[A-Z] - `) and fails on a
    new one. Allow-list only the fixed, non-remappable keys.
-7. **Preset accuracy.** With the above in place, answer the four open
-   questions and update the presets and the example file.
+7. **Preset accuracy.** Complete each preset into a full table. For each
+   source system, list every command in its own manual and mark it supported,
+   remapped, or not available (gap analysis above). Add the coverage notes and
+   `unsupported` tables, rename presets to "-style", and add the example file
+   for the #354 layout.
 8. **Docs.** `CONFIG.md`, `CLI.md`, `USER_GUIDE.md`, the Settings page text,
    and the module docs describe the new behaviour.
 
@@ -176,6 +179,65 @@ Each phase ends with the full gate from CLAUDE.md and a commit.
   (for example a reading-only key). `KeyHints` is action-based, and the guard
   test plus per-site tests cover it.
 - Hints get longer on radio. Covered by the length test.
+
+## Gap analysis: source commands we do not have
+
+A preset changes keys, not features. If we call a preset "Maximus" but a
+Maximus user reaches for a function we lack, or a key they know does something
+different here, the label misleads. There are two gaps, and they need different
+handling.
+
+**Gap A: our actions with no source equivalent.** Already sourced in
+`research-classic-bbs-commands.md`. Under complete tables each still needs a
+key. Examples: Maximus has no single key for "next room with unread"; packet
+BBS has no room navigation at all.
+
+**Gap B: source commands we do not have.** Not catalogued before. From the
+sourced research, the ones we know about:
+
+| System | Source command or habit | Here |
+|---|---|---|
+| Maximus | `J` jump to file areas | We have no file areas |
+| Maximus | `M` (Main menu vs Message menu, depends on where you are) | We have one flat menu |
+| Maximus | `B` Browse sub-menu with filters | No equivalent, only `N`, `F`, `R`, `S` |
+| Maximus | Top-level `R` = Reply | Reply exists only inside reading mode (`E`) |
+| PCBoard | `M` graphics mode, `P` page length | We have no terminal settings |
+| PCBoard | `R;S;A` (options after semicolons) | No option syntax |
+| PCBoard | `J;<name>` conference jump with semicolon | Only `C <name>` |
+| Packet BBS | `SP <call>`, `SR`, `KM`, `RN`, `LM` from any room | Mail actions work only inside the Mail room |
+| Packet BBS | Forwarding between BBSs | Not built (see RFC #306) |
+| WWIV | `//WHO` slash commands, `H` hop by name | Not supported |
+| Synchronet | `E` then `U` or `S` mail sub-menu | Mail is a room, not a sub-menu |
+| #354 layout | `qm` quick message to another user | No live user-to-user page (to confirm) |
+| #354 layout | `xm` exit mail, `cm` cancel mail | Mail is a room, so these map onto room and compose keys |
+
+This list is only what the condensed research mentions. The original research
+trail is not in the repo, so it is **not complete**. Phase 7 starts with a
+fresh pass per preset that lists every command in the source system's own
+manual and marks each one supported, remapped, or not available.
+
+### Rules so a preset never over-promises
+
+1. **Name and describe honestly.** Presets are called "Maximus-style keys", not
+   "Maximus". The description states what is covered and what is not, for
+   example "Keys only. No file areas, no menus." The description is shown in
+   setup, the CLI, the web UI and `H`.
+2. **Coverage note per preset.** Each preset carries a list of source commands
+   that do not exist here. It is documentation, shown to the sysop when they
+   pick it, and it feeds the docs page for the preset.
+3. **Friendly reply for known missing commands.** A preset may declare a small
+   `unsupported` table (keyword to short message). Typing `j` on the Maximus
+   preset then says "No file areas on this BBS. Type ? for help." instead of
+   "Unknown command". Kept short for radio. This is a new, optional field and
+   does not change any action.
+4. **Never reuse a source key for a different meaning.** If a source key means
+   something we do not offer (PCBoard `Q`, `M`, `P`), we do not bind it to a
+   different action. It goes in the `unsupported` table instead. The validator
+   already rejects duplicates, and this rule is enforced by review and a
+   per-preset test that lists the known trap keys.
+5. **Every gap key is marked.** A key given to an action only because complete
+   tables require one (Gap A) is tagged "no source equivalent" in the preset
+   notes and in the docs.
 
 ## Decisions (answered by TJ)
 
