@@ -1,8 +1,8 @@
 # Plan: action-based keymaps (replaces the "translate to the native key" approach)
 
-Status: phases 1 to 5 done (parser fixes merged, complete-table data model,
-parse by action, reading mode, key names in messages); phase 6 onward not
-started. Draft for TJ. Supersedes the translation design in `plan.md` and the
+Status: phases 1 to 6 done (parser fixes merged, complete-table data model,
+parse by action, reading mode, key names in messages, guard test); phase 7
+onward not started. Draft for TJ. Supersedes the translation design in `plan.md` and the
 module doc of `crates/bbs-plugin-api/src/keymap.rs`. GH #354.
 
 ## Why change
@@ -150,7 +150,7 @@ Each phase ends with the full gate from CLAUDE.md and a commit.
    `R <id>`, `E <text>`, and a bad id.
 5. **KeyHints.** (done, as `Keymap::key` and `key_with`; no separate type) Add the type and convert every site in the table above, one
    commit per area (reading, navigation, help, notifications, welcome text).
-6. **Guard test.** A test that scans the sources for literal key hints in
+6. **Guard test.** (done: `tests/keymap_hints.rs`) A test that scans the sources for literal key hints in
    user-facing strings (for example `Type [A-Z]`, `[A-Z] - `) and fails on a
    new one. Allow-list only the fixed, non-remappable keys.
 7. **Preset accuracy.** Complete each preset into a full table. For each
