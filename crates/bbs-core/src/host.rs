@@ -7183,13 +7183,11 @@ const QUICK_HELP_ACTIONS: &[(KeymapAction, &str)] = &[
 
 /// Build the "quick reference" line shown after login for `topic: None`
 /// (GH #354 Phase 3, P3.5): one `KEY  label` line per action in
-/// [`QUICK_HELP_ACTIONS`], using the active keymap's override keyword if
-/// the action is remapped, or its native keyword unchanged otherwise —
-/// generated at request time instead of hardcoded into a `const`, so it
+/// [`QUICK_HELP_ACTIONS`], using the active keymap's primary key for the
+/// action, generated at request time instead of hardcoded into a `const`, so it
 /// can never drift from the keymap actually in effect the way a per-preset
 /// hand-written string could. Byte-identical to the old
-/// `HELP_QUICK_LOGGED_IN` constant when `keymap` is [`Keymap::native`]
-/// (every lookup then falls straight through to `native_keyword()`).
+/// `HELP_QUICK_LOGGED_IN` constant when `keymap` is [`Keymap::native`].
 fn quick_help_logged_in(keymap: &Keymap) -> String {
     let mut lines: Vec<String> = QUICK_HELP_ACTIONS
         .iter()

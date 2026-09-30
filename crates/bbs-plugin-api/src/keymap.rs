@@ -107,35 +107,6 @@ impl KeymapAction {
         KeymapAction::ReadingDelete,
     ];
 
-    /// The keyword the native keymap binds to this action (its primary).
-    ///
-    /// Used today by the parser to translate a typed keyword into the word
-    /// its match statement understands. That translation goes away when
-    /// parsing moves to per-action argument parsers
-    /// (`plan-action-keymap.md`, phase 3).
-    #[must_use]
-    pub fn native_keyword(self) -> &'static str {
-        match self {
-            KeymapAction::Quit => "q",
-            KeymapAction::ListRooms => "k",
-            KeymapAction::GoNextUnread => "g",
-            KeymapAction::ChangeRoom => "c",
-            KeymapAction::GoMail => "m",
-            KeymapAction::ReadNew => "n",
-            KeymapAction::ReadForward => "f",
-            KeymapAction::ReadReverse => "r",
-            KeymapAction::ScanMessages => "s",
-            KeymapAction::EnterMessage => "e",
-            KeymapAction::DeleteMessage => "d",
-            KeymapAction::WhoIsOnline => "w",
-            KeymapAction::ReadingForward => "f",
-            KeymapAction::ReadingReverse => "r",
-            KeymapAction::ReadingReply => "e",
-            KeymapAction::ReadingHelp => "h",
-            KeymapAction::ReadingDelete => "d",
-        }
-    }
-
     /// Whether this action is one of the `Reading*` variants, which live in
     /// their own namespace (see the module docs).
     #[must_use]
@@ -618,9 +589,14 @@ impl Keymap {
     /// happen for a keymap that passed [`Keymap::validate`].
     #[must_use]
     pub fn primary(&self, action: KeymapAction) -> &str {
-        self.keywords(action)
-            .first()
-            .map_or_else(|| action.native_keyword(), String::as_str)
+        self.keywords(action).first().map_or_else(
+            || {
+                static NATIVE: std::sync::OnceLock<Keymap> = std::sync::OnceLock::new();
+                let native = NATIVE.get_or_init(Keymap::native);
+                native.keywords(action).first().map_or("", String::as_str)
+            },
+            String::as_str,
+        )
     }
 
     /// The top-level action bound to `keyword`, if any. `keyword` must
@@ -741,11 +717,11 @@ pub fn is_reserved_keyword(keyword: &str) -> bool {
 /// (kept so a user can always log out), and CANCEL/STOP, which the parser
 /// intercepts before any keymap lookup.
 ///
-/// This is `command.rs`'s `parse_with_keymap` match, keyword by keyword,
-/// minus the keywords owned by a top-level action. Keep it in sync by hand;
-/// the test `every_fixed_keyword_parses_to_a_non_action_command` in
+/// This is the match in `command.rs`'s `parse_fixed`, word for word (plus
+/// `cancel` and `stop`). Keep it in sync by hand;
+/// the test `fixed_words_and_the_reserved_list_are_the_same_set` in
 /// `command.rs` guards against drift.
-const RESERVED_KEYWORDS: &[&str] = &[
+pub(crate) const RESERVED_KEYWORDS: &[&str] = &[
     "h",
     "help",
     "?",
@@ -813,15 +789,39 @@ mod tests {
     }
 
     #[test]
-    fn native_lists_every_action_with_its_native_keyword_first() {
+    fn native_lists_every_action_with_its_documented_primary_key() {
+        use KeymapAction as A;
         let native = Keymap::native();
-        for action in KeymapAction::ALL {
-            assert_eq!(
-                native.primary(*action),
-                action.native_keyword(),
-                "{action:?}"
-            );
+        for (action, key) in [
+            (A::Quit, "q"),
+            (A::ListRooms, "k"),
+            (A::GoNextUnread, "g"),
+            (A::ChangeRoom, "c"),
+            (A::GoMail, "m"),
+            (A::ReadNew, "n"),
+            (A::ReadForward, "f"),
+            (A::ReadReverse, "r"),
+            (A::ScanMessages, "s"),
+            (A::EnterMessage, "e"),
+            (A::DeleteMessage, "d"),
+            (A::WhoIsOnline, "w"),
+            (A::ReadingForward, "f"),
+            (A::ReadingReverse, "r"),
+            (A::ReadingReply, "e"),
+            (A::ReadingHelp, "h"),
+            (A::ReadingDelete, "d"),
+        ] {
+            assert_eq!(native.primary(action), key, "{action:?}");
         }
+        // Every action is covered by the list above.
+        assert_eq!(native.bindings.len(), KeymapAction::ALL.len());
+    }
+
+    #[test]
+    fn primary_falls_back_to_native_for_an_unlisted_action() {
+        let mut km = Keymap::maximus();
+        km.bindings.remove(&KeymapAction::GoNextUnread);
+        assert_eq!(km.primary(KeymapAction::GoNextUnread), "g");
     }
 
     #[test]

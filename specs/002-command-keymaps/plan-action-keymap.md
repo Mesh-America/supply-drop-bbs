@@ -1,7 +1,7 @@
 # Plan: action-based keymaps (replaces the "translate to the native key" approach)
 
-Status: phases 1 and 2 done (parser fixes merged, complete-table data model);
-phase 3 onward not started. Draft for TJ. Supersedes the translation design in `plan.md` and the
+Status: phases 1 to 3 done (parser fixes merged, complete-table data model,
+parse by action); phase 4 onward not started. Draft for TJ. Supersedes the translation design in `plan.md` and the
 module doc of `crates/bbs-plugin-api/src/keymap.rs`. GH #354.
 
 ## Why change
@@ -140,7 +140,7 @@ Each phase ends with the full gate from CLAUDE.md and a commit.
    is still phase 7) Keymap with ordered keywords and primaries. `native()` built
    from it. Validation additions. Tests: primary survives layering, reserved
    words rejected, custom TOML still loads.
-3. **Parse by action.** Per-action argument parsers, one shared entry point.
+3. **Parse by action.** (done) Per-action argument parsers, one shared entry point.
    Delete the native-keyword translation and the `native_keyword()` drift
    test, replaced by a table-driven test that every action parses under its own
    primary key. Collapse the three parsers.

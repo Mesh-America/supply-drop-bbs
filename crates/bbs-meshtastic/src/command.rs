@@ -1,117 +1,21 @@
 //! Command parsing and response rendering for the Meshtastic transport.
 
-use bbs_plugin_api::{event::Notification, identity::Username, Command, Keymap, Response};
+use bbs_plugin_api::{event::Notification, Command, Keymap, Response};
 
 /// Parse the raw text of an incoming direct message into a [`Command`].
 ///
-/// See `crates/bbs-mesh/src/command.rs`'s `parse_command` doc comment — this
-/// is Meshtastic's copy of the same design (GH #354 Phase 2): one-shot
-/// `register`/`login` stays here (radio-only, ahead of any keymap lookup;
-/// reserved so a keymap can never bind it), everything else delegates to
-/// [`Command::parse_with_keymap`].
+/// A thin wrapper: the shared radio parser lives in
+/// [`Command::parse_radio`], so MeshCore and Meshtastic cannot drift apart.
+/// `keymap` is the active [`Keymap`], fetched fresh per message so a live
+/// switch takes effect immediately. Returns `None` when the message should be
+/// silently dropped (a prefix is configured and the message lacks it).
 pub fn parse_command(
     text: &str,
     prefix: Option<char>,
     awaiting_reply: bool,
     keymap: &Keymap,
 ) -> Option<Command> {
-    let text = text.trim();
-    let stripped = strip_zero_width(text);
-    let text = stripped.as_str();
-
-    if matches!(text.to_lowercase().as_str(), "cancel" | "stop") {
-        return Some(Command::Cancel);
-    }
-
-    if awaiting_reply {
-        return Some(Command::WorkflowReply {
-            reply: text.to_owned(),
-        });
-    }
-
-    let text = if let Some(p) = prefix {
-        if let Some(stripped) = text.strip_prefix(p) {
-            stripped.trim_start()
-        } else {
-            return None;
-        }
-    } else {
-        text
-    };
-
-    if text.is_empty() {
-        return Some(Command::Unknown { raw: String::new() });
-    }
-
-    let (word, rest) = split_first_word(text);
-    let keyword = word.to_lowercase();
-
-    match keyword.as_str() {
-        // `register <user>` → interactive; `register <user> <password>` → one-shot.
-        "register" => Some(match rest {
-            Some(r) => {
-                let (name, password) = split_first_word(r);
-                if name.is_empty() {
-                    Command::Help {
-                        topic: Some("register".to_owned()),
-                    }
-                } else if let Some(password) = password {
-                    Command::RegisterOneShot {
-                        username: name.to_owned(),
-                        password: password.into(),
-                    }
-                } else {
-                    Command::Register {
-                        username: name.to_owned(),
-                    }
-                }
-            }
-            None => Command::Help {
-                topic: Some("register".to_owned()),
-            },
-        }),
-        // `login <user>` → interactive; `login <user> <password>` → one-shot.
-        "login" => Some(match rest {
-            Some(r) => {
-                let (name, password) = split_first_word(r);
-                match (Username::new(name).ok(), password) {
-                    (Some(username), Some(password)) => Command::LoginOneShot {
-                        username,
-                        password: password.into(),
-                    },
-                    (Some(username), None) => Command::Login { username },
-                    (None, _) => Command::Help {
-                        topic: Some("login".to_owned()),
-                    },
-                }
-            }
-            None => Command::Help {
-                topic: Some("login".to_owned()),
-            },
-        }),
-        // Every other keyword goes through the canonical, keymap-aware
-        // parser. `awaiting_reply` is always `false` here.
-        _ => Some(Command::parse_with_keymap(text, false, keymap)),
-    }
-}
-
-fn split_first_word(s: &str) -> (&str, Option<&str>) {
-    match s.find(char::is_whitespace) {
-        None => (s, None),
-        Some(i) => {
-            let rest = s[i..].trim_start();
-            (&s[..i], if rest.is_empty() { None } else { Some(rest) })
-        }
-    }
-}
-
-/// Strip zero-width and other default-ignorable code points that survive
-/// `trim()`/`to_lowercase()`; see `bbs_plugin_api::command`'s identical
-/// helper for the full rationale (#412).
-fn strip_zero_width(s: &str) -> String {
-    s.chars()
-        .filter(|c| !matches!(*c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
-        .collect()
+    Command::parse_radio(text, prefix, awaiting_reply, keymap)
 }
 
 pub fn format_response(response: &Response) -> Option<String> {
@@ -156,6 +60,7 @@ pub fn truncate_utf8(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bbs_plugin_api::identity::Username;
 
     #[test]
     fn prefix_without_match_is_ignored() {

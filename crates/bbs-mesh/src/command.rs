@@ -29,166 +29,24 @@
 //! [`render_notification`] converts a [`Notification`] (a host-initiated push)
 //! into the text string delivered via `OutboundFrame::SendTxtMsg`.
 
-use bbs_plugin_api::{event::Notification, identity::Username, Command, Keymap, Response};
+use bbs_plugin_api::{event::Notification, Command, Keymap, Response};
 
 // ── Command parsing ───────────────────────────────────────────────────────────
 
 /// Parse the raw text of an incoming direct message into a [`Command`].
 ///
-/// ## Parameters
-///
-/// - `text`: the raw message text, straight from the wire.
-/// - `prefix`: optional single-character prefix configured by the operator.
-/// - `awaiting_reply`: `true` if the host is waiting for workflow input from
-///   this session (e.g. a password prompt was just sent).
-/// - `keymap`: the active [`Keymap`] ([`Host::active_keymap`](bbs_plugin_api::Host::active_keymap),
-///   fetched fresh per message so a live keymap switch takes effect
-///   immediately). `register`/`login`/CANCEL/STOP are checked before any
-///   keymap lookup and can never be remapped — see
-///   `Keymap::validate`'s reserved-keyword rule.
-///
-/// ## Return value
-///
-/// - `Some(Command)` — a command to dispatch to the host.
-/// - `None` — the message should be silently dropped (prefix configured,
-///   message doesn't start with it, and no workflow is active).
-///
-/// ## GH #354 Phase 2
-///
-/// One-shot `register`/`login` (a radio-transport-only feature —
-/// `Command::parse`/`parse_with_keymap` deliberately don't support it, see
-/// their doc comments) is still handled here, ahead of any keymap lookup.
-/// Everything else delegates to [`Command::parse_with_keymap`] for the
-/// keyword-matching core, so this file no longer hand-maintains its own
-/// copy of the ~35-arm match statement that used to drift from the
-/// canonical parser (`sysop_words_match_canonical_parser` below documents
-/// one such drift that already happened once).
+/// A thin wrapper: the shared radio parser lives in
+/// [`Command::parse_radio`], so MeshCore and Meshtastic cannot drift apart.
+/// `keymap` is the active [`Keymap`], fetched fresh per message so a live
+/// switch takes effect immediately. Returns `None` when the message should be
+/// silently dropped (a prefix is configured and the message lacks it).
 pub fn parse_command(
     text: &str,
     prefix: Option<char>,
     awaiting_reply: bool,
     keymap: &Keymap,
 ) -> Option<Command> {
-    // Trim standard whitespace and null bytes.  Some MeshCore firmware
-    // null-terminates its text payloads; without this, "N\0" would not match
-    // the "n" keyword and would produce Command::Unknown instead of ReadNew.
-    let text = text.trim().trim_matches('\0');
-    let stripped = strip_zero_width(text);
-    let text = stripped.as_str();
-
-    // ── Cancel / stop always break out of any workflow ───────────────────────
-    if matches!(text.to_lowercase().as_str(), "cancel" | "stop") {
-        return Some(Command::Cancel);
-    }
-
-    // ── Workflow continuations take priority ─────────────────────────────────
-    // If the host is waiting for a reply, treat the whole message as one
-    // regardless of whether it looks like a command keyword.
-    if awaiting_reply {
-        return Some(Command::WorkflowReply {
-            reply: text.to_owned(),
-        });
-    }
-
-    // ── Strip optional command prefix ────────────────────────────────────────
-    let text = if let Some(p) = prefix {
-        if let Some(stripped) = text.strip_prefix(p) {
-            stripped.trim_start()
-        } else {
-            // Prefix is configured but this message doesn't start with it —
-            // not a command and no workflow is active.
-            return None;
-        }
-    } else {
-        text
-    };
-
-    if text.is_empty() {
-        return Some(Command::Unknown { raw: String::new() });
-    }
-
-    // ── One-shot register/login (radio-only; not in the canonical parser,
-    // and not in KeymapAction's remappable set — "register"/"login" are
-    // reserved keywords a keymap can never bind, see keymap.rs) ────────────
-    let (word, rest) = split_first_word(text);
-    let keyword = word.to_lowercase();
-
-    match keyword.as_str() {
-        // `register <user>` → interactive flow; `register <user> <password>` →
-        // one-shot (account created + logged in from one message — fewer
-        // round-trips on lossy multi-hop links). Host validates the username
-        // (#128) and password.
-        "register" => Some(match rest {
-            Some(r) => {
-                let (name, password) = split_first_word(r);
-                if name.is_empty() {
-                    Command::Help {
-                        topic: Some("register".to_owned()),
-                    }
-                } else if let Some(password) = password {
-                    Command::RegisterOneShot {
-                        username: name.to_owned(),
-                        password: password.into(),
-                    }
-                } else {
-                    Command::Register {
-                        username: name.to_owned(),
-                    }
-                }
-            }
-            None => Command::Help {
-                topic: Some("register".to_owned()),
-            },
-        }),
-
-        // `login <user>` → interactive; `login <user> <password>` → one-shot.
-        "login" => Some(match rest {
-            Some(r) => {
-                let (name, password) = split_first_word(r);
-                match (Username::new(name).ok(), password) {
-                    (Some(username), Some(password)) => Command::LoginOneShot {
-                        username,
-                        password: password.into(),
-                    },
-                    (Some(username), None) => Command::Login { username },
-                    (None, _) => Command::Help {
-                        topic: Some("login".to_owned()),
-                    },
-                }
-            }
-            None => Command::Help {
-                topic: Some("login".to_owned()),
-            },
-        }),
-
-        // Every other keyword goes through the canonical, keymap-aware
-        // parser. `awaiting_reply` is always `false` here — the check above
-        // already returned early for the `true` case.
-        _ => Some(Command::parse_with_keymap(text, false, keymap)),
-    }
-}
-
-/// Split `s` on the first run of ASCII whitespace.
-///
-/// Returns `(first_word, rest)` where `rest` is `Some` (trimmed) if there
-/// were characters after the first word, or `None` otherwise.
-fn split_first_word(s: &str) -> (&str, Option<&str>) {
-    match s.find(char::is_whitespace) {
-        None => (s, None),
-        Some(i) => {
-            let rest = s[i..].trim_start();
-            (&s[..i], if rest.is_empty() { None } else { Some(rest) })
-        }
-    }
-}
-
-/// Strip zero-width and other default-ignorable code points that survive
-/// `trim()`/`to_lowercase()`; see `bbs_plugin_api::command`'s identical
-/// helper for the full rationale (#412).
-fn strip_zero_width(s: &str) -> String {
-    s.chars()
-        .filter(|c| !matches!(*c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
-        .collect()
+    Command::parse_radio(text, prefix, awaiting_reply, keymap)
 }
 
 // ── Response rendering ────────────────────────────────────────────────────────
@@ -250,6 +108,7 @@ pub fn render_notification(notification: &Notification) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bbs_plugin_api::identity::Username;
     use bbs_plugin_api::PermissionLevel;
 
     fn cmd(text: &str) -> Option<Command> {

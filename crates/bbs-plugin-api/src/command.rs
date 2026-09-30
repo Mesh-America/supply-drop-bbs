@@ -484,19 +484,19 @@ impl Command {
     /// syntax (e.g. MeshCore frames) do their own mapping.
     ///
     /// Equivalent to [`Self::parse_with_keymap`] with
-    /// [`crate::Keymap::native()`] — Supply Drop's own bindings, unaffected
-    /// by keymap machinery. Existing callers are unchanged; a transport that
-    /// wants keymap-aware parsing (GH #354) calls `parse_with_keymap`
+    /// [`crate::Keymap::native()`], Supply Drop's own keys. A caller that
+    /// wants a different keymap (GH #354) calls `parse_with_keymap`
     /// directly instead.
     pub fn parse(line: &str, awaiting_reply: bool) -> Self {
         Self::parse_with_keymap(line, awaiting_reply, &crate::Keymap::native())
     }
 
-    /// [`Self::parse`], but a non-native `keymap` can redirect a keyword to a
-    /// different [`crate::KeymapAction`]'s native keyword before the match
-    /// below runs — see `crates/bbs-plugin-api/src/keymap.rs`'s module doc
-    /// comment for the full design. The match arms themselves never need to
-    /// know keymaps exist: only the keyword text they see can change.
+    /// [`Self::parse`] with an explicit `keymap`. The keyword is looked up in
+    /// the keymap to find its [`crate::KeymapAction`], and that action's own
+    /// argument parser builds the command, so the keyword the user typed never
+    /// affects what the arguments mean. Only the keymap's keys work, plus the
+    /// fixed words that work under every keymap. See
+    /// `crates/bbs-plugin-api/src/keymap.rs` for the design.
     pub fn parse_with_keymap(line: &str, awaiting_reply: bool, keymap: &crate::Keymap) -> Self {
         let text = line.trim();
         let stripped = strip_zero_width(text);
@@ -520,249 +520,358 @@ impl Command {
 
         let (word, rest) = split_first_word(text);
         let typed_keyword = word.to_lowercase();
-        // Only the active keymap's keywords work. A typed keyword bound to a
-        // top-level action is translated to that action's own native keyword
-        // for the match below (this translation goes away when parsing moves
-        // to per-action argument parsers). A fixed word (help, account and
-        // admin commands, quit synonyms) is left alone. Anything else, such
-        // as a native key the preset dropped, is unknown. `Reading*` actions
-        // belong to reading mode's own lookup and are not consulted here.
-        let keyword = match keymap.action_for(&typed_keyword) {
-            Some(action) => action.native_keyword().to_owned(),
-            None if crate::keymap::is_reserved_keyword(&typed_keyword) => typed_keyword,
-            None => {
-                return Command::Unknown {
-                    raw: text.to_owned(),
-                }
-            }
-        };
 
-        match keyword.as_str() {
-            // ── Auth ─────────────────────────────────────────────────────────
-            "h" | "help" | "?" => Command::Help {
-                topic: rest.map(str::to_owned),
-            },
-            // One-shot auth (`register <user> <password>`) is a *radio-transport*
-            // feature for lossy multi-hop links; the canonical/CLI parser keeps
-            // the interactive flow (input is hidden at the prompt over the CLI).
-            "register" => match rest {
-                // Pass the raw username through; the host validates it and
-                // reports a specific error (#128). Bare `register` → help.
-                Some(name) if !name.is_empty() => Command::Register {
-                    username: name.to_owned(),
-                },
-                _ => Command::Help {
+        // Only the active keymap's keywords work. A keyword bound to a
+        // top-level action is parsed by that action's own argument parser.
+        // A fixed word (help, account and admin commands, quit synonyms)
+        // works under every keymap. Anything else, such as a native key the
+        // preset dropped, is unknown. `Reading*` actions belong to reading
+        // mode and are not consulted here.
+        if let Some(action) = keymap.action_for(&typed_keyword) {
+            return parse_action(action, text, rest);
+        }
+        if crate::keymap::is_reserved_keyword(&typed_keyword) {
+            return parse_fixed(&typed_keyword, text, rest);
+        }
+        Command::Unknown {
+            raw: text.to_owned(),
+        }
+    }
+}
+
+impl Command {
+    /// Parse a message from a radio transport (MeshCore, Meshtastic) into a
+    /// [`Command`]. Shared by both transports so they cannot drift apart.
+    ///
+    /// On top of [`Self::parse_with_keymap`] this handles what only radios
+    /// need:
+    ///
+    /// - trailing NUL bytes, which some firmware appends to text payloads;
+    /// - an optional command `prefix` character. With a prefix set, a message
+    ///   that does not start with it is not a command and yields `None`, unless
+    ///   the host is waiting for a workflow reply or the text is CANCEL/STOP;
+    /// - one-shot `register <user> <password>` and `login <user> <password>`,
+    ///   which save a round trip on lossy multi-hop links. `register` and
+    ///   `login` are reserved words, so a keymap can never rebind them.
+    ///
+    /// Returns `None` when the message should be silently dropped.
+    pub fn parse_radio(
+        text: &str,
+        prefix: Option<char>,
+        awaiting_reply: bool,
+        keymap: &crate::Keymap,
+    ) -> Option<Self> {
+        let text = text.trim().trim_matches('\0');
+        let stripped = strip_zero_width(text);
+        let text = stripped.as_str();
+
+        // Cancel / stop always break out of any workflow.
+        if matches!(text.to_lowercase().as_str(), "cancel" | "stop") {
+            return Some(Command::Cancel);
+        }
+
+        // A pending workflow reply takes priority over command parsing.
+        if awaiting_reply {
+            return Some(Command::WorkflowReply {
+                reply: text.to_owned(),
+            });
+        }
+
+        let text = match prefix {
+            Some(p) => text.strip_prefix(p)?.trim_start(),
+            None => text,
+        };
+        if text.is_empty() {
+            return Some(Command::Unknown { raw: String::new() });
+        }
+
+        let (word, rest) = split_first_word(text);
+        match word.to_lowercase().as_str() {
+            // `register <user>` starts the interactive flow; with a password
+            // it creates the account and logs in from one message. The host
+            // validates the username (#128) and password.
+            "register" => Some(match rest {
+                Some(r) => {
+                    let (name, password) = split_first_word(r);
+                    if name.is_empty() {
+                        Command::Help {
+                            topic: Some("register".to_owned()),
+                        }
+                    } else if let Some(password) = password {
+                        Command::RegisterOneShot {
+                            username: name.to_owned(),
+                            password: password.into(),
+                        }
+                    } else {
+                        Command::Register {
+                            username: name.to_owned(),
+                        }
+                    }
+                }
+                None => Command::Help {
                     topic: Some("register".to_owned()),
                 },
-            },
-            "login" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(u) => Command::Login { username: u },
+            }),
+            // `login <user>` is interactive; `login <user> <password>` is
+            // one-shot.
+            "login" => Some(match rest {
+                Some(r) => {
+                    let (name, password) = split_first_word(r);
+                    match (Username::new(name).ok(), password) {
+                        (Some(username), Some(password)) => Command::LoginOneShot {
+                            username,
+                            password: password.into(),
+                        },
+                        (Some(username), None) => Command::Login { username },
+                        (None, _) => Command::Help {
+                            topic: Some("login".to_owned()),
+                        },
+                    }
+                }
                 None => Command::Help {
                     topic: Some("login".to_owned()),
                 },
-            },
-            "logout" | "q" | "quit" | "exit" | "bye" => Command::Quit,
+            }),
+            _ => Some(Self::parse_with_keymap(text, false, keymap)),
+        }
+    }
+}
 
-            // ── Room navigation ───────────────────────────────────────────────
-            "k" => Command::ListRooms,
-            "g" => Command::GoNextUnread,
-            "c" => Command::ChangeRoom {
-                target: rest.unwrap_or("").to_owned(),
+/// Build the [`Command`] for a keymap action, given the full trimmed line and
+/// the text after the keyword. The keyword the user typed does not matter
+/// here: this is where each action's arguments are defined, once.
+fn parse_action(action: crate::KeymapAction, text: &str, rest: Option<&str>) -> Command {
+    use crate::KeymapAction as A;
+    match action {
+        A::Quit => Command::Quit,
+        A::ListRooms => Command::ListRooms,
+        A::GoNextUnread => Command::GoNextUnread,
+        A::ChangeRoom => Command::ChangeRoom {
+            target: rest.unwrap_or("").to_owned(),
+        },
+        A::GoMail => Command::GoMail,
+        A::ReadNew => Command::ReadNew,
+        A::ReadForward => match rest {
+            None => Command::ReadForward { after: None },
+            Some(s) => match s.parse::<i64>() {
+                Ok(id) => Command::ReadForward { after: Some(id) },
+                // A malformed id (e.g. "1o" for "10") must not silently
+                // degrade to "continue from cursor" (#413).
+                Err(_) => Command::Unknown {
+                    raw: text.to_owned(),
+                },
             },
-            "m" => Command::GoMail,
+        },
+        A::ReadReverse => Command::ReadReverse,
+        // Always ScanMessages whatever follows, so an argument can never turn
+        // it into a different command (#411).
+        A::ScanMessages => Command::ScanMessages,
+        A::EnterMessage => Command::EnterMessage {
+            body: rest.filter(|s| !s.is_empty()).map(str::to_owned),
+        },
+        A::DeleteMessage => match rest.and_then(|s| s.parse::<i64>().ok()) {
+            Some(id) => Command::DeleteMessage { id },
+            None => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+        A::WhoIsOnline => Command::WhoIsOnline,
+        // Reading-mode actions are parsed while reading, not at the prompt.
+        A::ReadingForward
+        | A::ReadingReverse
+        | A::ReadingReply
+        | A::ReadingHelp
+        | A::ReadingDelete => Command::Unknown {
+            raw: text.to_owned(),
+        },
+    }
+}
 
-            // ── Message reading ───────────────────────────────────────────────
-            "n" => Command::ReadNew,
-            "f" => match rest {
-                None => Command::ReadForward { after: None },
-                Some(s) => match s.parse::<i64>() {
-                    Ok(id) => Command::ReadForward { after: Some(id) },
-                    // A malformed id (e.g. "1o" for "10") must not silently
-                    // degrade to "continue from cursor" — mirrors "d"'s
-                    // fallback below (#413).
-                    Err(_) => Command::Unknown {
-                        raw: text.to_owned(),
-                    },
-                },
+/// Build the [`Command`] for a fixed word: one that works under every keymap
+/// because it is not a remappable action. Keep this match in step with
+/// `keymap::RESERVED_KEYWORDS`; a test checks both directions.
+fn parse_fixed(keyword: &str, text: &str, rest: Option<&str>) -> Command {
+    match keyword {
+        // ── Auth ─────────────────────────────────────────────────────────
+        "h" | "help" | "?" => Command::Help {
+            topic: rest.map(str::to_owned),
+        },
+        // One-shot auth (`register <user> <password>`) is a *radio-transport*
+        // feature for lossy multi-hop links; the canonical/CLI parser keeps
+        // the interactive flow (input is hidden at the prompt over the CLI).
+        "register" => match rest {
+            // Pass the raw username through; the host validates it and
+            // reports a specific error (#128). Bare `register` → help.
+            Some(name) if !name.is_empty() => Command::Register {
+                username: name.to_owned(),
             },
-            "r" => Command::ReadReverse,
-            // Unconditionally ScanMessages regardless of trailing text — a
-            // keyword's action must not change based on its argument, since
-            // a keymap preset can bind an unrelated key to "s" and any
-            // trailing word (or a keymap-translation quirk) would otherwise
-            // silently invoke the unrelated, Aide+-only SearchUsers (#411).
-            "s" => Command::ScanMessages,
-            "search" => match rest {
-                Some(q) if !q.is_empty() => Command::SearchUsers {
-                    query: q.to_owned(),
-                },
-                _ => Command::Unknown {
-                    raw: text.to_owned(),
-                },
+            _ => Command::Help {
+                topic: Some("register".to_owned()),
             },
-            ".ff" => Command::FastForward,
+        },
+        "login" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(u) => Command::Login { username: u },
+            None => Command::Help {
+                topic: Some("login".to_owned()),
+            },
+        },
+        "logout" | "quit" | "exit" | "bye" => Command::Quit,
 
-            // ── Message posting / deletion ────────────────────────────────────
-            "e" => Command::EnterMessage {
-                body: rest.filter(|s| !s.is_empty()).map(str::to_owned),
+        "search" => match rest {
+            Some(q) if !q.is_empty() => Command::SearchUsers {
+                query: q.to_owned(),
             },
-            "d" => match rest.and_then(|s| s.parse::<i64>().ok()) {
-                Some(id) => Command::DeleteMessage { id },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-
-            // ── Moderation / account ──────────────────────────────────────────
-            "w" => Command::WhoIsOnline,
-            "pending" => Command::ListPending,
-            "v" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::ValidateUser { username },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-            "b" => {
-                let raw_arg = rest.unwrap_or("").trim();
-                let (force, name) = if let Some(s) = raw_arg.strip_prefix('+') {
-                    (Some(true), s.trim())
-                } else if let Some(s) = raw_arg.strip_prefix('-') {
-                    (Some(false), s.trim())
-                } else {
-                    (None, raw_arg)
-                };
-                match Username::new(name) {
-                    Ok(target) => Command::BlockUser { target, force },
-                    Err(_) => Command::Unknown {
-                        raw: text.to_owned(),
-                    },
-                }
-            }
-            "ban" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::BanUser { username },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-            "unban" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::UnbanUser { username },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-            "timeout" => {
-                let mut parts = rest.unwrap_or("").split_whitespace();
-                let username = parts.next().and_then(|s| Username::new(s).ok());
-                let days = parts.next().and_then(|s| s.parse::<u8>().ok());
-                match (username, days) {
-                    (Some(username), Some(days)) if (1..=5).contains(&days) => {
-                        Command::TimeoutUser { username, days }
-                    }
-                    _ => Command::Unknown {
-                        raw: text.to_owned(),
-                    },
-                }
-            }
-            "u" | "users" => Command::ListUsers {
-                filter: rest.map(str::to_owned),
-            },
-            "whois" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::UserInfo { username },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-            "whoami" => Command::Whoami,
-            "profile" => Command::EditProfile,
-            "passwd" => Command::ChangePassword,
-
-            // ── Room / user management ────────────────────────────────────────
-            ".c" => match rest {
-                Some(name) if !name.is_empty() => Command::CreateRoom {
-                    name: name.to_owned(),
-                },
-                _ => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-            ".dr" => match rest {
-                Some(name) if !name.is_empty() => Command::DeleteRoom {
-                    name: name.to_owned(),
-                },
-                _ => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-            ".er" => Command::EditRoom,
-            ".eu" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::EditUser { username },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-            ".du" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::DeleteUser { username },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-
-            // Missing/invalid username → show the command's usage rather than a
-            // generic "unknown command". (#127 follow-up)
-            ".aide" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::SetUserLevel {
-                    username,
-                    level: PermissionLevel::Aide,
-                },
-                None => Command::Help {
-                    topic: Some(".aide".to_owned()),
-                },
-            },
-            ".sysop" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::SetUserLevel {
-                    username,
-                    level: PermissionLevel::Sysop,
-                },
-                None => Command::Help {
-                    topic: Some(".sysop".to_owned()),
-                },
-            },
-            ".user" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::SetUserLevel {
-                    username,
-                    level: PermissionLevel::User,
-                },
-                None => Command::Help {
-                    topic: Some(".user".to_owned()),
-                },
-            },
-
-            ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
-                Some(username) => Command::SetUserPassword { username },
-                None => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-
-            // ── Access policy ─────────────────────────────────────────────────
-            "openaccess" => Command::OpenAccess,
-            "closeaccess" => Command::CloseAccess,
-            "guestroom" => match rest {
-                Some(arg) if arg.eq_ignore_ascii_case("off") => {
-                    Command::SetGuestRoom { name: None }
-                }
-                Some(name) if !name.is_empty() => Command::SetGuestRoom {
-                    name: Some(name.to_owned()),
-                },
-                _ => Command::Unknown {
-                    raw: text.to_owned(),
-                },
-            },
-
             _ => Command::Unknown {
                 raw: text.to_owned(),
             },
+        },
+        ".ff" => Command::FastForward,
+        // ── Moderation / account ──────────────────────────────────────────
+        "pending" => Command::ListPending,
+        "v" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::ValidateUser { username },
+            None => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+        "b" => {
+            let raw_arg = rest.unwrap_or("").trim();
+            let (force, name) = if let Some(s) = raw_arg.strip_prefix('+') {
+                (Some(true), s.trim())
+            } else if let Some(s) = raw_arg.strip_prefix('-') {
+                (Some(false), s.trim())
+            } else {
+                (None, raw_arg)
+            };
+            match Username::new(name) {
+                Ok(target) => Command::BlockUser { target, force },
+                Err(_) => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            }
         }
+        "ban" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::BanUser { username },
+            None => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+        "unban" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::UnbanUser { username },
+            None => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+        "timeout" => {
+            let mut parts = rest.unwrap_or("").split_whitespace();
+            let username = parts.next().and_then(|s| Username::new(s).ok());
+            let days = parts.next().and_then(|s| s.parse::<u8>().ok());
+            match (username, days) {
+                (Some(username), Some(days)) if (1..=5).contains(&days) => {
+                    Command::TimeoutUser { username, days }
+                }
+                _ => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            }
+        }
+        "u" | "users" => Command::ListUsers {
+            filter: rest.map(str::to_owned),
+        },
+        "whois" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::UserInfo { username },
+            None => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+        "whoami" => Command::Whoami,
+        "profile" => Command::EditProfile,
+        "passwd" => Command::ChangePassword,
+
+        // ── Room / user management ────────────────────────────────────────
+        ".c" => match rest {
+            Some(name) if !name.is_empty() => Command::CreateRoom {
+                name: name.to_owned(),
+            },
+            _ => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+        ".dr" => match rest {
+            Some(name) if !name.is_empty() => Command::DeleteRoom {
+                name: name.to_owned(),
+            },
+            _ => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+        ".er" => Command::EditRoom,
+        ".eu" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::EditUser { username },
+            None => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+        ".du" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::DeleteUser { username },
+            None => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+
+        // Missing/invalid username → show the command's usage rather than a
+        // generic "unknown command". (#127 follow-up)
+        ".aide" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::SetUserLevel {
+                username,
+                level: PermissionLevel::Aide,
+            },
+            None => Command::Help {
+                topic: Some(".aide".to_owned()),
+            },
+        },
+        ".sysop" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::SetUserLevel {
+                username,
+                level: PermissionLevel::Sysop,
+            },
+            None => Command::Help {
+                topic: Some(".sysop".to_owned()),
+            },
+        },
+        ".user" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::SetUserLevel {
+                username,
+                level: PermissionLevel::User,
+            },
+            None => Command::Help {
+                topic: Some(".user".to_owned()),
+            },
+        },
+
+        ".pw" => match rest.and_then(|s| Username::new(s).ok()) {
+            Some(username) => Command::SetUserPassword { username },
+            None => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+
+        // ── Access policy ─────────────────────────────────────────────────
+        "openaccess" => Command::OpenAccess,
+        "closeaccess" => Command::CloseAccess,
+        "guestroom" => match rest {
+            Some(arg) if arg.eq_ignore_ascii_case("off") => Command::SetGuestRoom { name: None },
+            Some(name) if !name.is_empty() => Command::SetGuestRoom {
+                name: Some(name.to_owned()),
+            },
+            _ => Command::Unknown {
+                raw: text.to_owned(),
+            },
+        },
+
+        _ => Command::Unknown {
+            raw: text.to_owned(),
+        },
     }
 }
 
@@ -1055,10 +1164,9 @@ mod tests {
             );
         }
 
-        /// Drift guard: `KeymapAction::native_keyword()` and this file's
-        /// `match keyword.as_str()` arms are two hand-maintained tables. Bind
-        /// every top-level action to a fresh keyword and check it parses to
-        /// the same command as its native keyword.
+        /// Every top-level action parses to the same command through any keyword
+        /// bound to it: bind each to a fresh keyword and compare with its native
+        /// primary key.
         #[test]
         fn every_top_level_action_round_trips_through_its_own_override_keyword() {
             for (i, &action) in KeymapAction::ALL
@@ -1069,8 +1177,11 @@ mod tests {
                 let override_keyword = format!("zz{i}");
                 let km = Keymap::native_with_overrides(&[(&override_keyword, action)]);
                 let via_override = Command::parse_with_keymap(&override_keyword, false, &km);
-                let via_native =
-                    Command::parse_with_keymap(action.native_keyword(), false, &Keymap::native());
+                let via_native = Command::parse_with_keymap(
+                    Keymap::native().primary(action),
+                    false,
+                    &Keymap::native(),
+                );
                 // `Unknown { raw }` echoes the typed line, so compare only the
                 // variant there (for example a bare `d` with no id).
                 let matches = match (&via_override, &via_native) {
@@ -1080,54 +1191,56 @@ mod tests {
                 assert!(
                     matches,
                     "{action:?}: {override_keyword:?} gave {via_override:?}, native {:?} \
-                     gives {via_native:?}; native_keyword() and the match arms have drifted",
-                    action.native_keyword()
+                     gives {via_native:?}; the action parsers disagree with the native table",
+                    Keymap::native().primary(action)
                 );
             }
         }
 
-        /// Drift guard for the reserved list: every keyword in the parser's
-        /// match must be either a top-level action's native keyword or in
-        /// `RESERVED_KEYWORDS`. A word added to the match but not to the list
-        /// (as `search` once was) would be treated as a dropped key.
+        /// Drift guard for the fixed words: the words `parse_fixed` matches and
+        /// `RESERVED_KEYWORDS` must be the same set (`cancel` and `stop` are
+        /// handled before either). A word in the match but not the list, as
+        /// `search` once was, would be treated as a dropped key. A word in the
+        /// list but not the match could be bound by nobody and typed by nobody.
         #[test]
-        fn every_keyword_in_the_match_is_an_action_key_or_reserved() {
+        fn fixed_words_and_the_reserved_list_are_the_same_set() {
             let src = include_str!("command.rs");
-            let start = src
-                .find("match keyword.as_str() {")
-                .expect("parse_with_keymap match");
-            let body = &src[start..];
-            let end = body
-                .find("\n            _ => Command::Unknown")
-                .expect("default arm");
-            let native: Vec<&str> = KeymapAction::ALL
-                .iter()
-                .filter(|a| !a.is_reading_only())
-                .map(|a| a.native_keyword())
-                .collect();
-            let mut checked = 0;
-            for line in body[..end].lines() {
-                // Only arm heads at the match's own indent: `"a" | "b" =>`.
-                if !line.starts_with("            \"") {
+            let start = src.find("fn parse_fixed").expect("parse_fixed");
+            let end = start + src[start..].find("// ── Response helpers").expect("end");
+            let mut matched = std::collections::BTreeSet::new();
+            for line in src[start..end].lines() {
+                // Arm heads at the match's own indent: `"a" | "b" =>`.
+                if !line.starts_with("        \"") {
                     continue;
                 }
-                let Some(head) = line.split("=>").next() else {
-                    continue;
-                };
+                let head = line.split("=>").next().unwrap_or("");
                 for word in head.split('|') {
                     let word = word.trim().trim_matches('"');
-                    if word.is_empty() || word.contains(' ') {
-                        continue;
+                    if !word.is_empty() && !word.contains(' ') {
+                        matched.insert(word.to_owned());
                     }
-                    checked += 1;
-                    assert!(
-                        native.contains(&word) || crate::keymap::is_reserved_keyword(word),
-                        "{word:?} is matched by the parser but is neither an action \
-                         key nor in RESERVED_KEYWORDS"
-                    );
                 }
             }
-            assert!(checked > 30, "scan found only {checked} keywords");
+            assert!(
+                matched.len() > 30,
+                "scan found only {} words",
+                matched.len()
+            );
+            for word in &matched {
+                assert!(
+                    crate::keymap::is_reserved_keyword(word),
+                    "{word:?} is matched by parse_fixed but missing from RESERVED_KEYWORDS"
+                );
+            }
+            for word in crate::keymap::RESERVED_KEYWORDS {
+                if matches!(*word, "cancel" | "stop") {
+                    continue;
+                }
+                assert!(
+                    matched.contains(*word),
+                    "{word:?} is in RESERVED_KEYWORDS but parse_fixed does not match it"
+                );
+            }
         }
     }
 
