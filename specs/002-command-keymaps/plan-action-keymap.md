@@ -28,19 +28,28 @@ changing what any action does.
 
 ### 1. One table, native is just the default
 
-`Keymap` holds `keyword -> action` entries plus, for each action, an ordered
-list of keywords. The first keyword is the **primary** key, the one shown in
-messages. The native table becomes `Keymap::native()` built from the same
-structure, so there is no separate hidden match to keep in sync.
+A `Keymap` is a **complete** table. It lists every remappable action, each
+with an ordered list of keywords. The first keyword is the **primary** key, the
+one shown in messages. Only the keys in the active keymap work. There is no
+layering and no fallback to native keys.
 
-A preset is layered on native, as today: it overrides only what it lists.
-Layering must keep the primary correct. If a preset binds `l` to
-`ScanMessages`, `l` becomes the primary for that action, and native `s` stays
-as a working alias unless the preset is marked exclusive (open question 1).
+`Keymap::native()` is just one complete keymap, built from the same structure,
+so there is no separate hidden match to keep in sync. Every built-in preset and
+every custom file is a full table like it.
 
-Validation keeps the current rules (no action left without a key, no duplicate
-keyword) and adds: every action has a primary, and a keyword may not be a
-reserved word (`register`, `login`, `cancel`, `stop`).
+Validation rejects a keymap when:
+
+1. Any action has no keyword.
+2. Two actions share a keyword.
+3. A keyword is a reserved word (`register`, `login`, `cancel`, `stop`) or
+   collides with a fixed, non-remappable command (help, the admin commands).
+4. A keyword is empty, or contains whitespace or a zero-width character.
+
+Actions with no equivalent in the source BBS still need a key. The preset
+author picks one and marks it in the preset's notes as "no source equivalent",
+so it is never presented as authentic. The old partial-override reasoning in
+`plan.md` ("why partial, not total") no longer applies, and this is the cost we
+accepted for it.
 
 ### 2. Parse by action
 
@@ -170,11 +179,9 @@ Each phase ends with the full gate from CLAUDE.md and a commit.
 
 ## Decisions (answered by TJ)
 
-1. **Exclusive presets: drop native keys.** When a preset binds an action, the
-   native keys for that action stop working. Actions the preset does not
-   mention keep their native keys, because the validation rule that every
-   action needs a key still holds. This replaces the "native stays as an alias"
-   line in design section 1.
+1. **Exclusive, complete presets.** Every preset lists every action, and only
+   the preset's keys work. Native keys do not carry over. This replaces the
+   layering in design section 1.
 2. **Long-form aliases: allowed.** Any word can be a keyword.
 3. **Multi-key commands: allowed as plain keywords.** `lm`, `jm 3` and the rest
    of the #354 mail menu work. The first word is the keyword, the rest is the
@@ -187,12 +194,14 @@ Each phase ends with the full gate from CLAUDE.md and a commit.
 - A user on a preset who types a dropped native key gets "Unknown command". The
   unknown-command reply must name the preset's help key (`{help}`), so they can
   recover. Add this to the section 4 table and to phase 5.
-- Dropping native keys means the shown key is always a key that works, which
-  makes the "message names an unusable key" risk in the risks section smaller.
-- Validation adds a check: a keyword that a preset frees up (for example native
-  `g` when `Quit` takes it) may be rebound by that preset without a collision,
-  but two actions may never share a keyword.
+- Only the active keymap's keys work, so the shown key is always one that
+  works, which makes the "message names an unusable key" risk smaller.
 - Custom keymap files can use any word, so the radio length test in design
   section 5 must include a custom keymap with long keywords.
-- Phase 7 shrinks: the questions are answered, so it becomes updating the
-  presets and adding the example file.
+- Phase 7 grows: every existing built-in preset (written as partial overrides)
+  must be completed into a full table, each gap key marked "no source
+  equivalent", and the example file for the #354 layout must be complete too.
+- Existing custom keymap files written as partial overrides stop validating.
+  Proposed: reject them with a clear error naming the missing actions. Shipped
+  presets are the only known users, but check `docs/CONFIG.md` for any text that
+  told sysops to write partial files.
