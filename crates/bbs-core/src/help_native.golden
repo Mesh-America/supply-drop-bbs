@@ -1,0 +1,918 @@
+### quick None radio=false
+REGISTER <user>  create an account
+LOGIN <user>     log in to your account
+### quick None radio=true
+REGISTER <user> <password>
+LOGIN <user> <password>
+(omit password to be prompted)
+### all None
+No help for 'all'.
+H for commands, H reading/posting/navigation/account for topics.
+### mail None
+No help for 'mail'.
+H for commands, H reading/posting/navigation/account for topics.
+### read None
+No help for 'read'.
+H for commands, H reading/posting/navigation/account for topics.
+### reading None
+No help for 'reading'.
+H for commands, H reading/posting/navigation/account for topics.
+### post None
+No help for 'post'.
+H for commands, H reading/posting/navigation/account for topics.
+### posting None
+No help for 'posting'.
+H for commands, H reading/posting/navigation/account for topics.
+### users None
+No help for 'users'.
+H for commands, H reading/posting/navigation/account for topics.
+### nav None
+No help for 'nav'.
+H for commands, H reading/posting/navigation/account for topics.
+### navigation None
+No help for 'navigation'.
+H for commands, H reading/posting/navigation/account for topics.
+### acct None
+No help for 'acct'.
+H for commands, H reading/posting/navigation/account for topics.
+### account None
+No help for 'account'.
+H for commands, H reading/posting/navigation/account for topics.
+### aide None
+No help for 'aide'.
+H for commands, H reading/posting/navigation/account for topics.
+### sysop None
+No help for 'sysop'.
+H for commands, H reading/posting/navigation/account for topics.
+### h None
+H — show this help.
+### help None
+H — show this help.
+### ? None
+H — show this help.
+### q None
+Q — quit
+### register None
+REGISTER <user> — create an account (you'll be prompted for a password).
+On a radio you can also do it in one message: REGISTER <user> <password>.
+### login None
+LOGIN <user> — log in (you'll be prompted for a password).
+On a radio, one message works too: LOGIN <user> <password>.
+### cancel None
+CANCEL — cancel the current workflow
+### n None
+No help for 'n'.
+H for commands, H reading/posting/navigation/account for topics.
+### f None
+No help for 'f'.
+H for commands, H reading/posting/navigation/account for topics.
+### r None
+No help for 'r'.
+H for commands, H reading/posting/navigation/account for topics.
+### s None
+No help for 's'.
+H for commands, H reading/posting/navigation/account for topics.
+### search None
+No help for 'search'.
+H for commands, H reading/posting/navigation/account for topics.
+### .ff None
+No help for '.ff'.
+H for commands, H reading/posting/navigation/account for topics.
+### e None
+No help for 'e'.
+H for commands, H reading/posting/navigation/account for topics.
+### d None
+No help for 'd'.
+H for commands, H reading/posting/navigation/account for topics.
+### g None
+No help for 'g'.
+H for commands, H reading/posting/navigation/account for topics.
+### c None
+No help for 'c'.
+H for commands, H reading/posting/navigation/account for topics.
+### k None
+No help for 'k'.
+H for commands, H reading/posting/navigation/account for topics.
+### m None
+No help for 'm'.
+H for commands, H reading/posting/navigation/account for topics.
+### w None
+No help for 'w'.
+H for commands, H reading/posting/navigation/account for topics.
+### b None
+No help for 'b'.
+H for commands, H reading/posting/navigation/account for topics.
+### profile None
+No help for 'profile'.
+H for commands, H reading/posting/navigation/account for topics.
+### passwd None
+No help for 'passwd'.
+H for commands, H reading/posting/navigation/account for topics.
+### stop None
+No help for 'stop'.
+H for commands, H reading/posting/navigation/account for topics.
+### v None
+No help for 'v'.
+H for commands, H reading/posting/navigation/account for topics.
+### pending None
+No help for 'pending'.
+H for commands, H reading/posting/navigation/account for topics.
+### .er None
+No help for '.er'.
+H for commands, H reading/posting/navigation/account for topics.
+### .eu None
+No help for '.eu'.
+H for commands, H reading/posting/navigation/account for topics.
+### ban None
+No help for 'ban'.
+H for commands, H reading/posting/navigation/account for topics.
+### timeout None
+No help for 'timeout'.
+H for commands, H reading/posting/navigation/account for topics.
+### u None
+No help for 'u'.
+H for commands, H reading/posting/navigation/account for topics.
+### users None
+No help for 'users'.
+H for commands, H reading/posting/navigation/account for topics.
+### whois None
+No help for 'whois'.
+H for commands, H reading/posting/navigation/account for topics.
+### unban None
+No help for 'unban'.
+H for commands, H reading/posting/navigation/account for topics.
+### .aide None
+No help for '.aide'.
+H for commands, H reading/posting/navigation/account for topics.
+### .sysop None
+No help for '.sysop'.
+H for commands, H reading/posting/navigation/account for topics.
+### .user None
+No help for '.user'.
+H for commands, H reading/posting/navigation/account for topics.
+### .c None
+No help for '.c'.
+H for commands, H reading/posting/navigation/account for topics.
+### .dr None
+No help for '.dr'.
+H for commands, H reading/posting/navigation/account for topics.
+### .du None
+No help for '.du'.
+H for commands, H reading/posting/navigation/account for topics.
+### .pw None
+No help for '.pw'.
+H for commands, H reading/posting/navigation/account for topics.
+### openaccess None
+No help for 'openaccess'.
+H for commands, H reading/posting/navigation/account for topics.
+### closeaccess None
+No help for 'closeaccess'.
+H for commands, H reading/posting/navigation/account for topics.
+### guestroom None
+No help for 'guestroom'.
+H for commands, H reading/posting/navigation/account for topics.
+### nothing-like-this None
+No help for 'nothing-like-this'.
+H for commands, H reading/posting/navigation/account for topics.
+### quick Some(User) radio=false
+K  list rooms
+C  change room
+N  new messages
+E  enter message
+G  next unread
+M  go to Mail
+W  who's online
+Q  log out
+H all - help topics
+### quick Some(User) radio=true
+K  list rooms
+C  change room
+N  new messages
+E  enter message
+G  next unread
+M  go to Mail
+W  who's online
+Q  log out
+H all - help topics
+### all Some(User)
+H MAIL — Mail
+H READ — Reading
+H POST — Posting
+H USERS — Users
+H NAV — Navigation
+H ACCT — Account
+### mail Some(User)
+Mail (private messages):
+M    go to Mail
+E    write (prompts)
+E @user msg  send inline
+N    read new
+F/R  older/newer
+S    scan
+D <#> delete
+### read Some(User)
+Reading:
+N    read new messages
+F    forward-read (oldest first)
+R    reverse-read (newest first)
+S    scan message headers
+.FF  fast-forward past unread
+### reading Some(User)
+Reading:
+N    read new messages
+F    forward-read (oldest first)
+R    reverse-read (newest first)
+S    scan message headers
+.FF  fast-forward past unread
+### post Some(User)
+Posting:
+D <#>  delete
+E      enter message (prompts)
+E msg  draft a post (. sends, C cancels)
+E @user msg  draft a DM inline
+### posting Some(User)
+Posting:
+D <#>  delete
+E      enter message (prompts)
+E msg  draft a post (. sends, C cancels)
+E @user msg  draft a DM inline
+### users Some(User)
+Users:
+U         list active
+U banned  list banned
+U all     list all
+SEARCH <q> find
+WHOIS <u> details
+### nav Some(User)
+Navigation:
+C    change room
+G    unread here, else next room
+K    list known rooms
+M    go to Mail
+### navigation Some(User)
+Navigation:
+C    change room
+G    unread here, else next room
+K    list known rooms
+M    go to Mail
+### acct Some(User)
+Account:
+B      block / unblock a user
+PASSWD  change your password
+PROFILE edit your display name
+Q      log out
+W      who's online
+H USERS — Users
+### account Some(User)
+Account:
+B      block / unblock a user
+PASSWD  change your password
+PROFILE edit your display name
+Q      log out
+W      who's online
+H USERS — Users
+### aide Some(User)
+No help for 'aide'.
+H for commands, H reading/posting/navigation/account for topics.
+### sysop Some(User)
+No help for 'sysop'.
+H for commands, H reading/posting/navigation/account for topics.
+### h Some(User)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### help Some(User)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### ? Some(User)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### q Some(User)
+Q — log out
+### register Some(User)
+REGISTER <user> — create an account (you'll be prompted for a password).
+On a radio you can also do it in one message: REGISTER <user> <password>.
+### login Some(User)
+LOGIN <user> — log in (you'll be prompted for a password).
+On a radio, one message works too: LOGIN <user> <password>.
+### cancel Some(User)
+CANCEL — cancel the current workflow
+### n Some(User)
+N — read new messages since last visit
+### f Some(User)
+F — forward-read (oldest first)
+F <id> to start from a specific message
+### r Some(User)
+R — reverse-read (newest first)
+### s Some(User)
+S — scan message headers in this room
+### search Some(User)
+SEARCH <query> — find users by username (substring match)
+### .ff Some(User)
+.FF — fast-forward past unread
+Resets your last-read pointer to the latest message.
+### e Some(User)
+E — enter a message
+E <text> to post without a prompt
+In Mail: E @user message
+### d Some(User)
+D <id> — delete a message
+Aides and sysops can delete any message.
+### g Some(User)
+G — read unread here, else go to the next room with unread
+### c Some(User)
+C <name> — change room by name or number
+### k Some(User)
+K — list known rooms
+### m Some(User)
+M — go to Mail (private messages)
+In Mail: E to write, N to read new,
+F/R older/newer, S scan, D <#> delete.
+H MAIL for full mail help.
+### w Some(User)
+W — who's online
+### b Some(User)
+B <user> — block / unblock user
+Prefix + to force-block, - to force-unblock, or omit to toggle.
+Hides their messages from you.
+### profile Some(User)
+PROFILE — edit your display name
+### passwd Some(User)
+PASSWD — change your password
+You'll be asked for your current password, then the new one twice.
+### stop Some(User)
+STOP — stop pending messages
+### v Some(User)
+No help for 'v'.
+H for commands, H reading/posting/navigation/account for topics.
+### pending Some(User)
+No help for 'pending'.
+H for commands, H reading/posting/navigation/account for topics.
+### .er Some(User)
+No help for '.er'.
+H for commands, H reading/posting/navigation/account for topics.
+### .eu Some(User)
+No help for '.eu'.
+H for commands, H reading/posting/navigation/account for topics.
+### ban Some(User)
+No help for 'ban'.
+H for commands, H reading/posting/navigation/account for topics.
+### timeout Some(User)
+No help for 'timeout'.
+H for commands, H reading/posting/navigation/account for topics.
+### u Some(User)
+U — list active user accounts
+U banned — list banned accounts
+U all — list all accounts (sysop)
+### users Some(User)
+Users:
+U         list active
+U banned  list banned
+U all     list all
+SEARCH <q> find
+WHOIS <u> details
+### whois Some(User)
+WHOIS <user> — show account details
+Includes level, status, join date, last login, and active sessions.
+### unban Some(User)
+No help for 'unban'.
+H for commands, H reading/posting/navigation/account for topics.
+### .aide Some(User)
+No help for '.aide'.
+H for commands, H reading/posting/navigation/account for topics.
+### .sysop Some(User)
+No help for '.sysop'.
+H for commands, H reading/posting/navigation/account for topics.
+### .user Some(User)
+No help for '.user'.
+H for commands, H reading/posting/navigation/account for topics.
+### .c Some(User)
+No help for '.c'.
+H for commands, H reading/posting/navigation/account for topics.
+### .dr Some(User)
+No help for '.dr'.
+H for commands, H reading/posting/navigation/account for topics.
+### .du Some(User)
+No help for '.du'.
+H for commands, H reading/posting/navigation/account for topics.
+### .pw Some(User)
+No help for '.pw'.
+H for commands, H reading/posting/navigation/account for topics.
+### openaccess Some(User)
+No help for 'openaccess'.
+H for commands, H reading/posting/navigation/account for topics.
+### closeaccess Some(User)
+No help for 'closeaccess'.
+H for commands, H reading/posting/navigation/account for topics.
+### guestroom Some(User)
+No help for 'guestroom'.
+H for commands, H reading/posting/navigation/account for topics.
+### nothing-like-this Some(User)
+No help for 'nothing-like-this'.
+H for commands, H reading/posting/navigation/account for topics.
+### quick Some(Aide) radio=false
+K  list rooms
+C  change room
+N  new messages
+E  enter message
+G  next unread
+M  go to Mail
+W  who's online
+Q  log out
+H all - help topics
+### quick Some(Aide) radio=true
+K  list rooms
+C  change room
+N  new messages
+E  enter message
+G  next unread
+M  go to Mail
+W  who's online
+Q  log out
+H all - help topics
+### all Some(Aide)
+H MAIL — Mail
+H READ — Reading
+H POST — Posting
+H USERS — Users
+H NAV — Navigation
+H ACCT — Account
+H AIDE — Moderation
+### mail Some(Aide)
+Mail (private messages):
+M    go to Mail
+E    write (prompts)
+E @user msg  send inline
+N    read new
+F/R  older/newer
+S    scan
+D <#> delete
+### read Some(Aide)
+Reading:
+N    read new messages
+F    forward-read (oldest first)
+R    reverse-read (newest first)
+S    scan message headers
+.FF  fast-forward past unread
+### reading Some(Aide)
+Reading:
+N    read new messages
+F    forward-read (oldest first)
+R    reverse-read (newest first)
+S    scan message headers
+.FF  fast-forward past unread
+### post Some(Aide)
+Posting:
+D <#>  delete
+E      enter message (prompts)
+E msg  draft a post (. sends, C cancels)
+E @user msg  draft a DM inline
+### posting Some(Aide)
+Posting:
+D <#>  delete
+E      enter message (prompts)
+E msg  draft a post (. sends, C cancels)
+E @user msg  draft a DM inline
+### users Some(Aide)
+Users:
+U         list active
+U banned  list banned
+U all     list all
+SEARCH <q> find
+WHOIS <u> details
+### nav Some(Aide)
+Navigation:
+C    change room
+G    unread here, else next room
+K    list known rooms
+M    go to Mail
+### navigation Some(Aide)
+Navigation:
+C    change room
+G    unread here, else next room
+K    list known rooms
+M    go to Mail
+### acct Some(Aide)
+Account:
+B      block / unblock a user
+PASSWD  change your password
+PROFILE edit your display name
+Q      log out
+W      who's online
+H USERS — Users
+### account Some(Aide)
+Account:
+B      block / unblock a user
+PASSWD  change your password
+PROFILE edit your display name
+Q      log out
+W      who's online
+H USERS — Users
+### aide Some(Aide)
+Aide:
+PENDING  pending users
+V <u>   validate user
+BAN <u>  ban a user
+TIMEOUT <u> <d> suspend
+.ER     edit current room
+H USERS — Users
+### sysop Some(Aide)
+No help for 'sysop'.
+H for commands, H reading/posting/navigation/account for topics.
+### h Some(Aide)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### help Some(Aide)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### ? Some(Aide)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### q Some(Aide)
+Q — log out
+### register Some(Aide)
+REGISTER <user> — create an account (you'll be prompted for a password).
+On a radio you can also do it in one message: REGISTER <user> <password>.
+### login Some(Aide)
+LOGIN <user> — log in (you'll be prompted for a password).
+On a radio, one message works too: LOGIN <user> <password>.
+### cancel Some(Aide)
+CANCEL — cancel the current workflow
+### n Some(Aide)
+N — read new messages since last visit
+### f Some(Aide)
+F — forward-read (oldest first)
+F <id> to start from a specific message
+### r Some(Aide)
+R — reverse-read (newest first)
+### s Some(Aide)
+S — scan message headers in this room
+### search Some(Aide)
+SEARCH <query> — find users by username (substring match)
+### .ff Some(Aide)
+.FF — fast-forward past unread
+Resets your last-read pointer to the latest message.
+### e Some(Aide)
+E — enter a message
+E <text> to post without a prompt
+In Mail: E @user message
+### d Some(Aide)
+D <id> — delete a message
+Aides and sysops can delete any message.
+### g Some(Aide)
+G — read unread here, else go to the next room with unread
+### c Some(Aide)
+C <name> — change room by name or number
+### k Some(Aide)
+K — list known rooms
+### m Some(Aide)
+M — go to Mail (private messages)
+In Mail: E to write, N to read new,
+F/R older/newer, S scan, D <#> delete.
+H MAIL for full mail help.
+### w Some(Aide)
+W — who's online
+### b Some(Aide)
+B <user> — block / unblock user
+Prefix + to force-block, - to force-unblock, or omit to toggle.
+Hides their messages from you.
+### profile Some(Aide)
+PROFILE — edit your display name
+### passwd Some(Aide)
+PASSWD — change your password
+You'll be asked for your current password, then the new one twice.
+### stop Some(Aide)
+STOP — stop pending messages
+### v Some(Aide)
+V — validate pending users
+Enters the user validation workflow.
+### pending Some(Aide)
+PENDING — list users awaiting validation
+### .er Some(Aide)
+.ER — edit current room
+Edit name, description, read-only flag, or min permission level.
+### .eu Some(Aide)
+.EU <user> — edit a user's profile or permissions
+Aides cannot promote to Sysop.
+### ban Some(Aide)
+BAN <user> — ban a user account
+### timeout Some(Aide)
+TIMEOUT <user> <days> — suspend a user account for 1-5 days
+Logs them out immediately and rejects login with the days remaining shown; reactivates automatically once the timeout elapses. UNBAN lifts it early.
+### u Some(Aide)
+U — list active user accounts
+U banned — list banned accounts
+U all — list all accounts (sysop)
+### users Some(Aide)
+Users:
+U         list active
+U banned  list banned
+U all     list all
+SEARCH <q> find
+WHOIS <u> details
+### whois Some(Aide)
+WHOIS <user> — show account details
+Includes level, status, join date, last login, and active sessions.
+### unban Some(Aide)
+No help for 'unban'.
+H for commands, H reading/posting/navigation/account for topics.
+### .aide Some(Aide)
+No help for '.aide'.
+H for commands, H reading/posting/navigation/account for topics.
+### .sysop Some(Aide)
+No help for '.sysop'.
+H for commands, H reading/posting/navigation/account for topics.
+### .user Some(Aide)
+No help for '.user'.
+H for commands, H reading/posting/navigation/account for topics.
+### .c Some(Aide)
+No help for '.c'.
+H for commands, H reading/posting/navigation/account for topics.
+### .dr Some(Aide)
+No help for '.dr'.
+H for commands, H reading/posting/navigation/account for topics.
+### .du Some(Aide)
+No help for '.du'.
+H for commands, H reading/posting/navigation/account for topics.
+### .pw Some(Aide)
+No help for '.pw'.
+H for commands, H reading/posting/navigation/account for topics.
+### openaccess Some(Aide)
+No help for 'openaccess'.
+H for commands, H reading/posting/navigation/account for topics.
+### closeaccess Some(Aide)
+No help for 'closeaccess'.
+H for commands, H reading/posting/navigation/account for topics.
+### guestroom Some(Aide)
+No help for 'guestroom'.
+H for commands, H reading/posting/navigation/account for topics.
+### nothing-like-this Some(Aide)
+No help for 'nothing-like-this'.
+H for commands, H reading/posting/navigation/account for topics.
+### quick Some(Sysop) radio=false
+K  list rooms
+C  change room
+N  new messages
+E  enter message
+G  next unread
+M  go to Mail
+W  who's online
+Q  log out
+H all - help topics
+### quick Some(Sysop) radio=true
+K  list rooms
+C  change room
+N  new messages
+E  enter message
+G  next unread
+M  go to Mail
+W  who's online
+Q  log out
+H all - help topics
+### all Some(Sysop)
+H MAIL — Mail
+H READ — Reading
+H POST — Posting
+H USERS — Users
+H NAV — Navigation
+H ACCT — Account
+H AIDE — Moderation
+H SYSOP — Admin
+### mail Some(Sysop)
+Mail (private messages):
+M    go to Mail
+E    write (prompts)
+E @user msg  send inline
+N    read new
+F/R  older/newer
+S    scan
+D <#> delete
+### read Some(Sysop)
+Reading:
+N    read new messages
+F    forward-read (oldest first)
+R    reverse-read (newest first)
+S    scan message headers
+.FF  fast-forward past unread
+### reading Some(Sysop)
+Reading:
+N    read new messages
+F    forward-read (oldest first)
+R    reverse-read (newest first)
+S    scan message headers
+.FF  fast-forward past unread
+### post Some(Sysop)
+Posting:
+D <#>  delete
+E      enter message (prompts)
+E msg  draft a post (. sends, C cancels)
+E @user msg  draft a DM inline
+### posting Some(Sysop)
+Posting:
+D <#>  delete
+E      enter message (prompts)
+E msg  draft a post (. sends, C cancels)
+E @user msg  draft a DM inline
+### users Some(Sysop)
+Users:
+U         list active
+U banned  list banned
+U all     list all
+SEARCH <q> find
+WHOIS <u> details
+### nav Some(Sysop)
+Navigation:
+C    change room
+G    unread here, else next room
+K    list known rooms
+M    go to Mail
+### navigation Some(Sysop)
+Navigation:
+C    change room
+G    unread here, else next room
+K    list known rooms
+M    go to Mail
+### acct Some(Sysop)
+Account:
+B      block / unblock a user
+PASSWD  change your password
+PROFILE edit your display name
+Q      log out
+W      who's online
+H USERS — Users
+### account Some(Sysop)
+Account:
+B      block / unblock a user
+PASSWD  change your password
+PROFILE edit your display name
+Q      log out
+W      who's online
+H USERS — Users
+### aide Some(Sysop)
+Aide:
+PENDING  pending users
+V <u>   validate user
+BAN <u>  ban a user
+TIMEOUT <u> <d> suspend
+.ER     edit current room
+H USERS — Users
+### sysop Some(Sysop)
+Sysop:
+.AIDE/.SYSOP/.USER <u>
+.C .DR .DU .PW rooms/users
+UNBAN <u> lift a ban
+OPENACCESS skip verify
+CLOSEACCESS require verify
+GUESTROOM <name>|OFF
+### h Some(Sysop)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### help Some(Sysop)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### ? Some(Sysop)
+H — show this help
+H MAIL/READ/POST/USERS/NAV/ACCT for topics
+H <cmd> for detail on one command (eg. H N)
+### q Some(Sysop)
+Q — log out
+### register Some(Sysop)
+REGISTER <user> — create an account (you'll be prompted for a password).
+On a radio you can also do it in one message: REGISTER <user> <password>.
+### login Some(Sysop)
+LOGIN <user> — log in (you'll be prompted for a password).
+On a radio, one message works too: LOGIN <user> <password>.
+### cancel Some(Sysop)
+CANCEL — cancel the current workflow
+### n Some(Sysop)
+N — read new messages since last visit
+### f Some(Sysop)
+F — forward-read (oldest first)
+F <id> to start from a specific message
+### r Some(Sysop)
+R — reverse-read (newest first)
+### s Some(Sysop)
+S — scan message headers in this room
+### search Some(Sysop)
+SEARCH <query> — find users by username (substring match)
+### .ff Some(Sysop)
+.FF — fast-forward past unread
+Resets your last-read pointer to the latest message.
+### e Some(Sysop)
+E — enter a message
+E <text> to post without a prompt
+In Mail: E @user message
+### d Some(Sysop)
+D <id> — delete a message
+Aides and sysops can delete any message.
+### g Some(Sysop)
+G — read unread here, else go to the next room with unread
+### c Some(Sysop)
+C <name> — change room by name or number
+### k Some(Sysop)
+K — list known rooms
+### m Some(Sysop)
+M — go to Mail (private messages)
+In Mail: E to write, N to read new,
+F/R older/newer, S scan, D <#> delete.
+H MAIL for full mail help.
+### w Some(Sysop)
+W — who's online
+### b Some(Sysop)
+B <user> — block / unblock user
+Prefix + to force-block, - to force-unblock, or omit to toggle.
+Hides their messages from you.
+### profile Some(Sysop)
+PROFILE — edit your display name
+### passwd Some(Sysop)
+PASSWD — change your password
+You'll be asked for your current password, then the new one twice.
+### stop Some(Sysop)
+STOP — stop pending messages
+### v Some(Sysop)
+V — validate pending users
+Enters the user validation workflow.
+### pending Some(Sysop)
+PENDING — list users awaiting validation
+### .er Some(Sysop)
+.ER — edit current room
+Edit name, description, read-only flag, or min permission level.
+### .eu Some(Sysop)
+.EU <user> — edit a user's profile or permissions
+Aides cannot promote to Sysop.
+### ban Some(Sysop)
+BAN <user> — ban a user account
+### timeout Some(Sysop)
+TIMEOUT <user> <days> — suspend a user account for 1-5 days
+Logs them out immediately and rejects login with the days remaining shown; reactivates automatically once the timeout elapses. UNBAN lifts it early.
+### u Some(Sysop)
+U — list active user accounts
+U banned — list banned accounts
+U all — list all accounts (sysop)
+### users Some(Sysop)
+Users:
+U         list active
+U banned  list banned
+U all     list all
+SEARCH <q> find
+WHOIS <u> details
+### whois Some(Sysop)
+WHOIS <user> — show account details
+Includes level, status, join date, last login, and active sessions.
+### unban Some(Sysop)
+UNBAN <user> — lift a ban
+### .aide Some(Sysop)
+.AIDE/.SYSOP/.USER <user> — set a user's permission level
+Promote a validated user to Aide or Sysop, or demote to User.
+Validate pending users with V first.
+### .sysop Some(Sysop)
+.AIDE/.SYSOP/.USER <user> — set a user's permission level
+Promote a validated user to Aide or Sysop, or demote to User.
+Validate pending users with V first.
+### .user Some(Sysop)
+.AIDE/.SYSOP/.USER <user> — set a user's permission level
+Promote a validated user to Aide or Sysop, or demote to User.
+Validate pending users with V first.
+### .c Some(Sysop)
+.C — create a new room
+Enters the room creation workflow.
+### .dr Some(Sysop)
+.DR <name> — delete a room
+### .du Some(Sysop)
+.DU <user> — soft-delete a user account
+Sets status to deleted and ends active sessions.
+### .pw Some(Sysop)
+.PW <user> — reset a user to a single-use temp password
+Returns a temp password to share; they must change it at next login.
+### openaccess Some(Sysop)
+OPENACCESS — disable verification requirement (SHTF mode)
+All registrations immediately receive User-level access.
+Takes effect immediately and persists to config.toml.
+### closeaccess Some(Sysop)
+CLOSEACCESS — restore verification requirement
+New accounts must be validated by an aide or sysop.
+Takes effect immediately and persists to config.toml.
+### guestroom Some(Sysop)
+GUESTROOM <name> — set guest room (created if needed)
+Unverified users are placed here and cannot leave.
+GUESTROOM OFF to disable.
+Takes effect immediately and persists to config.toml.
+### nothing-like-this Some(Sysop)
+No help for 'nothing-like-this'.
+H for commands, H reading/posting/navigation/account for topics.
+### reading-mode
+Reading mode:
+F  next message
+R  previous message
+F/R <#>  jump to message
+E  reply to this message
+D  delete message
+H  this help
+X  exit reading

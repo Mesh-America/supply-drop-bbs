@@ -6997,42 +6997,117 @@ fn help_text(
             // Topics are spelled out. A bare letter that is also a command
             // (M, R, U, N) must reach `help_for_command` so `H N` explains the
             // N command instead of the Navigation topic (#407).
-            "mail" if logged_in => HELP_MAIL.to_owned(),
-            "read" | "reading" if logged_in => HELP_READING.to_owned(),
-            "post" | "posting" if logged_in => HELP_POSTING.to_owned(),
+            "mail" if logged_in => help_mail(keymap),
+            "read" | "reading" if logged_in => help_reading(keymap),
+            "post" | "posting" if logged_in => help_posting(keymap),
             "users" if logged_in => HELP_USERS.to_owned(),
-            "nav" | "navigation" if logged_in => HELP_NAVIGATION.to_owned(),
-            "acct" | "account" if logged_in => HELP_ACCOUNT.to_owned(),
+            "nav" | "navigation" if logged_in => help_navigation(keymap),
+            "acct" | "account" if logged_in => help_account(keymap),
             "aide" if is_aide => HELP_AIDE.to_owned(),
             "sysop" if is_sysop => HELP_SYSOP.to_owned(),
-            cmd => help_for_command(cmd, level),
+            cmd => help_for_command(cmd, level, keymap),
         },
     }
 }
 
-fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
+/// Help for one command word as typed by the user.
+///
+/// The word is looked up in the active keymap, so `H N` explains whichever
+/// action `N` triggers on this board, and the text names that action's key
+/// there. Fixed words (account and admin commands) are explained as they are.
+/// A key the keymap declares as unsupported gets its friendly message.
+fn help_for_command(cmd: &str, level: Option<PermissionLevel>, keymap: &Keymap) -> String {
+    let logged_in = level.is_some();
+    if let Some(action) = keymap.action_for(cmd) {
+        if let Some(text) = help_for_action(action, logged_in, keymap) {
+            return text;
+        }
+    }
+    if matches!(cmd, "h" | "help" | "?") {
+        return if logged_in {
+            format!(
+                "H — show this help\n\
+                 H MAIL/READ/POST/USERS/NAV/ACCT for topics\n\
+                 H <cmd> for detail on one command (eg. H {})",
+                keymap.key(KeymapAction::ReadNew)
+            )
+        } else {
+            "H — show this help.".to_owned()
+        };
+    }
+    if let Some(text) = help_for_fixed(cmd, level) {
+        return text;
+    }
+    if let Some(message) = keymap.unsupported_message(cmd) {
+        return message.to_owned();
+    }
+    format!(
+        "No help for '{cmd}'.\n\
+         H for commands, H reading/posting/navigation/account for topics."
+    )
+}
+
+/// Help for a keymap action, naming the keys of the active keymap. `None` when
+/// the user is not allowed to use the action yet (not logged in).
+fn help_for_action(action: KeymapAction, logged_in: bool, keymap: &Keymap) -> Option<String> {
+    use KeymapAction as A;
+    let k = |a: A| keymap.key(a);
+    let text = match action {
+        A::Quit if logged_in => format!("{} — log out", k(A::Quit)),
+        A::Quit => format!("{} — quit", k(A::Quit)),
+        _ if !logged_in => return None,
+        A::ReadNew => format!("{} — read new messages since last visit", k(A::ReadNew)),
+        A::ReadForward => format!(
+            "{} — forward-read (oldest first)\n{} to start from a specific message",
+            k(A::ReadForward),
+            keymap.key_with(A::ReadForward, "<id>")
+        ),
+        A::ReadReverse => format!("{} — reverse-read (newest first)", k(A::ReadReverse)),
+        A::ScanMessages => format!("{} — scan message headers in this room", k(A::ScanMessages)),
+        A::EnterMessage => format!(
+            "{e} — enter a message\n{e} <text> to post without a prompt\nIn Mail: {e} @user message",
+            e = k(A::EnterMessage)
+        ),
+        A::DeleteMessage => format!(
+            "{} <id> — delete a message\nAides and sysops can delete any message.",
+            k(A::DeleteMessage)
+        ),
+        A::GoNextUnread => format!(
+            "{} — read unread here, else go to the next room with unread",
+            k(A::GoNextUnread)
+        ),
+        A::ChangeRoom => format!("{} <name> — change room by name or number", k(A::ChangeRoom)),
+        A::ListRooms => format!("{} — list known rooms", k(A::ListRooms)),
+        A::GoMail => format!(
+            "{} — go to Mail (private messages)\n\
+             In Mail: {} to write, {} to read new,\n\
+             {}/{} older/newer, {} scan, {} <#> delete.\n\
+             H MAIL for full mail help.",
+            k(A::GoMail),
+            k(A::EnterMessage),
+            k(A::ReadNew),
+            k(A::ReadForward),
+            k(A::ReadReverse),
+            k(A::ScanMessages),
+            k(A::DeleteMessage)
+        ),
+        A::WhoIsOnline => format!("{} — who's online", k(A::WhoIsOnline)),
+        // Reading-mode actions are explained by the reading-mode help.
+        _ => return None,
+    };
+    Some(text)
+}
+
+/// Help for a word that works under every keymap (account and admin
+/// commands and other fixed words). `None` if `cmd` is not one of them or the
+/// user's level cannot use it.
+fn help_for_fixed(cmd: &str, level: Option<PermissionLevel>) -> Option<String> {
     let logged_in = level.is_some();
     let is_aide = level >= Some(PermissionLevel::Aide);
     let is_sysop = level >= Some(PermissionLevel::Sysop);
 
-    let detail = match cmd {
+    let detail: &str = match cmd {
         // ── Always available ─────────────────────────────────────────────
-        "h" | "help" | "?" => {
-            if logged_in {
-                "H — show this help\n\
-                 H MAIL/READ/POST/USERS/NAV/ACCT for topics\n\
-                 H <cmd> for detail on one command (eg. H N)"
-            } else {
-                "H — show this help."
-            }
-        }
-        "q" => {
-            if logged_in {
-                "Q — log out"
-            } else {
-                "Q — quit"
-            }
-        }
         "register" => {
             "REGISTER <user> — create an account (you'll be prompted for a password).\n\
              On a radio you can also do it in one message: REGISTER <user> <password>."
@@ -7044,24 +7119,8 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "cancel" => "CANCEL — cancel the current workflow",
 
         // ── Logged-in only ───────────────────────────────────────────────
-        "n" if logged_in => "N — read new messages since last visit",
-        "f" if logged_in => "F — forward-read (oldest first)\nF <id> to start from a specific message",
-        "r" if logged_in => "R — reverse-read (newest first)",
-        "s" if logged_in => "S — scan message headers in this room",
         "search" if logged_in => "SEARCH <query> — find users by username (substring match)",
         ".ff" if logged_in => ".FF — fast-forward past unread\nResets your last-read pointer to the latest message.",
-        "e" if logged_in => "E — enter a message\nE <text> to post without a prompt\nIn Mail: E @user message",
-        "d" if logged_in => "D <id> — delete a message\nAides and sysops can delete any message.",
-        "g" if logged_in => "G — read unread here, else go to the next room with unread",
-        "c" if logged_in => "C <name> — change room by name or number",
-        "k" if logged_in => "K — list known rooms",
-        "m" if logged_in => {
-            "M — go to Mail (private messages)\n\
-             In Mail: E to write, N to read new,\n\
-             F/R older/newer, S scan, D <#> delete.\n\
-             H MAIL for full mail help."
-        }
-        "w" if logged_in => "W — who's online",
         "b" if logged_in => {
             "B <user> — block / unblock user\n\
              Prefix + to force-block, - to force-unblock, or omit to toggle.\n\
@@ -7124,14 +7183,9 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
              Takes effect immediately and persists to config.toml."
         }
 
-        other => {
-            return format!(
-                "No help for '{other}'.\n\
-                 H for commands, H reading/posting/navigation/account for topics."
-            )
-        }
+        _ => return None,
     };
-    detail.to_owned()
+    Some(detail.to_owned())
 }
 
 const HELP_QUICK_ANON: &str = "\
@@ -7188,13 +7242,22 @@ H USERS — Users\n\
 H NAV — Navigation\n\
 H ACCT — Account";
 
-const HELP_READING: &str = "\
-Reading:\n\
- N    read new messages\n\
- F    forward-read (oldest first)\n\
- R    reverse-read (newest first)\n\
- S    scan message headers\n\
- .FF  fast-forward past unread";
+/// Help for the reading commands, with the active keymap's keys.
+fn help_reading(keymap: &Keymap) -> String {
+    let k = |a: KeymapAction| keymap.key(a);
+    format!(
+        "Reading:\n\
+         {}read new messages\n\
+         {}forward-read (oldest first)\n\
+         {}reverse-read (newest first)\n\
+         {}scan message headers\n\
+         .FF  fast-forward past unread",
+        pad_key(&k(KeymapAction::ReadNew), 5),
+        pad_key(&k(KeymapAction::ReadForward), 5),
+        pad_key(&k(KeymapAction::ReadReverse), 5),
+        pad_key(&k(KeymapAction::ScanMessages), 5),
+    )
+}
 
 /// Contextual help shown when the help key is pressed inside the
 /// one-at-a-time reading sub-mode (`Workflow::Reading`). Lists only the keys
@@ -7217,38 +7280,93 @@ fn help_reading_mode(keymap: &Keymap) -> String {
     )
 }
 
-const HELP_POSTING: &str = "\
-Posting:\n\
- D <#>  delete\n\
- E      enter message (prompts)\n\
- E msg  draft a post (. sends, C cancels)\n\
- E @user msg  draft a DM inline";
+/// Help for posting and deleting, with the active keymap's keys.
+fn help_posting(keymap: &Keymap) -> String {
+    let e = keymap.key(KeymapAction::EnterMessage);
+    format!(
+        "Posting:\n\
+         {} <#>  delete\n\
+         {}enter message (prompts)\n\
+         {e} msg  draft a post (. sends, C cancels)\n\
+         {e} @user msg  draft a DM inline",
+        keymap.key(KeymapAction::DeleteMessage),
+        pad_key(&e, 7),
+    )
+}
 
-const HELP_NAVIGATION: &str = "\
-Navigation:\n\
- C    change room\n\
- G    unread here, else next room\n\
- K    list known rooms\n\
- M    go to Mail";
+/// Help for moving between rooms, with the active keymap's keys.
+fn help_navigation(keymap: &Keymap) -> String {
+    let k = |a: KeymapAction| keymap.key(a);
+    format!(
+        "Navigation:\n\
+         {}change room\n\
+         {}unread here, else next room\n\
+         {}list known rooms\n\
+         {}go to Mail",
+        pad_key(&k(KeymapAction::ChangeRoom), 5),
+        pad_key(&k(KeymapAction::GoNextUnread), 5),
+        pad_key(&k(KeymapAction::ListRooms), 5),
+        pad_key(&k(KeymapAction::GoMail), 5),
+    )
+}
 
-const HELP_MAIL: &str = "\
-Mail (private messages):\n\
- M    go to Mail\n\
- E    write (prompts)\n\
- E @user msg  send inline\n\
- N    read new\n\
- F/R  older/newer\n\
- S    scan\n\
- D <#> delete";
+/// Help for Mail, with the active keymap's keys.
+fn help_mail(keymap: &Keymap) -> String {
+    let k = |a: KeymapAction| keymap.key(a);
+    let e = k(KeymapAction::EnterMessage);
+    format!(
+        "Mail (private messages):\n\
+         {}go to Mail\n\
+         {}write (prompts)\n\
+         {e} @user msg  send inline\n\
+         {}read new\n\
+         {}older/newer\n\
+         {}scan\n\
+         {} <#> delete",
+        pad_key(&k(KeymapAction::GoMail), 5),
+        pad_key(&e, 5),
+        pad_key(&k(KeymapAction::ReadNew), 5),
+        pad_key(
+            &format!(
+                "{}/{}",
+                k(KeymapAction::ReadForward),
+                k(KeymapAction::ReadReverse)
+            ),
+            5
+        ),
+        pad_key(&k(KeymapAction::ScanMessages), 5),
+        k(KeymapAction::DeleteMessage),
+    )
+}
 
-const HELP_ACCOUNT: &str = "\
-Account:\n\
- B      block / unblock a user\n\
- PASSWD  change your password\n\
- PROFILE edit your display name\n\
- Q      log out\n\
- W      who's online\n\
-H USERS — Users";
+/// Help for the account commands, with the active keymap's keys for the
+/// actions among them.
+fn help_account(keymap: &Keymap) -> String {
+    format!(
+        "Account:\n\
+         B      block / unblock a user\n\
+         PASSWD  change your password\n\
+         PROFILE edit your display name\n\
+         {}log out\n\
+         {}who's online\n\
+         H USERS — Users",
+        pad_key(&keymap.key(KeymapAction::Quit), 7),
+        pad_key(&keymap.key(KeymapAction::WhoIsOnline), 7),
+    )
+}
+
+/// `key` followed by spaces up to `width` columns, and always at least one
+/// space, so a longer key still separates from its description.
+fn pad_key(key: &str, width: usize) -> String {
+    format!(
+        "{key:<width$}{}",
+        if key.chars().count() >= width {
+            " "
+        } else {
+            ""
+        }
+    )
+}
 
 const HELP_AIDE: &str = "\
 Aide:\n\
@@ -7357,43 +7475,48 @@ mod tests {
     fn help_strings_fit_mesh_payload() {
         // MAX_FRAME_SIZE(172) - 16 bytes overhead = 156 bytes max text.
         const MESH_MAX: usize = 156;
-        let cases = [
+        for (name, s) in [
             ("HELP_QUICK_ANON", HELP_QUICK_ANON.to_owned()),
             ("HELP_QUICK_ANON_RADIO", HELP_QUICK_ANON_RADIO.to_owned()),
             ("HELP_OVERVIEW", HELP_OVERVIEW.to_owned()),
-            ("HELP_MAIL", HELP_MAIL.to_owned()),
-            ("HELP_READING", HELP_READING.to_owned()),
-            ("HELP_READING_MODE", help_reading_mode(&Keymap::native())),
-            ("HELP_POSTING", HELP_POSTING.to_owned()),
-            ("HELP_NAVIGATION", HELP_NAVIGATION.to_owned()),
-            ("HELP_ACCOUNT", HELP_ACCOUNT.to_owned()),
             ("HELP_AIDE", HELP_AIDE.to_owned()),
             ("HELP_USERS", HELP_USERS.to_owned()),
             ("HELP_SYSOP", HELP_SYSOP.to_owned()),
-        ];
-        for (name, s) in cases {
+        ] {
             assert!(
                 s.len() <= MESH_MAX,
-                "{name} is {} bytes — exceeds {MESH_MAX}-byte MeshCore payload limit",
+                "{name} is {} bytes, over the {MESH_MAX}-byte MeshCore payload limit",
                 s.len()
             );
         }
 
-        // Every built-in preset, not just native/maximus/packet-bbs — a
-        // hostile audit caught this gap: `wwiv_family()` binds WhoIsOnline
-        // to "//who" (6 bytes) instead of a single native letter, which the
-        // earlier hand-picked list never would have exercised. Iterating
-        // `BUILTIN_NAMES` means a future preset is covered automatically,
-        // not just the ones someone remembered to add to a fixed list.
+        // Every built-in preset, not only native: a key can be longer than one
+        // letter (`//WHO`), so every keymap-driven text is measured under every
+        // preset. A future preset is covered automatically.
         for name in Keymap::BUILTIN_NAMES {
             let km = Keymap::by_name(name).unwrap();
-            let s = quick_help_logged_in(&km);
-            assert!(
-                s.len() <= MESH_MAX,
-                "quick_help_logged_in({name:?}) is {} bytes — exceeds {MESH_MAX}-byte MeshCore \
-                 payload limit",
-                s.len()
-            );
+            let mut cases = vec![
+                ("quick help".to_owned(), quick_help_logged_in(&km)),
+                ("reading mode help".to_owned(), help_reading_mode(&km)),
+                ("reading".to_owned(), help_reading(&km)),
+                ("posting".to_owned(), help_posting(&km)),
+                ("navigation".to_owned(), help_navigation(&km)),
+                ("mail".to_owned(), help_mail(&km)),
+                ("account".to_owned(), help_account(&km)),
+            ];
+            for action in KeymapAction::ALL {
+                if let Some(text) = help_for_action(*action, true, &km) {
+                    cases.push((format!("help for {action:?}"), text));
+                }
+            }
+            for (what, s) in cases {
+                assert!(
+                    s.len() <= MESH_MAX,
+                    "{what} under {name:?} is {} bytes, over the {MESH_MAX}-byte MeshCore \
+                     payload limit",
+                    s.len()
+                );
+            }
         }
     }
 
@@ -15445,5 +15568,178 @@ mod tests {
                 .unwrap(),
         );
         assert!(text.contains("or O to log out"), "{text:?}");
+    }
+
+    // ── Native help text is frozen (GH #354 phase 5) ─────────────────────
+
+    /// Every help string, for every permission level, under the native keymap.
+    /// `help_native.golden` holds the text as it was before help became
+    /// keymap-driven; the test below keeps native output byte-identical.
+    fn native_help_snapshot() -> String {
+        const COMMANDS: &[&str] = &[
+            "h",
+            "help",
+            "?",
+            "q",
+            "register",
+            "login",
+            "cancel",
+            "n",
+            "f",
+            "r",
+            "s",
+            "search",
+            ".ff",
+            "e",
+            "d",
+            "g",
+            "c",
+            "k",
+            "m",
+            "w",
+            "b",
+            "profile",
+            "passwd",
+            "stop",
+            "v",
+            "pending",
+            ".er",
+            ".eu",
+            "ban",
+            "timeout",
+            "u",
+            "users",
+            "whois",
+            "unban",
+            ".aide",
+            ".sysop",
+            ".user",
+            ".c",
+            ".dr",
+            ".du",
+            ".pw",
+            "openaccess",
+            "closeaccess",
+            "guestroom",
+            "nothing-like-this",
+        ];
+        const TOPICS: &[&str] = &[
+            "all",
+            "mail",
+            "read",
+            "reading",
+            "post",
+            "posting",
+            "users",
+            "nav",
+            "navigation",
+            "acct",
+            "account",
+            "aide",
+            "sysop",
+        ];
+        let levels = [
+            None,
+            Some(PermissionLevel::User),
+            Some(PermissionLevel::Aide),
+            Some(PermissionLevel::Sysop),
+        ];
+        let mut out = String::new();
+        for level in levels {
+            for on_radio in [false, true] {
+                out.push_str(&format!(
+                    "### quick {level:?} radio={on_radio}\n{}\n",
+                    help_text(None, level, on_radio, &Keymap::native())
+                ));
+            }
+            for topic in TOPICS.iter().chain(COMMANDS) {
+                out.push_str(&format!(
+                    "### {topic} {level:?}\n{}\n",
+                    help_text(Some(topic), level, false, &Keymap::native())
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "### reading-mode\n{}\n",
+            help_reading_mode(&Keymap::native())
+        ));
+        out
+    }
+
+    #[test]
+    fn native_help_text_is_unchanged() {
+        let snapshot = native_help_snapshot();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/help_native.golden");
+        if std::env::var_os("UPDATE_HELP_GOLDEN").is_some() {
+            std::fs::write(path, &snapshot).unwrap();
+        }
+        let golden = std::fs::read_to_string(path).expect("help_native.golden");
+        assert_eq!(
+            snapshot, golden,
+            "native help text changed; if intended, regenerate with \
+             UPDATE_HELP_GOLDEN=1 cargo test -p bbs-core native_help_text_is_unchanged"
+        );
+    }
+
+    #[test]
+    fn help_for_a_key_explains_the_action_it_triggers_on_this_keymap() {
+        let lvl = Some(PermissionLevel::User);
+        let km = Keymap::maximus();
+        let h = |cmd: &str| help_text(Some(cmd), lvl, false, &km);
+        // `L` is scan on Maximus, and the text names L, not S.
+        assert_eq!(h("l"), "L — scan message headers in this room");
+        // Native `S` no longer does anything there, so there is no help for it.
+        assert!(h("s").starts_with("No help for 's'"), "{}", h("s"));
+        // `G` is quit on Maximus.
+        assert_eq!(h("g"), "G — log out");
+        // A key the preset declares unsupported gets its friendly message.
+        assert_eq!(h("j"), "No file areas on this BBS.");
+        // Fixed words are unchanged.
+        assert!(h("passwd").starts_with("PASSWD"), "{}", h("passwd"));
+        // The general help example uses the active read-new key.
+        let km = distinct_keymap();
+        assert!(
+            help_text(Some("h"), lvl, false, &km).contains("(eg. H L)"),
+            "{}",
+            help_text(Some("h"), lvl, false, &km)
+        );
+    }
+
+    #[test]
+    fn help_topics_name_the_active_keymaps_keys() {
+        let lvl = Some(PermissionLevel::User);
+        let km = distinct_keymap();
+        let topic = |t: &str| help_text(Some(t), lvl, false, &km);
+
+        let nav = topic("nav");
+        assert!(nav.contains("A    change room"), "{nav}");
+        assert!(nav.contains("Z    list known rooms"), "{nav}");
+        assert!(!nav.contains("K    list"), "{nav}");
+
+        let reading = topic("reading");
+        assert!(reading.contains("L    read new messages"), "{reading}");
+        assert!(reading.contains("J    forward-read"), "{reading}");
+        assert!(reading.contains("X    scan message headers"), "{reading}");
+
+        let mail = topic("mail");
+        assert!(mail.contains("J/R  older/newer"), "{mail}");
+        assert!(mail.contains("X    scan"), "{mail}");
+        assert!(mail.contains("L    read new"), "{mail}");
+
+        let account = topic("acct");
+        assert!(account.contains("O      log out"), "{account}");
+
+        let post = topic("post");
+        assert!(post.contains("D <#>  delete"), "{post}");
+    }
+
+    /// A key longer than the column still separates from its description.
+    #[test]
+    fn a_long_key_keeps_a_space_before_its_description() {
+        let km = Keymap::wwiv_family();
+        let account = help_text(Some("acct"), Some(PermissionLevel::User), false, &km);
+        assert!(account.contains("//WHO  who's online"), "{account}");
+        assert_eq!(pad_key("N", 5), "N    ");
+        assert_eq!(pad_key("//WHO", 5), "//WHO ");
     }
 }
