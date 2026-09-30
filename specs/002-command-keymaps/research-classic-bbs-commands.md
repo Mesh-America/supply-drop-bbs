@@ -144,12 +144,10 @@ best-effort preset, or as a community-contributed custom keymap (see spec's uplo
 ## Phase 7 addendum (2026-09-30): full command pass
 
 A second pass read each system's own menu, help and source files in full, to list
-every command and to check the preset keys. Three systems were read from primary
-sources. PCBoard and packet BBS could not be: this environment's network policy
-denied `kuehlbox.wtf`, `archive.org`, `textfiles.com`, `f6fbb.org` and
-`cantab.net`, and the agents stopped rather than guess. Those two presets keep
-only the keys already marked V above, and their full pass is still open (see
-"Still open").
+every command and to check the preset keys. Maximus, WWIV and Synchronet were read
+from their source trees. PCBoard and packet BBS were read in a follow-up once the
+cloud environment allowed `kuehlbox.wtf` and `f6fbb.org`/`cantab.net` (they were
+blocked the first time, and the agents stopped rather than guess).
 
 ### How the keys were verified
 
@@ -161,6 +159,13 @@ only the keys already marked V above, and their full pass is still open (see
   so the raw files were read.
 - **WWIV 5.x** (`github.com/wwivbbs/wwiv`, commit `56dfa23`: `main.mnu.json`,
   `mbmain.msg`, `msgscan.cpp`, `readmail.cpp`, `mmkey.cpp`).
+- **PCBoard 15.x** (the `kuehlbox.wtf` wiki transcription of the manual, raw
+  pages under `/wiki/_export/raw/commands:user:*`, 50 command pages; `r`, `k`,
+  `j`, `g`, `h`, `m`, `p`, `q`, `y`, `v`, `who`, `x` and several others read in
+  full). This is the manual text, not the shipped software.
+- **Packet BBS** (`f6fbb.org/fbbdoc/docbbs.htm` for F6FBB and
+  `cantab.net/.../BBSUserCommands.html` for BPQ). Command lists only; no prompts
+  or sessions are shown. No W0RLI source was reached.
 - **Synchronet** (the GitHub mirror of the GitLab tree, `exec/default.js`,
   `exec/email_sec.js`, `src/sbbs3/readmsgs.cpp`, `readmail.cpp`; the default
   shell only).
@@ -213,6 +218,50 @@ and jumps to a message by typing its bare number. WWIV and Synchronet also jump 
 typing a bare number; Synchronet's number is a position in the sub-board, not a
 message id.
 
+### PCBoard and packet BBS (verified in the follow-up pass)
+
+| Action | PCBoard 15.x | Packet BBS (F6FBB and BPQ) |
+|---|---|---|
+| Quit | G (asks to confirm; `BYE` and `G;Y` do not) | `B` or `BYE` (here `b` is block user, `bye` is fixed and works) |
+| List rooms | none (`SELECT` lists conferences with side effects) | none |
+| Change room | J, as `J;13` or `J;NAME` | none |
+| Next unread | none (`JUMP` only inside a multi-conference read) | none |
+| Go to Mail | none (Y only scans your mail and gives counts) | LM lists mail to you |
+| Read new | R;S (current conference), R;S;A (all) | RN (F6FBB), RM (BPQ) |
+| Read forward | R;n+ from message n; bare R opens a sub-prompt | R n; bare R is undocumented |
+| Read reverse | R;L (from the last message backward) | LR lists newest first (headers only) |
+| Scan | Q (one header per line), Q L reverse | L (new headers), LL n (last n) |
+| Enter message | E (prompts for the addressee) | S[type] call, SP call, SB |
+| Delete | K n | K n |
+| Who is online | WHO (multi-node systems only) | none (F6FBB: `%`, `JK`) |
+| Reading: next | NEXT, Enter or R | none (pager only) |
+| Reading: previous | PREV | none |
+| Reading: reply | RE | SR |
+| Reading: help | none documented | none |
+| Reading: delete | K | K n |
+
+Notes that matter for the presets:
+
+- PCBoard's `E` takes an addressee (`E;name`), never body text, and `Y` is a scan
+  that reports counts, not a mail room. PCBoard jumps to a message by typing its
+  number, with `+` or `-` to set direction.
+- Packet BBS bare `R`, `K` and `S` are undocumented; only `R msg#`, `K msg#` and
+  `S[type] call` are. `Q` sets your QTH in BPQ, `N` sets your name, `W` lists
+  files (F6FBB) and `V` is the version, so none of those are logoff, read new,
+  who or validate. The F6FBB `KM` text contradicts itself, so it is not bound.
+- Commands PCBoard has that this BBS does not: `M` graphics mode, `P` page length,
+  `D`/`F`/`L`/`Z` file commands, `T` transfer protocol, `QWK`, `OPEN` (doors),
+  `O` page operator, `CHAT`/`NODE`, `NEWS`, `S` questionnaires, `SELECT` and `A`
+  conference flags, `X` expert mode, `MENU`, `LANG`, `ALIAS`, `C` comment to
+  sysop, `TS` text search, `REPLY`. Each answers with a short message.
+- Commands packet BBS has that this BBS does not: `SP`/`SB`/`SC` sending,
+  forwarding (`@ BBS`), bulletin lists and categories (`LB`, `LC`), NTS traffic
+  (`LT`), `LU`/`LN` unread lists, `NODE`/`NODES`/`C call`, white pages (`I`),
+  file transfer (`FILES`, `YAPP`). Each answers with a short message.
+- Traps that cannot be answered with a message because they are also fixed words
+  here: PCBoard `B` (bulletins), `U` (upload) and `V` (view settings); packet
+  `B` (bye, which `bye` covers), `U` (upload), `V` (version).
+
 ### Telegard and Renegade
 
 Not covered. Telegard's read prompt shares several WWIV keys (`Enter`, number,
@@ -223,11 +272,10 @@ The lineage (Renegade from Telegard from WWIV) was not verified. The
 
 ### Still open
 
-- **PCBoard**: read the user command chapter of the v15.22 manual (kuehlbox.wtf or
-  an archive copy) and verify `J`, `Q`, `R;S`, `Y`, `WHO`, plus the keys for
-  reply, delete, next and previous while reading.
-- **Packet BBS**: read the F6FBB and BPQ user command pages and verify `L`, `LM`,
-  `R n`, `K n`, `SR`, and what a bare `R` does.
-- Both need those hosts allowed in the cloud environment's network settings, or
-  the pages pasted in.
-
+- PCBoard: the `E`, `D`, `F`, `U`, `L`, `Z`, `QWK`, `CHAT` and `TEST` pages were
+  only read in part, and there is no documented help key at the end-of-message
+  prompt. The wiki is a transcription of the manual; it was not checked against a
+  shipped PCBoard or an archive.org copy.
+- Packet BBS: what a bare `R` does, and how W0RLI differs, are not documented in
+  the two pages read. The BPQ Quickstart guide was not found.
+- Telegard and Renegade defaults, and the WWIV lineage claim.

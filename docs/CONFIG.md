@@ -155,15 +155,15 @@ preset):
 | `maximus`     | Maximus 3.0x                            | Keys verified from the shipped menu files. No list-rooms, mail or next-unread key exists in Maximus, so those are the words `ROOMS`, `MAIL` and `READ`, and `]` (next area) stands in for next unread. |
 | `wwiv-family` | WWIV 5.x                                | Keys verified from the shipped menus and read prompt. Telegard and Renegade are not covered. WWIV's `H` (hop) is help here, so the word `HOP` is used. |
 | `synchronet`  | Synchronet (default command shell)      | Keys verified from the shipped shell and reading prompt. `E` (the e-mail menu) goes to the Mail room. Next unread, newest first and delete use the words `UNREAD`, `BACK` and `DELETE`. |
-| `pcboard`     | PCBoard 15.x                            | Only the keys the earlier research verified (`G`, `J`, `Q`, `E`, `Y`, `R`, `R;S`, `WHO`). A full pass over the manual is still open. |
-| `packet-bbs`  | Packet-radio BBS (F6FBB / BPQ / W0RLI)  | Only the keys the earlier research verified (`L`, `LM`, `R`, `K`, `SR`). Packet BBS has no rooms, so room navigation uses plain words. A full pass is still open. |
+| `pcboard`     | PCBoard 15.x                            | Keys verified from the PCBoard 15.x manual. PCBoard has no mail room, list-rooms or next-unread command, so those use `Y` (nearest), `ROOMS` and `NEXT`. Reading uses `NEXT`, `PREV`, `RE` and `K`. |
+| `packet-bbs`  | Packet-radio BBS (F6FBB / BPQ / W0RLI)  | Commands verified from the F6FBB and BPQ user command pages. Packet BBS has no rooms, so room navigation uses the words `ROOMS`, `GOTO` and `NEXT`. Logoff is `LOGOFF` or `BYE`. Sending mail is done in the Mail room, not with `SP`. |
 
 Every preset answers the source system's own keys that this BBS lacks (file
 areas, doors, chat and so on) with a short message, and never gives such a key a
 different meaning. Three source keys cannot be answered because they are also
-fixed words here: `B` (Browse or Bypass in the source systems, block user here),
-`V` (Version, Voting or Polls, validate user here) and `H` in WWIV (hop, help
-here). The full list of what each system has is in
+fixed words here: `B` (Browse, Bypass, Bulletins or Bye in the source systems,
+block user here), `V` (Version, Voting, Polls or View settings, validate user
+here) and `H` in WWIV (hop, help here). The full list of what each system has is in
 `specs/002-command-keymaps/research-classic-bbs-commands.md`.
 
 An example custom keymap for the layout requested in GH #354 is in

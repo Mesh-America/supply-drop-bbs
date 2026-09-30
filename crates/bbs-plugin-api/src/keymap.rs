@@ -366,30 +366,35 @@ impl Keymap {
         )
     }
 
-    /// The packet-radio BBS (F6FBB/BPQ) style preset. Packet BBS has no rooms
-    /// and no reading mode, so most keys are plain words. Keys that are
-    /// sourced (`research-classic-bbs-commands.md`): `L` list new, `LM` list
-    /// your mail, `R n` read a message, `K n` kill a message, `SR` reply.
-    /// A full pass over the F6FBB manual is still pending network access.
+    /// The packet-radio BBS (F6FBB and BPQ) style preset. Commands are from the
+    /// F6FBB `docbbs.htm` and BPQ `BBSUserCommands.html` user command pages:
+    /// `L` lists new headers, `LL n` the last n, `LM` your mail, `RN` (F6FBB)
+    /// or `RM` (BPQ) reads new mail, `R n` reads a message, `K n` deletes one,
+    /// `SR` replies. Packet BBS has no rooms and no reading mode, and bare `R`
+    /// is undocumented, so room navigation and the stepping keys use plain
+    /// words. `Q` sets your QTH there, so logoff is the word `LOGOFF` (and
+    /// `BYE`, which works on every board).
     #[must_use]
     pub fn packet_bbs() -> Self {
         use KeymapAction as A;
         Self::build(
             "packet-bbs",
-            "Packet BBS style keys: L(ist new), LM (your mail), R (read a message), K(ill), \
-             SR (reply). Packet BBS has no rooms, so room navigation uses the words ROOMS, \
-             GOTO and NEXT. BYE logs off on every board. Sending mail uses the Mail room \
-             here, not SP, and there are no bulletin categories or forwarding.",
+            "Packet BBS style keys (F6FBB and BPQ): L(ist new), LL (list last), LM (your \
+             mail), RN or RM (read new mail), R <number> (read), K <number> (kill), SR \
+             (reply). Packet BBS has no rooms, so room navigation uses the words ROOMS, \
+             GOTO and NEXT. BYE logs off on every board. Sending mail is done in the Mail \
+             room here, not with SP or SB, and there is no forwarding, bulletin \
+             categories or node commands.",
             &[
-                (A::Quit, &["q"]),
+                (A::Quit, &["logoff"]),
                 (A::ListRooms, &["rooms"]),
                 (A::GoNextUnread, &["next"]),
                 (A::ChangeRoom, &["goto"]),
                 (A::GoMail, &["lm"]),
-                (A::ReadNew, &["l"]),
+                (A::ReadNew, &["rn", "rm"]),
                 (A::ReadForward, &["r"]),
                 (A::ReadReverse, &["back"]),
-                (A::ScanMessages, &["scan"]),
+                (A::ScanMessages, &["l", "ll"]),
                 (A::EnterMessage, &["e"]),
                 (A::DeleteMessage, &["k"]),
                 (A::WhoIsOnline, &["who"]),
@@ -400,17 +405,30 @@ impl Keymap {
                 (A::ReadingDelete, &["k"]),
             ],
             &[
-                (
-                    "sp",
-                    "Send mail from the Mail room: LM, then E @user message.",
-                ),
-                (
-                    "sb",
-                    "No bulletin categories. Post in a room: GOTO name, then E.",
-                ),
-                ("km", "Delete mail from the Mail room with K <number>."),
-                ("rm", "Read mail: type LM, then R <number>."),
-                ("rn", "Read new mail: type LM, then L."),
+                ("q", "Type BYE to log off."),
+                ("s", "Send from the Mail room: LM, then E @user message."),
+                ("sp", "Send from the Mail room: LM, then E @user message."),
+                ("sb", "No bulletin categories. Post in a room: GOTO name."),
+                ("sc", "No message copying on this BBS."),
+                ("km", "Delete mail in the Mail room with K <number>."),
+                ("lb", "No bulletin lists. Type ROOMS to list rooms."),
+                ("lc", "No category lists. Type ROOMS to list rooms."),
+                ("lt", "No NTS traffic on this BBS."),
+                ("lu", "Type RN to read new messages."),
+                ("ln", "Type RN to read new messages."),
+                ("lr", "Newest-first lists are not available. Type L."),
+                ("n", "Set your name with PROFILE."),
+                ("t", "No sysop paging on this BBS."),
+                ("d", "To delete a message type K <number>."),
+                ("w", "Type WHO to see who is online."),
+                ("jk", "Type WHO to see who is online."),
+                ("c", "No node or conference commands on this BBS."),
+                ("node", "No node commands on this BBS."),
+                ("nodes", "No node commands on this BBS."),
+                ("i", "Use WHOIS <user> or PROFILE for user details."),
+                ("x", "No expert mode on this BBS."),
+                ("files", "No file areas on this BBS."),
+                ("yapp", "No file transfers on this BBS."),
             ],
             &[
                 A::Quit,
@@ -418,7 +436,6 @@ impl Keymap {
                 A::GoNextUnread,
                 A::ChangeRoom,
                 A::ReadReverse,
-                A::ScanMessages,
                 A::EnterMessage,
                 A::WhoIsOnline,
                 A::ReadingForward,
@@ -427,20 +444,25 @@ impl Keymap {
         )
     }
 
-    /// The PCBoard-style preset. Sourced keys: `G` goodbye, `J` join
-    /// conference, `Q` quick scan, `E` enter, `Y` read new mail, `WHO`, `R n`
-    /// read a message and `R;S` read new. PCBoard's `M` (graphics mode) and
-    /// `P` (page length) are answered with a message, never bound. A full
-    /// pass over the PCBoard manual is still pending network access.
+    /// The PCBoard-style preset. Commands are from the PCBoard 15.x manual
+    /// (the kuehlbox.wtf wiki transcription): `G` goodbye, `J` join a
+    /// conference, `Q` quick scan, `E` enter, `K` kill, `WHO`, `R;S` read new,
+    /// `R;L` read from the last message backward, `R n` read message n, and at
+    /// the end-of-message prompt `NEXT`, `PREV`, `RE` (reply) and `K`.
+    /// PCBoard has no mail room (`Y` only scans your mail, used here as the
+    /// nearest key), no list-rooms or next-unread command, and no documented
+    /// help key at the end-of-message prompt. Its `M` (graphics mode) and `P`
+    /// (page length) are answered with a message, never bound.
     #[must_use]
     pub fn pcboard() -> Self {
         use KeymapAction as A;
         Self::build(
             "pcboard",
             "PCBoard style keys: G(oodbye), J(oin conference), Q(uick scan), E(nter), \
-             Y (your mail), R (read), R;S (read new), WHO. Keys only: no graphics mode, \
-             page length, file areas or doors. Actions with no PCBoard key use plain \
-             words such as ROOMS, NEXT, BACK and DELETE.",
+             K(ill), WHO, R;S (read new), R;L (newest first), R <number>. Reading: NEXT, \
+             PREV, RE (reply), K. Y (your mail) is the nearest key to going to Mail. \
+             Keys only: no graphics mode, page length, file areas, doors or chat. PCBoard \
+             has no list-rooms or next-unread key, so those use the words ROOMS and NEXT.",
             &[
                 (A::Quit, &["g"]),
                 (A::ListRooms, &["rooms"]),
@@ -449,31 +471,45 @@ impl Keymap {
                 (A::GoMail, &["y"]),
                 (A::ReadNew, &["r;s"]),
                 (A::ReadForward, &["r"]),
-                (A::ReadReverse, &["back"]),
+                (A::ReadReverse, &["r;l"]),
                 (A::ScanMessages, &["q"]),
                 (A::EnterMessage, &["e"]),
-                (A::DeleteMessage, &["delete"]),
+                (A::DeleteMessage, &["k"]),
                 (A::WhoIsOnline, &["who"]),
                 (A::ReadingForward, &["next"]),
-                (A::ReadingReverse, &["back"]),
-                (A::ReadingReply, &["reply"]),
+                (A::ReadingReverse, &["prev"]),
+                (A::ReadingReply, &["re"]),
                 (A::ReadingHelp, &["h", "?"]),
-                (A::ReadingDelete, &["delete"]),
+                (A::ReadingDelete, &["k"]),
             ],
             &[
                 ("m", "Graphics mode is not available on this BBS."),
                 ("p", "Page length is not available on this BBS."),
+                ("d", "Downloads are not available on this BBS."),
+                ("f", "File areas are not available on this BBS."),
+                ("l", "File areas are not available on this BBS."),
+                ("z", "File areas are not available on this BBS."),
+                ("t", "Transfer protocols are not available on this BBS."),
+                ("qwk", "Offline mail is not available on this BBS."),
+                ("open", "Doors are not available on this BBS."),
+                ("o", "Paging the sysop is not available on this BBS."),
+                ("chat", "Chat is not available on this BBS."),
+                ("node", "Chat is not available on this BBS."),
+                ("news", "System news is not available on this BBS."),
+                ("s", "Questionnaires are not available on this BBS."),
+                ("select", "Conference flags are not available on this BBS."),
+                ("a", "Conference flags are not available on this BBS."),
+                ("x", "Expert mode is not available on this BBS."),
+                ("menu", "Menus are not available on this BBS."),
+                ("lang", "Language settings are not available on this BBS."),
+                ("alias", "Aliases are not available on this BBS."),
+                ("c", "Use E @user to write to a user."),
+                ("w", "Use PASSWD to change your password."),
+                ("ts", "Message text search is not available on this BBS."),
+                ("reply", "Read the message first, then type RE to reply."),
+                ("user", "Use SEARCH <name> to find users."),
             ],
-            &[
-                A::ListRooms,
-                A::GoNextUnread,
-                A::ReadReverse,
-                A::DeleteMessage,
-                A::ReadingForward,
-                A::ReadingReverse,
-                A::ReadingReply,
-                A::ReadingDelete,
-            ],
+            &[A::ListRooms, A::GoNextUnread, A::ReadingHelp],
         )
     }
 
@@ -1227,11 +1263,31 @@ Quit = ["g"]
                 ("j", A::ChangeRoom),
                 ("q", A::ScanMessages),
                 ("e", A::EnterMessage),
-                ("y", A::GoMail),
+                ("k", A::DeleteMessage),
                 ("r;s", A::ReadNew),
+                ("r;l", A::ReadReverse),
+                ("r", A::ReadForward),
                 ("who", A::WhoIsOnline),
             ],
-            &[],
+            &[
+                ("next", A::ReadingForward),
+                ("prev", A::ReadingReverse),
+                ("re", A::ReadingReply),
+                ("k", A::ReadingDelete),
+            ],
+        );
+        check(
+            Keymap::packet_bbs(),
+            &[
+                ("lm", A::GoMail),
+                ("rn", A::ReadNew),
+                ("rm", A::ReadNew),
+                ("l", A::ScanMessages),
+                ("ll", A::ScanMessages),
+                ("r", A::ReadForward),
+                ("k", A::DeleteMessage),
+            ],
+            &[("sr", A::ReadingReply), ("k", A::ReadingDelete)],
         );
     }
 
@@ -1242,7 +1298,16 @@ Quit = ["g"]
         // (preset, key a source user would expect to do something else)
         for (preset, traps) in [
             ("maximus", &["f", "j", "y", "o", "t", "c", "s", "m"][..]),
-            ("pcboard", &["m", "p"][..]),
+            (
+                "pcboard",
+                &[
+                    "m", "p", "d", "f", "l", "z", "t", "o", "s", "a", "x", "c", "w",
+                ][..],
+            ),
+            (
+                "packet-bbs",
+                &["q", "s", "sp", "sb", "n", "t", "d", "w", "c", "i", "x"][..],
+            ),
             ("wwiv-family", &["t", "c", "a", "g", "f", "d", "q"][..]),
             (
                 "synchronet",
@@ -1280,8 +1345,8 @@ Quit = ["g"]
                     let allowed: &[&str] = match km.name.as_str() {
                         // `]` is Maximus's "next area", the closest key to next unread.
                         "maximus" => &["]"],
-                        // `q` is only a stand-in: BYE logs off on every board.
-                        "packet-bbs" => &["q", "e"],
+                        // `e` is this BBS's own key for entering a message.
+                        "packet-bbs" => &["e"],
                         _ => &[],
                     };
                     assert!(

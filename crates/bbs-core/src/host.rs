@@ -15800,7 +15800,7 @@ mod tests {
     fn reading_help_switches_to_a_compact_layout_for_long_keys() {
         let km = Keymap::pcboard();
         let help = help_reading_mode(&km);
-        for key in ["NEXT", "BACK", "REPLY", "DELETE"] {
+        for key in ["NEXT", "PREV", "RE", "K"] {
             assert!(help.contains(key), "{help}");
         }
         assert!(help.len() < 120, "{} bytes: {help}", help.len());

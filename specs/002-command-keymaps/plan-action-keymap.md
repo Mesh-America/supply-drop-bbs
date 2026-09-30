@@ -1,9 +1,9 @@
 # Plan: action-based keymaps (replaces the "translate to the native key" approach)
 
-Status: phases 1 to 7 done except the PCBoard and packet BBS manual passes,
-which are blocked by the cloud network policy (see the research addendum);
-phase 8 docs mostly done. Draft for TJ. Supersedes the translation design in `plan.md` and the
-module doc of `crates/bbs-plugin-api/src/keymap.rs`. GH #354.
+Status: all eight phases done. The PCBoard and packet BBS manual passes ran
+once the cloud network policy allowed the hosts (see the research addendum).
+Supersedes the translation design in `plan.md` and the module doc of
+`crates/bbs-plugin-api/src/keymap.rs`. GH #354.
 
 ## Why change
 
@@ -153,8 +153,7 @@ Each phase ends with the full gate from CLAUDE.md and a commit.
 6. **Guard test.** (done: `tests/keymap_hints.rs`) A test that scans the sources for literal key hints in
    user-facing strings (for example `Type [A-Z]`, `[A-Z] - `) and fails on a
    new one. Allow-list only the fixed, non-remappable keys.
-7. **Preset accuracy.** (done for Maximus, WWIV and Synchronet; open for PCBoard
-   and packet BBS) Complete each preset into a full table. For each
+7. **Preset accuracy.** (done for all five presets) Complete each preset into a full table. For each
    source system, list every command in its own manual and mark it supported,
    remapped, or not available (gap analysis above). Add the coverage notes and
    `unsupported` tables, rename presets to "-style", and add the example file
