@@ -1,5 +1,9 @@
 # Plan: Command keymaps
 
+> **Superseded in part.** How a keymap is applied (translate to the native key) and how
+> messages name keys is replaced by [plan-action-keymap.md](plan-action-keymap.md). The
+> data-model discussion and the research below still apply.
+
 ## Data model
 
 ```rust
