@@ -658,7 +658,7 @@ impl Host for BbsHost {
             // Message reading
             Command::ReadNew => self.handle_read_new(session).await,
             Command::ReadForward { after } => self.handle_read_forward(session, after).await,
-            Command::ReadReverse => self.handle_read_reverse(session).await,
+            Command::ReadReverse => self.handle_read_reverse(session, None).await,
             Command::ScanMessages => self.handle_scan(session).await,
             Command::FastForward => self.handle_fast_forward(session).await,
 
@@ -3781,8 +3781,8 @@ impl BbsHost {
                 };
                 match upper.as_str() {
                     "F" => self.handle_read_forward(session, None).await,
-                    "R" => self.handle_read_reverse(session).await,
-                    "E" => self.handle_reply_from_reading(session).await,
+                    "R" => self.handle_read_reverse(session, None).await,
+                    "E" => self.handle_reply_from_reading(session, None).await,
                     // H is the universal help key; in reading mode it shows
                     // contextual help and stays in the reading sub-mode rather
                     // than bouncing the user out (issue #109).
@@ -3797,6 +3797,32 @@ impl BbsHost {
                             .and_then(|rest| rest.trim().parse::<i64>().ok())
                         {
                             return self.handle_read_forward(session, Some(id)).await;
+                        }
+
+                        // R <id> is the reverse counterpart of F <id> (#415).
+                        // Without it "R 5" hit the catch-all and silently
+                        // exited reading mode.
+                        if let Some(id) = upper
+                            .strip_prefix("R ")
+                            .and_then(|rest| rest.trim().parse::<i64>().ok())
+                        {
+                            return self.handle_read_reverse(session, Some(id)).await;
+                        }
+
+                        // E <text> starts a reply with that text as the draft
+                        // (#410). Uses `reply`, not `upper`, to keep the case
+                        // the user typed.
+                        let trimmed = reply.trim();
+                        if trimmed.len() > 2
+                            && trimmed.is_char_boundary(2)
+                            && trimmed[..2].eq_ignore_ascii_case("e ")
+                        {
+                            let body = trimmed[2..].trim();
+                            if !body.is_empty() {
+                                return self
+                                    .handle_reply_from_reading(session, Some(body.to_owned()))
+                                    .await;
+                            }
                         }
 
                         // D [<id>] deletes without leaving reading mode (issue
@@ -4649,7 +4675,14 @@ impl BbsHost {
     /// sender pre-populated as recipient (Mail room) or no recipient (room
     /// post), and returns a body prompt so the user can type their reply
     /// without leaving the reading context manually.
-    async fn handle_reply_from_reading(&self, session: SessionId) -> Result<Response, HostError> {
+    ///
+    /// With `body = Some(text)` (`E <text>`), the text is staged as a draft
+    /// awaiting the usual `.` confirmation instead of prompting for it.
+    async fn handle_reply_from_reading(
+        &self,
+        session: SessionId,
+        body: Option<String>,
+    ) -> Result<Response, HostError> {
         let (_, _, level, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
@@ -4683,6 +4716,22 @@ impl BbsHost {
         } else {
             None
         };
+
+        if let Some(body) = body {
+            let on_radio = self.session_on_radio(session).await;
+            let preview = draft_preview(recipient.as_ref(), &body, on_radio);
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::Compose {
+                    room_id,
+                    stage: ComposeStage::AwaitingConfirmation { recipient, body },
+                };
+            }
+            return Ok(Response::Prompt {
+                text: preview,
+                hide_input: false,
+            });
+        }
 
         let prompt = match &recipient {
             Some(r) => format!("Reply to {}:", r.as_str()),
@@ -5330,7 +5379,13 @@ impl BbsHost {
         })
     }
 
-    async fn handle_read_reverse(&self, session: SessionId) -> Result<Response, HostError> {
+    /// Reverse-read. `before = Some(id)` (reading mode's `R <id>`) starts AT
+    /// that message, mirroring `F <id>`; `None` steps back from the cursor.
+    async fn handle_read_reverse(
+        &self,
+        session: SessionId,
+        before: Option<i64>,
+    ) -> Result<Response, HostError> {
         let (username, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
@@ -5350,10 +5405,14 @@ impl BbsHost {
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
         // R with no position → jump to last message; otherwise go one back.
+        // An explicit id is stepped forward by one so the step back lands on
+        // it; if the id is gone, the closest earlier message is shown.
         let (cursor, already_reading) = {
             let sessions = self.sessions.read().await;
             let r = sessions.get(&session);
-            let cursor = r.and_then(|r| r.current_message_id);
+            let cursor = before
+                .map(|id| MessageId::new(id.saturating_add(1)))
+                .or_else(|| r.and_then(|r| r.current_message_id));
             let already_reading = r.is_some_and(|r| matches!(r.workflow, Workflow::Reading));
             (cursor, already_reading)
         };
@@ -5450,11 +5509,15 @@ impl BbsHost {
             .map_err(|e| HostError::Storage(format!("{e}")))?
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
-        let page = self
-            .db
-            .list_in_room(room_id, None, MESH_PAGE * 2)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // Mail is stored via `post_direct`, which never writes `room_messages`,
+        // so the room join finds nothing there; use the direct-message query
+        // exactly as N/F/R do (#408).
+        let page = if room_id == MAIL_ROOM_ID {
+            self.db.list_direct(&username, None, MESH_PAGE * 2).await
+        } else {
+            self.db.list_in_room(room_id, None, MESH_PAGE * 2).await
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
 
         let blocked = self
             .db
@@ -5708,7 +5771,7 @@ impl BbsHost {
     }
 
     async fn handle_fast_forward(&self, session: SessionId) -> Result<Response, HostError> {
-        let (_, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
+        let (username, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -5721,13 +5784,19 @@ impl BbsHost {
             ));
         }
 
-        let recent = self
-            .db
-            .list_recent_in_room(room_id, 1)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        // Mail has no `room_messages` rows; take the newest direct message
+        // instead (#408).
+        let latest = if room_id == MAIL_ROOM_ID {
+            self.db.prev_direct(&username, None).await
+        } else {
+            self.db
+                .list_recent_in_room(room_id, 1)
+                .await
+                .map(|v| v.into_iter().next())
+        }
+        .map_err(|e| HostError::Storage(format!("{e}")))?;
 
-        if let Some(latest) = recent.into_iter().next() {
+        if let Some(latest) = latest {
             self.db
                 .mark_read(user_id, room_id, latest.id)
                 .await
@@ -6946,12 +7015,15 @@ fn help_text(
                 }
                 overview
             }
-            "m" | "mail" if logged_in => HELP_MAIL.to_owned(),
-            "r" | "read" | "reading" if logged_in => HELP_READING.to_owned(),
-            "p" | "post" | "posting" if logged_in => HELP_POSTING.to_owned(),
-            "u" | "users" if logged_in => HELP_USERS.to_owned(),
-            "n" | "nav" | "navigation" if logged_in => HELP_NAVIGATION.to_owned(),
-            "a" | "acct" | "account" if logged_in => HELP_ACCOUNT.to_owned(),
+            // Topics are spelled out. A bare letter that is also a command
+            // (M, R, U, N) must reach `help_for_command` so `H N` explains the
+            // N command instead of the Navigation topic (#407).
+            "mail" if logged_in => HELP_MAIL.to_owned(),
+            "read" | "reading" if logged_in => HELP_READING.to_owned(),
+            "post" | "posting" if logged_in => HELP_POSTING.to_owned(),
+            "users" if logged_in => HELP_USERS.to_owned(),
+            "nav" | "navigation" if logged_in => HELP_NAVIGATION.to_owned(),
+            "acct" | "account" if logged_in => HELP_ACCOUNT.to_owned(),
             "aide" if is_aide => HELP_AIDE.to_owned(),
             "sysop" if is_sysop => HELP_SYSOP.to_owned(),
             cmd => help_for_command(cmd, level),
@@ -6969,7 +7041,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "h" | "help" | "?" => {
             if logged_in {
                 "H — show this help\n\
-                 H M/R/P/U/N/A for topics (mail, reading, posting, users, nav, account)\n\
+                 H MAIL/READ/POST/USERS/NAV/ACCT for topics\n\
                  H <cmd> for detail on one command (eg. H N)"
             } else {
                 "H — show this help."
@@ -6997,6 +7069,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         "f" if logged_in => "F — forward-read (oldest first)\nF <id> to start from a specific message",
         "r" if logged_in => "R — reverse-read (newest first)",
         "s" if logged_in => "S — scan message headers in this room",
+        "search" if logged_in => "SEARCH <query> — find users by username (substring match)",
         ".ff" if logged_in => ".FF — fast-forward past unread\nResets your last-read pointer to the latest message.",
         "e" if logged_in => "E — enter a message\nE <text> to post without a prompt\nIn Mail: E @user message",
         "d" if logged_in => "D <id> — delete a message\nAides and sysops can delete any message.",
@@ -7007,7 +7080,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
             "M — go to Mail (private messages)\n\
              In Mail: E to write, N to read new,\n\
              F/R older/newer, S scan, D <#> delete.\n\
-             H mail for full mail help."
+             H MAIL for full mail help."
         }
         "w" if logged_in => "W — who's online",
         "b" if logged_in => {
@@ -7039,7 +7112,6 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
              U banned — list banned accounts\n\
              U all — list all accounts (sysop)"
         }
-        "s" | "search" if logged_in => "S <query> — find users by username (substring match)",
         "whois" if logged_in => {
             "WHOIS <user> — show account details\n\
              Includes level, status, join date, last login, and active sessions."
@@ -7137,12 +7209,12 @@ fn quick_help_logged_in(keymap: &Keymap) -> String {
 }
 
 const HELP_OVERVIEW: &str = "\
-H M — Mail\n\
-H R — Reading\n\
-H P — Posting\n\
-H U — Users\n\
-H N — Navigation\n\
-H A — Account";
+H MAIL — Mail\n\
+H READ — Reading\n\
+H POST — Posting\n\
+H USERS — Users\n\
+H NAV — Navigation\n\
+H ACCT — Account";
 
 const HELP_READING: &str = "\
 Reading:\n\
@@ -7156,8 +7228,9 @@ Reading:\n\
 /// reading sub-mode (`Workflow::Reading`). Lists only the keys valid there.
 const HELP_READING_MODE: &str = "\
 Reading mode:\n\
- F  next message (forward)\n\
- R  previous message (back)\n\
+ F  next message\n\
+ R  previous message\n\
+ F/R <#>  jump to message\n\
  E  reply to this message\n\
  D  delete message\n\
  H  this help\n\
@@ -7194,7 +7267,7 @@ Account:\n\
  PROFILE edit your display name\n\
  Q      log out\n\
  W      who's online\n\
-H U — Users";
+H USERS — Users";
 
 const HELP_AIDE: &str = "\
 Aide:\n\
@@ -7203,14 +7276,14 @@ Aide:\n\
  BAN <u>  ban a user\n\
  TIMEOUT <u> <d> suspend\n\
  .ER     edit current room\n\
-H U — Users";
+H USERS — Users";
 
 const HELP_USERS: &str = "\
 Users:\n\
  U         list active\n\
  U banned  list banned\n\
  U all     list all\n\
- S <q>     search\n\
+ SEARCH <q> find\n\
  WHOIS <u> details";
 
 const HELP_SYSOP: &str = "\
@@ -14799,5 +14872,159 @@ mod tests {
             "a concurrent reader observed a torn combination of location \
              and share_in_advert — the write wasn't atomic"
         );
+    }
+
+    // ── Parser/help hardening (#407, #408, #410, #415) ───────────────────
+
+    /// #407: a letter that is both a command and a topic alias explains the
+    /// command; the spelled-out topic names still open the topic.
+    #[test]
+    fn help_letter_shows_the_command_not_the_topic() {
+        let lvl = Some(PermissionLevel::User);
+        for (letter, cmd_text, topic_text) in [
+            ("n", "N — read new", "Navigation:"),
+            ("m", "M — go to Mail", "Mail (private messages):"),
+            ("r", "R — reverse-read", "Reading:"),
+            ("u", "U — list active", "Users:"),
+        ] {
+            let got = help_text(Some(letter), lvl, false, &Keymap::native());
+            assert!(got.contains(cmd_text), "H {letter}: {got}");
+            assert!(!got.starts_with(topic_text), "H {letter}: {got}");
+        }
+        for (word, topic_text) in [
+            ("nav", "Navigation:"),
+            ("mail", "Mail (private messages):"),
+            ("reading", "Reading:"),
+            ("users", "Users:"),
+        ] {
+            let got = help_text(Some(word), lvl, false, &Keymap::native());
+            assert!(got.starts_with(topic_text), "H {word}: {got}");
+        }
+    }
+
+    /// #408: S and .FF in Mail use the private-message queries.
+    #[tokio::test]
+    async fn scan_and_fast_forward_work_in_mail() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "pass1234").await;
+        let bob = Username::new("bob").unwrap();
+        let bob_sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, bob_sid, &bob, "pass1234").await;
+        host.db
+            .post_direct(&bob, &alice, "private hello", Timestamp::now())
+            .await
+            .unwrap();
+
+        host.process_command(sid, Command::GoMail).await.unwrap();
+        let text = shown(
+            host.process_command(sid, Command::ScanMessages)
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("private hello"), "{text:?}");
+
+        let text = shown(
+            host.process_command(sid, Command::FastForward)
+                .await
+                .unwrap(),
+        );
+        assert!(text.contains("Skipped"), "{text:?}");
+    }
+
+    /// #415: `R <id>` in reading mode reads that message and stays in
+    /// reading mode, mirroring `F <id>`.
+    #[tokio::test]
+    async fn r_with_an_id_inside_reading_mode_jumps_and_stays() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[0]),
+            },
+        )
+        .await
+        .unwrap();
+
+        for (id, body) in [(ids[2], "third"), (ids[1], "second")] {
+            let text = shown(say(&host, sid, &format!("R {id}")).await);
+            assert!(
+                text.contains(body) && !text.to_lowercase().contains("exited"),
+                "R {id} should show {body:?}, got: {text:?}"
+            );
+            let sessions = host.sessions.read().await;
+            assert!(matches!(sessions[&sid].workflow, Workflow::Reading));
+        }
+    }
+
+    /// #415: a non-numeric argument to R still exits reading mode.
+    #[tokio::test]
+    async fn r_with_something_other_than_a_number_still_exits_reading_mode() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        post_all(&host, sid, &["first"]).await;
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        let text = shown(say(&host, sid, "R x").await);
+        assert!(text.to_lowercase().contains("exited"), "{text:?}");
+    }
+
+    /// #410: bare `E` prompts; `E <text>` stages that text as a draft. Neither
+    /// exits reading mode via the catch-all.
+    #[tokio::test]
+    async fn e_in_reading_mode_replies_with_or_without_text() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first"]).await;
+
+        for reply in ["E", "e"] {
+            host.process_command(
+                sid,
+                Command::ReadForward {
+                    after: Some(ids[0]),
+                },
+            )
+            .await
+            .unwrap();
+            let text = shown(say(&host, sid, reply).await);
+            assert!(text.contains("Post to"), "{text:?}");
+            host.process_command(sid, Command::Cancel).await.unwrap();
+        }
+
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[0]),
+            },
+        )
+        .await
+        .unwrap();
+        let text = shown(say(&host, sid, "E Hello There").await);
+        assert!(
+            text.contains("Hello There") && !text.to_lowercase().contains("exited"),
+            "{text:?}"
+        );
+        {
+            let sessions = host.sessions.read().await;
+            assert!(matches!(
+                sessions[&sid].workflow,
+                Workflow::Compose {
+                    stage: ComposeStage::AwaitingConfirmation { .. },
+                    ..
+                }
+            ));
+        }
+        say(&host, sid, ".").await;
+        let all = crate::db::MessageStore::list_in_room(&host.db, RoomId::new(1), None, 100)
+            .await
+            .unwrap();
+        assert!(all.messages.iter().any(|m| m.content == "Hello There"));
     }
 }

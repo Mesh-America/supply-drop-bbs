@@ -73,9 +73,11 @@ pub fn parse_command(
     // null-terminates its text payloads; without this, "N\0" would not match
     // the "n" keyword and would produce Command::Unknown instead of ReadNew.
     let text = text.trim().trim_matches('\0');
+    let stripped = strip_zero_width(text);
+    let text = stripped.as_str();
 
     // ── Cancel / stop always break out of any workflow ───────────────────────
-    if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {
+    if matches!(text.to_lowercase().as_str(), "cancel" | "stop") {
         return Some(Command::Cancel);
     }
 
@@ -109,7 +111,7 @@ pub fn parse_command(
     // and not in KeymapAction's remappable set — "register"/"login" are
     // reserved keywords a keymap can never bind, see keymap.rs) ────────────
     let (word, rest) = split_first_word(text);
-    let keyword = word.to_ascii_lowercase();
+    let keyword = word.to_lowercase();
 
     match keyword.as_str() {
         // `register <user>` → interactive flow; `register <user> <password>` →
@@ -171,13 +173,22 @@ pub fn parse_command(
 /// Returns `(first_word, rest)` where `rest` is `Some` (trimmed) if there
 /// were characters after the first word, or `None` otherwise.
 fn split_first_word(s: &str) -> (&str, Option<&str>) {
-    match s.find(|c: char| c.is_ascii_whitespace()) {
+    match s.find(char::is_whitespace) {
         None => (s, None),
         Some(i) => {
             let rest = s[i..].trim_start();
             (&s[..i], if rest.is_empty() { None } else { Some(rest) })
         }
     }
+}
+
+/// Strip zero-width and other default-ignorable code points that survive
+/// `trim()`/`to_lowercase()`; see `bbs_plugin_api::command`'s identical
+/// helper for the full rationale (#412).
+fn strip_zero_width(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(*c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
+        .collect()
 }
 
 // ── Response rendering ────────────────────────────────────────────────────────
@@ -225,7 +236,7 @@ pub fn render_notification(notification: &Notification) -> String {
     match notification {
         Notification::Text(t) => t.clone(),
         Notification::MailWaiting { count } => format!(
-            "You have {} unread message{}. Reply 'mail' to read.",
+            "You have {} unread message{}. Reply 'M' to read.",
             count,
             if *count == 1 { "" } else { "s" }
         ),
@@ -703,5 +714,56 @@ mod tests {
     fn render_system_event() {
         let text = render_notification(&Notification::SystemEvent("validated".to_owned()));
         assert!(text.contains("validated") && text.contains("[system]"));
+    }
+
+    // ── Parser hardening (#409, #411, #412, #413) ────────────────────────
+
+    fn hardening(text: &str) -> Option<Command> {
+        parse_command(text, None, false, &Keymap::native())
+    }
+
+    #[test]
+    fn s_is_always_scan_and_search_is_the_user_search() {
+        assert_eq!(hardening("s"), Some(Command::ScanMessages));
+        assert_eq!(hardening("s foo"), Some(Command::ScanMessages));
+        assert_eq!(
+            hardening("search bob"),
+            Some(Command::SearchUsers {
+                query: "bob".to_owned()
+            })
+        );
+        assert!(matches!(hardening("search"), Some(Command::Unknown { .. })));
+    }
+
+    #[test]
+    fn zero_width_characters_cannot_defeat_cancel() {
+        for text in ["cancel\u{200B}", "\u{FEFF}STOP", "ca\u{200D}ncel"] {
+            assert_eq!(hardening(text), Some(Command::Cancel), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn non_breaking_space_splits_keyword_and_argument() {
+        assert!(matches!(
+            hardening("c\u{00A0}lobby"),
+            Some(Command::ChangeRoom { .. })
+        ));
+    }
+
+    #[test]
+    fn f_with_a_bad_id_is_unknown_not_continue() {
+        assert_eq!(
+            hardening("f 10"),
+            Some(Command::ReadForward { after: Some(10) })
+        );
+        assert!(matches!(hardening("f 1o"), Some(Command::Unknown { .. })));
+    }
+
+    /// #409: the notification must name a keyword that parses to GoMail.
+    #[test]
+    fn render_mail_waiting_names_a_real_working_command() {
+        let text = render_notification(&Notification::MailWaiting { count: 1 });
+        assert!(text.contains("'M'"), "{text}");
+        assert_eq!(hardening("M"), Some(Command::GoMail));
     }
 }

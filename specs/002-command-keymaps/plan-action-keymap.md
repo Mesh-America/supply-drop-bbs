@@ -64,10 +64,9 @@ accepted for it.
 typed key, because they are shared by every transport. Only input parsing and
 message rendering know about keys.
 
-The three parsers (`bbs-plugin-api`, `bbs-mesh`, `bbs-meshtastic`) currently
-repeat the same match. They collapse to prefix stripping plus one shared call.
-MeshCore already delegates most keywords on this branch. Meshtastic does not
-use the keymap yet, so it is wired in during this work.
+On this branch `bbs-mesh` and `bbs-meshtastic` already delegate to the shared
+parser after handling prefixes and one-shot `register` and `login`. What is left
+is the shared parser itself, which still translates to native keywords.
 
 ### 3. Reading mode uses the table
 
@@ -225,7 +224,7 @@ manual and marks each one supported, remapped, or not available.
 2. **Coverage note per preset.** Each preset carries a list of source commands
    that do not exist here. It is documentation, shown to the sysop when they
    pick it, and it feeds the docs page for the preset.
-3. **Friendly reply for known missing commands.** A preset may declare a small
+3. **Friendly reply for known missing commands (decided: yes).** A preset may declare a small
    `unsupported` table (keyword to short message). Typing `j` on the Maximus
    preset then says "No file areas on this BBS. Type ? for help." instead of
    "Unknown command". Kept short for radio. This is a new, optional field and
