@@ -83,6 +83,9 @@ pub enum KeymapAction {
     /// While reading: delete the message on screen, or a specific one with
     /// `<key> <id>`.
     ReadingDelete,
+    /// While reading: jump to a message. `<key> <id>` jumps at once; the key
+    /// alone asks for the message number.
+    ReadingJump,
 }
 
 impl KeymapAction {
@@ -105,6 +108,7 @@ impl KeymapAction {
         KeymapAction::ReadingReply,
         KeymapAction::ReadingHelp,
         KeymapAction::ReadingDelete,
+        KeymapAction::ReadingJump,
     ];
 
     /// Whether this action is one of the `Reading*` variants, which live in
@@ -118,6 +122,7 @@ impl KeymapAction {
                 | KeymapAction::ReadingReply
                 | KeymapAction::ReadingHelp
                 | KeymapAction::ReadingDelete
+                | KeymapAction::ReadingJump
         )
     }
 }
@@ -331,6 +336,7 @@ impl Keymap {
                 (A::ReadingReply, &["e"]),
                 (A::ReadingHelp, &["h", "?"]),
                 (A::ReadingDelete, &["d"]),
+                (A::ReadingJump, &["j"]),
             ],
             &[],
             &[],
@@ -396,6 +402,7 @@ impl Keymap {
                 (A::ReadingReply, &["r"]),
                 (A::ReadingHelp, &["?"]),
                 (A::ReadingDelete, &["k"]),
+                (A::ReadingJump, &["jump"]),
             ],
             &[
                 ("f", "No file areas or forwarding on this BBS."),
@@ -461,6 +468,7 @@ impl Keymap {
                 (A::ReadingReply, &["r"]),
                 (A::ReadingHelp, &["?"]),
                 (A::ReadingDelete, &["d", "k"]),
+                (A::ReadingJump, &["j"]),
             ],
             &[
                 ("m", "To write mail: type C for mail, then W @user message."),
@@ -529,6 +537,7 @@ impl Keymap {
                 (A::ReadingReply, &["sr"]),
                 (A::ReadingHelp, &["h", "?"]),
                 (A::ReadingDelete, &["k"]),
+                (A::ReadingJump, &["jump"]),
             ],
             &[
                 ("q", "Type BYE to log off."),
@@ -607,6 +616,7 @@ impl Keymap {
                 (A::ReadingReply, &["re"]),
                 (A::ReadingHelp, &["h", "?"]),
                 (A::ReadingDelete, &["k"]),
+                (A::ReadingJump, &["goto"]),
             ],
             &[
                 ("m", "Graphics mode is not available on this BBS."),
@@ -673,6 +683,7 @@ impl Keymap {
                 (A::ReadingReply, &["w"]),
                 (A::ReadingHelp, &["?"]),
                 (A::ReadingDelete, &["d"]),
+                (A::ReadingJump, &["j"]),
             ],
             &[
                 ("t", "No file areas on this BBS."),
@@ -734,6 +745,7 @@ impl Keymap {
                 (A::ReadingReply, &["a"]),
                 (A::ReadingHelp, &["?"]),
                 (A::ReadingDelete, &["d"]),
+                (A::ReadingJump, &["jump"]),
             ],
             &[
                 ("t", "No file libraries on this BBS."),
@@ -1045,6 +1057,7 @@ mod tests {
             (A::ReadingReply, "e"),
             (A::ReadingHelp, "h"),
             (A::ReadingDelete, "d"),
+            (A::ReadingJump, "j"),
         ] {
             assert_eq!(native.primary(action), key, "{action:?}");
         }
@@ -1252,7 +1265,8 @@ mod tests {
             | KeymapAction::ReadingReverse
             | KeymapAction::ReadingReply
             | KeymapAction::ReadingHelp
-            | KeymapAction::ReadingDelete => {}
+            | KeymapAction::ReadingDelete
+            | KeymapAction::ReadingJump => {}
         }
     }
 

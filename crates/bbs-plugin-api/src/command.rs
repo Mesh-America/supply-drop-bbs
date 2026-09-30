@@ -680,6 +680,8 @@ pub enum ReadingInput {
     /// Delete the message on screen (`None`) or a specific one
     /// (`ReadingDelete`).
     Delete(Option<i64>),
+    /// The jump key alone: ask which message to jump to.
+    JumpPrompt,
     /// Anything else, including a reading key with an argument it does not
     /// take. Reading mode ends.
     Other,
@@ -715,6 +717,8 @@ impl ReadingInput {
             (A::ReadingReply, Some(text)) => ReadingInput::Reply(Some(text.to_owned())),
             (A::ReadingHelp, None) => ReadingInput::Help,
             (A::ReadingDelete, None) => ReadingInput::Delete(None),
+            (A::ReadingJump, None) => ReadingInput::JumpPrompt,
+            (A::ReadingJump, Some(_)) => id().map_or(ReadingInput::Other, ReadingInput::Jump),
             (A::ReadingDelete, Some(_)) => {
                 id().map_or(ReadingInput::Other, |i| ReadingInput::Delete(Some(i)))
             }
@@ -776,7 +780,8 @@ fn parse_action(action: crate::KeymapAction, text: &str, rest: Option<&str>) -> 
         | A::ReadingReverse
         | A::ReadingReply
         | A::ReadingHelp
-        | A::ReadingDelete => Command::Unknown {
+        | A::ReadingDelete
+        | A::ReadingJump => Command::Unknown {
             raw: text.to_owned(),
         },
     }
@@ -1440,6 +1445,9 @@ mod tests {
         assert_eq!(p("?"), ReadingInput::Help);
         assert_eq!(p("d"), ReadingInput::Delete(None));
         assert_eq!(p("d 7"), ReadingInput::Delete(Some(7)));
+        assert_eq!(p("j"), ReadingInput::JumpPrompt);
+        assert_eq!(p("J 9"), ReadingInput::Jump(9));
+        assert_eq!(p("j x"), ReadingInput::Other);
     }
 
     #[test]

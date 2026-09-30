@@ -208,6 +208,7 @@ ReadingReverse = ["p"]
 ReadingReply = ["e"]
 ReadingHelp = ["?"]
 ReadingDelete = ["d"]
+ReadingJump = ["j"]
 
 # Optional: source-BBS keys this board does not support, with the reply.
 [unsupported]

@@ -390,7 +390,7 @@ mod tests {
         );
         assert_eq!(
             km.reading_action_for("j"),
-            Some(bbs_plugin_api::KeymapAction::ReadingForward)
+            Some(bbs_plugin_api::KeymapAction::ReadingJump)
         );
         // Every requested mail command has a reply.
         for key in ["lm", "jm", "rm", "dm", "nm", "cm", "sm", "xm", "qm"] {

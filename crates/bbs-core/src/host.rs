@@ -99,6 +99,8 @@ enum Workflow {
     /// Browsing messages one-at-a-time with F/R navigation.
     /// E replies to the current message; any other input exits.
     Reading,
+    /// Reading mode asked which message to jump to (the jump key alone).
+    ReadingJump,
     /// Choosing a room from the numbered list produced by K.
     /// Stores the ordered room IDs so the user can type a number to jump in
     /// (any id K has ever shown this session remains selectable, regardless
@@ -3749,6 +3751,31 @@ impl BbsHost {
                 self.finalize_login(session, &user).await
             }
 
+            // ── Jump prompt inside reading mode ───────────────────────────────
+            Workflow::ReadingJump => {
+                let id = reply.trim().parse::<i64>().ok();
+                match id {
+                    Some(id) => self.handle_read_forward(session, Some(id)).await,
+                    None => {
+                        // Not a number: go back to reading rather than leave it.
+                        let keymap = self.active_keymap().await;
+                        {
+                            let mut sessions = self.sessions.write().await;
+                            if let Some(r) = sessions.get_mut(&session) {
+                                r.workflow = Workflow::Reading;
+                            }
+                        }
+                        Ok(Response::Prompt {
+                            text: format!(
+                                "Not a message number.\n{}",
+                                reading_footer(&keymap, true, true)
+                            ),
+                            hide_input: false,
+                        })
+                    }
+                }
+            }
+
             // ── Message reading ──────────────────────────────────────────────
             Workflow::Reading => {
                 // Reading mode uses the same keymap as the command prompt: the
@@ -3767,6 +3794,19 @@ impl BbsHost {
                     // after another by number.
                     ReadingInput::Jump(id) => self.handle_read_forward(session, Some(id)).await,
                     ReadingInput::Reverse => self.handle_read_reverse(session, None).await,
+                    // The jump key alone asks for the message number.
+                    ReadingInput::JumpPrompt => {
+                        {
+                            let mut sessions = self.sessions.write().await;
+                            if let Some(r) = sessions.get_mut(&session) {
+                                r.workflow = Workflow::ReadingJump;
+                            }
+                        }
+                        Ok(Response::Prompt {
+                            text: "Message number:".into(),
+                            hide_input: false,
+                        })
+                    }
                     // The reverse counterpart of the jump (#415).
                     ReadingInput::ReverseTo(id) => {
                         self.handle_read_reverse(session, Some(id)).await
@@ -7288,15 +7328,16 @@ fn help_reading_mode(keymap: &Keymap) -> String {
     let reply = keymap.key(KeymapAction::ReadingReply);
     let delete = keymap.key(KeymapAction::ReadingDelete);
     let help = keymap.key(KeymapAction::ReadingHelp);
-    let key_chars: usize = [&fwd, &rev, &reply, &delete, &help]
+    let jump = keymap.key(KeymapAction::ReadingJump);
+    let key_chars: usize = [&fwd, &rev, &reply, &delete, &help, &jump]
         .iter()
         .map(|k| k.chars().count())
         .sum();
     // Long word keys (NEXT, REPLY, DELETE) would push the page over the radio
     // limit, so use a shorter layout for them.
-    if key_chars > 8 {
+    if key_chars > 10 {
         return format!(
-            "Reading mode:\n{fwd} next\n{rev} previous\n{fwd} <#> jump\n{reply} reply\n\
+            "Reading mode:\n{fwd} next\n{rev} previous\n{jump} <#> jump\n{reply} reply\n\
              {delete} delete\n{help} help\nX exit"
         );
     }
@@ -7304,7 +7345,7 @@ fn help_reading_mode(keymap: &Keymap) -> String {
         "Reading mode:\n\
          {fwd}  next message\n\
          {rev}  previous message\n\
-         {fwd}/{rev} <#>  jump to message\n\
+         {jump} <#>  jump to message\n\
          {reply}  reply to this message\n\
          {delete}  delete message\n\
          {help}  this help\n\
@@ -15427,7 +15468,7 @@ mod tests {
         let help = help_reading_mode(&Keymap::maximus_legacy());
         assert!(help.contains("N  next message"), "{help}");
         assert!(help.contains("P  previous message"), "{help}");
-        assert!(help.contains("N/P <#>  jump to message"), "{help}");
+        assert!(help.contains("JUMP <#>  jump to message"), "{help}");
         assert!(help.contains("?  this help"), "{help}");
         assert!(!help.contains("F  next"), "{help}");
 
@@ -15445,7 +15486,7 @@ mod tests {
             "Reading mode:",
             "F  next message",
             "R  previous message",
-            "F/R <#>  jump to message",
+            "J <#>  jump to message",
             "E  reply to this message",
             "D  delete message",
             "H  this help",
@@ -15847,5 +15888,47 @@ mod tests {
         // Native: a bare number at the prompt is an unknown command.
         let cmd = Command::parse_with_keymap("5", false, &Keymap::native());
         assert!(matches!(cmd, Command::Unknown { .. }));
+    }
+
+    /// The jump key asks for a number, then shows that message and stays in
+    /// reading mode; `<key> <id>` jumps at once; a non-number returns to reading.
+    #[tokio::test]
+    async fn the_jump_key_asks_for_a_message_number() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+        *host.keymap.write().await = Keymap::maximus_ng();
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[0]),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Bare J asks, the number answers.
+        let text = shown(say(&host, sid, "j").await);
+        assert_eq!(text, "Message number:");
+        let text = shown(say(&host, sid, &ids[2].to_string()).await);
+        assert!(text.contains("third"), "{text:?}");
+        assert!(matches!(
+            host.sessions.read().await[&sid].workflow,
+            Workflow::Reading
+        ));
+
+        // J with a number jumps at once.
+        let text = shown(say(&host, sid, &format!("J {}", ids[1])).await);
+        assert!(text.contains("second"), "{text:?}");
+
+        // A non-number at the prompt goes back to reading, not out of it.
+        say(&host, sid, "j").await;
+        let text = shown(say(&host, sid, "soon").await);
+        assert!(text.contains("Not a message number"), "{text:?}");
+        assert!(matches!(
+            host.sessions.read().await[&sid].workflow,
+            Workflow::Reading
+        ));
     }
 }

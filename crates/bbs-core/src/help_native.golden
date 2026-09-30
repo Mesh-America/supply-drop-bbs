@@ -911,7 +911,7 @@ H for commands, H reading/posting/navigation/account for topics.
 Reading mode:
 F  next message
 R  previous message
-F/R <#>  jump to message
+J <#>  jump to message
 E  reply to this message
 D  delete message
 H  this help
