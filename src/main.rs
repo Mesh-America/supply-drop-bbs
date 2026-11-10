@@ -356,7 +356,30 @@ enum RoomAction {
         /// Optional one-line description shown in room listings.
         #[arg(long)]
         description: Option<String>,
+        /// Order `N` (read new) shows unread messages: `oldest` (default) or
+        /// `newest` (newest first, for timely channels).
+        #[arg(long, value_parser = parse_read_order)]
+        read_order: Option<String>,
     },
+
+    /// Change settings of an existing room.
+    Set {
+        /// Room name (case-insensitive).
+        name: String,
+        /// Order `N` (read new) shows unread messages: `oldest` or `newest`.
+        #[arg(long, value_parser = parse_read_order)]
+        read_order: String,
+    },
+}
+
+/// Normalise a `--read-order` argument (`oldest`/`newest`, with or without a
+/// `_first` suffix) to the stored form.
+fn parse_read_order(s: &str) -> Result<String, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "oldest" | "oldest_first" | "oldest-first" => Ok("oldest_first".to_owned()),
+        "newest" | "newest_first" | "newest-first" => Ok("newest_first".to_owned()),
+        _ => Err("expected 'oldest' or 'newest'".to_owned()),
+    }
 }
 
 #[cfg(feature = "transport-process")]
@@ -2977,13 +3000,47 @@ async fn cmd_room(cli: &Cli, action: &RoomAction) {
     let host: Arc<dyn bbs_plugin_api::Host> = Arc::new(BbsHost::new(db));
 
     match action {
-        RoomAction::Create { name, description } => {
-            match host.admin_create_room(name, description.as_deref()).await {
-                Ok(room) => println!("created room '{}' (id {})", room.name, room.id),
-                Err(bbs_plugin_api::HostError::PreconditionFailed(msg)) => {
-                    eprintln!("error: {msg}");
+        RoomAction::Create {
+            name,
+            description,
+            read_order,
+        } => match host.admin_create_room(name, description.as_deref()).await {
+            Ok(room) => {
+                println!("created room '{}' (id {})", room.name, room.id);
+                if let Some(order) = read_order.as_deref().filter(|o| *o != "oldest_first") {
+                    match host.admin_set_room_read_order(room.id, order).await {
+                        Ok(_) => println!("read order: {order}"),
+                        Err(e) => {
+                            eprintln!(
+                                "error: room created, but setting its read order failed: {e}"
+                            );
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
+        RoomAction::Set { name, read_order } => {
+            let rooms = match host.admin_list_rooms().await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("error: {e}");
                     std::process::exit(1);
                 }
+            };
+            let Some(room) = rooms.iter().find(|r| r.name.eq_ignore_ascii_case(name)) else {
+                eprintln!("error: no room named '{name}'");
+                std::process::exit(1);
+            };
+            match host.admin_set_room_read_order(room.id, read_order).await {
+                Ok(updated) => println!(
+                    "room '{}' (id {}) read order: {}",
+                    updated.name, updated.id, updated.read_order
+                ),
                 Err(e) => {
                     eprintln!("error: {e}");
                     std::process::exit(1);
@@ -4514,6 +4571,40 @@ mod backup_cli_tests {
         // Even if the backup directory has a file of the same bare name.
         std::fs::write(backups.path().join("mine.zip"), b"y").unwrap();
         assert_eq!(resolve_stage_source(&file, backups.path()), file);
+    }
+
+    #[test]
+    fn room_read_order_args_parse_and_normalise() {
+        use crate::{Cli, Commands, RoomAction};
+        use clap::Parser as _;
+        let c = Cli::try_parse_from(["x", "room", "create", "Alerts", "--read-order", "newest"])
+            .unwrap();
+        let Some(Commands::Room {
+            action: RoomAction::Create { read_order, .. },
+        }) = c.command
+        else {
+            panic!("expected room create");
+        };
+        assert_eq!(read_order.as_deref(), Some("newest_first"));
+
+        let c =
+            Cli::try_parse_from(["x", "room", "set", "Alerts", "--read-order", "OLDEST"]).unwrap();
+        let Some(Commands::Room {
+            action: RoomAction::Set { name, read_order },
+        }) = c.command
+        else {
+            panic!("expected room set");
+        };
+        assert_eq!(
+            (name.as_str(), read_order.as_str()),
+            ("Alerts", "oldest_first")
+        );
+
+        assert!(
+            Cli::try_parse_from(["x", "room", "set", "Alerts", "--read-order", "sideways"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["x", "room", "set", "Alerts"]).is_err());
     }
 
     #[test]
