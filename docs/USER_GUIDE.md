@@ -408,6 +408,26 @@ Type `N` again to continue to the next batch.
 (more — type N again or F 15 to continue)
 ```
 
+#### Newest-first rooms
+
+A sysop can switch a room to **newest first** (for example an emergency
+channel, where the latest message matters most). In such a room `N` shows the
+newest unread messages first, newest at the top, and then marks everything up
+to the newest one as read. If more unread messages are waiting than fit in one
+batch, `N` ends with a hint for reading the earlier ones:
+
+```
+[Alerts — new messages]
+#27 dana: Road closed at the bridge
+#26 eli: Shelter at the school is open
+(older: R, then R 21 to continue)
+```
+
+Those older messages are not shown again by `N`. Press `R` to start reading
+backwards, then `R 21` to start at message #21 and step back from there. Rooms
+are oldest first unless a sysop changes them, and the Mail room is always
+oldest first.
+
 ### Read forward (oldest first)
 
 ```
@@ -985,6 +1005,23 @@ From the command line:
 supply-drop-bbs room create "Ham Radio"
 supply-drop-bbs room create "Net Control" --description "Weekly net check-ins"
 ```
+
+### Setting a room's read order (Sysop only)
+
+Each public room has a read order for `N`: **oldest first** (the default) or
+**newest first**, which shows the most recent unread messages at the top so
+timely information (an emergency channel, say) is seen first. The Mail room has
+no read order. Existing rooms stay oldest first until you change them.
+
+From the command line:
+
+```bash
+supply-drop-bbs room create "Alerts" --read-order newest
+supply-drop-bbs room set Lobby --read-order oldest
+```
+
+From the web admin: **Rooms** → **edit** on the room → **Read order**. The
+change applies to the next `N` and is logged in the audit trail.
 
 ### Deleting a room (Sysop only)
 
