@@ -1908,6 +1908,26 @@ async fn api_update_room(
         }
     }
 
+    // Every field this PATCH changes, for the audit detail (description text
+    // is left out: it can be long, and the audit row only needs to say it
+    // changed).
+    let mut changed: Vec<String> = Vec::new();
+    match &body.description {
+        Some(Some(_)) => changed.push("description=set".to_owned()),
+        Some(None) => changed.push("description=cleared".to_owned()),
+        None => {}
+    }
+    if let Some(v) = body.read_only {
+        changed.push(format!("read_only={v}"));
+    }
+    if let Some(v) = body.min_permission_level {
+        changed.push(format!("min_permission_level={v}"));
+    }
+    if let Some(v) = body.read_order.as_deref() {
+        changed.push(format!("read_order={v}"));
+    }
+    let other_fields = changed.len() - usize::from(body.read_order.is_some());
+
     let mut result = state
         .host
         .admin_update_room(
@@ -1918,22 +1938,26 @@ async fn api_update_room(
         )
         .await;
     if let (Ok(_), Some(order)) = (&result, body.read_order.as_deref()) {
-        result = state.host.admin_set_room_read_order(id, order).await;
+        result = match state.host.admin_set_room_read_order(id, order).await {
+            Ok(room) => Ok(room),
+            Err(e) if other_fields > 0 => {
+                // The first write already landed; say so rather than report a
+                // clean failure. No audit row: the PATCH did not complete.
+                return server_error(&format!(
+                    "the other room changes were saved, but setting the read order failed: {e}"
+                ));
+            }
+            Err(e) => Err(e),
+        };
     }
     match result {
         Ok(room) => {
+            // Audited only once every write has succeeded.
             let actor_str = format!("web:{}", caller.username);
+            let detail = (!changed.is_empty()).then(|| changed.join(", "));
             if let Err(e) = state
                 .host
-                .admin_write_audit(
-                    &actor_str,
-                    "edit_room",
-                    Some(&room.name),
-                    body.read_order
-                        .as_deref()
-                        .map(|o| format!("read_order={o}"))
-                        .as_deref(),
-                )
+                .admin_write_audit(&actor_str, "edit_room", Some(&room.name), detail.as_deref())
                 .await
             {
                 warn!("audit write failed: {e}");
@@ -5384,6 +5408,30 @@ mod tests {
         let resp = patch(1, r#"{"read_only":false,"read_order":"oldest_first"}"#).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await["read_order"], "oldest_first");
+        // The audit detail lists every field the PATCH changed.
+        let log = state
+            .host
+            .admin_audit_log(10, 0, Some("edit_room"))
+            .await
+            .unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.detail.as_deref() == Some("read_only=false, read_order=oldest_first")),
+            "{log:?}"
+        );
+        // An edit that leaves read_order alone does not mention it.
+        let resp = patch(1, r#"{"min_permission_level":0}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let log = state
+            .host
+            .admin_audit_log(10, 0, Some("edit_room"))
+            .await
+            .unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.detail.as_deref() == Some("min_permission_level=0")),
+            "{log:?}"
+        );
 
         // Bad value, Mail room, unknown room.
         assert_eq!(

@@ -57,8 +57,15 @@ async function saveEdit() {
       body.read_only = editReadOnly.value
       body.min_permission_level = editMinLevel.value
     }
-    // The Mail room (id 2) is private and has no read order.
-    if (editTarget.value.id !== 2) body.read_order = editReadOrder.value
+    // The Mail room (id 2) is private and has no read order. Send the order
+    // only when the sysop changed it, so an unrelated edit neither writes a
+    // read_order audit entry nor overwrites a concurrent change.
+    if (
+      editTarget.value.id !== 2 &&
+      editReadOrder.value !== (editTarget.value.read_order ?? 'oldest_first')
+    ) {
+      body.read_order = editReadOrder.value
+    }
     // Send null to clear, string to set
     body.description = editDesc.value.trim() === '' ? null : editDesc.value.trim()
 
