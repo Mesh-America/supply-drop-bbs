@@ -14,8 +14,9 @@ use crate::timestamp::Timestamp;
 use bbs_plugin_api::PermissionLevel;
 use serde::{Deserialize, Serialize};
 
-/// The order in which `N` (read new) presents a public room's unread
-/// messages. Set per room by the sysop; the Mail room ignores it.
+/// The order in which `N` (read new) presents a room's unread messages. Set
+/// per room by the sysop; it applies to every room except Mail, which is
+/// private and always reads oldest-first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReadOrder {

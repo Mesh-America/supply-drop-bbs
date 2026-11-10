@@ -48,6 +48,10 @@ const MAIL_ROOM_ID: RoomId = RoomId::new(2);
 
 /// Messages shown per page for mesh radio (keep short for LoRa).
 const MESH_PAGE: u32 = 5;
+
+/// How many of the newest raw messages a newest-first `N` looks at (#420).
+const NEWEST_FIRST_WINDOW: u32 = 200;
+
 /// Most consecutive blocked messages one `F` or `R` step will skip over.
 const MAX_BLOCKED_SKIP: usize = 200;
 
@@ -621,6 +625,9 @@ impl Host for BbsHost {
             Command::ReadNew => self.handle_read_new(session).await,
             Command::ReadForward { after } => self.handle_read_forward(session, after).await,
             Command::ReadReverse => self.handle_read_reverse(session, None).await,
+            Command::ReadReverseFrom { start_at } => {
+                self.handle_read_reverse(session, Some(start_at)).await
+            }
             Command::ScanMessages => self.handle_scan(session).await,
             Command::FastForward => self.handle_fast_forward(session).await,
 
@@ -5027,7 +5034,7 @@ impl BbsHost {
             raw_after
         };
 
-        // A newest-first public room (#420) shows the newest unread page first.
+        // A newest-first room (#420) shows the newest unread page first.
         // The Mail room is private and always reads oldest-first.
         if room_id != MAIL_ROOM_ID
             && RoomStore::get_read_order(&self.db, room_id)
@@ -5102,11 +5109,18 @@ impl BbsHost {
         Ok(Response::MultiText(parts))
     }
 
-    /// `N` for a newest-first room (#420): the newest page of unread messages,
-    /// newest at the top, then the read pointer moves to the newest message
-    /// seen (blocked senders included, as the oldest-first path does for its raw
-    /// page). Older unread messages that did not fit are not shown again by `N`;
-    /// a trailing hint says how to reach them with reading mode's `R <id>`.
+    /// `N` for a newest-first room (#420; every room except Mail): the newest
+    /// page of unread messages, newest at the top.
+    ///
+    /// A bounded window of the newest raw messages is fetched, only ids above
+    /// the read pointer are kept and blocked senders dropped; up to
+    /// [`MESH_PAGE`] visible messages are shown. The read pointer then moves to
+    /// the newest raw message fetched (blocked senders included), so it is
+    /// monotonic. If more visible unread messages remain below the page, a
+    /// trailing hint names the next-older one (`R <id>`). If no visible unread
+    /// message is in the window the reply is "No new messages". The fetch and
+    /// the pointer update are separate queries, not one atomic step: a message
+    /// posted in between is simply picked up by the next `N`.
     async fn read_new_newest_first(
         &self,
         user_id: UserId,
@@ -5115,28 +5129,28 @@ impl BbsHost {
         room_id: RoomId,
         after: Option<MessageId>,
     ) -> Result<Response, HostError> {
-        // One extra message tells us whether older unread messages exist.
         let mut unread = self
             .db
-            .list_recent_in_room(room_id, MESH_PAGE + 1)
+            .list_recent_in_room(room_id, NEWEST_FIRST_WINDOW)
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
         unread.retain(|m| after.is_none_or(|a| m.id > a));
-        let older = if unread.len() > MESH_PAGE as usize {
-            unread.pop().map(|m| m.id)
-        } else {
-            None
-        };
 
         let blocked = self
             .db
             .blocks_by(username.as_str())
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
-        let visible: Vec<_> = unread
+        let mut visible: Vec<_> = unread
             .iter()
             .filter(|m| !blocked.contains(m.sender.as_str()))
             .collect();
+        let older = if visible.len() > MESH_PAGE as usize {
+            visible.get(MESH_PAGE as usize).map(|m| m.id)
+        } else {
+            None
+        };
+        visible.truncate(MESH_PAGE as usize);
 
         if let Some(newest) = unread.first() {
             self.db
@@ -5160,9 +5174,8 @@ impl BbsHost {
             }
         }
         if let Some(id) = older {
-            // `R <id>` starts AT that message and steps backwards; it only
-            // works once reading mode is on, which a bare `R` enters.
-            parts.push(format!("(older: R, then R {} to continue)", id.as_i64()));
+            // `R <id>` starts AT that message and steps backwards.
+            parts.push(format!("(older: R {} to continue)", id.as_i64()));
         }
         Ok(Response::MultiText(parts))
     }
@@ -6976,6 +6989,7 @@ fn cmd_label(cmd: &Command) -> &'static str {
         Command::ReadNew => "ReadNew",
         Command::ReadForward { .. } => "ReadForward",
         Command::ReadReverse => "ReadReverse",
+        Command::ReadReverseFrom { .. } => "ReadReverseFrom",
         Command::ScanMessages => "ScanMessages",
         Command::FastForward => "FastForward",
         Command::EnterMessage { .. } => "EnterMessage",
@@ -10813,7 +10827,7 @@ mod tests {
         let hint = parts.last().unwrap();
         assert_eq!(
             hint,
-            &format!("(older: R, then R {} to continue)", ids[1]),
+            &format!("(older: R {} to continue)", ids[1]),
             "hint names the next older message"
         );
         assert!(hint.len() <= 156);
@@ -10876,6 +10890,85 @@ mod tests {
             Some(eve_id)
         );
         let _ = ids;
+    }
+
+    #[tokio::test]
+    async fn newest_first_keeps_older_unread_when_newest_page_is_all_blocked() {
+        use crate::db::MessageStore as _;
+        use crate::room::ReadOrder;
+        let (host, _tmp, sid, _uid, ids) = order_fixture(ReadOrder::NewestFirst, 3).await;
+        let eve = Username::new("eve").unwrap();
+        for i in 0..MESH_PAGE {
+            host.db
+                .post_to_room(RoomId::new(1), &eve, &format!("e{i}"), Timestamp::now())
+                .await
+                .unwrap();
+        }
+        host.db.block_user("alice", "eve").await.unwrap();
+        let parts = read_new_parts(&host, sid).await;
+        assert_eq!(parts.len(), 3, "older unread must still show: {parts:?}");
+        assert!(
+            parts[0].contains("m3") && parts[2].contains("m1"),
+            "{parts:?}"
+        );
+        let _ = ids;
+    }
+
+    #[tokio::test]
+    async fn newest_first_hint_names_a_visible_message() {
+        use crate::db::MessageStore as _;
+        use crate::room::ReadOrder;
+        let (host, _tmp, sid, _uid, ids) =
+            order_fixture(ReadOrder::NewestFirst, MESH_PAGE as usize).await;
+        // A blocked message sits right below the visible page.
+        let eve = Username::new("eve").unwrap();
+        let eve_id = host
+            .db
+            .post_to_room(RoomId::new(1), &eve, "from eve", Timestamp::now())
+            .await
+            .unwrap();
+        // Make the blocked message the oldest unread by posting visible ones after it.
+        let mut newer = Vec::new();
+        for i in 0..MESH_PAGE {
+            let id = host
+                .db
+                .post_to_room(
+                    RoomId::new(1),
+                    &Username::new("bob").unwrap(),
+                    &format!("n{i}"),
+                    Timestamp::now(),
+                )
+                .await
+                .unwrap();
+            newer.push(id.as_i64());
+        }
+        host.db.block_user("alice", "eve").await.unwrap();
+        let parts = read_new_parts(&host, sid).await;
+        let hint = parts.last().unwrap();
+        // Next older visible message is the newest of the first batch, not eve's.
+        assert_eq!(
+            hint,
+            &format!("(older: R {} to continue)", ids[MESH_PAGE as usize - 1])
+        );
+        assert_ne!(*hint, format!("(older: R {} to continue)", eve_id.as_i64()));
+    }
+
+    #[test]
+    fn newest_first_hint_fits_the_radio_limit_with_a_19_digit_id() {
+        let hint = format!("(older: R {} to continue)", i64::MAX);
+        assert!(hint.len() <= 156, "{} bytes", hint.len());
+    }
+
+    #[tokio::test]
+    async fn top_level_r_with_an_id_reads_from_that_message() {
+        use crate::room::ReadOrder;
+        let (host, _tmp, sid, _uid, ids) = order_fixture(ReadOrder::OldestFirst, 3).await;
+        let r = host
+            .process_command(sid, Command::ReadReverseFrom { start_at: ids[1] })
+            .await
+            .unwrap();
+        let text = shown(r);
+        assert!(text.contains("m2"), "{text:?}");
     }
 
     #[tokio::test]
