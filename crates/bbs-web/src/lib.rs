@@ -7082,9 +7082,16 @@ mod tests {
                 .admin_write_audit("sysop", "ban", Some("bob"), None)
                 .await
                 .expect("write an audit entry");
+            // The entry is stamped with the real clock, so archive the month
+            // it landed in rather than a fixed one.
+            let now = time::OffsetDateTime::now_utc();
             f.state
                 .host
-                .admin_archive_audit_log(&f.archive_dir.path().to_string_lossy(), 2026, 9)
+                .admin_archive_audit_log(
+                    &f.archive_dir.path().to_string_lossy(),
+                    now.year(),
+                    u32::from(u8::from(now.month())),
+                )
                 .await
                 .expect("archive")
                 .expect("something to archive")
