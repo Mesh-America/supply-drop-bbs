@@ -10734,7 +10734,8 @@ mod tests {
         let (host, tmp) = make_host().await;
         let sid = host.create_session("test").await.unwrap();
         let alice = Username::new("alice").unwrap();
-        register_and_login(&host, sid, &alice, "pass1234").await;
+        let pw = random_test_password();
+        register_and_login(&host, sid, &alice, &pw).await;
         let uid = UserStore::get_by_username(&host.db, &alice)
             .await
             .unwrap()
