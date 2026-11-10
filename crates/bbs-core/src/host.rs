@@ -1779,8 +1779,9 @@ impl Host for BbsHost {
             // The archive is renamed into place before the entries it took
             // are cleared, so an existing archive with those entries still
             // live means a previous run died in that gap. Finish its clear —
-            // bounded by the range the archive itself records, so only
-            // entries demonstrably inside it are removed — rather than
+            // bounded by the id the archive itself records AND by this
+            // month's date range (as the normal path is), so older months
+            // that were never archived are not swept up — rather than
             // leaving them to be swept into next month's archive under the
             // wrong name.
             let path = target.clone();
@@ -1799,13 +1800,13 @@ impl Host for BbsHost {
                 Some(archived_through) => {
                     let stranded = self
                         .db
-                        .audit_count_through(archived_through)
+                        .audit_count_in_range(archived_through, &month_start, &month_end)
                         .await
                         .map_err(storage)?;
                     if stranded > 0 {
                         let removed = self
                             .db
-                            .audit_delete_through(archived_through)
+                            .audit_delete_in_range(archived_through, &month_start, &month_end)
                             .await
                             .map_err(storage)?;
                         tracing::warn!(
@@ -5543,25 +5544,32 @@ impl BbsHost {
             ));
         }
 
-        MessageStore::delete(&self.db, msg_id)
-            .await
-            .map_err(|e| HostError::Storage(format!("{e}")))?;
-
-        // Audit when a privileged user moderates someone else's content.
+        // Audit when a privileged user moderates someone else's content. The
+        // audit row commits in the same transaction as the delete, so a
+        // privileged destruction of (possibly private) mail is never
+        // unaudited. For mail the detail names both parties.
         if level >= PermissionLevel::Aide && msg.sender != username {
-            let detail = format!("by {}", msg.sender.as_str());
-            if let Err(e) = self
-                .db
-                .audit_write(
-                    username.as_str(),
-                    "delete_message",
-                    Some(&format!("#{id}")),
-                    Some(&detail),
+            let detail = match &msg.recipient {
+                Some(r) => format!("by {} to {}", msg.sender.as_str(), r.as_str()),
+                None => format!("by {}", msg.sender.as_str()),
+            };
+            let target = format!("#{id}");
+            self.db
+                .delete_message_audited(
+                    msg_id,
+                    Some(crate::db::MessageDeleteAudit {
+                        actor: username.as_str(),
+                        action: "delete_message",
+                        target: &target,
+                        detail: &detail,
+                    }),
                 )
                 .await
-            {
-                tracing::warn!("audit write failed: {e}");
-            }
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+        } else {
+            MessageStore::delete(&self.db, msg_id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
         }
 
         Ok(Response::Text(format!("Message #{id} deleted.")))
@@ -12147,6 +12155,60 @@ mod tests {
         );
     }
 
+    /// Crash recovery is bounded by the archive's month, not just its id
+    /// ceiling: an earlier month that was never archived (its own archive
+    /// failed, and the catch-up loop carried on) must survive finishing a
+    /// later month's interrupted clear.
+    #[tokio::test]
+    async fn finishing_an_interrupted_clear_keeps_earlier_unarchived_months() {
+        let (host, _db) = make_host().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dir_str = dir.path().to_string_lossy().to_string();
+
+        host.db
+            .audit_write_at_for_test(1, "sysop", "ban", "august", "2026-08-10T09:00:00Z")
+            .await
+            .unwrap();
+        host.db
+            .audit_write_in_2026_09_for_test("sysop", "ban", "september")
+            .await
+            .unwrap();
+        host.admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .unwrap()
+            .expect("september archive");
+
+        // Crash stand-in: September's entry is back in the live log.
+        let archived_through = crate::audit_archive::archived_through(
+            &dir.path().join("audit-2026-09.zip"),
+            &crate::audit_archive::entry_name(2026, 9),
+        )
+        .unwrap()
+        .expect("the archive records its range");
+        host.db
+            .audit_restore_for_test(archived_through, "sysop", "ban", "september")
+            .await
+            .unwrap();
+
+        let again = host
+            .admin_archive_audit_log(&dir_str, 2026, 9)
+            .await
+            .expect("re-running should not be an error");
+        assert!(again.is_none());
+
+        let left = host.admin_audit_log(50, 0, None).await.unwrap();
+        assert!(
+            left.iter().any(|e| e.target.as_deref() == Some("august")),
+            "the never-archived August entry must survive: {left:?}"
+        );
+        assert!(
+            !left
+                .iter()
+                .any(|e| e.target.as_deref() == Some("september")),
+            "the stranded September entry should be cleared: {left:?}"
+        );
+    }
+
     /// An existing archive whose range can't be read leaves the live log
     /// alone and says so, rather than guessing at what it holds.
     #[tokio::test]
@@ -14478,6 +14540,151 @@ mod tests {
                 .unwrap(),
         );
         assert!(text.contains("Skipped"), "{text:?}");
+    }
+
+    /// Deleting the direct message a user's Mail read pointer sits on must
+    /// not reset that pointer to NULL (which reads as "all caught up" and
+    /// would mark every other unread mail read).
+    #[tokio::test]
+    async fn deleting_the_pointed_at_direct_message_keeps_other_mail_unread() {
+        let (host, _tmp) = make_host().await;
+        let pw = random_test_password();
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, &pw).await;
+        let bob = Username::new("bob").unwrap();
+        let bob_sid = host.create_session("test").await.unwrap();
+        register_and_login(&host, bob_sid, &bob, &pw).await;
+        let alice_id = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+
+        let mut ids = Vec::new();
+        for body in ["one", "two", "three", "four"] {
+            ids.push(
+                host.db
+                    .post_direct(&bob, &alice, body, Timestamp::now())
+                    .await
+                    .unwrap(),
+            );
+        }
+        // Alice has read up to "one"; "two".."four" are unread.
+        host.db
+            .mark_read(alice_id, MAIL_ROOM_ID, ids[0])
+            .await
+            .unwrap();
+        assert_eq!(
+            host.db
+                .unread_direct_count(&alice, alice_id, MAIL_ROOM_ID)
+                .await
+                .unwrap(),
+            3
+        );
+
+        // Bob (the sender) deletes the message alice's pointer is on, which
+        // is the first direct message: no earlier one to fall back to.
+        assert!(MessageStore::delete(&host.db, ids[0]).await.unwrap());
+        assert_eq!(
+            host.db
+                .unread_direct_count(&alice, alice_id, MAIL_ROOM_ID)
+                .await
+                .unwrap(),
+            3,
+            "the other unread mail must stay unread"
+        );
+
+        // Pointer on "two"; delete it: pointer falls back, "three" and
+        // "four" stay unread.
+        host.db
+            .mark_read(alice_id, MAIL_ROOM_ID, ids[1])
+            .await
+            .unwrap();
+        assert_eq!(
+            host.db
+                .unread_direct_count(&alice, alice_id, MAIL_ROOM_ID)
+                .await
+                .unwrap(),
+            2
+        );
+        assert!(MessageStore::delete(&host.db, ids[1]).await.unwrap());
+        assert_eq!(
+            host.db
+                .unread_direct_count(&alice, alice_id, MAIL_ROOM_ID)
+                .await
+                .unwrap(),
+            2,
+            "deleting the pointed-at message must not mark the rest read"
+        );
+    }
+
+    /// An aide deleting someone else's private mail leaves an audit row
+    /// naming both parties, committed with the delete.
+    #[tokio::test]
+    async fn aide_deleting_private_mail_is_audited_with_the_recipient() {
+        let (host, _tmp) = make_host().await;
+        let pw = random_test_password();
+        let alice = Username::new("alice").unwrap();
+        let bob = Username::new("bob").unwrap();
+        let carol = Username::new("carol").unwrap();
+        for (name, sess_name) in [(&alice, "a"), (&bob, "b"), (&carol, "c")] {
+            let s = host.create_session(sess_name).await.unwrap();
+            register_and_login(&host, s, name, &pw).await;
+        }
+        let carol_sid = {
+            let sessions = host.sessions.read().await;
+            *sessions
+                .iter()
+                .find(|(_, r)| r.username.as_ref() == Some(&carol))
+                .map(|(k, _)| k)
+                .unwrap()
+        };
+        let carol_user = UserStore::get_by_username(&host.db, &carol)
+            .await
+            .unwrap()
+            .unwrap();
+        UserStore::update(
+            &host.db,
+            carol_user.id,
+            None,
+            None,
+            Some(PermissionLevel::Aide),
+            None,
+        )
+        .await
+        .unwrap();
+        {
+            let mut sessions = host.sessions.write().await;
+            sessions.get_mut(&carol_sid).unwrap().level = PermissionLevel::Aide;
+        }
+        let id = host
+            .db
+            .post_direct(&bob, &alice, "secret", Timestamp::now())
+            .await
+            .unwrap();
+
+        host.process_command(carol_sid, Command::GoMail)
+            .await
+            .unwrap();
+        let out = shown(
+            host.process_command(carol_sid, Command::DeleteMessage { id: id.as_i64() })
+                .await
+                .unwrap(),
+        );
+        assert!(out.contains("deleted"), "{out:?}");
+
+        let log = host
+            .admin_audit_log(50, 0, Some("delete_message"))
+            .await
+            .unwrap();
+        assert_eq!(log.len(), 1, "{log:?}");
+        assert_eq!(log[0].actor, "carol");
+        let detail = log[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("bob") && detail.contains("alice"),
+            "{detail}"
+        );
     }
 
     /// #415: `R <id>` in reading mode reads that message and stays in
