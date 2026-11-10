@@ -14,6 +14,39 @@ use crate::timestamp::Timestamp;
 use bbs_plugin_api::PermissionLevel;
 use serde::{Deserialize, Serialize};
 
+/// The order in which `N` (read new) presents a room's unread messages. Set
+/// per room by the sysop; it applies to every room except Mail, which is
+/// private and always reads oldest-first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadOrder {
+    /// Oldest unread message first (the default).
+    #[default]
+    OldestFirst,
+    /// Newest unread message first, for timely channels.
+    NewestFirst,
+}
+
+impl ReadOrder {
+    /// The value stored in the database and exchanged with the admin API.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OldestFirst => "oldest_first",
+            Self::NewestFirst => "newest_first",
+        }
+    }
+
+    /// Parse the stored / API form (`oldest_first` or `newest_first`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "oldest_first" => Some(Self::OldestFirst),
+            "newest_first" => Some(Self::NewestFirst),
+            _ => None,
+        }
+    }
+}
+
 /// A named topic in the BBS.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Room {
@@ -246,6 +279,16 @@ mod tests {
             Err(InvalidRoomDescription::NullByte(_)) => {}
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    #[test]
+    fn read_order_round_trips_and_defaults_to_oldest_first() {
+        assert_eq!(ReadOrder::default(), ReadOrder::OldestFirst);
+        for o in [ReadOrder::OldestFirst, ReadOrder::NewestFirst] {
+            assert_eq!(ReadOrder::parse(o.as_str()), Some(o));
+        }
+        assert_eq!(ReadOrder::parse("newest"), None);
+        assert_eq!(ReadOrder::parse(""), None);
     }
 
     #[test]

@@ -171,7 +171,15 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             },
         },
 
-        "r" => Some(Command::ReadReverse),
+        "r" => match rest {
+            None => Some(Command::ReadReverse),
+            Some(s) => match s.parse::<i64>() {
+                Ok(start_at) => Some(Command::ReadReverseFrom { start_at }),
+                Err(_) => Some(Command::Unknown {
+                    raw: text.to_owned(),
+                }),
+            },
+        },
 
         // Bare `s` scans; `s <text>` is Unknown, never a silent scan (#411,
         // F-008) — see bbs-plugin-api::Command::parse's identical arm.
@@ -893,6 +901,16 @@ mod tests {
             hardening("c\u{00A0}lobby"),
             Some(Command::ChangeRoom { .. })
         ));
+    }
+
+    #[test]
+    fn r_with_an_id_starts_reverse_reading_there() {
+        assert_eq!(hardening("r"), Some(Command::ReadReverse));
+        assert_eq!(
+            hardening("R 3"),
+            Some(Command::ReadReverseFrom { start_at: 3 })
+        );
+        assert!(matches!(hardening("r abc"), Some(Command::Unknown { .. })));
     }
 
     #[test]

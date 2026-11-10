@@ -615,6 +615,21 @@ pub trait Host: Send + Sync {
         Err(HostError::NotSupported("admin_update_room".into()))
     }
 
+    /// Set how `N` (read new) orders a public room's unread messages:
+    /// `"oldest_first"` (the default) or `"newest_first"`.
+    ///
+    /// Returns `HostError::PreconditionFailed` for an unknown value or the
+    /// Mail room (which ignores the setting), `HostError::NotFound` for an
+    /// unknown room, and the updated `AdminRoomSummary` on success.
+    async fn admin_set_room_read_order(
+        &self,
+        room_id: i64,
+        read_order: &str,
+    ) -> Result<AdminRoomSummary, HostError> {
+        let _ = (room_id, read_order);
+        Err(HostError::NotSupported("admin_set_room_read_order".into()))
+    }
+
     /// Search room messages (excludes private Mail DMs).
     ///
     /// `sender`: filter by exact username; `None` = all senders.

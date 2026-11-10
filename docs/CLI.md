@@ -694,6 +694,35 @@ Equivalent to the in-BBS `TIMEOUT <username> <days>` (Aide+) command, and to the
 
 ---
 
+### `room create` / `room set`
+
+```
+supply-drop-bbs room create <NAME> [--description <TEXT>] [--read-order <oldest|newest>]
+supply-drop-bbs room set <NAME> --read-order <oldest|newest>
+```
+
+`room create` adds a room at the end of the room list. `room set` changes a setting of an existing room, found by name: an exact match wins, otherwise a unique case-insensitive match is used, and an ambiguous name is refused with an error.
+
+`--read-order` chooses how `N` (read new) presents a room's unread messages: `oldest` (the default, oldest unread first) or `newest` (newest unread first, for timely rooms such as an emergency channel). The Mail room is private and has no read order. See the [User Guide](USER_GUIDE.md) for what readers see.
+
+| Argument / flag | Description |
+|-----------------|-------------|
+| `<NAME>` | Room name |
+| `--description <TEXT>` | `create` only: one-line description |
+| `--read-order <oldest\|newest>` | Read order for `N` (also accepts `oldest_first` / `newest_first`) |
+
+```sh
+supply-drop-bbs room create "Alerts" --read-order newest
+supply-drop-bbs room set Alerts --read-order oldest
+# room 'Alerts' (id 6) read order: oldest_first
+```
+
+**Exit codes:** `0` on success; `1` if the room is not found, the name is already taken, or the database cannot be opened. A value other than `oldest`/`newest` is rejected by argument parsing and exits `2`, as clap does for any invalid argument.
+
+The same setting is in the web admin's Rooms page (edit). Running the CLI against a database migrates it to schema 0016; after that an older binary cannot open it, so rolling back to an older version is not supported.
+
+---
+
 ### `contacts list` / `contacts discovered` / `contacts delete`
 
 ```
