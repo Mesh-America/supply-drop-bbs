@@ -652,7 +652,7 @@ When you log in and have unread mail, the BBS will notify you. On radio
 transports you may receive an unsolicited push notification:
 
 ```
-You have 2 unread messages. Reply 'mail' to read.
+You have 2 unread messages. Reply 'M' to read.
 ```
 
 ---
@@ -699,9 +699,9 @@ Finds accounts whose username contains `<query>` (substring match). Handy when
 you remember part of a callsign but not the whole thing. Aides and sysops only;
 other users are told "Aide access required."
 
-> **Note:** `S` scans message headers in your current room, whatever follows
-> it — see [section 8](#8-reading-messages). Only `SEARCH <query>` searches
-> users.
+> **Note:** `S` on its own scans message headers in your current room — see
+> [section 8](#8-reading-messages). `S` takes no text: `S <text>` is not
+> recognised. Only `SEARCH <query>` searches users.
 
 ### User details
 
@@ -724,7 +724,7 @@ Online (1 session)
 
 (The `Name`, `Last login`, and `Online` lines appear only when applicable.)
 
-These commands are also grouped under `H U` (the **Users** help topic).
+These commands are also grouped under `H USERS` (the **Users** help topic).
 
 ---
 
