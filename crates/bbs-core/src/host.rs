@@ -10287,6 +10287,12 @@ mod tests {
         );
     }
 
+    /// A random password for tests that don't care what it is, so no fixed
+    /// credential is written into the source.
+    fn random_test_password() -> String {
+        format!("pw-{}", uuid::Uuid::new_v4().simple())
+    }
+
     // ── Test helper: register + login in one call ─────────────────────────────
 
     /// Register `username` with `password` and complete the login flow.
@@ -14446,12 +14452,13 @@ mod tests {
     #[tokio::test]
     async fn scan_and_fast_forward_work_in_mail() {
         let (host, _tmp) = make_host().await;
+        let pw = random_test_password();
         let sid = host.create_session("test").await.unwrap();
         let alice = Username::new("alice").unwrap();
-        register_and_login(&host, sid, &alice, "pass1234").await;
+        register_and_login(&host, sid, &alice, &pw).await;
         let bob = Username::new("bob").unwrap();
         let bob_sid = host.create_session("test").await.unwrap();
-        register_and_login(&host, bob_sid, &bob, "pass1234").await;
+        register_and_login(&host, bob_sid, &bob, &pw).await;
         host.db
             .post_direct(&bob, &alice, "private hello", Timestamp::now())
             .await
@@ -14478,8 +14485,9 @@ mod tests {
     #[tokio::test]
     async fn r_with_an_id_inside_reading_mode_jumps_and_stays() {
         let (host, _tmp) = make_host().await;
+        let pw = random_test_password();
         let sid = host.create_session("test").await.unwrap();
-        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), &pw).await;
         let ids = post_all(&host, sid, &["first", "second", "third"]).await;
         host.process_command(
             sid,
@@ -14505,8 +14513,9 @@ mod tests {
     #[tokio::test]
     async fn r_with_something_other_than_a_number_still_exits_reading_mode() {
         let (host, _tmp) = make_host().await;
+        let pw = random_test_password();
         let sid = host.create_session("test").await.unwrap();
-        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), &pw).await;
         post_all(&host, sid, &["first"]).await;
         host.process_command(sid, Command::ReadForward { after: None })
             .await
@@ -14520,8 +14529,9 @@ mod tests {
     #[tokio::test]
     async fn e_in_reading_mode_replies_with_or_without_text() {
         let (host, _tmp) = make_host().await;
+        let pw = random_test_password();
         let sid = host.create_session("test").await.unwrap();
-        register_and_login(&host, sid, &Username::new("alice").unwrap(), "pass1234").await;
+        register_and_login(&host, sid, &Username::new("alice").unwrap(), &pw).await;
         let ids = post_all(&host, sid, &["first"]).await;
 
         for reply in ["E", "e"] {
