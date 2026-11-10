@@ -29,6 +29,9 @@
 //! [`render_notification`] converts a [`Notification`] (a host-initiated push)
 //! into the text string delivered via `OutboundFrame::SendTxtMsg`.
 
+use bbs_plugin_api::command::{
+    is_cancel_line, normalise_keyword, skip_leading_noise, split_first_word, trim_line,
+};
 use bbs_plugin_api::{event::Notification, identity::Username, Command, PermissionLevel, Response};
 
 // ── Command parsing ───────────────────────────────────────────────────────────
@@ -51,12 +54,12 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
     // Trim standard whitespace and null bytes.  Some MeshCore firmware
     // null-terminates its text payloads; without this, "N\0" would not match
     // the "n" keyword and would produce Command::Unknown instead of ReadNew.
-    let text = text.trim().trim_matches('\0');
-    let stripped = strip_zero_width(text);
-    let text = stripped.as_str();
+    // `raw` is the payload form (trimmed of whitespace/NULs only). Invisible
+    // characters are stripped from a probe copy for CANCEL/STOP and keyword
+    // matching, never from payloads (workflow replies, passwords, bodies).
+    let raw = trim_line(text);
 
-    // ── Cancel / stop always break out of any workflow ───────────────────────
-    if matches!(text.to_lowercase().as_str(), "cancel" | "stop") {
+    if is_cancel_line(raw) {
         return Some(Command::Cancel);
     }
 
@@ -65,21 +68,21 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
     // regardless of whether it looks like a command keyword.
     if awaiting_reply {
         return Some(Command::WorkflowReply {
-            reply: text.to_owned(),
+            reply: raw.to_owned(),
         });
     }
 
     // ── Strip optional command prefix ────────────────────────────────────────
     let text = if let Some(p) = prefix {
-        if let Some(stripped) = text.strip_prefix(p) {
-            stripped.trim_start()
+        if let Some(stripped) = skip_leading_noise(raw).strip_prefix(p) {
+            skip_leading_noise(stripped)
         } else {
             // Prefix is configured but this message doesn't start with it —
             // not a command and no workflow is active.
             return None;
         }
     } else {
-        text
+        skip_leading_noise(raw)
     };
 
     if text.is_empty() {
@@ -90,7 +93,7 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
     // Split on the first run of whitespace: `word` is the command keyword,
     // `rest` is the remainder (trimmed), or None if there is none.
     let (word, rest) = split_first_word(text);
-    let keyword = word.to_lowercase();
+    let keyword = normalise_keyword(word);
 
     match keyword.as_str() {
         "h" | "help" | "?" => Some(Command::Help {
@@ -170,9 +173,14 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
 
         "r" => Some(Command::ReadReverse),
 
-        // Unconditionally ScanMessages regardless of trailing text (#411) —
-        // see bbs-plugin-api::Command::parse's identical arm for the reason.
-        "s" => Some(Command::ScanMessages),
+        // Bare `s` scans; `s <text>` is Unknown, never a silent scan (#411,
+        // F-008) — see bbs-plugin-api::Command::parse's identical arm.
+        "s" => match rest {
+            None => Some(Command::ScanMessages),
+            Some(_) => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
+        },
 
         "search" => match rest {
             Some(q) if !q.is_empty() => Some(Command::SearchUsers {
@@ -343,34 +351,6 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
             raw: text.to_owned(),
         }),
     }
-}
-
-/// Split `s` on the first run of whitespace.
-///
-/// Unicode-aware (`char::is_whitespace`), matching `text.trim()`'s own
-/// whitespace definition — an ASCII-only split here left a line joined by
-/// e.g. a non-breaking space (U+00A0) as one unmatched word instead of
-/// keyword + argument (#413).
-///
-/// Returns `(first_word, rest)` where `rest` is `Some` (trimmed) if there
-/// were characters after the first word, or `None` otherwise.
-fn split_first_word(s: &str) -> (&str, Option<&str>) {
-    match s.find(char::is_whitespace) {
-        None => (s, None),
-        Some(i) => {
-            let rest = s[i..].trim_start();
-            (&s[..i], if rest.is_empty() { None } else { Some(rest) })
-        }
-    }
-}
-
-/// Strip zero-width and other default-ignorable code points that survive
-/// `trim()`/`to_lowercase()` — see `bbs_plugin_api::command`'s identical
-/// helper for the full rationale (#412).
-fn strip_zero_width(s: &str) -> String {
-    s.chars()
-        .filter(|c| !matches!(*c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
-        .collect()
 }
 
 /// Parse a `.AIDE` / `.SYSOP` / `.USER <user>` set-level command. (#127)
@@ -888,9 +868,9 @@ mod tests {
     }
 
     #[test]
-    fn s_is_always_scan_and_search_is_the_user_search() {
+    fn s_scans_only_when_bare_and_search_is_the_user_search() {
         assert_eq!(hardening("s"), Some(Command::ScanMessages));
-        assert_eq!(hardening("s foo"), Some(Command::ScanMessages));
+        assert!(matches!(hardening("s foo"), Some(Command::Unknown { .. })));
         assert_eq!(
             hardening("search bob"),
             Some(Command::SearchUsers {
@@ -922,5 +902,132 @@ mod tests {
             Some(Command::ReadForward { after: Some(10) })
         );
         assert!(matches!(hardening("f 1o"), Some(Command::Unknown { .. })));
+    }
+
+    // ── Audit regressions (F-001, F-005, F-006, F-008) ───────────────────
+
+    #[test]
+    fn payloads_keep_zero_width_joiners_when_awaiting_reply() {
+        for text in [
+            "family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "mi\u{200C}xed",
+            "pw\u{200B}x\u{FEFF}",
+        ] {
+            assert_eq!(
+                parse_command(text, None, true),
+                Some(Command::WorkflowReply {
+                    reply: text.to_owned()
+                }),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_body_keeps_zwj_emoji() {
+        let body = "\u{1F468}\u{200D}\u{1F469}";
+        let line = format!("e {body}");
+        assert_eq!(
+            parse_command(&line, None, false),
+            Some(Command::EnterMessage {
+                body: Some(body.to_owned())
+            })
+        );
+    }
+
+    #[test]
+    fn cancel_survives_invisible_noise_and_nuls() {
+        for awaiting in [true, false] {
+            for text in [
+                "cancel \u{200B}",
+                "\u{FEFF} stop",
+                "cancel\0\u{200B}",
+                "\u{200B}\0 CANCEL \u{2060}",
+                "st\u{00AD}op",
+                "cancel\u{200E}",
+                "cancel\u{FE0F}",
+                "cancel\u{E0041}",
+            ] {
+                assert_eq!(
+                    parse_command(text, None, awaiting),
+                    Some(Command::Cancel),
+                    "{text:?} awaiting={awaiting}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kelvin_sign_does_not_fold_to_k() {
+        // U+212A lowercases to ASCII 'k' under Unicode folding; keywords use
+        // ASCII folding only, so this is Unknown, not ListRooms.
+        assert!(matches!(
+            parse_command("\u{212A}", None, false),
+            Some(Command::Unknown { .. })
+        ));
+        assert_eq!(parse_command("K", None, false), Some(Command::ListRooms));
+    }
+
+    #[test]
+    fn s_with_text_is_unknown_not_a_scan() {
+        assert_eq!(parse_command("s", None, false), Some(Command::ScanMessages));
+        assert!(matches!(
+            parse_command("s foo", None, false),
+            Some(Command::Unknown { .. })
+        ));
+        assert_eq!(
+            parse_command("search bob", None, false),
+            Some(Command::SearchUsers {
+                query: "bob".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn one_shot_passwords_keep_zero_width_characters() {
+        for pw in ["a\u{200D}b", "pe\u{200C}rs", "x\u{200B}y\u{FEFF}"] {
+            match parse_command(&format!("register bob {pw}"), None, false) {
+                Some(Command::RegisterOneShot { password, .. }) => {
+                    assert_eq!(password.expose(), pw)
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+            match parse_command(&format!("login bob {pw}"), None, false) {
+                Some(Command::LoginOneShot { password, .. }) => {
+                    assert_eq!(password.expose(), pw)
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// Mirrors `bbs-mesh`'s `sysop_words_match_canonical_parser`: this parser
+    /// must agree with the canonical one on the audit (#411-#413) inputs.
+    #[test]
+    fn hardening_inputs_match_canonical_parser() {
+        for text in [
+            "f\u{00A0}12",
+            "c\u{00A0}lobby",
+            "cancel \u{200B}",
+            "\u{FEFF} stop",
+            "cancel\0\u{200B}",
+            "f abc",
+            "f 10",
+            "s",
+            "s text",
+            "search text",
+            "search",
+            "\u{212A}",
+            "timeout bob 1",
+            "guestroom Lobby",
+        ] {
+            for awaiting in [false, true] {
+                assert_eq!(
+                    parse_command(text, None, awaiting),
+                    Some(Command::parse(text, awaiting)),
+                    "{text:?} awaiting={awaiting}"
+                );
+            }
+        }
     }
 }

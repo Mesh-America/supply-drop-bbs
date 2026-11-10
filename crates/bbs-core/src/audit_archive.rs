@@ -177,6 +177,10 @@ impl ArchiveWriter {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&self.tmp, &self.target)?;
+        // Make the rename itself durable before the caller clears the live
+        // rows: without syncing the directory, a power loss could keep the
+        // delete but lose the new directory entry.
+        sync_parent_dir(&self.target)?;
         Ok(std::fs::metadata(&self.target)?.len())
     }
 
@@ -186,6 +190,22 @@ impl ArchiveWriter {
         drop(self.zip);
         let _ = std::fs::remove_file(tmp);
     }
+}
+
+/// fsync the directory holding `path` so a rename into it survives power loss.
+#[cfg(unix)]
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Directories cannot be opened for syncing on other platforms.
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 /// The highest audit id an existing archive holds, read back from its own
@@ -470,6 +490,24 @@ mod tests {
             line.ends_with("-\t-"),
             "target and detail should be dashes: {line}"
         );
+    }
+
+    #[test]
+    fn finish_succeeds_with_the_parent_directory_synced() {
+        // Power loss can't be tested; this pins that syncing the directory
+        // after the rename doesn't turn a good archive into an error, for an
+        // absolute and for a bare relative target alike.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(archive_name(2026, 9));
+        let w = ArchiveWriter::create(
+            &target,
+            &entry_name(2026, 9),
+            &header(0, 0, 0, "2026-10-01T00:00:00Z"),
+        )
+        .unwrap();
+        assert!(w.finish().unwrap() > 0);
+        assert!(target.exists());
+        sync_parent_dir(Path::new("bare-name.zip")).unwrap();
     }
 
     #[test]
