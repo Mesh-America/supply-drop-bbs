@@ -290,6 +290,30 @@ impl Database {
         Ok(())
     }
 
+    /// Insert an entry stamped in September 2026, at the next free id.
+    ///
+    /// The archive tests name that month. `audit_write` stamps entries with
+    /// the real clock, so once the calendar moved past September those tests
+    /// archived a month holding nothing and failed.
+    #[cfg(test)]
+    pub(crate) async fn audit_write_in_2026_09_for_test(
+        &self,
+        actor: &str,
+        action: &str,
+        target: &str,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO audit_log (actor, action, target, created_at) \
+             VALUES (?, ?, ?, '2026-09-15T09:00:00Z')",
+        )
+        .bind(actor)
+        .bind(action)
+        .bind(target)
+        .execute(&self.write_pool)
+        .await?;
+        Ok(())
+    }
+
     /// Insert an entry at a chosen id.
     ///
     /// Test-only. It reproduces the state a crash between an archive's rename
@@ -304,13 +328,18 @@ impl Database {
         action: &str,
         target: &str,
     ) -> Result<(), StoreError> {
-        sqlx::query("INSERT INTO audit_log (id, actor, action, target) VALUES (?, ?, ?, ?)")
-            .bind(id)
-            .bind(actor)
-            .bind(action)
-            .bind(target)
-            .execute(&self.write_pool)
-            .await?;
+        // Stamped in September 2026, like the entries it stands in for, so
+        // the month it is archived under does not depend on the real clock.
+        sqlx::query(
+            "INSERT INTO audit_log (id, actor, action, target, created_at) \
+             VALUES (?, ?, ?, ?, '2026-09-15T09:00:00Z')",
+        )
+        .bind(id)
+        .bind(actor)
+        .bind(action)
+        .bind(target)
+        .execute(&self.write_pool)
+        .await?;
         Ok(())
     }
 

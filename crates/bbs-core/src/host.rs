@@ -11828,7 +11828,7 @@ mod tests {
 
         for i in 0..3 {
             host.db
-                .audit_write("sysop", "ban", Some(&format!("bob{i}")), None)
+                .audit_write_in_2026_09_for_test("sysop", "ban", &format!("bob{i}"))
                 .await
                 .unwrap();
         }
@@ -11882,7 +11882,7 @@ mod tests {
         let dir_str = dir.path().to_string_lossy().to_string();
 
         host.db
-            .audit_write("sysop", "ban", Some("bob"), None)
+            .audit_write_in_2026_09_for_test("sysop", "ban", "bob")
             .await
             .unwrap();
         let first = host
@@ -11895,7 +11895,7 @@ mod tests {
             .len();
 
         host.db
-            .audit_write("sysop", "ban", Some("carol"), None)
+            .audit_write_in_2026_09_for_test("sysop", "ban", "carol")
             .await
             .unwrap();
         let again = host
@@ -12099,7 +12099,7 @@ mod tests {
         let dir_str = dir.path().to_string_lossy().to_string();
 
         host.db
-            .audit_write("sysop", "ban", Some("bob"), None)
+            .audit_write_in_2026_09_for_test("sysop", "ban", "bob")
             .await
             .unwrap();
         host.admin_archive_audit_log(&dir_str, 2026, 9)
@@ -12152,7 +12152,7 @@ mod tests {
         // Not a zip at all.
         std::fs::write(dir.path().join("audit-2026-09.zip"), b"not a zip").unwrap();
         host.db
-            .audit_write("sysop", "ban", Some("bob"), None)
+            .audit_write_in_2026_09_for_test("sysop", "ban", "bob")
             .await
             .unwrap();
 
@@ -12241,7 +12241,7 @@ mod tests {
         std::fs::write(dir.path().join("notes.txt"), b"not ours").unwrap();
 
         host.db
-            .audit_write("sysop", "ban", Some("bob"), None)
+            .audit_write_in_2026_09_for_test("sysop", "ban", "bob")
             .await
             .unwrap();
         host.admin_archive_audit_log(&dir_str, 2026, 9)
@@ -12266,7 +12266,7 @@ mod tests {
         std::fs::write(&backup, b"not ours").unwrap();
 
         host.db
-            .audit_write("sysop", "ban", Some("bob"), None)
+            .audit_write_in_2026_09_for_test("sysop", "ban", "bob")
             .await
             .unwrap();
         host.admin_archive_audit_log(&dir_str, 2026, 9)
