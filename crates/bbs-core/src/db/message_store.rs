@@ -218,9 +218,126 @@ pub trait MessageStore: Send + Sync {
         username: &Username,
         before: Option<MessageId>,
     ) -> Result<Option<Message>, StoreError>;
+
+    /// The id of the newest direct message *addressed to* `username`
+    /// (`recipient = username`), ignoring mail they sent themselves.
+    async fn latest_direct_to(&self, username: &Username) -> Result<Option<MessageId>, StoreError>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────
+
+/// The audit row written atomically with a message deletion.
+pub(crate) struct MessageDeleteAudit<'a> {
+    pub(crate) actor: &'a str,
+    pub(crate) action: &'a str,
+    pub(crate) target: &'a str,
+    pub(crate) detail: &'a str,
+}
+
+impl Database {
+    /// Delete a message, optionally writing an audit row in the same
+    /// transaction so a privileged deletion can't commit unaudited.
+    ///
+    /// Behaves as [`MessageStore::delete`] otherwise.
+    pub(crate) async fn delete_message_audited(
+        &self,
+        id: MessageId,
+        audit: Option<MessageDeleteAudit<'_>>,
+    ) -> Result<bool, StoreError> {
+        let mid = id.as_i64();
+
+        // Both statements run inside a single transaction so a crash between
+        // the UPDATE and the DELETE cannot advance read pointers past a
+        // surviving message (SYN-24).
+        let mut tx = self.write_pool.begin().await?;
+
+        // A direct message is one row seen by both parties, and a Mail read
+        // pointer can sit on it. The room rescue below finds nothing for a DM
+        // (it is in no room), so the FK's SET NULL would fire, and
+        // `unread_direct_count` reads NULL-with-a-state-row as "all caught
+        // up": deleting one DM would mark the rest of that user's mail read.
+        // Instead, move each affected pointer back to that user's previous
+        // direct message; with none, drop the state row so every remaining
+        // message counts as unread.
+        const PREV_DIRECT: &str = "SELECT MAX(m.id) FROM messages m \
+             JOIN users u ON u.id = user_room_state.user_id \
+             WHERE m.id < ? AND m.recipient IS NOT NULL \
+               AND (m.sender = u.username OR m.recipient = u.username)";
+        let is_direct: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM messages WHERE id = ? AND recipient IS NOT NULL",
+        )
+        .bind(mid)
+        .fetch_one(&mut *tx)
+        .await?;
+        if is_direct > 0 {
+            sqlx::query(&format!(
+                "DELETE FROM user_room_state \
+                 WHERE last_read_message_id = ? AND ({PREV_DIRECT}) IS NULL"
+            ))
+            .bind(mid)
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(&format!(
+                "UPDATE user_room_state SET last_read_message_id = ({PREV_DIRECT}) \
+                 WHERE last_read_message_id = ?"
+            ))
+            .bind(mid)
+            .bind(mid)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Before deleting, rescue any read pointers that land on this message.
+        // Move them to the highest message_id in the same room that is strictly
+        // less than `id`.  If no earlier message exists (this was the first),
+        // the subquery returns NULL and the FK's ON DELETE SET NULL fires; the
+        // `unread_count` query treats NULL-with-existing-row as "all caught up".
+        //
+        // Only room messages are in `room_messages`; for DMs the subquery
+        // returns NULL (a no-op since ON DELETE SET NULL handles it anyway).
+        sqlx::query!(
+            r#"
+            UPDATE user_room_state
+            SET last_read_message_id = (
+                SELECT MAX(rm2.message_id)
+                FROM room_messages rm2
+                JOIN room_messages rm1 ON rm1.room_id = rm2.room_id
+                WHERE rm1.message_id = ?
+                  AND rm2.message_id < ?
+            )
+            WHERE last_read_message_id = ?
+            "#,
+            mid,
+            mid,
+            mid
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        let rows = sqlx::query!("DELETE FROM messages WHERE id = ?", mid)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        if rows > 0 {
+            if let Some(a) = audit {
+                sqlx::query(
+                    "INSERT INTO audit_log (actor, action, target, detail) VALUES (?, ?, ?, ?)",
+                )
+                .bind(a.actor)
+                .bind(a.action)
+                .bind(a.target)
+                .bind(a.detail)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(rows > 0)
+    }
+}
 
 #[async_trait]
 impl MessageStore for Database {
@@ -387,47 +504,7 @@ impl MessageStore for Database {
     }
 
     async fn delete(&self, id: MessageId) -> Result<bool, StoreError> {
-        let mid = id.as_i64();
-
-        // Both statements run inside a single transaction so a crash between
-        // the UPDATE and the DELETE cannot advance read pointers past a
-        // surviving message (SYN-24).
-        let mut tx = self.write_pool.begin().await?;
-
-        // Before deleting, rescue any read pointers that land on this message.
-        // Move them to the highest message_id in the same room that is strictly
-        // less than `id`.  If no earlier message exists (this was the first),
-        // the subquery returns NULL and the FK's ON DELETE SET NULL fires; the
-        // `unread_count` query treats NULL-with-existing-row as "all caught up".
-        //
-        // Only room messages are in `room_messages`; for DMs the subquery
-        // returns NULL (a no-op since ON DELETE SET NULL handles it anyway).
-        sqlx::query!(
-            r#"
-            UPDATE user_room_state
-            SET last_read_message_id = (
-                SELECT MAX(rm2.message_id)
-                FROM room_messages rm2
-                JOIN room_messages rm1 ON rm1.room_id = rm2.room_id
-                WHERE rm1.message_id = ?
-                  AND rm2.message_id < ?
-            )
-            WHERE last_read_message_id = ?
-            "#,
-            mid,
-            mid,
-            mid
-        )
-        .execute(&mut *tx)
-        .await?;
-
-        let rows = sqlx::query!("DELETE FROM messages WHERE id = ?", mid)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-
-        tx.commit().await?;
-        Ok(rows > 0)
+        self.delete_message_audited(id, None).await
     }
 
     async fn mark_read(
@@ -702,5 +779,14 @@ impl MessageStore for Database {
         .await?;
         row.map(|r| map_message_row(r.id, r.sender, r.recipient, r.content, r.timestamp))
             .transpose()
+    }
+
+    async fn latest_direct_to(&self, username: &Username) -> Result<Option<MessageId>, StoreError> {
+        let id: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(id) FROM messages WHERE recipient = ?")
+                .bind(username.as_str())
+                .fetch_one(&self.read_pool)
+                .await?;
+        Ok(id.map(MessageId::new))
     }
 }

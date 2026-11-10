@@ -26,6 +26,8 @@
 use crate::identity::Username;
 use crate::permissions::PermissionLevel;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
+use zeroize::Zeroize;
 
 /// A secret string carried inside a [`Command`] (currently a one-shot password).
 ///
@@ -34,15 +36,42 @@ use serde::{Deserialize, Serialize};
 /// prints `<redacted>`, so the plaintext can never reach a log via `?cmd`.
 ///
 /// `Serialize`/`Deserialize` are transparent (the wire form is the raw string)
-/// so the enum still round-trips across the process transport; only `Debug` is
-/// redacted. Call [`Secret::expose`] only where the plaintext is genuinely
-/// required (hashing/verifying) and never log the result.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// so the enum still round-trips across the process transport. That means
+/// **`Debug` is the only redacted output**: serialising a `Command` (for
+/// structured logs, telemetry or an audit trail) writes the plaintext, so never
+/// do that outside the transport itself. Call [`Secret::expose`] only where the
+/// plaintext is genuinely required (hashing/verifying) and never log the result.
+///
+/// **What is wiped:** only the `Secret`'s own buffer, overwritten when the value
+/// is dropped. The original input line, intermediate parse strings,
+/// deserialisation buffers, clones and copies made from [`Secret::expose`] are
+/// *not* wiped. This is best-effort hygiene, not a guarantee.
+///
+/// **Comparison:** `==` compares equal-length secrets in constant time. The
+/// length itself is not hidden: secrets of different lengths compare unequal
+/// immediately.
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Secret(String);
 
+impl Drop for Secret {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl PartialEq for Secret {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_bytes().ct_eq(other.0.as_bytes()).into()
+    }
+}
+
+impl Eq for Secret {}
+
 impl Secret {
-    /// Borrow the plaintext. Use only for hashing/verification; never log it.
+    /// Borrow the plaintext. Use only where the plaintext is genuinely needed
+    /// (hashing/verification, policy checks such as a length limit); never log
+    /// it. Anything copied out of the returned `&str` is not wiped on drop.
     pub fn expose(&self) -> &str {
         &self.0
     }
@@ -66,10 +95,96 @@ impl From<&str> for Secret {
     }
 }
 
-// ── Parsing helpers (private) ─────────────────────────────────────────────────
+// ── Parsing helpers (shared with the transport crates) ───────────────────────
+//
+// `bbs-mesh` and `bbs-meshtastic` call these instead of keeping their own
+// copies, so a change to the invisible-character set or the whitespace rules
+// is made in exactly one place.
 
-fn split_first_word(s: &str) -> (&str, Option<&str>) {
-    match s.find(|c: char| c.is_ascii_whitespace()) {
+/// `true` for Unicode `Default_Ignorable_Code_Point` characters that are cheap
+/// to enumerate: soft hyphen, combining grapheme joiner, Arabic letter mark,
+/// Hangul fillers, Khmer inherent vowels, Mongolian free variation selectors,
+/// zero-width and bidi controls, word joiner and invisible operators,
+/// variation selectors, BOM, interlinear/shorthand controls and tag
+/// characters. Unassigned code points inside the Unicode "ignorable" blocks
+/// are included too.
+pub fn is_default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Remove every [`is_default_ignorable`] character.
+///
+/// **Only for probing** (the `CANCEL`/`STOP` check and keyword matching).
+/// Never use the result as a payload: ZWJ/ZWNJ are meaningful in emoji
+/// sequences and Persian/Indic text, and a password containing them must reach
+/// the host exactly as typed.
+pub fn strip_ignorable(s: &str) -> String {
+    s.chars().filter(|c| !is_default_ignorable(*c)).collect()
+}
+
+/// Trim Unicode whitespace and NUL bytes from both ends, repeating until
+/// stable (some firmware NUL-terminates text payloads, so `"N\0"` must still
+/// be the `N` keyword). This is the *payload* form of a line: it is never
+/// altered further.
+pub fn trim_line(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_whitespace() || c == '\0')
+}
+
+/// The probe form of a line: ignorable characters stripped **first**, then
+/// trimmed (whitespace and NULs, until stable). `"cancel \u{200B}"`,
+/// `"\u{FEFF} stop"` and `"cancel\0\u{200B}"` all probe as the bare word.
+pub fn probe_line(line: &str) -> String {
+    trim_line(&strip_ignorable(line)).to_owned()
+}
+
+/// `true` when the line is `CANCEL` or `STOP` (ASCII case-insensitive, after
+/// [`probe_line`] normalisation).
+pub fn is_cancel_line(line: &str) -> bool {
+    let probe = probe_line(line);
+    probe.eq_ignore_ascii_case("cancel") || probe.eq_ignore_ascii_case("stop")
+}
+
+/// Drop leading whitespace, NULs and ignorable characters (used before the
+/// command prefix and keyword of a *command* line; never applied to workflow
+/// replies).
+pub fn skip_leading_noise(s: &str) -> &str {
+    s.trim_start_matches(|c: char| c.is_whitespace() || c == '\0' || is_default_ignorable(c))
+}
+
+/// Normalise a keyword token for matching: ignorable characters removed and
+/// **ASCII** case folding only, so e.g. the Kelvin sign U+212A never folds to
+/// `k` (which Unicode `to_lowercase` would do).
+pub fn normalise_keyword(word: &str) -> String {
+    strip_ignorable(word).to_ascii_lowercase()
+}
+
+/// Split `s` on the first run of Unicode whitespace.
+///
+/// Matches `trim()`'s own whitespace definition — an ASCII-only split left a
+/// line joined by e.g. a non-breaking space (U+00A0) as one unmatched word
+/// instead of keyword + argument (#413). Returns `(first_word, rest)` where
+/// `rest` is `Some` (left-trimmed) when non-empty. Both slices borrow from the
+/// input unchanged, so payloads keep their exact bytes.
+pub fn split_first_word(s: &str) -> (&str, Option<&str>) {
+    match s.find(char::is_whitespace) {
         None => (s, None),
         Some(i) => {
             let rest = s[i..].trim_start();
@@ -321,7 +436,7 @@ pub enum Command {
         filter: Option<String>,
     },
 
-    /// Search user accounts by username substring (Aide+). (SEARCH)
+    /// Search user accounts by username substring (Aide+). (`SEARCH <query>`)
     SearchUsers {
         /// Substring to match against usernames (case-insensitive).
         query: String,
@@ -436,26 +551,31 @@ impl Command {
     /// text lines (CLI, process plugins).  Transports with their own wire
     /// syntax (e.g. MeshCore frames) do their own mapping.
     pub fn parse(line: &str, awaiting_reply: bool) -> Self {
-        let text = line.trim();
+        // `raw` is the payload form (trimmed only); invisible characters are
+        // stripped from a probe copy for CANCEL/STOP and keyword matching,
+        // never from the payload (#412, audit F-001).
+        let raw = trim_line(line);
 
         // CANCEL / STOP always break out of a workflow, before the awaiting-reply
         // passthrough, so they can't be swallowed as a literal reply. (#120)
-        if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {
+        if is_cancel_line(raw) {
             return Command::Cancel;
         }
 
         if awaiting_reply {
             return Command::WorkflowReply {
-                reply: text.to_owned(),
+                reply: raw.to_owned(),
             };
         }
+
+        let text = skip_leading_noise(raw);
 
         if text.is_empty() {
             return Command::Unknown { raw: String::new() };
         }
 
         let (word, rest) = split_first_word(text);
-        let keyword = word.to_ascii_lowercase();
+        let keyword = normalise_keyword(word);
 
         match keyword.as_str() {
             // ── Auth ─────────────────────────────────────────────────────────
@@ -493,15 +613,35 @@ impl Command {
 
             // ── Message reading ───────────────────────────────────────────────
             "n" => Command::ReadNew,
-            "f" => Command::ReadForward {
-                after: rest.and_then(|s| s.parse::<i64>().ok()),
+            "f" => match rest {
+                None => Command::ReadForward { after: None },
+                Some(s) => match s.parse::<i64>() {
+                    Ok(id) => Command::ReadForward { after: Some(id) },
+                    // A malformed id (e.g. "1o" for "10") must not silently
+                    // degrade to "continue from cursor" — mirrors "d"'s
+                    // fallback below (#413).
+                    Err(_) => Command::Unknown {
+                        raw: text.to_owned(),
+                    },
+                },
             },
             "r" => Command::ReadReverse,
+            // Bare `s` scans; `s <text>` is Unknown rather than silently
+            // dropping the argument (`S bob` is not a scan, and the user
+            // search is the separate `search <q>` keyword) (#411, audit F-008).
             "s" => match rest {
+                None => Command::ScanMessages,
+                Some(_) => Command::Unknown {
+                    raw: text.to_owned(),
+                },
+            },
+            "search" => match rest {
                 Some(q) if !q.is_empty() => Command::SearchUsers {
                     query: q.to_owned(),
                 },
-                _ => Command::ScanMessages,
+                _ => Command::Unknown {
+                    raw: text.to_owned(),
+                },
             },
             ".ff" => Command::FastForward,
 
@@ -839,5 +979,176 @@ mod tests {
                 reply: "Alice".to_owned()
             }
         );
+    }
+
+    // ── Parser hardening (#411, #412, #413) ──────────────────────────────
+
+    #[test]
+    fn s_scans_only_when_bare_and_search_is_the_user_search() {
+        assert_eq!(Command::parse("s", false), Command::ScanMessages);
+        assert!(matches!(
+            Command::parse("s foo", false),
+            Command::Unknown { .. }
+        ));
+        assert_eq!(
+            Command::parse("SEARCH bob", false),
+            Command::SearchUsers {
+                query: "bob".to_owned()
+            }
+        );
+        assert!(matches!(
+            Command::parse("search", false),
+            Command::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn zero_width_characters_cannot_defeat_cancel_or_keywords() {
+        for text in ["cancel\u{200B}", "\u{FEFF}STOP", "ca\u{200D}ncel"] {
+            assert_eq!(Command::parse(text, true), Command::Cancel, "{text:?}");
+            assert_eq!(Command::parse(text, false), Command::Cancel, "{text:?}");
+        }
+        assert_eq!(Command::parse("n\u{200B}", false), Command::ReadNew);
+    }
+
+    #[test]
+    fn non_breaking_space_splits_keyword_and_argument() {
+        assert!(matches!(
+            Command::parse("c\u{00A0}lobby", false),
+            Command::ChangeRoom { .. }
+        ));
+    }
+
+    #[test]
+    fn keyword_matching_uses_unicode_lowercasing() {
+        assert_eq!(Command::parse("N", false), Command::ReadNew);
+        // A non-ASCII capital must not panic and is not a keyword.
+        assert!(matches!(
+            Command::parse("\u{0130}", false),
+            Command::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn f_with_a_bad_id_is_unknown_not_continue() {
+        assert_eq!(
+            Command::parse("f 10", false),
+            Command::ReadForward { after: Some(10) }
+        );
+        assert_eq!(
+            Command::parse("f", false),
+            Command::ReadForward { after: None }
+        );
+        assert!(matches!(
+            Command::parse("f 1o", false),
+            Command::Unknown { .. }
+        ));
+    }
+
+    // ── Secret (#414) ────────────────────────────────────────────────────
+
+    #[test]
+    fn secret_compares_by_value_and_stays_redacted_in_debug() {
+        assert_eq!(Secret::from("abc"), Secret::from("abc"));
+        assert_ne!(Secret::from("abc"), Secret::from("abd"));
+        assert_ne!(Secret::from("abc"), Secret::from("abcd"));
+        assert_eq!(format!("{:?}", Secret::from("abc")), "<redacted>");
+    }
+
+    #[test]
+    fn secret_still_round_trips_over_the_wire() {
+        let json = serde_json::to_string(&Secret::from("pw")).unwrap();
+        assert_eq!(json, "\"pw\"");
+        let back: Secret = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.expose(), "pw");
+    }
+
+    // ── Audit regressions (F-001, F-005, F-006, F-008) ───────────────────
+
+    #[test]
+    fn payloads_keep_zero_width_joiners_when_awaiting_reply() {
+        for text in [
+            "family \u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}",
+            "mi\u{200C}xed",
+            "pw\u{200B}x\u{FEFF}",
+        ] {
+            assert_eq!(
+                Command::parse(text, true),
+                Command::WorkflowReply {
+                    reply: text.to_owned()
+                },
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn message_body_keeps_zwj_emoji() {
+        let body = "\u{1F468}\u{200D}\u{1F469}";
+        let line = format!("e {body}");
+        assert_eq!(
+            Command::parse(&line, false),
+            Command::EnterMessage {
+                body: Some(body.to_owned())
+            }
+        );
+    }
+
+    #[test]
+    fn cancel_survives_invisible_noise_and_nuls() {
+        for awaiting in [true, false] {
+            for text in [
+                "cancel \u{200B}",
+                "\u{FEFF} stop",
+                "cancel\0\u{200B}",
+                "\u{200B}\0 CANCEL \u{2060}",
+                "st\u{00AD}op",
+                "cancel\u{200E}",
+                "cancel\u{FE0F}",
+                "cancel\u{E0041}",
+            ] {
+                assert_eq!(
+                    Command::parse(text, awaiting),
+                    Command::Cancel,
+                    "{text:?} awaiting={awaiting}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kelvin_sign_does_not_fold_to_k() {
+        // U+212A lowercases to ASCII 'k' under Unicode folding; keywords use
+        // ASCII folding only, so this is Unknown, not ListRooms.
+        assert!(matches!(
+            Command::parse("\u{212A}", false),
+            Command::Unknown { .. }
+        ));
+        assert_eq!(Command::parse("K", false), Command::ListRooms);
+    }
+
+    #[test]
+    fn s_with_text_is_unknown_not_a_scan() {
+        assert_eq!(Command::parse("s", false), Command::ScanMessages);
+        assert!(matches!(
+            Command::parse("s foo", false),
+            Command::Unknown { .. }
+        ));
+        assert_eq!(
+            Command::parse("search bob", false),
+            Command::SearchUsers {
+                query: "bob".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn shared_helpers_normalise_as_documented() {
+        assert_eq!(probe_line("\u{200B} stop \0\u{FEFF}"), "stop");
+        assert_eq!(strip_ignorable("a\u{00AD}b\u{E0001}c\u{3164}"), "abc");
+        assert_eq!(normalise_keyword("H\u{200B}elp"), "help");
+        assert_eq!(normalise_keyword("\u{212A}"), "\u{212A}");
+        assert_eq!(split_first_word("c\u{00A0}lobby"), ("c", Some("lobby")));
+        assert_eq!(trim_line("\0 N\0"), "N");
     }
 }

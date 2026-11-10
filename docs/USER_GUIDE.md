@@ -256,19 +256,21 @@ Shows the quick command list for your current access level.
 
 ### Help topics
 
-`H all` lists the help topics. Each topic has a single-letter shortcut and a
-full-word form — both work (e.g. `H M` is the same as `H mail`):
+`H all` lists the help topics. Type the topic name in full:
 
 ```
-H M  mail      — private messaging
-H R  reading   — reading messages in a room (incl. .FF fast-forward)
-H P  posting   — writing and deleting messages
-H U  users     — finding and listing user accounts
-H N  nav       — navigating between rooms
-H A  acct      — your profile and password
-H aide         — moderation commands (Aide+)
-H sysop        — administration commands (Sysop+)
+H MAIL   — private messaging
+H READ   — reading messages in a room (incl. .FF fast-forward)
+H POST   — writing and deleting messages
+H USERS  — finding and listing user accounts
+H NAV    — navigating between rooms
+H ACCT   — your profile and password
+H AIDE   — moderation commands (Aide+)
+H SYSOP  — administration commands (Sysop+)
 ```
+
+A single letter that is also a command explains that command instead, so
+`H N` is help for the `N` command, not the navigation topic.
 
 ### Help on a specific command
 
@@ -370,7 +372,9 @@ quickly working through activity across all rooms.
 
 Fast-forward: marks everything in the current room as read without actually
 reading the messages. Useful when you've been away and just want a clean slate
-in a busy room.
+in a busy room. The reply tells you how many unread messages it skipped. In
+Mail the marker moves to the newest message *sent to you* (not mail you sent).
+It cannot be undone.
 
 ### Go to Mail
 
@@ -436,7 +440,9 @@ happens next — no need to retype the full command:
 |-----|--------|
 | `F` | Next message (forward) |
 | `R` | Previous message (back) |
-| `E` | Reply to this message |
+| `F <id>` / `R <id>` | Jump to message #id |
+| `E` | Reply to this message (prompts for the text) |
+| `E <text>` | Reply with that text as the draft (send it with `.`) |
 | `D` | Delete this message |
 | `H` | Show this help |
 | `X` | Exit reading |
@@ -646,7 +652,7 @@ When you log in and have unread mail, the BBS will notify you. On radio
 transports you may receive an unsolicited push notification:
 
 ```
-You have 2 unread messages. Reply 'mail' to read.
+You have 2 unread messages. Reply 'M' to read.
 ```
 
 ---
@@ -686,14 +692,16 @@ U all      — list every account, any status (Sysop only)
 ### Searching for a user
 
 ```
-S <query>
+SEARCH <query>
 ```
 
 Finds accounts whose username contains `<query>` (substring match). Handy when
-you remember part of a callsign but not the whole thing.
+you remember part of a callsign but not the whole thing. Aides and sysops only;
+other users are told "Aide access required."
 
-> **Note:** `S` on its own (with no query) scans message headers in your current
-> room — see [section 8](#8-reading-messages). `S <query>` searches users.
+> **Note:** `S` on its own scans message headers in your current room — see
+> [section 8](#8-reading-messages). `S` takes no text: `S <text>` is not
+> recognised. Only `SEARCH <query>` searches users.
 
 ### User details
 
@@ -716,7 +724,7 @@ Online (1 session)
 
 (The `Name`, `Last login`, and `Online` lines appear only when applicable.)
 
-These commands are also grouped under `H U` (the **Users** help topic).
+These commands are also grouped under `H USERS` (the **Users** help topic).
 
 ---
 
@@ -1153,6 +1161,7 @@ account and you can re-register with the same username.
 | `N` | Read new messages (5 at a time) |
 | `F` | Forward read from the beginning |
 | `F <id>` | Forward read starting at message #id (the next one if #id is gone); works inside reading mode too |
+| `R <id>` | Inside reading mode only: jump to message #id (if #id is deleted, blocked or not yours to see, the nearest earlier message is shown with a notice). Jumping does not move your read marker |
 | `R` | Reverse read (newest first) |
 | `S` | Scan message headers |
 | `.FF` | Fast-forward past unread (mark all read) |
@@ -1188,7 +1197,7 @@ account and you can re-register with the same username.
 | `U` | List active accounts |
 | `U banned` | List banned accounts |
 | `U all` | List every account (Sysop only) |
-| `S <query>` | Search users by username (substring) |
+| `SEARCH <query>` | Search users by username (substring; Aide and above) |
 | `WHOIS <user>` | Show one user's account details |
 
 ### Help topics
@@ -1197,12 +1206,12 @@ account and you can re-register with the same username.
 |---|---|
 | `H` | Quick command list |
 | `H all` | List of help topics |
-| `H M` / `H mail` | Mail / private message commands |
-| `H R` / `H reading` | All reading commands (incl. `.FF`) |
-| `H P` / `H posting` | Writing and deleting |
-| `H U` / `H users` | Finding and listing user accounts |
-| `H N` / `H nav` | Room navigation |
-| `H A` / `H acct` | Profile and password |
+| `H MAIL` | Mail / private message commands |
+| `H READ` | All reading commands (incl. `.FF`) |
+| `H POST` | Writing and deleting |
+| `H USERS` | Finding and listing user accounts |
+| `H NAV` | Room navigation |
+| `H ACCT` | Profile and password |
 | `H <cmd>` | Detail on one command (e.g. `H N`) |
 
 ### Aide commands

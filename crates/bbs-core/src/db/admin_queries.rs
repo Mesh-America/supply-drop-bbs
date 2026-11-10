@@ -1666,8 +1666,15 @@ name = \"X\"
     // never to the shared path — and the task ends (`is_cancelled()`) rather
     // than running unbounded in the background the way a whole-file
     // `spawn_blocking` copy would.
+    //
+    // Scope: this covers cancellation MID-COPY only, which the start-gate
+    // below pins. It does not cover cancellation during the final rename
+    // (a rename already dispatched to the blocking pool can still complete
+    // and publish; see `copy_via_private_temp`'s doc), nor an abort during
+    // `new_private_temp`'s unguarded blocking open, which can orphan a
+    // `restore_upload_*.tmp` for the startup sweep (see that function's doc).
     #[tokio::test]
-    async fn cancelling_the_copy_fallback_never_publishes_to_the_shared_path() {
+    async fn cancelling_mid_copy_never_publishes_to_the_shared_path() {
         let data = tempfile::tempdir().unwrap();
         let d = data.path().to_path_buf();
         // Large enough that many chunks are needed, so the copy is still

@@ -22,6 +22,7 @@ mod room_store;
 mod user_store;
 
 pub use error::{DbOpenError, StoreError};
+pub(crate) use message_store::MessageDeleteAudit;
 pub use message_store::{MessagePage, MessageStore};
 pub use room_store::RoomStore;
 pub use user_store::UserStore;
