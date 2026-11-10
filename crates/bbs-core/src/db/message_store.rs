@@ -218,6 +218,10 @@ pub trait MessageStore: Send + Sync {
         username: &Username,
         before: Option<MessageId>,
     ) -> Result<Option<Message>, StoreError>;
+
+    /// The id of the newest direct message *addressed to* `username`
+    /// (`recipient = username`), ignoring mail they sent themselves.
+    async fn latest_direct_to(&self, username: &Username) -> Result<Option<MessageId>, StoreError>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────
@@ -702,5 +706,14 @@ impl MessageStore for Database {
         .await?;
         row.map(|r| map_message_row(r.id, r.sender, r.recipient, r.content, r.timestamp))
             .transpose()
+    }
+
+    async fn latest_direct_to(&self, username: &Username) -> Result<Option<MessageId>, StoreError> {
+        let id: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(id) FROM messages WHERE recipient = ?")
+                .bind(username.as_str())
+                .fetch_one(&self.read_pool)
+                .await?;
+        Ok(id.map(MessageId::new))
     }
 }

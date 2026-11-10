@@ -372,7 +372,9 @@ quickly working through activity across all rooms.
 
 Fast-forward: marks everything in the current room as read without actually
 reading the messages. Useful when you've been away and just want a clean slate
-in a busy room.
+in a busy room. The reply tells you how many unread messages it skipped. In
+Mail the marker moves to the newest message *sent to you* (not mail you sent).
+It cannot be undone.
 
 ### Go to Mail
 
@@ -694,7 +696,8 @@ SEARCH <query>
 ```
 
 Finds accounts whose username contains `<query>` (substring match). Handy when
-you remember part of a callsign but not the whole thing.
+you remember part of a callsign but not the whole thing. Aides and sysops only;
+other users are told "Aide access required."
 
 > **Note:** `S` scans message headers in your current room, whatever follows
 > it — see [section 8](#8-reading-messages). Only `SEARCH <query>` searches
@@ -1158,7 +1161,7 @@ account and you can re-register with the same username.
 | `N` | Read new messages (5 at a time) |
 | `F` | Forward read from the beginning |
 | `F <id>` | Forward read starting at message #id (the next one if #id is gone); works inside reading mode too |
-| `R <id>` | Inside reading mode only: jump to message #id |
+| `R <id>` | Inside reading mode only: jump to message #id (if #id is deleted, blocked or not yours to see, the nearest earlier message is shown with a notice). Jumping does not move your read marker |
 | `R` | Reverse read (newest first) |
 | `S` | Scan message headers |
 | `.FF` | Fast-forward past unread (mark all read) |
@@ -1194,7 +1197,7 @@ account and you can re-register with the same username.
 | `U` | List active accounts |
 | `U banned` | List banned accounts |
 | `U all` | List every account (Sysop only) |
-| `SEARCH <query>` | Search users by username (substring) |
+| `SEARCH <query>` | Search users by username (substring; Aide and above) |
 | `WHOIS <user>` | Show one user's account details |
 
 ### Help topics
