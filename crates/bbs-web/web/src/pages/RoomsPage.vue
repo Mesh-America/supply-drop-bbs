@@ -13,6 +13,7 @@ interface Room {
   created_at: string
   deletable: boolean
   locked: boolean
+  read_order: 'oldest_first' | 'newest_first'
 }
 
 const rooms = ref<Room[]>([])
@@ -29,6 +30,7 @@ const editTarget = ref<Room | null>(null)
 const editDesc = ref('')
 const editReadOnly = ref(false)
 const editMinLevel = ref(0)
+const editReadOrder = ref<'oldest_first' | 'newest_first'>('oldest_first')
 const saving = ref(false)
 
 function openEdit(room: Room) {
@@ -36,6 +38,11 @@ function openEdit(room: Room) {
   editDesc.value = room.description ?? ''
   editReadOnly.value = room.read_only
   editMinLevel.value = room.min_permission_level
+  editReadOrder.value = room.read_order ?? 'oldest_first'
+}
+
+function readOrderLabel(o: string | undefined) {
+  return o === 'newest_first' ? 'newest first' : 'oldest first'
 }
 
 function closeEdit() { editTarget.value = null }
@@ -44,10 +51,14 @@ async function saveEdit() {
   if (!editTarget.value) return
   saving.value = true
   try {
-    const body: Record<string, unknown> = {
-      read_only: editReadOnly.value,
-      min_permission_level: editMinLevel.value,
+    const body: Record<string, unknown> = {}
+    // The server rejects permission and read-only edits on locked rooms.
+    if (!editTarget.value.locked) {
+      body.read_only = editReadOnly.value
+      body.min_permission_level = editMinLevel.value
     }
+    // The Mail room (id 2) is private and has no read order.
+    if (editTarget.value.id !== 2) body.read_order = editReadOrder.value
     // Send null to clear, string to set
     body.description = editDesc.value.trim() === '' ? null : editDesc.value.trim()
 
@@ -139,6 +150,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
           <th>msgs</th>
           <th>read-only</th>
           <th>min level</th>
+          <th>read order</th>
           <th>created</th>
           <th>actions</th>
         </tr>
@@ -153,6 +165,7 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
           <td>{{ r.message_count }}</td>
           <td>{{ r.read_only ? '✓' : '' }}</td>
           <td>{{ r.min_permission_level }}</td>
+          <td class="muted small">{{ r.id === 2 ? '—' : readOrderLabel(r.read_order) }}</td>
           <td class="muted small">{{ r.created_at.slice(0, 10) }}</td>
           <td class="actions">
             <button class="small-btn secondary" @click="openEdit(r)">edit</button>
@@ -172,6 +185,14 @@ onUnmounted(() => { if (pollTimer !== null) clearInterval(pollTimer) })
           <label class="field">
             <span>description</span>
             <input v-model="editDesc" placeholder="leave blank to clear" maxlength="512" />
+          </label>
+
+          <label v-if="editTarget.id !== 2" class="field">
+            <span>read order (N, read new)</span>
+            <select v-model="editReadOrder">
+              <option value="oldest_first">Oldest first</option>
+              <option value="newest_first">Newest first</option>
+            </select>
           </label>
 
           <template v-if="!editTarget.locked">
