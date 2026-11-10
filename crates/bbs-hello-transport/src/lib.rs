@@ -277,7 +277,7 @@ fn render_notification(n: &Notification) -> String {
     match n {
         Notification::Text(t) => t.clone(),
         Notification::MailWaiting { count } => format!(
-            "You have {count} unread message{}. Type 'mail' to read.",
+            "You have {count} unread message{}. Reply 'M' to read.",
             if *count == 1 { "" } else { "s" }
         ),
         Notification::SystemEvent(s) => format!("[system] {s}"),
