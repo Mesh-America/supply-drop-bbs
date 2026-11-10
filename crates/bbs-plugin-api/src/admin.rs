@@ -91,6 +91,14 @@ pub struct AdminRoomSummary {
     /// Whether name, min_permission_level, and read_only are locked and cannot
     /// be changed. True for Mail (2), Aides (3), and Sysop (4).
     pub locked: bool,
+    /// How `N` (read new) orders this room's unread messages:
+    /// `"oldest_first"` (default) or `"newest_first"`. The Mail room ignores it.
+    #[serde(default = "default_read_order")]
+    pub read_order: String,
+}
+
+fn default_read_order() -> String {
+    "oldest_first".to_owned()
 }
 
 /// A message as seen by the admin.

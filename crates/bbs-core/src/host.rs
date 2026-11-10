@@ -2202,7 +2202,44 @@ impl Host for BbsHost {
             created_at: room.created_at.to_rfc3339(),
             deletable: room_id > 5,
             locked: (2..=4).contains(&room_id),
+            read_order: RoomStore::get_read_order(&self.db, rid)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+                .as_str()
+                .to_owned(),
         })
+    }
+
+    async fn admin_set_room_read_order(
+        &self,
+        room_id: i64,
+        read_order: &str,
+    ) -> Result<bbs_plugin_api::AdminRoomSummary, HostError> {
+        use crate::ids::RoomId;
+        use crate::room::ReadOrder;
+        let order = ReadOrder::parse(read_order).ok_or_else(|| {
+            HostError::PreconditionFailed(format!(
+                "unknown read_order {read_order:?}; expected \"oldest_first\" or \"newest_first\""
+            ))
+        })?;
+        if room_id == MAIL_ROOM_ID.as_i64() {
+            return Err(HostError::PreconditionFailed(
+                "the Mail room has no read order".into(),
+            ));
+        }
+        let rid = RoomId::new(room_id);
+        match RoomStore::set_read_order(&self.db, rid, order).await {
+            Ok(()) => {}
+            Err(crate::db::StoreError::NotFound) => {
+                return Err(HostError::NotFound(format!("room {room_id}")));
+            }
+            Err(e) => return Err(HostError::Storage(format!("{e}"))),
+        }
+        self.admin_list_rooms()
+            .await?
+            .into_iter()
+            .find(|r| r.id == room_id)
+            .ok_or_else(|| HostError::NotFound(format!("room {room_id}")))
     }
 
     async fn admin_search_messages(
@@ -4990,6 +5027,19 @@ impl BbsHost {
             raw_after
         };
 
+        // A newest-first public room (#420) shows the newest unread page first.
+        // The Mail room is private and always reads oldest-first.
+        if room_id != MAIL_ROOM_ID
+            && RoomStore::get_read_order(&self.db, room_id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?
+                == crate::room::ReadOrder::NewestFirst
+        {
+            return self
+                .read_new_newest_first(user_id, &username, &room.name, room_id, after)
+                .await;
+        }
+
         let page = if room_id == MAIL_ROOM_ID {
             self.db
                 .list_direct(&username, after, MESH_PAGE)
@@ -5048,6 +5098,71 @@ impl BbsHost {
                 // F starts AT an id, so the next message is the id after the last shown.
                 cursor.as_i64().saturating_add(1)
             ));
+        }
+        Ok(Response::MultiText(parts))
+    }
+
+    /// `N` for a newest-first room (#420): the newest page of unread messages,
+    /// newest at the top, then the read pointer moves to the newest message
+    /// seen (blocked senders included, as the oldest-first path does for its raw
+    /// page). Older unread messages that did not fit are not shown again by `N`;
+    /// a trailing hint says how to reach them with reading mode's `R <id>`.
+    async fn read_new_newest_first(
+        &self,
+        user_id: UserId,
+        username: &Username,
+        room_name: &str,
+        room_id: RoomId,
+        after: Option<MessageId>,
+    ) -> Result<Response, HostError> {
+        // One extra message tells us whether older unread messages exist.
+        let mut unread = self
+            .db
+            .list_recent_in_room(room_id, MESH_PAGE + 1)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        unread.retain(|m| after.is_none_or(|a| m.id > a));
+        let older = if unread.len() > MESH_PAGE as usize {
+            unread.pop().map(|m| m.id)
+        } else {
+            None
+        };
+
+        let blocked = self
+            .db
+            .blocks_by(username.as_str())
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?;
+        let visible: Vec<_> = unread
+            .iter()
+            .filter(|m| !blocked.contains(m.sender.as_str()))
+            .collect();
+
+        if let Some(newest) = unread.first() {
+            self.db
+                .mark_read(user_id, room_id, newest.id)
+                .await
+                .map_err(|e| HostError::Storage(format!("{e}")))?;
+        }
+
+        if visible.is_empty() {
+            return Ok(Response::Text(format!("No new messages in {room_name}.")));
+        }
+
+        // Header merged into the first frame, as in the oldest-first path (#106).
+        let header = format!("[{room_name} — new messages]");
+        let mut parts: Vec<String> = Vec::with_capacity(visible.len() + 1);
+        for (i, msg) in visible.iter().enumerate() {
+            if i == 0 {
+                parts.push(format!("{header}\n{}", format_message(msg)));
+            } else {
+                parts.push(format_message(msg));
+            }
+        }
+        if let Some(id) = older {
+            // `R <id>` starts AT that message and steps backwards; it only
+            // works once reading mode is on, which a bare `R` enters.
+            parts.push(format!("(older: R, then R {} to continue)", id.as_i64()));
         }
         Ok(Response::MultiText(parts))
     }
@@ -10604,6 +10719,249 @@ mod tests {
         assert!(
             !parts.iter().any(|p| p.trim() == lone_header),
             "header must not be a standalone frame, got: {parts:?}"
+        );
+    }
+
+    // ── #420: per-room read order ─────────────────────────────────────────────
+
+    /// A logged-in alice, a room's worth of posts from bob, and the lobby set to
+    /// `order`. Returns the posted ids oldest first.
+    async fn order_fixture(
+        order: crate::room::ReadOrder,
+        posts: usize,
+    ) -> (Arc<BbsHost>, NamedTempFile, SessionId, UserId, Vec<i64>) {
+        use crate::db::MessageStore as _;
+        let (host, tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, "pass1234").await;
+        let uid = UserStore::get_by_username(&host.db, &alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .id;
+        RoomStore::set_read_order(&host.db, RoomId::new(1), order)
+            .await
+            .unwrap();
+        let bob = Username::new("bob").unwrap();
+        let mut ids = Vec::new();
+        for i in 1..=posts {
+            let id = host
+                .db
+                .post_to_room(RoomId::new(1), &bob, &format!("m{i}"), Timestamp::now())
+                .await
+                .unwrap();
+            ids.push(id.as_i64());
+        }
+        (host, tmp, sid, uid, ids)
+    }
+
+    async fn read_new_parts(host: &BbsHost, sid: SessionId) -> Vec<String> {
+        match host.process_command(sid, Command::ReadNew).await.unwrap() {
+            Response::MultiText(p) => p,
+            Response::Text(t) => vec![t],
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn newest_first_room_shows_newest_unread_first_and_moves_pointer_to_newest() {
+        use crate::db::MessageStore as _;
+        use crate::room::ReadOrder;
+        let (host, _tmp, sid, uid, ids) = order_fixture(ReadOrder::NewestFirst, 3).await;
+
+        let parts = read_new_parts(&host, sid).await;
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert!(
+            parts[0].contains("new messages") && parts[0].contains("m3"),
+            "{parts:?}"
+        );
+        assert!(
+            parts[1].contains("m2") && parts[2].contains("m1"),
+            "{parts:?}"
+        );
+        assert!(!parts.iter().any(|p| p.contains("older:")), "{parts:?}");
+        assert_eq!(
+            host.db.get_last_read(uid, RoomId::new(1)).await.unwrap(),
+            Some(MessageId::new(ids[2]))
+        );
+        // Nothing is unread now.
+        assert_eq!(
+            read_new_parts(&host, sid).await,
+            vec!["No new messages in Lobby."]
+        );
+    }
+
+    #[tokio::test]
+    async fn newest_first_older_hint_only_when_older_unread_exist() {
+        use crate::room::ReadOrder;
+        // MESH_PAGE = 5: exactly a page of unread -> no hint.
+        let (host, _tmp, sid, _uid, _ids) =
+            order_fixture(ReadOrder::NewestFirst, MESH_PAGE as usize).await;
+        let parts = read_new_parts(&host, sid).await;
+        assert_eq!(parts.len(), MESH_PAGE as usize, "{parts:?}");
+        assert!(!parts.iter().any(|p| p.contains("older:")), "{parts:?}");
+
+        // A page and two more: newest five shown, hint points at the next older.
+        let (host, _tmp, sid, uid, ids) =
+            order_fixture(ReadOrder::NewestFirst, MESH_PAGE as usize + 2).await;
+        let parts = read_new_parts(&host, sid).await;
+        assert_eq!(parts.len(), MESH_PAGE as usize + 1, "{parts:?}");
+        assert!(parts[0].contains("m7"), "{parts:?}");
+        assert!(parts[4].contains("m3"), "{parts:?}");
+        let hint = parts.last().unwrap();
+        assert_eq!(
+            hint,
+            &format!("(older: R, then R {} to continue)", ids[1]),
+            "hint names the next older message"
+        );
+        assert!(hint.len() <= 156);
+        // The older ones are not shown again by N.
+        assert_eq!(
+            read_new_parts(&host, sid).await,
+            vec!["No new messages in Lobby."]
+        );
+        // ...but the id in the hint is readable with R <id> in reading mode.
+        let intro = host
+            .process_command(sid, Command::ReadReverse)
+            .await
+            .unwrap();
+        assert!(matches!(intro, Response::Prompt { .. }), "{intro:?}");
+        let text = shown(say(&host, sid, &format!("R {}", ids[1])).await);
+        assert!(text.contains("m2"), "{text:?}");
+        let _ = uid;
+    }
+
+    #[tokio::test]
+    async fn newest_first_only_shows_messages_newer_than_the_pointer() {
+        use crate::db::MessageStore as _;
+        use crate::room::ReadOrder;
+        let (host, _tmp, sid, uid, ids) = order_fixture(ReadOrder::NewestFirst, 8).await;
+        host.db
+            .mark_read(uid, RoomId::new(1), MessageId::new(ids[5]))
+            .await
+            .unwrap();
+        let parts = read_new_parts(&host, sid).await;
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(
+            parts[0].contains("m8") && parts[1].contains("m7"),
+            "{parts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn newest_first_hides_blocked_senders_but_still_advances_past_them() {
+        use crate::db::MessageStore as _;
+        use crate::room::ReadOrder;
+        let (host, _tmp, sid, uid, ids) = order_fixture(ReadOrder::NewestFirst, 2).await;
+        let eve = Username::new("eve").unwrap();
+        let eve_id = host
+            .db
+            .post_to_room(RoomId::new(1), &eve, "from eve", Timestamp::now())
+            .await
+            .unwrap();
+        host.db.block_user("alice", "eve").await.unwrap();
+
+        let parts = read_new_parts(&host, sid).await;
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(
+            parts[0].contains("m2") && parts[1].contains("m1"),
+            "{parts:?}"
+        );
+        assert!(!parts.iter().any(|p| p.contains("from eve")), "{parts:?}");
+        // Pointer is at the newest raw message, the blocked one.
+        assert_eq!(
+            host.db.get_last_read(uid, RoomId::new(1)).await.unwrap(),
+            Some(eve_id)
+        );
+        let _ = ids;
+    }
+
+    #[tokio::test]
+    async fn oldest_first_room_is_unchanged() {
+        use crate::room::ReadOrder;
+        let (host, _tmp, sid, _uid, ids) =
+            order_fixture(ReadOrder::OldestFirst, MESH_PAGE as usize + 2).await;
+        let parts = read_new_parts(&host, sid).await;
+        assert!(parts[0].contains("m1"), "{parts:?}");
+        assert!(parts[4].contains("m5"), "{parts:?}");
+        assert_eq!(
+            parts[5],
+            format!("(more — type N again or F {} to continue)", ids[4] + 1)
+        );
+        let parts = read_new_parts(&host, sid).await;
+        assert!(
+            parts[0].contains("m6") && parts[1].contains("m7"),
+            "{parts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mail_room_ignores_read_order() {
+        use crate::db::MessageStore as _;
+        use crate::room::ReadOrder;
+        let (host, _tmp, sid, _uid, _ids) = order_fixture(ReadOrder::OldestFirst, 0).await;
+        // Even a row forced to newest_first in the database must not matter.
+        RoomStore::set_read_order(&host.db, RoomId::new(2), ReadOrder::NewestFirst)
+            .await
+            .unwrap();
+        let alice = Username::new("alice").unwrap();
+        let bob = Username::new("bob").unwrap();
+        for t in ["d1", "d2"] {
+            host.db
+                .post_direct(&bob, &alice, t, Timestamp::now())
+                .await
+                .unwrap();
+        }
+        host.process_command(sid, Command::GoMail).await.unwrap();
+        let parts = read_new_parts(&host, sid).await;
+        assert!(
+            parts[0].contains("d1") && parts[1].contains("d2"),
+            "{parts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_set_room_read_order_validates_and_reports() {
+        let (host, _tmp) = make_host().await;
+        let rooms = host.admin_list_rooms().await.unwrap();
+        assert!(rooms.iter().all(|r| r.read_order == "oldest_first"));
+
+        let r = host
+            .admin_set_room_read_order(1, "newest_first")
+            .await
+            .unwrap();
+        assert_eq!((r.id, r.read_order.as_str()), (1, "newest_first"));
+        let again = host.admin_list_rooms().await.unwrap();
+        assert_eq!(again[0].read_order, "newest_first");
+        assert_eq!(again[1].read_order, "oldest_first");
+
+        // A user-created room can be set and shows in admin_update_room's reply.
+        let room = host.admin_create_room("alerts", None).await.unwrap();
+        host.admin_set_room_read_order(room.id, "newest_first")
+            .await
+            .unwrap();
+        let upd = host
+            .admin_update_room(room.id, None, Some(true), None)
+            .await
+            .unwrap();
+        assert_eq!(upd.read_order, "newest_first");
+
+        assert!(matches!(
+            host.admin_set_room_read_order(1, "sideways").await,
+            Err(HostError::PreconditionFailed(_))
+        ));
+        assert!(matches!(
+            host.admin_set_room_read_order(2, "newest_first").await,
+            Err(HostError::PreconditionFailed(_))
+        ));
+        assert!(matches!(
+            host.admin_set_room_read_order(9999, "newest_first").await,
+            Err(HostError::NotFound(_))
+        ));
+        assert_eq!(
+            host.admin_list_rooms().await.unwrap()[0].read_order,
+            "newest_first"
         );
     }
 
