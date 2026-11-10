@@ -301,6 +301,16 @@ pub enum Command {
     /// Browse the most recent messages newest-first. (R)
     ReadReverse,
 
+    /// Start reverse-reading AT a given message and step backwards from it
+    /// (`R <id>`), the reverse counterpart of `F <id>`. The same as `R <id>`
+    /// typed in reading mode. A non-integer argument is `Unknown`, never a
+    /// bare `ReadReverse`. (R)
+    ReadReverseFrom {
+        /// Message ID to start at (the nearest earlier visible message if it
+        /// is gone or not visible to the reader).
+        start_at: i64,
+    },
+
     /// Show one-line message summaries (ID, sender, snippet). (S)
     ScanMessages,
 
@@ -625,7 +635,15 @@ impl Command {
                     },
                 },
             },
-            "r" => Command::ReadReverse,
+            "r" => match rest {
+                None => Command::ReadReverse,
+                Some(s) => match s.parse::<i64>() {
+                    Ok(start_at) => Command::ReadReverseFrom { start_at },
+                    Err(_) => Command::Unknown {
+                        raw: text.to_owned(),
+                    },
+                },
+            },
             // Bare `s` scans; `s <text>` is Unknown rather than silently
             // dropping the argument (`S bob` is not a scan, and the user
             // search is the separate `search <q>` keyword) (#411, audit F-008).
@@ -1016,6 +1034,19 @@ mod tests {
         assert!(matches!(
             Command::parse("c\u{00A0}lobby", false),
             Command::ChangeRoom { .. }
+        ));
+    }
+
+    #[test]
+    fn r_with_an_id_starts_reverse_reading_there() {
+        assert_eq!(Command::parse("r", false), Command::ReadReverse);
+        assert_eq!(
+            Command::parse("R 3", false),
+            Command::ReadReverseFrom { start_at: 3 }
+        );
+        assert!(matches!(
+            Command::parse("r abc", false),
+            Command::Unknown { .. }
         ));
     }
 

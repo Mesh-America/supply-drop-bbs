@@ -483,6 +483,7 @@ pub enum Command {
     ReadNew,
     ReadForward  { after: Option<i64> },   // F <id>: start AT that id (or the first message after it)
     ReadReverse,
+    ReadReverseFrom { start_at: i64 },     // R <id>: start AT that id and read backwards
     ScanMessages,
     FastForward,
 

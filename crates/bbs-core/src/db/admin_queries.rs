@@ -72,7 +72,7 @@ impl Database {
         let rows = sqlx::query(
             r#"
             SELECT r.id, r.name, r.description, r.read_only, r.min_permission_level,
-                   r.created_at, COUNT(rm.message_id) AS message_count
+                   r.created_at, r.read_order, COUNT(rm.message_id) AS message_count
             FROM rooms r
             LEFT JOIN room_messages rm ON rm.room_id = r.id
             GROUP BY r.id
@@ -93,6 +93,7 @@ impl Database {
                     min_permission_level: r.try_get::<i64, _>("min_permission_level")? as u8,
                     message_count: r.try_get("message_count")?,
                     created_at: r.try_get("created_at")?,
+                    read_order: r.try_get("read_order")?,
                     deletable: id > 5,
                     locked: (2..=4).contains(&id),
                 })

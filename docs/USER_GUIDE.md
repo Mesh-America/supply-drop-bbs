@@ -408,6 +408,30 @@ Type `N` again to continue to the next batch.
 (more — type N again or F 15 to continue)
 ```
 
+#### Newest-first rooms
+
+A sysop can switch a room to **newest first** (for example an emergency
+channel, where the latest message matters most). In such a room `N` shows the
+newest unread messages first, newest at the top, and then marks everything up
+to the newest one as read. If more unread messages are waiting than fit in one
+batch, `N` ends with a hint for reading the earlier ones:
+
+```
+[Alerts — new messages]
+#27 dana: Road closed at the bridge
+#26 eli: Shelter at the school is open
+#25 fay: Power is back on Elm Street
+#24 gus: Water station moved to the library
+#23 hana: Bridge inspection at noon
+(older: R 22 to continue)
+```
+
+Those older messages are not shown again by `N`. Type `R 22` to start at
+message #22 and read backwards from there; the hint always names the next older
+message you can see (messages from users you have blocked are skipped). Rooms
+are oldest first unless a sysop changes them, and the Mail room is always
+oldest first.
+
 ### Read forward (oldest first)
 
 ```
@@ -986,6 +1010,24 @@ supply-drop-bbs room create "Ham Radio"
 supply-drop-bbs room create "Net Control" --description "Weekly net check-ins"
 ```
 
+### Setting a room's read order (Sysop only)
+
+Each room has a read order for `N`: **oldest first** (the default) or
+**newest first**, which shows the most recent unread messages at the top so
+timely information (an emergency channel, say) is seen first. The Mail room has
+no read order (the setting applies to every room except Mail). Existing rooms stay oldest first until you change them.
+
+From the command line:
+
+```bash
+supply-drop-bbs room create "Alerts" --read-order newest
+supply-drop-bbs room set Lobby --read-order oldest
+```
+
+From the web admin: **Rooms** → **edit** on the room → **Read order**. The
+change applies to the next `N`. Changes made in the web admin are recorded in
+the audit trail; changes made with the command-line `room` command are not.
+
 ### Deleting a room (Sysop only)
 
 ```
@@ -1161,7 +1203,7 @@ account and you can re-register with the same username.
 | `N` | Read new messages (5 at a time) |
 | `F` | Forward read from the beginning |
 | `F <id>` | Forward read starting at message #id (the next one if #id is gone); works inside reading mode too |
-| `R <id>` | Inside reading mode only: jump to message #id (if #id is deleted, blocked or not yours to see, the nearest earlier message is shown with a notice). Jumping does not move your read marker |
+| `R <id>` | Start reverse reading at message #id, from the command prompt or inside reading mode (if #id is deleted, blocked or not yours to see, the nearest earlier message is shown with a notice). Jumping does not move your read marker |
 | `R` | Reverse read (newest first) |
 | `S` | Scan message headers |
 | `.FF` | Fast-forward past unread (mark all read) |

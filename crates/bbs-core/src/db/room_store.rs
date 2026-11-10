@@ -1,9 +1,14 @@
 //! `RoomStore` trait and its SQLite implementation on `Database`.
 
 use super::{error::StoreError, Database};
-use crate::{ids::RoomId, room::Room, timestamp::Timestamp};
+use crate::{
+    ids::RoomId,
+    room::{ReadOrder, Room},
+    timestamp::Timestamp,
+};
 use async_trait::async_trait;
 use bbs_plugin_api::PermissionLevel;
+use sqlx::Row;
 
 // ── Helpers ───────────────────────────────────────────────────────────
 
@@ -92,6 +97,17 @@ pub trait RoomStore: Send + Sync {
     /// Delete a room. Cascades to `room_messages` and
     /// `user_room_state`; the underlying `messages` rows survive.
     async fn delete(&self, id: RoomId) -> Result<(), StoreError>;
+
+    /// The room's `N` read order (#420). `Err(NotFound)` for an unknown room.
+    async fn get_read_order(&self, id: RoomId) -> Result<ReadOrder, StoreError>;
+
+    /// Set the room's `N` read order. `Err(NotFound)` for an unknown room.
+    async fn set_read_order(&self, id: RoomId, order: ReadOrder) -> Result<(), StoreError>;
+
+    /// Every room's read order, keyed by room id.
+    async fn list_read_orders(
+        &self,
+    ) -> Result<std::collections::HashMap<RoomId, ReadOrder>, StoreError>;
 }
 
 // ── Implementation ────────────────────────────────────────────────────
@@ -462,5 +478,157 @@ impl RoomStore for Database {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn get_read_order(&self, id: RoomId) -> Result<ReadOrder, StoreError> {
+        let raw: Option<String> = sqlx::query_scalar("SELECT read_order FROM rooms WHERE id = ?")
+            .bind(id.as_i64())
+            .fetch_optional(&self.read_pool)
+            .await?;
+        let raw = raw.ok_or(StoreError::NotFound)?;
+        ReadOrder::parse(&raw)
+            .ok_or_else(|| StoreError::Decode(format!("unknown read_order {raw:?}")))
+    }
+
+    async fn set_read_order(&self, id: RoomId, order: ReadOrder) -> Result<(), StoreError> {
+        let done = sqlx::query("UPDATE rooms SET read_order = ? WHERE id = ?")
+            .bind(order.as_str())
+            .bind(id.as_i64())
+            .execute(&self.write_pool)
+            .await?;
+        if done.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
+    async fn list_read_orders(
+        &self,
+    ) -> Result<std::collections::HashMap<RoomId, ReadOrder>, StoreError> {
+        let rows = sqlx::query("SELECT id, read_order FROM rooms")
+            .fetch_all(&self.read_pool)
+            .await?;
+        rows.into_iter()
+            .map(|r| {
+                let id: i64 = r.try_get("id")?;
+                let raw: String = r.try_get("read_order")?;
+                let order = ReadOrder::parse(&raw)
+                    .ok_or_else(|| StoreError::Decode(format!("unknown read_order {raw:?}")))?;
+                Ok((RoomId::new(id), order))
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::room::ReadOrder;
+
+    async fn open_db() -> (Database, tempfile::NamedTempFile) {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let db = Database::open(&f.path().to_string_lossy()).await.unwrap();
+        (db, f)
+    }
+
+    #[tokio::test]
+    async fn read_order_round_trip_and_defaults() {
+        let (db, _f) = open_db().await;
+        assert_eq!(
+            db.get_read_order(RoomId::new(1)).await.unwrap(),
+            ReadOrder::OldestFirst
+        );
+        db.set_read_order(RoomId::new(1), ReadOrder::NewestFirst)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_read_order(RoomId::new(1)).await.unwrap(),
+            ReadOrder::NewestFirst
+        );
+        let all = db.list_read_orders().await.unwrap();
+        assert_eq!(all[&RoomId::new(1)], ReadOrder::NewestFirst);
+        assert_eq!(all[&RoomId::new(2)], ReadOrder::OldestFirst);
+        assert_eq!(all.len(), db.list_in_order().await.unwrap().len());
+
+        // A new room defaults to oldest first.
+        let id = db
+            .create(
+                "alerts",
+                None,
+                false,
+                PermissionLevel::User,
+                Timestamp::now(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(db.get_read_order(id).await.unwrap(), ReadOrder::OldestFirst);
+        db.set_read_order(id, ReadOrder::OldestFirst).await.unwrap();
+
+        assert!(matches!(
+            db.get_read_order(RoomId::new(999)).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            db.set_read_order(RoomId::new(999), ReadOrder::NewestFirst)
+                .await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn database_rejects_unknown_read_order_values() {
+        let (db, _f) = open_db().await;
+        let res = sqlx::query("UPDATE rooms SET read_order = 'sideways' WHERE id = 1")
+            .execute(&db.write_pool)
+            .await;
+        assert!(res.is_err(), "CHECK constraint should reject the value");
+    }
+
+    /// Rooms that exist before migration 0016 come out as oldest-first.
+    #[tokio::test]
+    async fn migration_defaults_pre_existing_rooms_to_oldest_first() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        let f = tempfile::NamedTempFile::new().unwrap();
+        let opts = SqliteConnectOptions::new()
+            .filename(f.path())
+            .create_if_missing(true);
+        let pool = SqlitePoolOptions::new().connect_with(opts).await.unwrap();
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .iter()
+                .filter(|m| m.version < 16)
+                .cloned()
+                .collect(),
+        );
+        migrator.run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO rooms (name, description, read_only, min_permission_level,
+                                prev_neighbor, created_at)
+             VALUES ('legacy', NULL, 0, 10, 5, '2025-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE rooms SET next_neighbor = (SELECT id FROM rooms WHERE name = 'legacy') WHERE id = 5")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        // Opening applies 0016 on top of the existing database.
+        let db = Database::open(&f.path().to_string_lossy()).await.unwrap();
+        let legacy = db.get_by_name("legacy").await.unwrap().unwrap();
+        assert_eq!(
+            db.get_read_order(legacy.id).await.unwrap(),
+            ReadOrder::OldestFirst
+        );
+        assert!(db
+            .list_read_orders()
+            .await
+            .unwrap()
+            .values()
+            .all(|o| *o == ReadOrder::OldestFirst));
     }
 }

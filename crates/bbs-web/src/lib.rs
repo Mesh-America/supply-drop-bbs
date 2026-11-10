@@ -1857,6 +1857,9 @@ struct UpdateRoomBody {
     description: Option<Option<String>>,
     read_only: Option<bool>,
     min_permission_level: Option<u8>,
+    /// `"oldest_first"` or `"newest_first"`: how `N` orders unread messages
+    /// in this room (#420). Absent = leave unchanged.
+    read_order: Option<String>,
 }
 
 async fn api_update_room(
@@ -1884,7 +1887,48 @@ async fn api_update_room(
             .into_response();
     }
 
-    match state
+    // The Mail room is private and ignores the read order.
+    if id == 2 && body.read_order.is_some() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json_error("the Mail room has no read order")),
+        )
+            .into_response();
+    }
+    // Validate up front so a bad value cannot leave the other fields half-applied.
+    if let Some(order) = body.read_order.as_deref() {
+        if !matches!(order, "oldest_first" | "newest_first") {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json_error(
+                    "read_order must be \"oldest_first\" or \"newest_first\"",
+                )),
+            )
+                .into_response();
+        }
+    }
+
+    // Every field this PATCH changes, for the audit detail (description text
+    // is left out: it can be long, and the audit row only needs to say it
+    // changed).
+    let mut changed: Vec<String> = Vec::new();
+    match &body.description {
+        Some(Some(_)) => changed.push("description=set".to_owned()),
+        Some(None) => changed.push("description=cleared".to_owned()),
+        None => {}
+    }
+    if let Some(v) = body.read_only {
+        changed.push(format!("read_only={v}"));
+    }
+    if let Some(v) = body.min_permission_level {
+        changed.push(format!("min_permission_level={v}"));
+    }
+    if let Some(v) = body.read_order.as_deref() {
+        changed.push(format!("read_order={v}"));
+    }
+    let other_fields = changed.len() - usize::from(body.read_order.is_some());
+
+    let mut result = state
         .host
         .admin_update_room(
             id,
@@ -1892,13 +1936,28 @@ async fn api_update_room(
             body.read_only,
             body.min_permission_level,
         )
-        .await
-    {
+        .await;
+    if let (Ok(_), Some(order)) = (&result, body.read_order.as_deref()) {
+        result = match state.host.admin_set_room_read_order(id, order).await {
+            Ok(room) => Ok(room),
+            Err(e) if other_fields > 0 => {
+                // The first write already landed; say so rather than report a
+                // clean failure. No audit row: the PATCH did not complete.
+                return server_error(&format!(
+                    "the other room changes were saved, but setting the read order failed: {e}"
+                ));
+            }
+            Err(e) => Err(e),
+        };
+    }
+    match result {
         Ok(room) => {
+            // Audited only once every write has succeeded.
             let actor_str = format!("web:{}", caller.username);
+            let detail = (!changed.is_empty()).then(|| changed.join(", "));
             if let Err(e) = state
                 .host
-                .admin_write_audit(&actor_str, "edit_room", Some(&room.name), None)
+                .admin_write_audit(&actor_str, "edit_room", Some(&room.name), detail.as_deref())
                 .await
             {
                 warn!("audit write failed: {e}");
@@ -5308,6 +5367,90 @@ mod tests {
                 .unwrap();
         }
         (state, db, db_file)
+    }
+
+    /// #420: PATCH accepts `read_order`, the list returns it, the change is
+    /// audited, bad values and the Mail room are rejected.
+    #[tokio::test]
+    async fn room_read_order_is_settable_listed_and_audited() {
+        let (state, _file) = real_host_state().await;
+        let patch = |id: i64, json: &str| {
+            let state = state.clone();
+            let body: UpdateRoomBody = serde_json::from_str(json).unwrap();
+            async move { api_update_room(State(state), Extension(sysop()), Path(id), Json(body)).await }
+        };
+
+        // Default is oldest_first.
+        let listed = body_json(api_list_rooms(State(state.clone())).await).await;
+        assert!(listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["read_order"] == "oldest_first"));
+
+        let resp = patch(1, r#"{"read_order":"newest_first"}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["read_order"], "newest_first");
+        let listed = body_json(api_list_rooms(State(state.clone())).await).await;
+        let lobby = &listed.as_array().unwrap()[0];
+        assert_eq!(lobby["id"], 1);
+        assert_eq!(lobby["read_order"], "newest_first");
+
+        let log = state
+            .host
+            .admin_audit_log(10, 0, Some("edit_room"))
+            .await
+            .unwrap();
+        assert!(log.iter().any(|e| e.target.as_deref() == Some("Lobby")
+            && e.detail.as_deref() == Some("read_order=newest_first")));
+
+        // Combined with another field.
+        let resp = patch(1, r#"{"read_only":false,"read_order":"oldest_first"}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["read_order"], "oldest_first");
+        // The audit detail lists every field the PATCH changed.
+        let log = state
+            .host
+            .admin_audit_log(10, 0, Some("edit_room"))
+            .await
+            .unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.detail.as_deref() == Some("read_only=false, read_order=oldest_first")),
+            "{log:?}"
+        );
+        // An edit that leaves read_order alone does not mention it.
+        let resp = patch(1, r#"{"min_permission_level":0}"#).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let log = state
+            .host
+            .admin_audit_log(10, 0, Some("edit_room"))
+            .await
+            .unwrap();
+        assert!(
+            log.iter()
+                .any(|e| e.detail.as_deref() == Some("min_permission_level=0")),
+            "{log:?}"
+        );
+
+        // Bad value, Mail room, unknown room.
+        assert_eq!(
+            patch(1, r#"{"read_order":"sideways"}"#).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            patch(2, r#"{"read_order":"newest_first"}"#).await.status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
+        // A non-sysop may not.
+        let denied = api_update_room(
+            State(state.clone()),
+            Extension(regular_user()),
+            Path(1),
+            Json(serde_json::from_str(r#"{"read_order":"newest_first"}"#).unwrap()),
+        )
+        .await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
     }
 
     async fn level_of(state: &AppState, token: &str) -> Option<u8> {
