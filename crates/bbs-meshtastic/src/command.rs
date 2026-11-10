@@ -4,8 +4,10 @@ use bbs_plugin_api::{event::Notification, identity::Username, Command, Permissio
 
 pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> Option<Command> {
     let text = text.trim();
+    let stripped = strip_zero_width(text);
+    let text = stripped.as_str();
 
-    if matches!(text.to_ascii_lowercase().as_str(), "cancel" | "stop") {
+    if matches!(text.to_lowercase().as_str(), "cancel" | "stop") {
         return Some(Command::Cancel);
     }
 
@@ -30,7 +32,7 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
     }
 
     let (word, rest) = split_first_word(text);
-    let keyword = word.to_ascii_lowercase();
+    let keyword = word.to_lowercase();
 
     match keyword.as_str() {
         "h" | "help" | "?" => Some(Command::Help {
@@ -86,15 +88,26 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
         }),
         "m" => Some(Command::GoMail),
         "n" => Some(Command::ReadNew),
-        "f" => Some(Command::ReadForward {
-            after: rest.and_then(|s| s.parse::<i64>().ok()),
-        }),
+        "f" => match rest {
+            None => Some(Command::ReadForward { after: None }),
+            Some(s) => match s.parse::<i64>() {
+                Ok(id) => Some(Command::ReadForward { after: Some(id) }),
+                Err(_) => Some(Command::Unknown {
+                    raw: text.to_owned(),
+                }),
+            },
+        },
         "r" => Some(Command::ReadReverse),
-        "s" => match rest {
+        // Unconditionally ScanMessages regardless of trailing text (#411) —
+        // see bbs-plugin-api::Command::parse's identical arm for the reason.
+        "s" => Some(Command::ScanMessages),
+        "search" => match rest {
             Some(q) if !q.is_empty() => Some(Command::SearchUsers {
                 query: q.to_owned(),
             }),
-            _ => Some(Command::ScanMessages),
+            _ => Some(Command::Unknown {
+                raw: text.to_owned(),
+            }),
         },
         ".ff" => Some(Command::FastForward),
         "e" => Some(Command::EnterMessage {
@@ -227,14 +240,29 @@ pub fn parse_command(text: &str, prefix: Option<char>, awaiting_reply: bool) -> 
     }
 }
 
+/// Split `s` on the first run of whitespace.
+///
+/// Unicode-aware (`char::is_whitespace`), matching `text.trim()`'s own
+/// whitespace definition — an ASCII-only split here left a line joined by
+/// e.g. a non-breaking space (U+00A0) as one unmatched word instead of
+/// keyword + argument (#413).
 fn split_first_word(s: &str) -> (&str, Option<&str>) {
-    match s.find(|c: char| c.is_ascii_whitespace()) {
+    match s.find(char::is_whitespace) {
         None => (s, None),
         Some(i) => {
             let rest = s[i..].trim_start();
             (&s[..i], if rest.is_empty() { None } else { Some(rest) })
         }
     }
+}
+
+/// Strip zero-width and other default-ignorable code points that survive
+/// `trim()`/`to_lowercase()` — see `bbs_plugin_api::command`'s identical
+/// helper for the full rationale (#412).
+fn strip_zero_width(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(*c, '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}'))
+        .collect()
 }
 
 /// Parse a `.AIDE` / `.SYSOP` / `.USER <user>` set-level command. (#127)
@@ -410,5 +438,48 @@ mod tests {
     #[test]
     fn truncate_preserves_utf8() {
         assert_eq!(truncate_utf8("ab😀cd", 5), "ab");
+    }
+
+    // ── Parser hardening (#411, #412, #413) ──────────────────────────────
+
+    fn hardening(text: &str) -> Option<Command> {
+        parse_command(text, None, false)
+    }
+
+    #[test]
+    fn s_is_always_scan_and_search_is_the_user_search() {
+        assert_eq!(hardening("s"), Some(Command::ScanMessages));
+        assert_eq!(hardening("s foo"), Some(Command::ScanMessages));
+        assert_eq!(
+            hardening("search bob"),
+            Some(Command::SearchUsers {
+                query: "bob".to_owned()
+            })
+        );
+        assert!(matches!(hardening("search"), Some(Command::Unknown { .. })));
+    }
+
+    #[test]
+    fn zero_width_characters_cannot_defeat_cancel() {
+        for text in ["cancel\u{200B}", "\u{FEFF}STOP", "ca\u{200D}ncel"] {
+            assert_eq!(hardening(text), Some(Command::Cancel), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn non_breaking_space_splits_keyword_and_argument() {
+        assert!(matches!(
+            hardening("c\u{00A0}lobby"),
+            Some(Command::ChangeRoom { .. })
+        ));
+    }
+
+    #[test]
+    fn f_with_a_bad_id_is_unknown_not_continue() {
+        assert_eq!(
+            hardening("f 10"),
+            Some(Command::ReadForward { after: Some(10) })
+        );
+        assert!(matches!(hardening("f 1o"), Some(Command::Unknown { .. })));
     }
 }
