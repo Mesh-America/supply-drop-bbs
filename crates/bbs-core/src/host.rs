@@ -163,6 +163,21 @@ enum AuthEscape {
     },
 }
 
+/// Split a workflow reply (reading mode, or the register/login escape) into an
+/// upper-cased keyword and its argument.
+///
+/// One `trim()` plus one Unicode-whitespace split, matching the command
+/// parser, so NBSP and tab separators work. Only the keyword is ASCII
+/// upper-cased; the remainder is trimmed and keeps its case. There is no byte
+/// slicing, so multi-byte input cannot panic.
+fn split_reply_keyword(reply: &str) -> (String, &str) {
+    let trimmed = reply.trim();
+    match trimmed.split_once(char::is_whitespace) {
+        Some((keyword, rest)) => (keyword.to_ascii_uppercase(), rest.trim()),
+        None => (trimmed.to_ascii_uppercase(), ""),
+    }
+}
+
 /// Detect a REGISTER/LOGIN command in raw workflow-reply text.
 ///
 /// Only these two commands escape an active register/login workflow: a lost
@@ -174,11 +189,7 @@ enum AuthEscape {
 /// re-prompts). A trailing word after the username is taken as a one-shot
 /// password. Matching is case-insensitive.
 fn auth_escape(reply: &str) -> Option<AuthEscape> {
-    let trimmed = reply.trim();
-    let (word, rest) = match trimmed.split_once(char::is_whitespace) {
-        Some((w, r)) => (w, r.trim()),
-        None => (trimmed, ""),
-    };
+    let (word, rest) = split_reply_keyword(reply);
     if rest.is_empty() {
         return None;
     }
@@ -190,12 +201,12 @@ fn auth_escape(reply: &str) -> Option<AuthEscape> {
         }
         None => (rest, None),
     };
-    match word.to_ascii_lowercase().as_str() {
-        "register" => Some(AuthEscape::Register {
+    match word.as_str() {
+        "REGISTER" => Some(AuthEscape::Register {
             username: name.to_owned(),
             password,
         }),
-        "login" => Username::new(name).ok().map(|u| AuthEscape::Login {
+        "LOGIN" => Username::new(name).ok().map(|u| AuthEscape::Login {
             username: u,
             password,
         }),
@@ -3238,51 +3249,16 @@ impl BbsHost {
                 room_id,
                 stage: ComposeStage::AwaitingBody { recipient },
             } => {
-                let body = reply.trim();
-                if body.is_empty() {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::Compose {
-                            room_id,
-                            stage: ComposeStage::AwaitingBody { recipient },
-                        };
-                    }
-                    return Ok(Response::Prompt {
-                        text: "Message cannot be empty. Enter your message:".into(),
-                        hide_input: false,
-                    });
-                }
-
-                // Transition to AwaitingConfirmation instead of posting immediately,
-                // so both E paths (inline and multi-step) require "." to confirm.
-                let body = body.to_string();
-                {
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::Compose {
-                            room_id,
-                            stage: ComposeStage::AwaitingConfirmation {
-                                recipient: recipient.clone(),
-                                body: body.clone(),
-                            },
-                        };
-                    }
-                }
-                let preview = draft_preview(
-                    recipient.as_ref(),
-                    &body,
-                    self.session_on_radio(session).await,
-                );
-                Ok(Response::Prompt {
-                    text: preview,
-                    hide_input: false,
-                })
+                // Both E paths (inline and multi-step) end in a staged draft
+                // that needs "." to confirm; an empty body re-prompts and
+                // leaves the workflow as it is.
+                self.stage_draft(session, room_id, recipient, &reply).await
             }
 
             // ── Draft confirmation ────────────────────────────────────────────
             Workflow::Compose {
-                room_id,
                 stage: ComposeStage::AwaitingConfirmation { recipient, body },
+                ..
             } => {
                 if reply.trim().eq_ignore_ascii_case("c") {
                     // Abandon the draft: nothing is posted and the user is back at
@@ -3309,14 +3285,9 @@ impl BbsHost {
                         &body,
                         self.session_on_radio(session).await,
                     );
-                    // Keep workflow state unchanged.
-                    let mut sessions = self.sessions.write().await;
-                    if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::Compose {
-                            room_id,
-                            stage: ComposeStage::AwaitingConfirmation { recipient, body },
-                        };
-                    }
+                    // The workflow state is left as it is: rewriting it from
+                    // this snapshot could resurrect a draft a concurrent "."
+                    // has just claimed.
                     return Ok(Response::Prompt {
                         text: preview,
                         hide_input: false,
@@ -3331,32 +3302,97 @@ impl BbsHost {
                         .and_then(|r| r.username.clone())
                         .ok_or(HostError::NotAuthenticated)?
                 };
+
+                // Claim the draft atomically. `workflow` above is a snapshot
+                // taken before any lock was held, so two concurrent "." replies
+                // would both see AwaitingConfirmation and both post. Under one
+                // write lock, exactly one caller swaps the draft out for
+                // Workflow::None and takes it; the other finds nothing to
+                // confirm and hears the idempotent last confirmation (#107).
+                let claimed = {
+                    let mut sessions = self.sessions.write().await;
+                    let r = sessions
+                        .get_mut(&session)
+                        .ok_or(HostError::UnknownSession(session))?;
+                    if matches!(
+                        r.workflow,
+                        Workflow::Compose {
+                            stage: ComposeStage::AwaitingConfirmation { .. },
+                            ..
+                        }
+                    ) {
+                        match std::mem::replace(&mut r.workflow, Workflow::None) {
+                            Workflow::Compose {
+                                room_id,
+                                stage: ComposeStage::AwaitingConfirmation { recipient, body },
+                            } => Ok((room_id, recipient, body)),
+                            _ => unreachable!("checked just above under the same lock"),
+                        }
+                    } else {
+                        Err(r.last_post_confirmation.clone())
+                    }
+                };
+                let (room_id, recipient, body) = match claimed {
+                    Ok(draft) => draft,
+                    Err(Some(confirmation)) => return Ok(Response::Text(confirmation)),
+                    Err(None) => {
+                        return Ok(Response::Error("Nothing to confirm. Type 'H'.".into()))
+                    }
+                };
+
+                // Mail needs a recipient; never write a public row into the
+                // Mail room (the Mail view would not show it).
+                if recipient.is_none() && room_id == MAIL_ROOM_ID {
+                    return Ok(Response::Error(
+                        "No recipient for this message. Use E @user text.".into(),
+                    ));
+                }
+
                 let now = Timestamp::now();
                 // Mail (a direct recipient) gets a mail-specific confirmation so
                 // the sender knows they used the private-mail path, not a public
                 // room (#121); room posts keep "Message posted."
-                let (msg_id, event_recipient, confirmation) = if let Some(ref rcpt) = recipient {
-                    let mid = self
-                        .db
+                let posted = if let Some(ref rcpt) = recipient {
+                    self.db
                         .post_direct(&sender, rcpt, &body, now)
                         .await
-                        .map_err(|e| HostError::Storage(format!("post_direct: {e}")))?;
-                    (
-                        mid,
-                        MessageRecipient::Direct(rcpt.clone()),
-                        format!("Mail sent to {}.", rcpt.as_str()),
-                    )
+                        .map(|mid| {
+                            (
+                                mid,
+                                MessageRecipient::Direct(rcpt.clone()),
+                                format!("Mail sent to {}.", rcpt.as_str()),
+                            )
+                        })
+                        .map_err(|e| HostError::Storage(format!("post_direct: {e}")))
                 } else {
-                    let mid = self
-                        .db
+                    self.db
                         .post_to_room(room_id, &sender, &body, now)
                         .await
-                        .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))?;
-                    (
-                        mid,
-                        MessageRecipient::Room(room_id.as_i64().to_string()),
-                        "Message posted.".to_owned(),
-                    )
+                        .map(|mid| {
+                            (
+                                mid,
+                                MessageRecipient::Room(room_id.as_i64().to_string()),
+                                "Message posted.".to_owned(),
+                            )
+                        })
+                        .map_err(|e| HostError::Storage(format!("post_to_room: {e}")))
+                };
+                let (msg_id, event_recipient, confirmation) = match posted {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // The post failed: put the draft back (unless the
+                        // session has moved on) so the user can retry with ".".
+                        let mut sessions = self.sessions.write().await;
+                        if let Some(r) = sessions.get_mut(&session) {
+                            if matches!(r.workflow, Workflow::None) {
+                                r.workflow = Workflow::Compose {
+                                    room_id,
+                                    stage: ComposeStage::AwaitingConfirmation { recipient, body },
+                                };
+                            }
+                        }
+                        return Err(e);
+                    }
                 };
                 let _ = self.events_tx.send(DomainEvent::MessagePosted {
                     sender,
@@ -3366,7 +3402,6 @@ impl BbsHost {
                 {
                     let mut sessions = self.sessions.write().await;
                     if let Some(r) = sessions.get_mut(&session) {
-                        r.workflow = Workflow::None;
                         // Arm idempotent re-confirm: a re-sent bare `.` re-emits
                         // this same confirmation rather than erroring (#107).
                         r.last_post_confirmation = Some(confirmation.clone());
@@ -3617,71 +3652,51 @@ impl BbsHost {
 
             // ── Message reading ──────────────────────────────────────────────
             Workflow::Reading => {
-                let upper = reply.trim().to_uppercase();
-                match upper.as_str() {
-                    "F" => self.handle_read_forward(session, None).await,
-                    "R" => self.handle_read_reverse(session, None).await,
-                    "E" => self.handle_reply_from_reading(session, None).await,
+                // One Unicode-whitespace split for every reading-mode key, the
+                // same rule the command parser uses, so NBSP and tab separators
+                // work here too. Only the keyword is upper-cased; the remainder
+                // keeps the case the user typed (it is the draft text for `E`).
+                let (keyword, rest) = split_reply_keyword(&reply);
+                match (keyword.as_str(), rest) {
+                    ("F", "") => return self.handle_read_forward(session, None).await,
+                    ("R", "") => return self.handle_read_reverse(session, None).await,
+                    ("E", "") => return self.handle_reply_from_reading(session, None).await,
                     // H is the universal help key; in reading mode it shows
                     // contextual help and stays in the reading sub-mode rather
                     // than bouncing the user out (issue #109).
-                    "H" | "?" => Ok(Response::Text(HELP_READING_MODE.into())),
-                    _ => {
-                        // F <id> jumps to a message without leaving reading
-                        // mode. Without this it fell through to the catch-all
-                        // below and exited, so the messages a scan listed could
-                        // not be read one after another by number.
-                        if let Some(id) = upper
-                            .strip_prefix("F ")
-                            .and_then(|rest| rest.trim().parse::<i64>().ok())
-                        {
+                    ("H" | "?", "") => return Ok(Response::Text(HELP_READING_MODE.into())),
+                    // F <id> jumps to a message without leaving reading mode,
+                    // so the messages a scan listed can be read by number.
+                    ("F", arg) => {
+                        if let Ok(id) = arg.parse::<i64>() {
                             return self.handle_read_forward(session, Some(id)).await;
                         }
-
-                        // R <id> is the reverse counterpart of F <id> (#415).
-                        // Without it "R 5" hit the catch-all and silently
-                        // exited reading mode.
-                        if let Some(id) = upper
-                            .strip_prefix("R ")
-                            .and_then(|rest| rest.trim().parse::<i64>().ok())
-                        {
+                    }
+                    // R <id> is the reverse counterpart of F <id> (#415).
+                    ("R", arg) => {
+                        if let Ok(id) = arg.parse::<i64>() {
                             return self.handle_read_reverse(session, Some(id)).await;
                         }
-
-                        // E <text> starts a reply with that text as the draft
-                        // (#410). Uses `reply`, not `upper`, to keep the case
-                        // the user typed.
-                        let trimmed = reply.trim();
-                        if trimmed.len() > 2
-                            && trimmed.is_char_boundary(2)
-                            && trimmed[..2].eq_ignore_ascii_case("e ")
-                        {
-                            let body = trimmed[2..].trim();
-                            if !body.is_empty() {
-                                return self
-                                    .handle_reply_from_reading(session, Some(body.to_owned()))
-                                    .await;
-                            }
-                        }
-
-                        // D [<id>] deletes without leaving reading mode (issue
-                        // #184) -- previously any input other than F/R/E/H
-                        // fell straight to the catch-all below, so "D <id>"
-                        // just exited reading mode instead of deleting; only
-                        // a second, out-of-reading-mode "D <id>" worked.
-                        // Bare "D" targets whatever message is on screen.
-                        let delete_id = if upper == "D" {
+                    }
+                    // E <text> starts a reply with that text as the draft
+                    // (#410).
+                    ("E", text) => {
+                        return self
+                            .handle_reply_from_reading(session, Some(text.to_owned()))
+                            .await;
+                    }
+                    // D [<id>] deletes without leaving reading mode (issue
+                    // #184). Bare "D" targets whatever message is on screen.
+                    ("D", arg) => {
+                        let delete_id = if arg.is_empty() {
                             let sessions = self.sessions.read().await;
                             sessions
                                 .get(&session)
                                 .and_then(|r| r.current_message_id)
                                 .map(MessageId::as_i64)
                         } else {
-                            upper
-                                .strip_prefix("D ")
-                                .and_then(|rest| rest.trim().parse::<i64>().ok())
+                            arg.parse::<i64>().ok()
                         };
-
                         if let Some(id) = delete_id {
                             let current = {
                                 let sessions = self.sessions.read().await;
@@ -3701,20 +3716,21 @@ impl BbsHost {
                             }
                             return response;
                         }
+                    }
+                    _ => {}
+                }
 
-                        // Any other input exits reading mode.
-                        {
-                            let mut sessions = self.sessions.write().await;
-                            if let Some(r) = sessions.get_mut(&session) {
-                                r.workflow = Workflow::None;
-                                r.current_message_id = None;
-                            }
-                        }
-                        Ok(Response::Text(
-                            "Exited reading mode. Type H for help.".into(),
-                        ))
+                // Any other input exits reading mode.
+                {
+                    let mut sessions = self.sessions.write().await;
+                    if let Some(r) = sessions.get_mut(&session) {
+                        r.workflow = Workflow::None;
+                        r.current_message_id = None;
                     }
                 }
+                Ok(Response::Text(
+                    "Exited reading mode. Type H for help.".into(),
+                ))
             }
 
             // ── Room selection ────────────────────────────────────────────────
@@ -4522,7 +4538,7 @@ impl BbsHost {
         session: SessionId,
         body: Option<String>,
     ) -> Result<Response, HostError> {
-        let (_, _, level, room_id) = match self.session_auth_user(session).await {
+        let (me, _, level, room_id) = match self.session_auth_user(session).await {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
@@ -4541,35 +4557,40 @@ impl BbsHost {
             sessions.get(&session).and_then(|r| r.current_message_id)
         };
 
-        let recipient: Option<Username> = if let Some(mid) = msg_id {
-            let msg = MessageStore::get_by_id(&self.db, mid)
-                .await
-                .map_err(|e| HostError::Storage(format!("{e}")))?;
-            // In Mail room, reply goes to the sender of the current message.
-            // In a regular room, there is no specific recipient.
-            if room_id == MAIL_ROOM_ID {
-                msg.map(|m| m.sender)
-            } else {
-                None
+        // In Mail the reply goes to the other party of the current message: its
+        // sender, or, for a message the user sent themselves, its recipient.
+        // In a regular room there is no specific recipient.
+        let recipient: Option<Username> = if room_id == MAIL_ROOM_ID {
+            let msg = match msg_id {
+                Some(mid) => MessageStore::get_by_id(&self.db, mid)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("{e}")))?,
+                None => None,
+            };
+            let target = msg.map(|m| {
+                if m.sender == me {
+                    m.recipient.unwrap_or(m.sender)
+                } else {
+                    m.sender
+                }
+            });
+            match target {
+                Some(t) => Some(t),
+                // No message on screen (empty mailbox, deleted message): a
+                // reply here would otherwise be posted as a public row in the
+                // Mail room.
+                None => {
+                    return Ok(Response::Error(
+                        "No message to reply to. Use E @user text.".into(),
+                    ))
+                }
             }
         } else {
             None
         };
 
         if let Some(body) = body {
-            let on_radio = self.session_on_radio(session).await;
-            let preview = draft_preview(recipient.as_ref(), &body, on_radio);
-            let mut sessions = self.sessions.write().await;
-            if let Some(r) = sessions.get_mut(&session) {
-                r.workflow = Workflow::Compose {
-                    room_id,
-                    stage: ComposeStage::AwaitingConfirmation { recipient, body },
-                };
-            }
-            return Ok(Response::Prompt {
-                text: preview,
-                hide_input: false,
-            });
+            return self.stage_draft(session, room_id, recipient, &body).await;
         }
 
         let prompt = match &recipient {
@@ -4589,6 +4610,67 @@ impl BbsHost {
 
         Ok(Response::Prompt {
             text: prompt,
+            hide_input: false,
+        })
+    }
+
+    /// Stage `body` as a draft awaiting the usual `.` confirmation and return
+    /// the preview. The one place every compose path ends in, so the checks
+    /// cannot drift apart: the body must be non-empty (after trimming) and
+    /// within [`crate::message::Message::CONTENT_MAX_LEN`] bytes, the room
+    /// must be writable by the user, and Mail needs a recipient.
+    async fn stage_draft(
+        &self,
+        session: SessionId,
+        room_id: RoomId,
+        recipient: Option<Username>,
+        body: &str,
+    ) -> Result<Response, HostError> {
+        let (_, _, level, _) = match self.session_auth_or_guest(session).await {
+            Ok(t) => t,
+            Err(r) => return Ok(r),
+        };
+        let body = body.trim();
+        if body.is_empty() {
+            return Ok(Response::Prompt {
+                text: "Message cannot be empty. Enter your message:".into(),
+                hide_input: false,
+            });
+        }
+        if let Err(e) = crate::message::Message::validate_content(body) {
+            return Ok(Response::Error(format!("Message not sent: {e}.")));
+        }
+        if room_id == MAIL_ROOM_ID && recipient.is_none() {
+            return Ok(Response::Error(
+                "No recipient for this message. Use E @user text.".into(),
+            ));
+        }
+        let room = RoomStore::get_by_id(&self.db, room_id)
+            .await
+            .map_err(|e| HostError::Storage(format!("{e}")))?
+            .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
+        if room.read_only && level < PermissionLevel::Aide {
+            return Ok(Response::Error(format!("'{}' is read-only.", room.name)));
+        }
+
+        // Read before the sessions lock is taken: the preview is clipped for
+        // radio sessions.
+        let on_radio = self.session_on_radio(session).await;
+        let preview = draft_preview(recipient.as_ref(), body, on_radio);
+        {
+            let mut sessions = self.sessions.write().await;
+            if let Some(r) = sessions.get_mut(&session) {
+                r.workflow = Workflow::Compose {
+                    room_id,
+                    stage: ComposeStage::AwaitingConfirmation {
+                        recipient,
+                        body: body.to_owned(),
+                    },
+                };
+            }
+        }
+        Ok(Response::Prompt {
+            text: preview,
             hide_input: false,
         })
     }
@@ -5177,12 +5259,23 @@ impl BbsHost {
         })
     }
 
-    /// Reverse-read. `before = Some(id)` (reading mode's `R <id>`) starts AT
-    /// that message, mirroring `F <id>`; `None` steps back from the cursor.
+    /// Reverse-read.
+    ///
+    /// `start_at = None` steps back from the reading cursor (or, with no
+    /// cursor and not yet reading, shows the reading intro); only this step
+    /// navigation advances the read pointer.
+    ///
+    /// `start_at = Some(id)` (reading mode's `R <id>`) starts AT that message,
+    /// mirroring `F <id>`. The message is looked up by id and must be visible to
+    /// the reader: in this room (or, in Mail, to or from them) and not from a
+    /// blocked sender. If it is not (deleted, another room, blocked), the
+    /// nearest earlier visible message is shown instead, with a notice naming
+    /// the id that was not shown. An explicit jump never moves the read
+    /// pointer, so a mistyped id cannot mark everything up to it as read.
     async fn handle_read_reverse(
         &self,
         session: SessionId,
-        before: Option<i64>,
+        start_at: Option<i64>,
     ) -> Result<Response, HostError> {
         let (username, user_id, level, room_id) = match self.session_auth_or_guest(session).await {
             Ok(t) => t,
@@ -5203,20 +5296,16 @@ impl BbsHost {
             .ok_or_else(|| HostError::NotFound(format!("{room_id}")))?;
 
         // R with no position → jump to last message; otherwise go one back.
-        // An explicit id is stepped forward by one so the step back lands on
-        // it; if the id is gone, the closest earlier message is shown.
         let (cursor, already_reading) = {
             let sessions = self.sessions.read().await;
             let r = sessions.get(&session);
-            let cursor = before
-                .map(|id| MessageId::new(id.saturating_add(1)))
-                .or_else(|| r.and_then(|r| r.current_message_id));
+            let cursor = r.and_then(|r| r.current_message_id);
             let already_reading = r.is_some_and(|r| matches!(r.workflow, Workflow::Reading));
             (cursor, already_reading)
         };
 
         // First R with no cursor and not yet in reading mode → show intro.
-        if cursor.is_none() && !already_reading {
+        if start_at.is_none() && cursor.is_none() && !already_reading {
             let count = if room_id == MAIL_ROOM_ID {
                 self.db.count_direct(&username).await
             } else {
@@ -5245,27 +5334,82 @@ impl BbsHost {
             .blocks_by(username.as_str())
             .await
             .map_err(|e| HostError::Storage(format!("{e}")))?;
-        let msg = match self
-            .neighbour_step(room_id, &username, cursor, false, &blocked)
-            .await?
-        {
+
+        let mut notice = None;
+        let found = match start_at {
+            None => {
+                self.neighbour_step(room_id, &username, cursor, false, &blocked)
+                    .await?
+            }
+            Some(id) => {
+                let wanted = MessageId::new(id);
+                let direct = MessageStore::get_by_id(&self.db, wanted)
+                    .await
+                    .map_err(|e| HostError::Storage(format!("{e}")))?
+                    .filter(|m| !blocked.contains(m.sender.as_str()));
+                let visible = match direct {
+                    Some(m) if room_id == MAIL_ROOM_ID => ((m.sender == username
+                        || m.recipient.as_ref() == Some(&username))
+                        && m.recipient.is_some())
+                    .then_some(m),
+                    Some(m) => self
+                        .db
+                        .is_in_room(m.id, room_id)
+                        .await
+                        .map_err(|e| HostError::Storage(format!("{e}")))?
+                        .then_some(m),
+                    None => None,
+                };
+                match visible {
+                    Some(m) => ReadStep::Found(m),
+                    None => {
+                        // The query behind a step is strictly "earlier than the
+                        // cursor", so stepping back from `id` itself lands on
+                        // the nearest earlier visible message.
+                        let step = self
+                            .neighbour_step(room_id, &username, Some(wanted), false, &blocked)
+                            .await?;
+                        if let ReadStep::Found(m) = &step {
+                            notice = Some(format!(
+                                "#{id} is not available; showing #{}.",
+                                m.id.as_i64()
+                            ));
+                        }
+                        step
+                    }
+                }
+            }
+        };
+        let msg = match found {
             ReadStep::Found(m) => m,
             ReadStep::Skipped(at) => {
                 return Ok(self.stopped_in_blocked_run(session, at, "R").await);
             }
             ReadStep::End { .. } => {
+                let missing = start_at
+                    .map(|id| format!("#{id} is not available.\n"))
+                    .unwrap_or_default();
                 return Ok(Response::Prompt {
                     text: format!(
-                        "No previous messages in {}.\nF - Forward  H - Help  X - Exit",
+                        "{missing}No previous messages in {}.\nF - Forward  H - Help  X - Exit",
                         room.name
                     ),
                     hide_input: false,
-                })
+                });
             }
         };
 
-        // Advance read pointer and update session cursor.
-        let _ = self.db.mark_read(user_id, room_id, msg.id).await;
+        // Only step navigation advances the read pointer; a jump to an explicit
+        // id leaves it where it is. A failed write is logged, not fatal: the
+        // message is still shown.
+        if start_at.is_none() {
+            if let Err(e) = self.db.mark_read(user_id, room_id, msg.id).await {
+                warn!(
+                    room = room_id.as_i64(),
+                    "could not advance the read pointer: {e}"
+                );
+            }
+        }
         {
             let mut sessions = self.sessions.write().await;
             if let Some(r) = sessions.get_mut(&session) {
@@ -5282,8 +5426,12 @@ impl BbsHost {
             .has_neighbour(room_id, &username, msg.id, true, &blocked)
             .await?;
 
+        let body = build_message_with_nav(&msg, has_prev, has_next);
         Ok(Response::Prompt {
-            text: build_message_with_nav(&msg, has_prev, has_next),
+            text: match notice {
+                Some(n) => format!("{n}\n{body}"),
+                None => body,
+            },
             hide_input: false,
         })
     }
@@ -5360,10 +5508,6 @@ impl BbsHost {
             Ok(t) => t,
             Err(r) => return Ok(r),
         };
-        // Read before any sessions lock is taken below: the draft preview is
-        // clipped for radio sessions.
-        let on_radio = self.session_on_radio(session).await;
-
         let is_guest = level < PermissionLevel::User;
         let guest_rid = self.guest_room_id();
         if is_guest && Some(room_id) != guest_rid {
@@ -5434,21 +5578,9 @@ impl BbsHost {
                                 hide_input: false,
                             });
                         }
-                        let body = body.to_owned();
-                        let mut sessions = self.sessions.write().await;
-                        if let Some(r) = sessions.get_mut(&session) {
-                            r.workflow = Workflow::Compose {
-                                room_id,
-                                stage: ComposeStage::AwaitingConfirmation {
-                                    recipient: Some(recipient.clone()),
-                                    body: body.clone(),
-                                },
-                            };
-                        }
-                        return Ok(Response::Prompt {
-                            text: draft_preview(Some(&recipient), &body, on_radio),
-                            hide_input: false,
-                        });
+                        return self
+                            .stage_draft(session, room_id, Some(recipient), body)
+                            .await;
                     }
                     Err(_) => {
                         return Ok(Response::Prompt {
@@ -5459,21 +5591,7 @@ impl BbsHost {
                 }
             } else {
                 // Room inline: "E message text" → stage draft.
-                let body = raw.to_owned();
-                let mut sessions = self.sessions.write().await;
-                if let Some(r) = sessions.get_mut(&session) {
-                    r.workflow = Workflow::Compose {
-                        room_id,
-                        stage: ComposeStage::AwaitingConfirmation {
-                            recipient: None,
-                            body: body.clone(),
-                        },
-                    };
-                }
-                return Ok(Response::Prompt {
-                    text: draft_preview(None, &body, on_radio),
-                    hide_input: false,
-                });
+                return self.stage_draft(session, room_id, None, raw).await;
             }
         }
 
@@ -5590,23 +5708,47 @@ impl BbsHost {
         }
 
         // Mail has no `room_messages` rows; take the newest direct message
-        // instead (#408).
-        let latest = if room_id == MAIL_ROOM_ID {
-            self.db.prev_direct(&username, None).await
-        } else {
-            self.db
-                .list_recent_in_room(room_id, 1)
+        // instead (#408). The pointer is the user's single high-water mark, so
+        // in Mail it moves to the newest message *addressed to them*, never to
+        // mail they sent, and the reply says how many unread messages that
+        // skipped (counted before the pointer moves).
+        let storage = |e: crate::db::StoreError| HostError::Storage(format!("{e}"));
+        let (latest, unread) = if room_id == MAIL_ROOM_ID {
+            let unread = self
+                .db
+                .unread_direct_count(&username, user_id, room_id)
                 .await
-                .map(|v| v.into_iter().next())
-        }
-        .map_err(|e| HostError::Storage(format!("{e}")))?;
+                .map_err(storage)?;
+            (
+                self.db.latest_direct_to(&username).await.map_err(storage)?,
+                unread,
+            )
+        } else {
+            let unread = self
+                .db
+                .unread_count(user_id, room_id)
+                .await
+                .map_err(storage)?;
+            (
+                self.db
+                    .list_recent_in_room(room_id, 1)
+                    .await
+                    .map_err(storage)?
+                    .into_iter()
+                    .next()
+                    .map(|m| m.id),
+                unread,
+            )
+        };
 
         if let Some(latest) = latest {
             self.db
-                .mark_read(user_id, room_id, latest.id)
+                .mark_read(user_id, room_id, latest)
                 .await
-                .map_err(|e| HostError::Storage(format!("{e}")))?;
-            Ok(Response::Text("Skipped to latest message.".into()))
+                .map_err(storage)?;
+            Ok(Response::Text(format!(
+                "Skipped to latest message ({unread} unread skipped)."
+            )))
         } else {
             Ok(Response::Text("No messages in this room.".into()))
         }
@@ -6268,8 +6410,11 @@ impl BbsHost {
         session: SessionId,
         query: String,
     ) -> Result<Response, HostError> {
+        // User search exposes every account's level and status, so it is an
+        // Aide-and-above tool (docs, `Command::SearchUsers`, #411).
         match self.session_auth_user(session).await {
-            Ok(_) => {}
+            Ok((_, _, level, _)) if level >= PermissionLevel::Aide => {}
+            Ok(_) => return Ok(Response::Error("Aide access required.".into())),
             Err(r) => return Ok(r),
         }
         if query.is_empty() {
@@ -6820,10 +6965,14 @@ fn help_text(topic: Option<&str>, level: Option<PermissionLevel>, on_radio: bool
             // N command instead of the Navigation topic (#407).
             "mail" if logged_in => HELP_MAIL.to_owned(),
             "read" | "reading" if logged_in => HELP_READING.to_owned(),
-            "post" | "posting" if logged_in => HELP_POSTING.to_owned(),
+            // `P` and `A` are not commands, so the single letters stay as
+            // topic aliases (they were documented in v1.4.2).
+            "p" | "post" | "posting" if logged_in => HELP_POSTING.to_owned(),
+            // SEARCH is Aide+, so a plain User's topic text leaves it out.
+            "users" if is_aide => HELP_USERS_AIDE.to_owned(),
             "users" if logged_in => HELP_USERS.to_owned(),
             "nav" | "navigation" if logged_in => HELP_NAVIGATION.to_owned(),
-            "acct" | "account" if logged_in => HELP_ACCOUNT.to_owned(),
+            "a" | "acct" | "account" if logged_in => HELP_ACCOUNT.to_owned(),
             "aide" if is_aide => HELP_AIDE.to_owned(),
             "sysop" if is_sysop => HELP_SYSOP.to_owned(),
             cmd => help_for_command(cmd, level),
@@ -6867,9 +7016,9 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         // ── Logged-in only ───────────────────────────────────────────────
         "n" if logged_in => "N — read new messages since last visit",
         "f" if logged_in => "F — forward-read (oldest first)\nF <id> to start from a specific message",
-        "r" if logged_in => "R — reverse-read (newest first)",
+        "r" if logged_in => "R — reverse-read (newest first)\nR <id> to start from a specific message",
         "s" if logged_in => "S — scan message headers in this room",
-        "search" if logged_in => "SEARCH <query> — find users by username (substring match)",
+        "search" if is_aide => "SEARCH <query> — find users by username (substring match)",
         ".ff" if logged_in => ".FF — fast-forward past unread\nResets your last-read pointer to the latest message.",
         "e" if logged_in => "E — enter a message\nE <text> to post without a prompt\nIn Mail: E @user message",
         "d" if logged_in => "D <id> — delete a message\nAides and sysops can delete any message.",
@@ -6948,7 +7097,7 @@ fn help_for_command(cmd: &str, level: Option<PermissionLevel>) -> String {
         other => {
             return format!(
                 "No help for '{other}'.\n\
-                 H for commands, H reading/posting/navigation/account for topics."
+                 H for commands, H mail/read/post/users/nav/acct for topics."
             )
         }
     };
@@ -6989,10 +7138,11 @@ H ACCT — Account";
 const HELP_READING: &str = "\
 Reading:\n\
  N    read new messages\n\
- F    forward-read (oldest first)\n\
- R    reverse-read (newest first)\n\
- S    scan message headers\n\
- .FF  fast-forward past unread";
+ F    forward (oldest first)\n\
+ R    reverse (newest first)\n\
+ F/R <#>  start at message #\n\
+ S    scan headers\n\
+ .FF  skip past unread";
 
 /// Contextual help shown when `H`/`?` is pressed inside the one-at-a-time
 /// reading sub-mode (`Workflow::Reading`). Lists only the keys valid there.
@@ -7001,10 +7151,9 @@ Reading mode:\n\
  F  next message\n\
  R  previous message\n\
  F/R <#>  jump to message\n\
- E  reply to this message\n\
+ E  reply (E <text> drafts)\n\
  D  delete message\n\
- H  this help\n\
- X  exit reading";
+ H  this help  X  exit";
 
 const HELP_POSTING: &str = "\
 Posting:\n\
@@ -7049,6 +7198,14 @@ Aide:\n\
 H USERS — Users";
 
 const HELP_USERS: &str = "\
+Users:\n\
+ U         list active\n\
+ U banned  list banned\n\
+ U all     list all\n\
+ WHOIS <u> details";
+
+/// `H USERS` for Aide and above: SEARCH is Aide+.
+const HELP_USERS_AIDE: &str = "\
 Users:\n\
  U         list active\n\
  U banned  list banned\n\
@@ -7124,6 +7281,7 @@ mod tests {
             ("HELP_ACCOUNT", HELP_ACCOUNT),
             ("HELP_AIDE", HELP_AIDE),
             ("HELP_USERS", HELP_USERS),
+            ("HELP_USERS_AIDE", HELP_USERS_AIDE),
             ("HELP_SYSOP", HELP_SYSOP),
         ];
         for (name, s) in cases {
@@ -14783,5 +14941,528 @@ mod tests {
             .await
             .unwrap();
         assert!(all.messages.iter().any(|m| m.content == "Hello There"));
+    }
+
+    // ── Audit fixes (F-004 .. F-036) ─────────────────────────────────────
+
+    /// Log in a second, validated User-level account on a fresh session.
+    async fn second_user(host: &BbsHost, name: &str) -> (SessionId, Username) {
+        let pw = random_test_password();
+        let sid = host.create_session("test").await.unwrap();
+        let u = Username::new(name).unwrap();
+        register_and_login(host, sid, &u, &pw).await;
+        force_validate(host, &u).await;
+        (sid, u)
+    }
+
+    async fn user_id_of(host: &BbsHost, u: &Username) -> UserId {
+        UserStore::get_by_username(&host.db, u)
+            .await
+            .unwrap()
+            .unwrap()
+            .id
+    }
+
+    async fn workflow_is_reading(host: &BbsHost, sid: SessionId) -> bool {
+        matches!(host.sessions.read().await[&sid].workflow, Workflow::Reading)
+    }
+
+    /// F-007: SEARCH is Aide+; Users get a denial and no SEARCH in help.
+    #[tokio::test]
+    async fn search_requires_aide_and_is_hidden_from_users() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sid,
+            &Username::new("alice").unwrap(),
+            &random_test_password(),
+        )
+        .await;
+        let (bob_sid, _) = second_user(&host, "bobby").await;
+
+        let search = |q: &str| Command::SearchUsers { query: q.into() };
+        let r = host.process_command(bob_sid, search("ali")).await.unwrap();
+        assert!(
+            matches!(&r, Response::Error(m) if m.contains("Aide")),
+            "{r:?}"
+        );
+        // The first account is the sysop, so it may search.
+        let r = host.process_command(sid, search("bob")).await.unwrap();
+        assert!(shown(r).contains("bobby"));
+
+        let user = Some(PermissionLevel::User);
+        let aide = Some(PermissionLevel::Aide);
+        assert!(!help_text(Some("users"), user, false).contains("SEARCH"));
+        assert!(help_text(Some("users"), aide, false).contains("SEARCH"));
+        assert!(help_text(Some("search"), user, false).starts_with("No help"));
+        assert!(help_text(Some("search"), aide, false).contains("SEARCH <query>"));
+    }
+
+    /// F-010: every help topic arm (and alias) opens its text; `H P`/`H A`
+    /// work; the fallback hint names real topics.
+    #[test]
+    fn every_help_topic_arm_maps_to_its_text() {
+        let sysop = Some(PermissionLevel::Sysop);
+        for (topics, text) in [
+            (&["mail"][..], HELP_MAIL),
+            (&["read", "reading"][..], HELP_READING),
+            (&["p", "post", "posting"][..], HELP_POSTING),
+            (&["users"][..], HELP_USERS_AIDE),
+            (&["nav", "navigation"][..], HELP_NAVIGATION),
+            (&["a", "acct", "account"][..], HELP_ACCOUNT),
+            (&["aide"][..], HELP_AIDE),
+            (&["sysop"][..], HELP_SYSOP),
+        ] {
+            for t in topics {
+                assert_eq!(help_text(Some(t), sysop, false), text, "H {t}");
+                assert_eq!(
+                    help_text(Some(&t.to_uppercase()), sysop, false),
+                    text,
+                    "H {t} (upper)"
+                );
+            }
+        }
+        assert_eq!(
+            help_text(Some("users"), Some(PermissionLevel::User), false),
+            HELP_USERS
+        );
+        let none = help_text(Some("zzz"), sysop, false);
+        for topic in ["mail", "read", "post", "users", "nav", "acct"] {
+            assert!(none.contains(topic), "{none}");
+        }
+        assert!(HELP_READING.contains("F/R <#>"));
+        assert!(HELP_READING_MODE.contains("E <text>"));
+        assert!(help_text(Some("r"), sysop, false).contains("R <id>"));
+    }
+
+    /// F-013/F-034: reading-mode keys split on any Unicode whitespace.
+    #[test]
+    fn reply_keyword_split_handles_unicode_whitespace() {
+        assert_eq!(split_reply_keyword("r\u{a0}3"), ("R".to_owned(), "3"));
+        assert_eq!(
+            split_reply_keyword(" E\thi There "),
+            ("E".to_owned(), "hi There")
+        );
+        assert_eq!(split_reply_keyword("d"), ("D".to_owned(), ""));
+        assert_eq!(
+            split_reply_keyword("\u{20ac}x y"),
+            ("\u{20ac}X".to_owned(), "y")
+        );
+    }
+
+    #[tokio::test]
+    async fn reading_mode_keys_accept_nbsp_and_tab_separators() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sid,
+            &Username::new("alice").unwrap(),
+            &random_test_password(),
+        )
+        .await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+
+        for sep in ["\u{a0}", "\t"] {
+            let start = |after: i64| Command::ReadForward { after: Some(after) };
+            // F <id>
+            host.process_command(sid, start(ids[0])).await.unwrap();
+            let t = shown(say(&host, sid, &format!("F{sep}{}", ids[1])).await);
+            assert!(t.contains("second"), "F{sep:?}: {t:?}");
+            assert!(workflow_is_reading(&host, sid).await);
+            // R <id>
+            let t = shown(say(&host, sid, &format!("R{sep}{}", ids[2])).await);
+            assert!(t.contains("third"), "R{sep:?}: {t:?}");
+            assert!(workflow_is_reading(&host, sid).await);
+            // E <text>
+            let t = shown(say(&host, sid, &format!("E{sep}hello world")).await);
+            assert!(t.contains("hello world"), "E{sep:?}: {t:?}");
+            assert!(matches!(
+                host.sessions.read().await[&sid].workflow,
+                Workflow::Compose {
+                    stage: ComposeStage::AwaitingConfirmation { .. },
+                    ..
+                }
+            ));
+            say(&host, sid, "C").await;
+        }
+
+        // D <id>
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[1]),
+            },
+        )
+        .await
+        .unwrap();
+        say(&host, sid, &format!("D\u{a0}{}", ids[0])).await;
+        assert!(workflow_is_reading(&host, sid).await);
+        assert!(MessageStore::get_by_id(&host.db, MessageId::new(ids[0]))
+            .await
+            .unwrap()
+            .is_none());
+        say(&host, sid, &format!("D\t{}", ids[2])).await;
+        assert!(MessageStore::get_by_id(&host.db, MessageId::new(ids[2]))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// F-004: replying in Mail with nothing to reply to is an error, never a
+    /// public post in the Mail room.
+    #[tokio::test]
+    async fn mail_reply_with_no_message_is_an_error() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sid,
+            &Username::new("alice").unwrap(),
+            &random_test_password(),
+        )
+        .await;
+        host.process_command(sid, Command::GoMail).await.unwrap();
+        host.process_command(sid, Command::ReadForward { after: None })
+            .await
+            .unwrap();
+        assert!(workflow_is_reading(&host, sid).await);
+        for reply in ["E", "E public-looking text"] {
+            let r = say(&host, sid, reply).await;
+            assert!(
+                matches!(&r, Response::Error(m) if m.contains("No message to reply to")),
+                "{reply:?}: {r:?}"
+            );
+            assert!(workflow_is_reading(&host, sid).await);
+        }
+        let rows = MessageStore::list_in_room(&host.db, MAIL_ROOM_ID, None, 10)
+            .await
+            .unwrap();
+        assert!(rows.messages.is_empty());
+    }
+
+    /// F-004: the confirm step never posts into the Mail room.
+    #[tokio::test]
+    async fn confirming_a_recipientless_mail_draft_does_not_post() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sid,
+            &Username::new("alice").unwrap(),
+            &random_test_password(),
+        )
+        .await;
+        host.sessions.write().await.get_mut(&sid).unwrap().workflow = Workflow::Compose {
+            room_id: MAIL_ROOM_ID,
+            stage: ComposeStage::AwaitingConfirmation {
+                recipient: None,
+                body: "x".into(),
+            },
+        };
+        let r = say(&host, sid, ".").await;
+        assert!(matches!(r, Response::Error(_)), "{r:?}");
+        let rows = MessageStore::list_in_room(&host.db, MAIL_ROOM_ID, None, 10)
+            .await
+            .unwrap();
+        assert!(rows.messages.is_empty());
+    }
+
+    /// F-004: a reply goes to the other party; for mail the user sent, that is
+    /// the recipient, not the user themself.
+    #[tokio::test]
+    async fn mail_reply_targets_the_other_party() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, &random_test_password()).await;
+        let (bob_sid, bob) = second_user(&host, "bobby").await;
+        let sent = host
+            .db
+            .post_direct(&alice, &bob, "from alice", Timestamp::now())
+            .await
+            .unwrap();
+
+        let staged_recipient = |host: Arc<BbsHost>, sid: SessionId| async move {
+            match &host.sessions.read().await[&sid].workflow {
+                Workflow::Compose {
+                    stage: ComposeStage::AwaitingConfirmation { recipient, .. },
+                    ..
+                } => recipient.clone(),
+                other => panic!("unexpected workflow {other:?}"),
+            }
+        };
+
+        // Alice reads her own sent mail and replies: it goes to bobby.
+        host.process_command(sid, Command::GoMail).await.unwrap();
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(sent.as_i64()),
+            },
+        )
+        .await
+        .unwrap();
+        say(&host, sid, "E again").await;
+        assert_eq!(staged_recipient(host.clone(), sid).await, Some(bob.clone()));
+
+        // Bobby replies to alice.
+        host.process_command(bob_sid, Command::GoMail)
+            .await
+            .unwrap();
+        host.process_command(
+            bob_sid,
+            Command::ReadForward {
+                after: Some(sent.as_i64()),
+            },
+        )
+        .await
+        .unwrap();
+        say(&host, bob_sid, "E thanks").await;
+        assert_eq!(staged_recipient(host.clone(), bob_sid).await, Some(alice));
+    }
+
+    /// F-014: `.FF` in Mail reports the unread count it skipped and parks the
+    /// pointer on the newest mail addressed to the user, not mail they sent.
+    #[tokio::test]
+    async fn fast_forward_in_mail_counts_and_ignores_sent_mail() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, &random_test_password()).await;
+        let (_, bob) = second_user(&host, "bobby").await;
+        let uid = user_id_of(&host, &alice).await;
+        let mut to_me = vec![];
+        for body in ["one", "two", "three"] {
+            to_me.push(
+                host.db
+                    .post_direct(&bob, &alice, body, Timestamp::now())
+                    .await
+                    .unwrap(),
+            );
+        }
+        // Alice's own, newer, sent mail.
+        host.db
+            .post_direct(&alice, &bob, "mine", Timestamp::now())
+            .await
+            .unwrap();
+
+        host.process_command(sid, Command::GoMail).await.unwrap();
+        let before = host
+            .db
+            .unread_direct_count(&alice, uid, MAIL_ROOM_ID)
+            .await
+            .unwrap();
+        // Three messages, alice's own sent mail, and the welcome mail.
+        assert!(before >= 4, "{before}");
+        let text = shown(
+            host.process_command(sid, Command::FastForward)
+                .await
+                .unwrap(),
+        );
+        assert!(
+            text.contains(&format!("{before} unread skipped")),
+            "{text:?}"
+        );
+        assert_eq!(
+            host.db.get_last_read(uid, MAIL_ROOM_ID).await.unwrap(),
+            Some(*to_me.last().unwrap())
+        );
+        // Only the sent message is still "unread".
+        let after = host
+            .db
+            .unread_direct_count(&alice, uid, MAIL_ROOM_ID)
+            .await
+            .unwrap();
+        assert_eq!(after, 1);
+    }
+
+    /// F-015: an explicit `R <id>` never advances the read pointer.
+    #[tokio::test]
+    async fn r_with_an_id_does_not_advance_the_read_pointer() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sid,
+            &Username::new("alice").unwrap(),
+            &random_test_password(),
+        )
+        .await;
+        let ids = post_all(&host, sid, &["a", "b", "c", "d"]).await;
+        let (bob_sid, bob) = second_user(&host, "bobby").await;
+        let uid = user_id_of(&host, &bob).await;
+
+        host.process_command(
+            bob_sid,
+            Command::ReadForward {
+                after: Some(ids[0]),
+            },
+        )
+        .await
+        .unwrap();
+        let pointer = host.db.get_last_read(uid, RoomId::new(1)).await.unwrap();
+        assert_eq!(pointer, Some(MessageId::new(ids[0])));
+
+        let t = shown(say(&host, bob_sid, &format!("R {}", ids[3])).await);
+        assert!(t.contains('d'), "{t:?}");
+        assert_eq!(
+            host.db.get_last_read(uid, RoomId::new(1)).await.unwrap(),
+            pointer,
+            "an explicit jump must not move the pointer"
+        );
+        // Stepping still advances it.
+        say(&host, bob_sid, "F").await;
+        let _ = say(&host, bob_sid, "R").await;
+        assert!(host.db.get_last_read(uid, RoomId::new(1)).await.unwrap() >= pointer);
+    }
+
+    /// F-036: `R <id>` for a deleted or blocked id falls back to the nearest
+    /// earlier visible message and says so.
+    #[tokio::test]
+    async fn r_with_an_unavailable_id_falls_back_with_a_notice() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        let alice = Username::new("alice").unwrap();
+        register_and_login(&host, sid, &alice, &random_test_password()).await;
+        let (_, bob) = second_user(&host, "bobby").await;
+        let ids = post_all(&host, sid, &["first", "second", "third"]).await;
+        let blocked_id = host
+            .db
+            .post_to_room(RoomId::new(1), &bob, "from bobby", Timestamp::now())
+            .await
+            .unwrap()
+            .as_i64();
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[0]),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Deleted.
+        MessageStore::delete(&host.db, MessageId::new(ids[1]))
+            .await
+            .unwrap();
+        let t = shown(say(&host, sid, &format!("R {}", ids[1])).await);
+        assert!(
+            t.contains(&format!("#{} is not available", ids[1])) && t.contains("first"),
+            "{t:?}"
+        );
+        assert!(workflow_is_reading(&host, sid).await);
+
+        // Blocked sender.
+        host.process_command(
+            sid,
+            Command::BlockUser {
+                target: bob.clone(),
+                force: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+        let t = shown(say(&host, sid, &format!("R {blocked_id}")).await);
+        assert!(
+            t.contains(&format!("#{blocked_id} is not available")) && t.contains("third"),
+            "{t:?}"
+        );
+        assert!(!t.contains("from bobby"));
+
+        // Existing, visible id: no notice.
+        let t = shown(say(&host, sid, &format!("R {}", ids[2])).await);
+        assert!(t.contains("third") && !t.contains("not available"), "{t:?}");
+    }
+
+    /// F-035: every staging path rejects an empty or oversized draft the same
+    /// way, and a read-only room for a plain user.
+    #[tokio::test]
+    async fn staging_paths_share_one_set_of_checks() {
+        let (host, _tmp) = make_host().await;
+        let sid = host.create_session("test").await.unwrap();
+        register_and_login(
+            &host,
+            sid,
+            &Username::new("alice").unwrap(),
+            &random_test_password(),
+        )
+        .await;
+        let big = "x".repeat(Message::CONTENT_MAX_LEN + 1);
+
+        // Inline E.
+        let r = host
+            .process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some(big.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(r, Response::Error(_)), "{r:?}");
+        // Prompted E.
+        host.process_command(sid, Command::EnterMessage { body: None })
+            .await
+            .unwrap();
+        let r = say(&host, sid, &big).await;
+        assert!(matches!(r, Response::Error(_)), "{r:?}");
+        let r = say(&host, sid, "   ").await;
+        assert!(shown(r).contains("cannot be empty"));
+        host.process_command(sid, Command::Cancel).await.unwrap();
+        // Reading-mode E <text>.
+        let ids = post_all(&host, sid, &["first"]).await;
+        host.process_command(
+            sid,
+            Command::ReadForward {
+                after: Some(ids[0]),
+            },
+        )
+        .await
+        .unwrap();
+        let r = say(&host, sid, &format!("E {big}")).await;
+        assert!(matches!(r, Response::Error(_)), "{r:?}");
+        assert!(workflow_is_reading(&host, sid).await);
+    }
+
+    /// F-016: two concurrent confirmations post exactly once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_confirmations_post_exactly_once() {
+        for round in 0..5 {
+            let (host, _tmp) = make_host().await;
+            let sid = host.create_session("test").await.unwrap();
+            register_and_login(
+                &host,
+                sid,
+                &Username::new("alice").unwrap(),
+                &random_test_password(),
+            )
+            .await;
+            let body = format!("once-{round}");
+            host.process_command(
+                sid,
+                Command::EnterMessage {
+                    body: Some(body.clone()),
+                },
+            )
+            .await
+            .unwrap();
+            let a = tokio::spawn({
+                let h = host.clone();
+                async move { say(&h, sid, ".").await }
+            });
+            let b = tokio::spawn({
+                let h = host.clone();
+                async move { say(&h, sid, ".").await }
+            });
+            let (a, b) = (a.await.unwrap(), b.await.unwrap());
+            drop((a, b));
+            let all = MessageStore::list_in_room(&host.db, RoomId::new(1), None, 100)
+                .await
+                .unwrap();
+            let n = all.messages.iter().filter(|m| m.content == body).count();
+            assert_eq!(n, 1, "round {round}: posted {n} times");
+        }
     }
 }
