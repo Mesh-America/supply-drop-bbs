@@ -3032,9 +3032,12 @@ async fn cmd_room(cli: &Cli, action: &RoomAction) {
                     std::process::exit(1);
                 }
             };
-            let Some(room) = rooms.iter().find(|r| r.name.eq_ignore_ascii_case(name)) else {
-                eprintln!("error: no room named '{name}'");
-                std::process::exit(1);
+            let room = match find_room_by_name(&rooms, name) {
+                Ok(r) => r,
+                Err(msg) => {
+                    eprintln!("error: {msg}");
+                    std::process::exit(1);
+                }
             };
             match host.admin_set_room_read_order(room.id, read_order).await {
                 Ok(updated) => println!(
@@ -3047,6 +3050,26 @@ async fn cmd_room(cli: &Cli, action: &RoomAction) {
                 }
             }
         }
+    }
+}
+
+/// Pick the room a CLI `room set` names: an exact match wins, otherwise a
+/// unique case-insensitive match. Several case-insensitive matches (rooms whose
+/// names differ only by case) are refused rather than guessed at.
+fn find_room_by_name<'a>(
+    rooms: &'a [bbs_plugin_api::AdminRoomSummary],
+    name: &str,
+) -> Result<&'a bbs_plugin_api::AdminRoomSummary, String> {
+    if let Some(r) = rooms.iter().find(|r| r.name == name) {
+        return Ok(r);
+    }
+    let mut matches = rooms.iter().filter(|r| r.name.eq_ignore_ascii_case(name));
+    match (matches.next(), matches.next()) {
+        (Some(r), None) => Ok(r),
+        (None, _) => Err(format!("no room named '{name}'")),
+        (Some(_), Some(_)) => Err(format!(
+            "'{name}' matches more than one room; give the exact name, including its case"
+        )),
     }
 }
 
@@ -4605,6 +4628,35 @@ mod backup_cli_tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["x", "room", "set", "Alerts"]).is_err());
+    }
+
+    #[test]
+    fn room_set_prefers_an_exact_name_and_refuses_ambiguity() {
+        use super::find_room_by_name;
+        let room = |id: i64, name: &str| bbs_plugin_api::AdminRoomSummary {
+            id,
+            name: name.to_owned(),
+            description: None,
+            read_only: false,
+            min_permission_level: 0,
+            message_count: 0,
+            created_at: String::new(),
+            deletable: true,
+            locked: false,
+            read_order: "oldest_first".to_owned(),
+        };
+        let rooms = vec![room(1, "Alerts"), room(2, "alerts"), room(3, "Chat")];
+        // Exact match wins over a case-insensitive one, whichever comes first.
+        assert_eq!(find_room_by_name(&rooms, "alerts").unwrap().id, 2);
+        assert_eq!(find_room_by_name(&rooms, "Alerts").unwrap().id, 1);
+        // Two case-insensitive matches and no exact one: refuse.
+        let err = find_room_by_name(&rooms, "ALERTS").unwrap_err();
+        assert!(err.contains("more than one room"), "{err}");
+        // A unique case-insensitive match is accepted.
+        assert_eq!(find_room_by_name(&rooms, "chat").unwrap().id, 3);
+        assert!(find_room_by_name(&rooms, "nope")
+            .unwrap_err()
+            .contains("no room named"));
     }
 
     #[test]
