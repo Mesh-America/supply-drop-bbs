@@ -10,8 +10,11 @@ This project's issue data is published to `refs/dolt/data` on the GitHub
 remote, alongside the source branches. A fresh clone starts empty until you
 bootstrap it.
 
-**bd 1.3.0 or newer is required.** The database schema here has been migrated
-to v66; older binaries are refused by a pending-migration gate.
+**bd 1.3.4 is the pinned version** (see `.beads/PINNED_BD_VERSION`). The database
+schema here is v66; older binaries are refused by a pending-migration gate.
+Moving from 1.3.0 to 1.3.4 needs no schema migration, only a binary swap. Do
+not run `bd compact` or `bd flatten` on a clone that got the data by `bd dolt
+pull` or `bd bootstrap` (upstream issue 7039, not fixed in 1.3.4).
 
 ### New machine or new teammate
 
